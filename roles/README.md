@@ -3,7 +3,8 @@
 Канонические промты ролей находятся в этом каталоге. Основной маршрут:
 
 ```text
-Architect
+Structure Keeper (системная роль, всегда первой)
+  → Architect
   → Decomposer
   → Programmer
   → Scanner
@@ -15,6 +16,10 @@ Architect
   → Done
 ```
 
+`Structure Keeper` запускается при старте/перезапуске программы и при создании нового проекта или сервиса,
+до всех остальных ролей. Он не выполняет бизнес-задачи: только приводит структуру проекта к эталону
+`_orchestrator_template/`. Подробности — `structure-keeper.md`.
+
 Условные возвраты:
 
 - `Task Reviewer: NEEDS_FIX` → Programmer;
@@ -25,6 +30,7 @@ Architect
 
 | Код роли | Промт |
 |---|---|
+| `STRUCTURE_KEEPER` | `structure-keeper.md` |
 | `ARCHITECT` | `architect.md` |
 | `DECOMPOSER` | `decomposer.md` |
 | `PROGRAMMER` | `programmer.md` |

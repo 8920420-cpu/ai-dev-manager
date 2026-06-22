@@ -11,5 +11,8 @@ dist/
 *.log
 *.out
 
+# Структурные журналы оркестратора (Structure Keeper) — отслеживаются в репозитории
+!**/.orchestrator/migrations.log
+
 # Локальные настройки Claude Code (не для репозитория)
 .claude/settings.local.json

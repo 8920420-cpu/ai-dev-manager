@@ -2,6 +2,18 @@
 
 Этот файл — единственная точка входа в очередь. Подробные задачи находятся в каталоге [tasks](tasks/README.md).
 
+## Эталон структуры и роль Structure Keeper
+
+Структура проекта стандартизирована по эталону [_orchestrator_template/](_orchestrator_template/README.md)
+(версия структуры — [_orchestrator_template/version.json](_orchestrator_template/version.json)). Системная
+роль [Structure Keeper](roles/structure-keeper.md) **запускается первой** — при старте/перезапуске программы
+и при создании нового проекта/сервиса — и приводит структуру к эталону: каркас `tasks/`, документацию,
+конфигурацию `.orchestrator/`, реестр сервисов и карту зависимостей. Она не пишет код и не выполняет
+бизнес-задачи. Глобальное состояние — в [_orchestrator/](_orchestrator/README.md).
+
+Очередь задач ведётся по **папочной модели**: каждая задача — отдельный файл, перемещаемый между стадиями
+`tasks/{inbox,ready,in_progress,review,qa,blocked,done,archive}/`. Подробности — [tasks/README.md](tasks/README.md).
+
 ## Обязательный алгоритм Claude Code
 
 Claude Code выполняет только роль `PROGRAMMER`: получает от оркестратора уже подготовленную и декомпозированную
@@ -52,55 +64,55 @@ Claude Code не меняет эту постановку и не разреза
 
 ## Статусы
 
-- `[ ]` — готово к работе
-- `[B]` — сервис атомарно захвачен Claude Code; повторно брать его запрещено
-- `[~]` — отдельная задача захваченного сервиса выполняется
-- `[R]` — код готов, идёт итоговое сервисное ревью и проверка
-- `[!]` — заблокировано; рядом обязательна конкретная причина
-- `[x]` — сервисная очередь полностью завершена и закоммичена
+Стадия задачи задаётся папкой в `tasks/` и полем `status` во frontmatter файла:
 
-## Очередь микросервисов
+| Стадия (папка) | `status` | Прежний маркер | Значение |
+|---|---|---|---|
+| `inbox/` | inbox | — | сырые задачи до триажа |
+| `ready/` | ready | `[ ]` | готово к работе; Programmer забирает отсюда |
+| `in_progress/` | in_progress | `[B]` / `[~]` | сервис захвачен, задача выполняется |
+| `review/` | review | `[R]` | код готов, идёт ревью |
+| `qa/` | qa | — | проверка: тесты/pipeline/smoke |
+| `blocked/` | blocked | `[!]` | заблокировано; в теле обязательна причина |
+| `done/` | done | `[x]` | завершено и проверено |
+| `archive/` | archive | — | история и legacy-постановки |
 
-### [R] P0 SERVICE.ORCHESTRATOR — orchestrator-service
+## Прямая постановка задачи (пока роли до Programmer не работают)
 
-Файл: [tasks/orchestrator-service.md](tasks/orchestrator-service.md)
-Владелец исходников: `orchestrator-service/`. Зависимости: нет. Контракты `/api/*` из этой очереди должны
-предшествовать зависимым сервисам.
+Пока автоматические роли до Programmer (`ARCHITECT`, `DECOMPOSER`) не запущены и задачи пишутся напрямую,
+**задачу нужно сразу записывать со статусом, который Programmer забирает в работу** — иначе она не будет
+принята и зависнет:
 
-### [R] P0 SERVICE.FRONTEND — frontend (SPA)
+- В папочной очереди — положить файл задачи в `tasks/ready/` со `status: ready` (готово к работе). Не
+  использовать другие стадии (`in_progress`, `review`, `blocked`, `done`, `archive`) для задачи, которая
+  должна сразу пойти в работу.
+- В `runtime/claude-tasks.json` — `status: "готово к работе"`. Запись должна быть валидной и полной:
+  `id` (UUID), `project` и `service` (оба уже зарегистрированы в БД — Scanner их не создаёт), `title`, и
+  `status: "готово к работе"`. Поля `result: ""`, `changedFiles: []`, `completedAt: null`. В слоте держать
+  одну задачу за раз; документ — `{ "version": 1, "tasks": [ ... ] }`.
 
-Файл: [tasks/frontend.md](tasks/frontend.md)
-Владелец исходников: `src/` (сборка в `dist/`). Зависимости: HTTP-контракт `/api/*` оркестратора.
+Статусы `block`/`блок` и `выполнено`/`done`/`completed` Programmer пропускает, поэтому для прямой постановки
+их использовать нельзя.
 
-> Статус блока: весь блок выполнен (Programmer), готов к ревью `[R]`: P0.1, P1.1, P1.2, P2.1, P2.2.
-> P2.1 потребовала cross-service серверной части (orchestrator P2.1 `[R]` + миграция `0008`, применена с подтверждением пользователя).
-> Локальные проверки: frontend typecheck/build/vitest (65 тестов) и orchestrator `node --test` (112) — зелёные.
+## Очередь задач
 
-### [ ] P1 SERVICE.PIPELINE-RUNNER — pipeline-runner
+Задачи лежат в стадиях `tasks/<стадия>/` отдельными файлами; владелец указан в поле `service` каждого
+файла. Активная очередь (после миграции на папочную модель, версия структуры 1.0.0):
 
-Файл: [tasks/pipeline-runner.md](tasks/pipeline-runner.md)
-Владелец исходников: `pipeline-runner/`. Зависимости: определения этапов и статусов из orchestrator-service.
+| Сервис | Код | Владелец исходников | Зависимости | ready | review | blocked |
+|---|---|---|---|---|---|---|
+| orchestrator-service | `ORCHESTRATOR` | `orchestrator-service/` | нет | P1.2, P1.3, P1.4, P2.2, P2.3 | P0.1, P1.1, P2.1 | — |
+| frontend (SPA) | `FRONTEND` | `src/` → `dist/` | `/api/*` оркестратора | P1.3 | P0.1, P1.1, P1.2, P2.1, P2.2 | — |
+| pipeline-runner | `PIPELINE_RUNNER` | `pipeline-runner/` | этапы/статусы orchestrator-service | P1.2, P2.1 | P1.1 | — |
+| scanner-service | `SCANNER` | `scanner-service/` | контракт этапов/Scanner orchestrator-service | — | P1.1 | P1.2, P2.1 |
+| tester-service | `TESTER` | `tester-service/` | orchestrator-service, pipeline-runner | — | — | — |
+| интеграция/выпуск | `INTEGRATION` | межсервисные E2E | сервисы соответствующего E2E | P2.1–P2.4, P3.1 | — | — |
 
-### [R] P1 SERVICE.SCANNER — scanner-service
-
-Файл: [tasks/scanner-service.md](tasks/scanner-service.md)
-Владелец исходников: `scanner-service/`. Зависимости: контракт конфигурации этапов и Scanner из orchestrator-service.
-
-> Статус блока: P1.1 реализован (Programmer), готов к ревью `[R]` — мульти-watcher Scanner по конфигурации этапов
-> оркестратора (`GET /api/projects` → enabled SCANNER-этапы), один watcher на `projectId+stageId`, проверка папки,
-> защита от path traversal/symlink escape, атомарное переключение папки, readiness/health, изоляция exactly-once state;
-> legacy single-watcher + feeder сохранены как fallback (приоритет API над `SCANNER_DOCUMENT`).
-> P1.2 и P2.1 — `[!]` блокированы незавершёнными зависимостями orchestrator P1.2 и P2.3.
-
-### [ ] P1 SERVICE.TESTER — tester-service
-
-Файл: [tasks/tester-service.md](tasks/tester-service.md)
-Владелец исходников: `tester-service/`. Зависимости: orchestrator-service и pipeline-runner.
-
-### [ ] P2 SERVICE.INTEGRATION — сквозная интеграция и выпуск
-
-Файл: [tasks/Integration.md](tasks/Integration.md)
-Зависимости: все сервисы, участвующие в соответствующем E2E-сценарии.
+Зависимости между сервисами зафиксированы в [_orchestrator/dependencies.json](_orchestrator/dependencies.json),
+реестр сервисов — в [_orchestrator/services_registry.json](_orchestrator/services_registry.json).
+`SCANNER` P1.2 и P2.1 заблокированы незавершёнными зависимостями orchestrator P1.2 и P2.3 (причина — в теле
+файлов в `tasks/blocked/`). Прежние сервисные очереди сохранены в
+[tasks/archive/legacy-service-queues/](tasks/archive/legacy-service-queues/).
 
 ## Общие ограничения
 

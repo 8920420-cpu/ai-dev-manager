@@ -1,0 +1,19 @@
+{
+  "code": "<SERVICE_CODE>",
+  "name": "<Service Name>",
+  "project": "<PROJECT_CODE>",
+  "root": "<относительный путь корня сервиса>",
+  "sourceDir": "<каталог исходников>",
+  "language": "<go|node|typescript|...>",
+  "type": "service",
+  "pipeline": ".pipeline.json",
+  "docs": [
+    "PROJECT_MAP.md",
+    "ARCHITECTURE.md",
+    "API_MAP.md",
+    "DATABASE_MAP.md",
+    "DECISIONS.md"
+  ],
+  "tasksDir": "tasks",
+  "structureVersion": "1.0.0"
+}

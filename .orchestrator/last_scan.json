@@ -1,0 +1,26 @@
+{
+  "lastScanAt": "2026-06-22",
+  "structureVersion": "1.0.0",
+  "templateVersion": "1.0.0",
+  "status": "READY",
+  "createdDirs": [
+    "tasks/inbox",
+    "tasks/ready",
+    "tasks/in_progress",
+    "tasks/review",
+    "tasks/qa",
+    "tasks/blocked",
+    "tasks/done",
+    "tasks/archive"
+  ],
+  "createdFiles": [
+    ".orchestrator/version.json",
+    ".orchestrator/service.json",
+    ".orchestrator/locks.json",
+    ".orchestrator/last_scan.json",
+    ".orchestrator/migrations.log",
+    ".orchestrator/structure_report.md"
+  ],
+  "appliedMigrations": ["0.0.0_to_1.0.0"],
+  "problems": []
+}
