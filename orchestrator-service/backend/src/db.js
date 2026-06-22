@@ -12,7 +12,7 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 export const MIGRATIONS_DIR = process.env.MIGRATIONS_DIR || resolve(__dirname, '../db/migrations');
 export const SEED_DIR = process.env.SEED_DIR || resolve(__dirname, '../db/seed');
 
-function clientConfig(s, database) {
+export function clientConfig(s, database) {
   return {
     host: s.host,
     port: s.port,
@@ -28,7 +28,7 @@ function assertIdentifier(name) {
   }
 }
 
-async function withClient(cfg, fn) {
+export async function withClient(cfg, fn) {
   const client = new Client(cfg);
   await client.connect();
   try {
@@ -144,19 +144,10 @@ export async function acceptScannerCompletion(s, input) {
   return withClient(clientConfig(s), async (c) => {
     await c.query('BEGIN');
     try {
-      const found = await c.query(
-        `SELECT t.id, t.status::text AS status, p.code AS project_code,
-                s.service_code, rr.id AS reviewer_role_id
-         FROM tasks t
-         JOIN projects p ON p.id = t.project_id
-         LEFT JOIN services s ON s.id = t.service_id
-         JOIN roles rr ON rr.code = 'TASK_REVIEWER'
-         WHERE t.id = $1
-         FOR UPDATE OF t`,
-        [payload.taskId],
-      );
-      if (!found.rowCount) throw scannerError(404, 'task_not_found');
-      const task = found.rows[0];
+      // Задачи может не быть в БД (её завели прямо в документе Claude) —
+      // тогда Scanner создаёт её (и при необходимости проект/сервис) по
+      // координатам completion и продолжает обычный переход к Task Reviewer.
+      const { task, created } = await findOrCreateScannerTask(c, payload);
       if (task.project_code !== payload.project) throw scannerError(409, 'project_mismatch');
       if ((task.service_code ?? '') !== payload.service) throw scannerError(409, 'service_mismatch');
       if (['DONE', 'CANCELLED'].includes(task.status)) throw scannerError(409, 'task_is_terminal');
@@ -171,7 +162,7 @@ export async function acceptScannerCompletion(s, input) {
       );
       if (!inserted.rowCount) {
         await c.query('COMMIT');
-        return { accepted: true, duplicate: true, taskId: payload.taskId, nextRole: 'TASK_REVIEWER' };
+        return { accepted: true, duplicate: true, autoCreated: created, taskId: payload.taskId, nextRole: 'TASK_REVIEWER' };
       }
 
       await c.query(
@@ -193,12 +184,96 @@ export async function acceptScannerCompletion(s, input) {
         })],
       );
       await c.query('COMMIT');
-      return { accepted: true, duplicate: false, taskId: payload.taskId, nextRole: 'TASK_REVIEWER' };
+      return { accepted: true, duplicate: false, autoCreated: created, taskId: payload.taskId, nextRole: 'TASK_REVIEWER' };
     } catch (error) {
       await c.query('ROLLBACK');
       throw error;
     }
   });
+}
+
+// SELECT задачи в форме, нужной диспетчеру Scanner (FOR UPDATE — блокируем строку).
+const SCANNER_TASK_SELECT = `SELECT t.id, t.status::text AS status, p.code AS project_code,
+        s.service_code, rr.id AS reviewer_role_id
+   FROM tasks t
+   JOIN projects p ON p.id = t.project_id
+   LEFT JOIN services s ON s.id = t.service_id
+   JOIN roles rr ON rr.code = 'TASK_REVIEWER'
+  WHERE t.id = $1
+  FOR UPDATE OF t`;
+
+/**
+ * Найти задачу по id или создать её из completion, если в БД её ещё нет.
+ * Новая задача создаётся в статусе CODING под ролью PROGRAMMER (как будто её
+ * только что закодил Programmer) с событием TASK_CREATED — дальше обычный
+ * переход к Task Reviewer сохраняет связную историю. Проект/сервис создаются
+ * при отсутствии. Идемпотентно: ON CONFLICT + повторный SELECT под блокировкой.
+ * Возвращает { task, created } (created — была ли задача создана сейчас).
+ */
+export async function findOrCreateScannerTask(c, payload) {
+  const existing = await c.query(SCANNER_TASK_SELECT, [payload.taskId]);
+  if (existing.rowCount) return { task: existing.rows[0], created: false };
+
+  const projectId = await ensureProject(c, payload.project);
+  const serviceId = await ensureService(c, projectId, payload.service);
+  const role = await c.query(`SELECT id FROM roles WHERE code = 'PROGRAMMER'`);
+  const programmerRoleId = role.rows[0]?.id ?? null;
+
+  const ins = await c.query(
+    `INSERT INTO tasks (id, project_id, service_id, title, status, current_role_id, created_by)
+     VALUES ($1, $2, $3, $4, 'CODING', $5, 'scanner')
+     ON CONFLICT (id) DO NOTHING
+     RETURNING id`,
+    [payload.taskId, projectId, serviceId, payload.title, programmerRoleId],
+  );
+  if (ins.rowCount) {
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, to_status, role_id, payload_json)
+       VALUES ($1, 'TASK_CREATED', 'CODING', $2, $3::jsonb)`,
+      [payload.taskId, programmerRoleId, JSON.stringify({
+        source: 'scanner', autoCreated: true, project: payload.project, service: payload.service, title: payload.title,
+      })],
+    );
+  }
+
+  const created = await c.query(SCANNER_TASK_SELECT, [payload.taskId]);
+  if (!created.rowCount) throw scannerError(500, 'task_autocreate_failed');
+  return { task: created.rows[0], created: ins.rowCount > 0 };
+}
+
+// Найти проект по коду или создать минимальный (code=name). Идемпотентно.
+async function ensureProject(c, code) {
+  const found = await c.query('SELECT id FROM projects WHERE code = $1', [code]);
+  if (found.rowCount) return found.rows[0].id;
+  const ins = await c.query(
+    `INSERT INTO projects (code, name) VALUES ($1, $1)
+     ON CONFLICT (code) DO NOTHING RETURNING id`,
+    [code],
+  );
+  if (ins.rowCount) return ins.rows[0].id;
+  const again = await c.query('SELECT id FROM projects WHERE code = $1', [code]);
+  return again.rows[0].id;
+}
+
+// Найти сервис по (project, service_code) или создать минимальный. Пустой код
+// сервиса → null (задача без привязки к сервису). Идемпотентно.
+async function ensureService(c, projectId, serviceCode) {
+  const code = String(serviceCode ?? '').trim();
+  if (!code) return null;
+  const found = await c.query(
+    'SELECT id FROM services WHERE project_id = $1 AND service_code = $2', [projectId, code],
+  );
+  if (found.rowCount) return found.rows[0].id;
+  const ins = await c.query(
+    `INSERT INTO services (project_id, service_code, service_name) VALUES ($1, $2, $2)
+     ON CONFLICT (project_id, service_code) DO NOTHING RETURNING id`,
+    [projectId, code],
+  );
+  if (ins.rowCount) return ins.rows[0].id;
+  const again = await c.query(
+    'SELECT id FROM services WHERE project_id = $1 AND service_code = $2', [projectId, code],
+  );
+  return again.rows[0].id;
 }
 
 /**

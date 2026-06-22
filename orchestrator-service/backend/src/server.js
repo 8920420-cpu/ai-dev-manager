@@ -26,6 +26,9 @@ import {
   listExchanges,
   invokeConnector,
 } from './connectors.js';
+import { getProjectStages, saveProjectStages } from './stages.js';
+import { getTaskStatistics } from './taskStats.js';
+import { upsertProjectByPath, listProjects } from './projects.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const FRONTEND_DIR = process.env.FRONTEND_DIR || resolve(__dirname, '../../frontend');
@@ -94,6 +97,13 @@ async function serveStatic(res, pathname) {
   const type = MIME[extname(file)] || 'application/octet-stream';
   res.writeHead(200, { 'Content-Type': type });
   res.end(await readFile(file));
+}
+
+// Разбор путей /api/projects/:projectId/(stages|task-statistics).
+function matchProjectRoute(pathname) {
+  const m = pathname.match(/^\/api\/projects\/([^/]+)\/(stages|task-statistics)$/);
+  if (!m) return null;
+  return { id: decodeURIComponent(m[1]), kind: m[2] };
 }
 
 // Разбор путей /api/integrations[/:id[/exchanges|/invoke]].
@@ -172,6 +182,42 @@ export function createApp() {
             await releaseHostTask(await loadSettings(), (await readBody(req)).taskId),
           );
 
+        // --- Проекты: регистрация/привязка по папке (root_path) ---
+        if (p === '/api/projects') {
+          if (req.method === 'GET') return sendJson(res, 200, await listProjects(await loadSettings()));
+          if (req.method === 'POST')
+            return sendJson(res, 200, await upsertProjectByPath(await loadSettings(), await readBody(req)));
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Проекты: этапы пайплайна (stage-config) и статистика задач ---
+        const proj = matchProjectRoute(p);
+        if (proj) {
+          if (proj.kind === 'stages') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await getProjectStages(await loadSettings(), proj.id));
+            if (req.method === 'PUT')
+              return sendJson(
+                res,
+                200,
+                await saveProjectStages(await loadSettings(), proj.id, await readBody(req)),
+              );
+            return sendJson(res, 405, { error: 'method_not_allowed' });
+          }
+          if (proj.kind === 'task-statistics') {
+            if (req.method === 'GET')
+              return sendJson(
+                res,
+                200,
+                await getTaskStatistics(await loadSettings(), proj.id, {
+                  limit: url.searchParams.get('limit'),
+                  offset: url.searchParams.get('offset'),
+                }),
+              );
+            return sendJson(res, 405, { error: 'method_not_allowed' });
+          }
+        }
+
         // --- Интеграции (коннекторы AI) + журнал обмена ---
         const intg = matchIntegrationRoute(p);
         if (intg) {
@@ -202,7 +248,11 @@ export function createApp() {
       res.writeHead(405);
       res.end('Method not allowed');
     } catch (e) {
-      sendJson(res, e.statusCode || 500, { ok: false, error: e.message });
+      const body = { ok: false, error: e.message };
+      // Стабильный машинный код и привязанные к stageId ошибки валидации.
+      if (e.code) body.code = e.code;
+      if (Array.isArray(e.errors)) body.errors = e.errors;
+      sendJson(res, e.statusCode || 500, body);
     }
   });
 }

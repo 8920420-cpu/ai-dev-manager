@@ -9,6 +9,7 @@ dist/
 .tmp/
 **/.tmp/
 *.log
+*.out
 
 # Локальные настройки Claude Code (не для репозитория)
 .claude/settings.local.json

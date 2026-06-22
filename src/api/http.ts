@@ -19,10 +19,16 @@ export function setApiToken(token: string | null): void {
   apiToken = token;
 }
 
+interface RequestOptions {
+  /** Для отмены устаревших запросов (напр. при смене проекта). */
+  signal?: AbortSignal;
+}
+
 async function request<T>(
   method: string,
   path: string,
   body?: unknown,
+  opts?: RequestOptions,
 ): Promise<T> {
   const headers: Record<string, string> = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -34,8 +40,11 @@ async function request<T>(
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
+      signal: opts?.signal,
     });
-  } catch {
+  } catch (err) {
+    // Отмену пробрасываем как есть, чтобы вызывающий мог её отличить.
+    if (err instanceof DOMException && err.name === 'AbortError') throw err;
     throw new ApiError('Не удалось связаться с сервером оркестратора', 0);
   }
 
@@ -61,7 +70,7 @@ async function request<T>(
 }
 
 export const http = {
-  get: <T>(path: string) => request<T>('GET', path),
+  get: <T>(path: string, opts?: RequestOptions) => request<T>('GET', path, undefined, opts),
   post: <T>(path: string, body?: unknown) => request<T>('POST', path, body),
   put: <T>(path: string, body?: unknown) => request<T>('PUT', path, body),
   del: <T>(path: string) => request<T>('DELETE', path),

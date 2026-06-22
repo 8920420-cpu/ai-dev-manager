@@ -40,7 +40,14 @@ export function ProjectCard({ project, onOpen, onEdit, onDelete }: ProjectCardPr
     <Card className={styles.card} aria-label={`Проект ${project.name}`}>
       <div className={styles.head}>
         <h3 className={styles.name} title={project.name}>
-          {project.name}
+          <button
+            type="button"
+            className={styles.nameBtn}
+            onClick={() => onOpen(project)}
+            aria-label={`Открыть монитор задач проекта ${project.name}`}
+          >
+            {project.name}
+          </button>
         </h3>
         <div className={styles.menu}>
           <Menu items={menuItems} label={`Действия для проекта ${project.name}`} />

@@ -24,6 +24,32 @@
   min-width: 0;
 }
 
+.nameBtn {
+  appearance: none;
+  border: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+
+.nameBtn:hover {
+  text-decoration: underline;
+}
+
+.nameBtn:focus-visible {
+  outline: 2px solid var(--primary, #2563eb);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm, 4px);
+}
+
 .menu {
   flex: none;
   margin: calc(-1 * var(--space-1)) calc(-1 * var(--space-1)) 0 0;

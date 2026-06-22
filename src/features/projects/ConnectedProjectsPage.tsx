@@ -12,6 +12,7 @@ import { projectsApi } from '../../api/projectsApi';
 import type { Project } from '../../types/project';
 import { ProjectCard } from './ProjectCard';
 import { CreateProjectModal } from './CreateProjectModal';
+import { ProjectMonitor } from './ProjectMonitor';
 import styles from './ConnectedProjectsPage.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
@@ -26,6 +27,9 @@ export function ConnectedProjectsPage() {
 
   const [deleteTarget, setDeleteTarget] = useState<Project | null>(null);
   const [deleting, setDeleting] = useState(false);
+
+  // Открытый монитор задач конкретного проекта (экран поверх списка).
+  const [monitorProject, setMonitorProject] = useState<Project | null>(null);
 
   const load = useCallback(async () => {
     setLoadState('loading');
@@ -62,8 +66,8 @@ export function ConnectedProjectsPage() {
     });
   };
 
-  const handleOpenProject = () => {
-    toast.info('Открытие проекта пока недоступно — нужен backend');
+  const handleOpenProject = (project: Project) => {
+    setMonitorProject(project);
   };
 
   const confirmDelete = async () => {
@@ -80,6 +84,15 @@ export function ConnectedProjectsPage() {
       setDeleting(false);
     }
   };
+
+  // Экран монитора задач выбранного проекта.
+  if (monitorProject) {
+    return (
+      <div className={styles.page}>
+        <ProjectMonitor project={monitorProject} onBack={() => setMonitorProject(null)} />
+      </div>
+    );
+  }
 
   return (
     <div className={styles.page}>
