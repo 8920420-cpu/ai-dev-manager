@@ -49,10 +49,14 @@ export const integrationsApi = {
     return exchanges;
   },
 
-  /** Вызвать ИИ через коннектор (промт). Обмен записывается в журнал. */
-  async invoke(id: string, prompt: string): Promise<InvokeResult> {
+  /**
+   * Вызвать ИИ через коннектор. Обмен записывается в журнал.
+   * Канонический контракт: входное пользовательское поле — `user`. Legacy-поле
+   * `prompt` больше не отправляется (см. tasks/frontend.md → P2.2).
+   */
+  async invoke(id: string, user: string): Promise<InvokeResult> {
     return http.post<InvokeResult>(`/api/integrations/${encodeURIComponent(id)}/invoke`, {
-      prompt,
+      user,
     });
   },
 

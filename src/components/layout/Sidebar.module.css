@@ -33,8 +33,16 @@
   gap: var(--space-1);
 }
 
+.itemRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
 .item {
   display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
   align-items: center;
   gap: var(--space-3);
   height: var(--control-h-lg);
@@ -46,6 +54,28 @@
   transition:
     background-color var(--dur-fast) var(--ease-in-out),
     color var(--dur-fast) var(--ease-in-out);
+}
+
+/* Кнопка-disclosure (шеврон) для сворачивания/раскрытия категории. */
+.disclosure {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-h-lg);
+  height: var(--control-h-lg);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-fast) var(--ease-in-out),
+    color var(--dur-fast) var(--ease-in-out);
+}
+.disclosure:hover {
+  background: var(--surface-hover);
+  color: var(--text);
 }
 .item:hover {
   background: var(--surface-hover);

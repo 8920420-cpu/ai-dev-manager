@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { FolderGit2, Plus } from 'lucide-react';
 import {
   Button,
@@ -9,6 +9,10 @@ import {
   useToast,
 } from '../../components/ui';
 import { projectsApi } from '../../api/projectsApi';
+import {
+  OPEN_PROJECT_MONITOR_EVENT,
+  type OpenProjectMonitorDetail,
+} from '../../app/projectMonitorBus';
 import type { Project } from '../../types/project';
 import { ProjectCard } from './ProjectCard';
 import { CreateProjectModal } from './CreateProjectModal';
@@ -30,6 +34,8 @@ export function ConnectedProjectsPage() {
 
   // Открытый монитор задач конкретного проекта (экран поверх списка).
   const [monitorProject, setMonitorProject] = useState<Project | null>(null);
+  // Запрос «открыть монитор», пришедший до загрузки списка проектов.
+  const pendingMonitorId = useRef<string | null>(null);
 
   const load = useCallback(async () => {
     setLoadState('loading');
@@ -37,6 +43,12 @@ export function ConnectedProjectsPage() {
       const list = await projectsApi.list();
       setProjects(list);
       setLoadState('ready');
+      // Применить отложенный запрос открытия монитора из сайдбара.
+      if (pendingMonitorId.current) {
+        const target = list.find((p) => p.id === pendingMonitorId.current);
+        pendingMonitorId.current = null;
+        if (target) setMonitorProject(target);
+      }
     } catch {
       setLoadState('error');
     }
@@ -45,6 +57,19 @@ export function ConnectedProjectsPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  // Открытие монитора по клику на проект в сайдбаре.
+  useEffect(() => {
+    const onOpen = (e: Event) => {
+      const id = (e as CustomEvent<OpenProjectMonitorDetail>).detail?.projectId;
+      if (!id) return;
+      const target = projects.find((p) => p.id === id);
+      if (target) setMonitorProject(target);
+      else pendingMonitorId.current = id; // список ещё грузится — откроем после load
+    };
+    window.addEventListener(OPEN_PROJECT_MONITOR_EVENT, onOpen);
+    return () => window.removeEventListener(OPEN_PROJECT_MONITOR_EVENT, onOpen);
+  }, [projects]);
 
   const openCreate = () => {
     setEditProject(null);
@@ -64,6 +89,8 @@ export function ConnectedProjectsPage() {
         : [saved, ...prev];
       return [...next].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
     });
+    // Если редактировали проект с открытым монитором — обновим его данные.
+    setMonitorProject((cur) => (cur && cur.id === saved.id ? saved : cur));
   };
 
   const handleOpenProject = (project: Project) => {
@@ -89,7 +116,17 @@ export function ConnectedProjectsPage() {
   if (monitorProject) {
     return (
       <div className={styles.page}>
-        <ProjectMonitor project={monitorProject} onBack={() => setMonitorProject(null)} />
+        <ProjectMonitor
+          project={monitorProject}
+          onBack={() => setMonitorProject(null)}
+          onEdit={openEdit}
+        />
+        <CreateProjectModal
+          open={modalOpen}
+          onClose={() => setModalOpen(false)}
+          onCreated={handleSaved}
+          editProject={editProject}
+        />
       </div>
     );
   }

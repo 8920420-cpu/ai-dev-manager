@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Layers } from 'lucide-react';
+import { Layers, Settings } from 'lucide-react';
 import {
   Badge,
   Button,
@@ -20,6 +20,8 @@ interface ProjectMonitorProps {
   project: Project;
   /** Закрыть монитор и вернуться к списку проектов. */
   onBack: () => void;
+  /** Открыть настройки проекта (редактирование). Если не задан — кнопка скрыта. */
+  onEdit?: (project: Project) => void;
   /** id для aria-controls (раскрываемый/экранный вариант). */
   regionId?: string;
 }
@@ -66,6 +68,41 @@ function statusTone(status: string): BadgeTone {
   return STATUS_TONE[status] ?? 'neutral';
 }
 
+// Пайплайн ролей: роль → этап(ы), на которых она ответственна. Код этапа
+// совпадает с stageCode из summary.byStage (см. backend taskStats.STAGE_BY_STATUS).
+// Несколько этапов на роль (COMMIT+DEPLOY) суммируются.
+const ROLE_PIPELINE: { name: string; stages: string[]; tone: BadgeTone }[] = [
+  { name: 'Архитектор', stages: ['ARCHITECTURE'], tone: 'primary' },
+  { name: 'Декомпозер', stages: ['DECOMPOSITION'], tone: 'primary' },
+  { name: 'Разработчик', stages: ['CODING'], tone: 'primary' },
+  { name: 'Тестировщик', stages: ['TESTING'], tone: 'info' },
+  { name: 'Аналитик сбоев', stages: ['FAILURE_ANALYSIS'], tone: 'warning' },
+  { name: 'Ревьюер', stages: ['REVIEW'], tone: 'info' },
+  { name: 'Git-интегратор', stages: ['COMMIT', 'DEPLOY'], tone: 'success' },
+];
+
+// Этапы вне зоны ответственности ролей — показываем сводной строкой «Очередь».
+const QUEUE_STAGES = ['BACKLOG', 'READY'];
+
+interface RoleStat {
+  name: string;
+  stageLabel: string;
+  count: number;
+  tone: BadgeTone;
+}
+
+// Свести byStage (по всему проекту) к строкам «по ролям».
+function buildRoleStats(byStage: Record<string, number>): RoleStat[] {
+  return ROLE_PIPELINE.map((role) => ({
+    name: role.name,
+    stageLabel: role.stages.map((s) => statusLabel(s)).join(' · '),
+    count: role.stages.reduce((acc, s) => acc + (byStage[s] ?? 0), 0),
+    tone: role.tone,
+  }));
+}
+
+type ViewMode = 'tasks' | 'roles';
+
 // Длительность активной задачи растёт относительно момента загрузки данных
 // (нельзя завязываться на часы браузера vs сервера — берём elapsed с fetch).
 function liveDuration(
@@ -77,7 +114,7 @@ function liveDuration(
   return active ? base + elapsedSinceFetch : base;
 }
 
-export function ProjectMonitor({ project, onBack, regionId = 'project-monitor' }: ProjectMonitorProps) {
+export function ProjectMonitor({ project, onBack, onEdit, regionId = 'project-monitor' }: ProjectMonitorProps) {
   const [data, setData] = useState<TaskStatistics | null>(null);
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [errorMsg, setErrorMsg] = useState<string>('');
@@ -86,6 +123,7 @@ export function ProjectMonitor({ project, onBack, regionId = 'project-monitor' }
   const [filterStage, setFilterStage] = useState('');
   const [filterStatus, setFilterStatus] = useState('');
   const [sortKey, setSortKey] = useState<SortKey>('default');
+  const [view, setView] = useState<ViewMode>('roles');
 
   // Метка момента получения данных (для тика активных длительностей) и «сейчас».
   const [fetchedAt, setFetchedAt] = useState(0);
@@ -222,6 +260,17 @@ export function ProjectMonitor({ project, onBack, regionId = 'project-monitor' }
   }, [rows, filterStage, filterStatus, sortKey]);
 
   const summary = data?.summary;
+  const roleStats = useMemo(
+    () => (summary ? buildRoleStats(summary.byStage ?? {}) : []),
+    [summary],
+  );
+  const queueCount = useMemo(
+    () =>
+      summary
+        ? QUEUE_STAGES.reduce((acc, s) => acc + (summary.byStage?.[s] ?? 0), 0)
+        : 0,
+    [summary],
+  );
   const total = data?.pagination.total ?? 0;
   const pageStart = total === 0 ? 0 : offset + 1;
   const pageEnd = Math.min(offset + PAGE_SIZE, total);
@@ -252,6 +301,16 @@ export function ProjectMonitor({ project, onBack, regionId = 'project-monitor' }
           >
             Обновить
           </Button>
+          {onEdit && (
+            <Button
+              variant="secondary"
+              size="sm"
+              leftIcon={<Settings size={16} aria-hidden="true" />}
+              onClick={() => onEdit(project)}
+            >
+              Настройка
+            </Button>
+          )}
         </div>
       </header>
 
@@ -263,6 +322,29 @@ export function ProjectMonitor({ project, onBack, regionId = 'project-monitor' }
           <Stat label="Заблокировано" value={summary.blocked} tone={summary.blocked ? 'danger' : 'neutral'} />
           <Stat label="Ср. время завершённых" text={formatDuration(summary.averageCompletedDurationMs)} />
         </dl>
+      )}
+
+      {data && loadState !== 'error' && (
+        <div className={styles.viewToggle} role="tablist" aria-label="Вид монитора">
+          <Button
+            variant={view === 'roles' ? 'primary' : 'secondary'}
+            size="sm"
+            role="tab"
+            aria-selected={view === 'roles'}
+            onClick={() => setView('roles')}
+          >
+            По ролям
+          </Button>
+          <Button
+            variant={view === 'tasks' ? 'primary' : 'secondary'}
+            size="sm"
+            role="tab"
+            aria-selected={view === 'tasks'}
+            onClick={() => setView('tasks')}
+          >
+            По задачам
+          </Button>
+        </div>
       )}
 
       {loadState === 'loading' && !data && <LoadingBlock label="Загрузка статистики задач…" />}
@@ -280,7 +362,45 @@ export function ProjectMonitor({ project, onBack, regionId = 'project-monitor' }
         />
       )}
 
-      {loadState === 'ready' && rows.length === 0 && (
+      {/* --- Вид «По ролям»: сводка задач проекта по ответственным ролям. --- */}
+      {data && loadState !== 'error' && view === 'roles' && (
+        <div className={styles.tableWrap} role="region" aria-label="Таблица по ролям" tabIndex={0}>
+          <table className={styles.table}>
+            <thead>
+              <tr>
+                <th scope="col">Роль</th>
+                <th scope="col">Этап пайплайна</th>
+                <th scope="col">Задач сейчас</th>
+              </tr>
+            </thead>
+            <tbody>
+              {roleStats.map((r) => (
+                <tr key={r.name}>
+                  <td className={styles.cellTitle}>
+                    <Badge tone={r.count ? r.tone : 'neutral'}>{r.name}</Badge>
+                  </td>
+                  <td className={styles.cellMuted}>{r.stageLabel}</td>
+                  <td className={styles.live}>{r.count}</td>
+                </tr>
+              ))}
+              {queueCount > 0 && (
+                <tr>
+                  <td className={styles.cellMuted}>В очереди</td>
+                  <td className={styles.cellMuted}>{statusLabel('BACKLOG')} · {statusLabel('READY')}</td>
+                  <td className={styles.live}>{queueCount}</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+          {(summary?.total ?? 0) === 0 && (
+            <p className={styles.noMatch}>
+              В этом проекте пока нет задач. Когда оркестратор создаст их, распределение по ролям появится здесь.
+            </p>
+          )}
+        </div>
+      )}
+
+      {loadState === 'ready' && view === 'tasks' && rows.length === 0 && (
         <EmptyState
           icon={<Layers size={36} aria-hidden="true" />}
           title="В этом проекте пока нет задач"
@@ -288,7 +408,7 @@ export function ProjectMonitor({ project, onBack, regionId = 'project-monitor' }
         />
       )}
 
-      {loadState !== 'error' && rows.length > 0 && (
+      {loadState !== 'error' && view === 'tasks' && rows.length > 0 && (
         <>
           <div className={styles.filters}>
             <Select

@@ -13,32 +13,41 @@ import {
 } from '../../components/ui';
 import { roleConnectionsApi } from '../../api/roleConnectionsApi';
 import { integrationsApi } from '../../api/integrationsApi';
-import { PRESET_ROLE_NAMES } from '../../data/presets';
+import { PRESET_ROLES } from '../../data/presets';
 import { required } from '../../lib/validation';
 import type { RoleConnection } from '../../types/settings';
 import type { Integration } from '../../types/integration';
 import styles from './settings.module.css';
 
-/** Нормализация имени роли для сравнения дубликатов. */
+/** Нормализация кода роли для сравнения дубликатов. */
 function normalizeRole(role: string): string {
   return role.trim().toLocaleLowerCase('ru-RU');
 }
 
+/** Отображаемое имя роли по каноническому коду (или сам код, если кастомная). */
+const ROLE_NAME_BY_CODE = new Map<string, string>(
+  PRESET_ROLES.map((r) => [r.code, r.name]),
+);
+function roleLabel(code: string): string {
+  return ROLE_NAME_BY_CODE.get(code) ?? code;
+}
+
 /**
- * Показать сразу ВСЕ доступные роли пайплайна (пресеты), подставив сохранённые
- * назначения интеграций. Пользовательские роли вне пресетов сохраняются ниже.
+ * Показать сразу ВСЕ доступные роли пайплайна (пресеты по коду), подставив
+ * сохранённые назначения. Поле `role` хранит канонический roleCode.
+ * Пользовательские роли вне пресетов (по коду) сохраняются ниже.
  */
 function withAllRoles(saved: RoleConnection[]): RoleConnection[] {
   const used = new Set<string>();
-  const rows: RoleConnection[] = PRESET_ROLE_NAMES.map((name) => {
+  const rows: RoleConnection[] = PRESET_ROLES.map((preset) => {
     const match = saved.find(
-      (r) => !used.has(r.id) && normalizeRole(r.role) === normalizeRole(name),
+      (r) => !used.has(r.id) && normalizeRole(r.role) === normalizeRole(preset.code),
     );
     if (match) {
       used.add(match.id);
-      return { ...match, role: name };
+      return { ...match, role: preset.code };
     }
-    return roleConnectionsApi.make(name);
+    return roleConnectionsApi.make(preset.code);
   });
   // Дополнительные (пользовательские) роли, которых нет среди пресетов.
   for (const r of saved) {
@@ -49,8 +58,7 @@ function withAllRoles(saved: RoleConnection[]): RoleConnection[] {
 
 /**
  * Секция «Роли и подключения»: назначение коннектора каждой роли.
- * ⚠️ Сохранение пока локальное (roleConnectionsApi → localStorage),
- * серверного API для этого назначения ещё нет.
+ * Источник истины — сервер (roleConnectionsApi → /api/role-connectors).
  */
 export function RoleConnectionsSection() {
   const toast = useToast();
@@ -172,20 +180,23 @@ export function RoleConnectionsSection() {
 
           {rows.length > 0 && (
             <ul className={styles.rolesList}>
-              {rows.map((row, index) => {
+              {rows.map((row) => {
                 const selected = integrationStatus(row.integrationId);
-                const roleLabel = row.role.trim() || `роль ${index + 1}`;
+                const isPreset = ROLE_NAME_BY_CODE.has(row.role);
+                const display = isPreset ? roleLabel(row.role) : row.role;
                 return (
                   <li key={row.id} className={styles.roleRow}>
                     <div className={styles.roleName}>
                       <Input
                         label="Название роли"
-                        value={row.role}
+                        value={display}
                         onChange={(e) => updateRow(row.id, { role: e.target.value })}
-                        placeholder="Например, Разработчик"
+                        placeholder="Например, CUSTOM_ROLE"
                         required
                         error={errorFor(row)}
                         autoComplete="off"
+                        readOnly={isPreset}
+                        title={isPreset ? `Канонический код роли: ${row.role}` : undefined}
                       />
                     </div>
 
@@ -221,7 +232,7 @@ export function RoleConnectionsSection() {
                         iconOnly
                         leftIcon={<Trash2 size={16} aria-hidden="true" />}
                         onClick={() => removeRow(row.id)}
-                        aria-label={`Удалить роль «${roleLabel}»`}
+                        aria-label={`Удалить роль «${display}»`}
                         title="Удалить роль"
                       />
                     </div>

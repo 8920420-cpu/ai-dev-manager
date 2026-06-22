@@ -20,27 +20,38 @@ import styles from './settings.module.css';
 
 const SSL_MODES = Object.keys(PG_SSL_LABEL) as PgSslMode[];
 
+/** Локальный (несохранённый) черновик имеет id с префиксом `db_`. */
+function isDraftId(id: string): boolean {
+  return id.startsWith('db_');
+}
+
 /**
  * Секция «Дополнительные базы данных»: список именованных подключений.
- * ⚠️ Хранится локально (databasesApi → localStorage), БЕЗ пароля.
- * Пароли/секреты задаются на стороне backend (BACKEND_REQUIRED).
+ * Хранится на сервере (REST `/api/additional-databases`), БЕЗ пароля в браузере.
+ * Пароли/секреты задаются на стороне backend.
  */
 export function DatabasesSection() {
   const toast = useToast();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [rows, setRows] = useState<DatabaseConnection[]>([]);
+  /** id записей с сервера, помеченных к удалению (применяются при сохранении). */
+  const [removedIds, setRemovedIds] = useState<string[]>([]);
   /** Показывать ошибки только после попытки сохранить. */
   const [submitted, setSubmitted] = useState(false);
 
   useEffect(() => {
+    const ctrl = new AbortController();
     let active = true;
     databasesApi
-      .list()
+      .list(ctrl.signal)
       .then((list) => {
         if (active) setRows(list);
       })
-      .catch(() => {
+      .catch((err) => {
+        if (ctrl.signal.aborted || (err instanceof DOMException && err.name === 'AbortError')) {
+          return;
+        }
         if (active) toast.error('Не удалось загрузить список баз данных');
       })
       .finally(() => {
@@ -48,6 +59,7 @@ export function DatabasesSection() {
       });
     return () => {
       active = false;
+      ctrl.abort();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -84,6 +96,8 @@ export function DatabasesSection() {
 
   function removeRow(id: string) {
     setRows((prev) => prev.filter((row) => row.id !== id));
+    // Существующие на сервере записи помечаем к удалению; черновики просто убираем.
+    if (!isDraftId(id)) setRemovedIds((prev) => [...prev, id]);
   }
 
   async function handleSave() {
@@ -101,8 +115,16 @@ export function DatabasesSection() {
         database: row.database.trim(),
         user: row.user.trim(),
       }));
-      const saved = await databasesApi.saveAll(trimmed);
+      // Удаления → создание новых → обновление существующих.
+      await Promise.all(removedIds.map((id) => databasesApi.remove(id)));
+      for (const row of trimmed) {
+        if (isDraftId(row.id)) await databasesApi.create(row);
+        else await databasesApi.update(row.id, row);
+      }
+      // Перечитываем актуальный список с сервера (получаем серверные id).
+      const saved = await databasesApi.list();
       setRows(saved);
+      setRemovedIds([]);
       toast.success('Список баз данных сохранён');
     } catch {
       toast.error('Не удалось сохранить список баз данных');

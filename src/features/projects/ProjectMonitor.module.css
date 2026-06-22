@@ -90,6 +90,12 @@
 .tone_info { color: var(--info, #0891b2); }
 .tone_warning { color: var(--warning, #d97706); }
 
+/* --- Переключатель вида (по ролям / по задачам) --- */
+.viewToggle {
+  display: inline-flex;
+  gap: var(--space-2);
+}
+
 /* --- Фильтры --- */
 .filters {
   display: flex;

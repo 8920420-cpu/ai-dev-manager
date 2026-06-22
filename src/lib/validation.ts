@@ -28,6 +28,21 @@ export function validHost(value: string): string | null {
   return null;
 }
 
+/**
+ * Абсолютный путь к каталогу. Поддерживает POSIX (`/...`), Windows-диск
+ * (`C:\...` или `C:/...`) и UNC (`\\server\share`). Проверяется только синтаксис —
+ * существование каталога проверяет scanner-service, т.к. путь может относиться к
+ * другой машине или Docker-mount.
+ */
+export function isAbsolutePath(value: string): boolean {
+  const v = value.trim();
+  if (!v) return false;
+  if (v.startsWith('/')) return true;
+  if (/^[A-Za-z]:[\\/]/.test(v)) return true;
+  if (/^\\\\/.test(v)) return true;
+  return false;
+}
+
 /** Порт TCP: 1..65535. */
 export function validPort(value: string | number): string | null {
   const n = typeof value === 'number' ? value : Number(value);

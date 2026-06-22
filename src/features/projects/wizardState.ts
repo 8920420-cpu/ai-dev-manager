@@ -2,9 +2,11 @@
 import { makeId } from '../../lib/format';
 import {
   DEFAULT_STAGE_ROLE_MAP,
-  PRESET_ROLE_NAMES,
+  PRESET_ROLES,
   PRESET_STAGE_NAMES,
+  roleCanonicalCode,
 } from '../../data/presets';
+import { isStageEnabled } from '../../types/project';
 import type { Project, ProjectStatus, Role, Stage } from '../../types/project';
 
 export interface WizardState {
@@ -26,28 +28,56 @@ export type WizardAction =
   | { type: 'renameStage'; stageId: string; name: string }
   | { type: 'reorderStage'; from: number; to: number }
   | { type: 'setStageRole'; stageId: string; roleId: string | null }
+  | { type: 'setStageEnabled'; stageId: string; enabled: boolean }
   | { type: 'setStageScanPath'; stageId: string; scanPath: string }
+  | { type: 'applyDefaultStages' }
   | { type: 'addRole'; name: string }
   | { type: 'removeRole'; roleId: string }
   | { type: 'setDatabase'; databaseId: string | null }
   | { type: 'reset'; state: WizardState };
 
-/** Построить начальное состояние из пресетов этапов/ролей. */
-export function buildPresetState(): WizardState {
-  const roles: Role[] = PRESET_ROLE_NAMES.map((name) => ({ id: makeId('role'), name }));
-  const roleIdByName = new Map(roles.map((r) => [r.name, r.id]));
+/**
+ * Построить этапы пайплайна в стандартном порядке (PRESET_STAGE_NAMES) с ролями
+ * по умолчанию (DEFAULT_STAGE_ROLE_MAP). Роли сопоставляются с переданным списком
+ * по каноническому коду — это устойчиво к переименованию ролей пользователем.
+ * Если подходящей роли в списке нет, этап остаётся без роли.
+ */
+export function buildPresetStages(roles: Role[]): Stage[] {
+  const roleIdByCode = new Map<string, string>();
+  for (const r of roles) {
+    const code = roleCanonicalCode(r);
+    if (code && !roleIdByCode.has(code)) roleIdByCode.set(code, r.id);
+  }
 
-  const stages: Stage[] = PRESET_STAGE_NAMES.map((name) => {
+  return PRESET_STAGE_NAMES.map((name) => {
     const mappedNames = DEFAULT_STAGE_ROLE_MAP[name] ?? [];
     const roleIds: string[] = [];
     for (const roleName of mappedNames) {
-      const id = roleIdByName.get(roleName);
+      const code = roleCanonicalCode({ name: roleName });
+      const id = code ? roleIdByCode.get(code) : undefined;
       if (id) roleIds.push(id);
     }
-    return { id: makeId('stage'), name, roleIds };
+    // Новые этапы по умолчанию включены.
+    return { id: makeId('stage'), name, roleIds, enabled: true };
   });
+}
 
-  return { name: '', path: '', status: 'active', roles, stages, databaseId: null };
+/** Построить начальное состояние из пресетов этапов/ролей. */
+export function buildPresetState(): WizardState {
+  const roles: Role[] = PRESET_ROLES.map((r) => ({
+    id: makeId('role'),
+    name: r.name,
+    code: r.code,
+  }));
+
+  return {
+    name: '',
+    path: '',
+    status: 'active',
+    roles,
+    stages: buildPresetStages(roles),
+    databaseId: null,
+  };
 }
 
 /** Построить состояние из существующего проекта (для редактирования). */
@@ -56,8 +86,14 @@ export function buildStateFromProject(project: Project): WizardState {
     name: project.name,
     path: project.path,
     status: project.status,
-    roles: project.roles.map((r) => ({ ...r })),
-    stages: project.stages.map((s) => ({ ...s, roleIds: [...s.roleIds] })),
+    // Бэкафилл канонического кода для ролей старых данных (по точному пресетному имени).
+    roles: project.roles.map((r) => ({ ...r, code: roleCanonicalCode(r) ?? r.code })),
+    stages: project.stages.map((s) => ({
+      ...s,
+      roleIds: [...s.roleIds],
+      // Старые данные без enabled читаются как включённые.
+      enabled: isStageEnabled(s),
+    })),
     databaseId: project.databaseId ?? null,
   };
 }
@@ -73,7 +109,10 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
     case 'addStage':
       return {
         ...state,
-        stages: [...state.stages, { id: makeId('stage'), name: '', roleIds: [] }],
+        stages: [
+          ...state.stages,
+          { id: makeId('stage'), name: '', roleIds: [], enabled: true },
+        ],
       };
     case 'removeStage':
       return {
@@ -113,6 +152,14 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
             : s,
         ),
       };
+    case 'setStageEnabled':
+      return {
+        ...state,
+        stages: state.stages.map((s) =>
+          // Переключаем только флаг; scanPath, роль, позиция и прочие настройки сохраняются.
+          s.id === action.stageId ? { ...s, enabled: action.enabled } : s,
+        ),
+      };
     case 'setStageScanPath':
       return {
         ...state,
@@ -120,6 +167,10 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
           s.id === action.stageId ? { ...s, scanPath: action.scanPath } : s,
         ),
       };
+    case 'applyDefaultStages':
+      // Пересобрать этапы в стандартном порядке с ролями по умолчанию.
+      // Роли проекта сохраняются как есть; перезаписываются только этапы.
+      return { ...state, stages: buildPresetStages(state.roles) };
     case 'setDatabase':
       return { ...state, databaseId: action.databaseId };
     case 'addRole': {

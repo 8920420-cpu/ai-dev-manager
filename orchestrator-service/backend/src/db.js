@@ -144,12 +144,11 @@ export async function acceptScannerCompletion(s, input) {
   return withClient(clientConfig(s), async (c) => {
     await c.query('BEGIN');
     try {
-      // Задачи может не быть в БД (её завели прямо в документе Claude) —
-      // тогда Scanner создаёт её (и при необходимости проект/сервис) по
-      // координатам completion и продолжает обычный переход к Task Reviewer.
+      // Задачи может не быть в БД (её завели прямо в документе Claude) — тогда
+      // Scanner создаёт её ПО координатам completion, но только внутри уже
+      // зарегистрированного вручную проекта и сервиса. Проверки соответствия
+      // проекта/сервиса и их существования выполняет findOrCreateScannerTask.
       const { task, created } = await findOrCreateScannerTask(c, payload);
-      if (task.project_code !== payload.project) throw scannerError(409, 'project_mismatch');
-      if ((task.service_code ?? '') !== payload.service) throw scannerError(409, 'service_mismatch');
       if (['DONE', 'CANCELLED'].includes(task.status)) throw scannerError(409, 'task_is_terminal');
 
       const inserted = await c.query(
@@ -204,18 +203,37 @@ const SCANNER_TASK_SELECT = `SELECT t.id, t.status::text AS status, p.code AS pr
 
 /**
  * Найти задачу по id или создать её из completion, если в БД её ещё нет.
- * Новая задача создаётся в статусе CODING под ролью PROGRAMMER (как будто её
- * только что закодил Programmer) с событием TASK_CREATED — дальше обычный
- * переход к Task Reviewer сохраняет связную историю. Проект/сервис создаются
- * при отсутствии. Идемпотентно: ON CONFLICT + повторный SELECT под блокировкой.
+ *
+ * ВАЖНО: проекты и сервисы заводятся ТОЛЬКО вручную (через UI/API). Сканер их
+ * больше НЕ создаёт: если проект/сервис из completion не зарегистрирован —
+ * задача отклоняется (project_not_registered / service_not_registered). Раньше
+ * по полям project/service из документа плодились «левые» проекты и сервисы
+ * (напр. PS + Chat_Service/IAM_Service/…), не привязанные к папке проекта.
+ *
+ * Сама задача по-прежнему создаётся из completion (в статусе CODING под ролью
+ * PROGRAMMER, с событием TASK_CREATED) — но только внутри уже существующих
+ * проекта и сервиса. Идемпотентно: ON CONFLICT + повторный SELECT под блокировкой.
  * Возвращает { task, created } (created — была ли задача создана сейчас).
  */
 export async function findOrCreateScannerTask(c, payload) {
-  const existing = await c.query(SCANNER_TASK_SELECT, [payload.taskId]);
-  if (existing.rowCount) return { task: existing.rows[0], created: false };
+  // Проект обязан существовать (создаётся только вручную). Резолвим гибко:
+  // по code | name | root_path — чтобы поле project из документа совпало с
+  // зарегистрированным проектом независимо от способа записи.
+  const project = await requireProject(c, payload.project);
 
-  const projectId = await ensureProject(c, payload.project);
-  const serviceId = await ensureService(c, projectId, payload.service);
+  const existing = await c.query(SCANNER_TASK_SELECT, [payload.taskId]);
+  if (existing.rowCount) {
+    const task = existing.rows[0];
+    // Существующая задача должна принадлежать тому же проекту/сервису, что и completion.
+    if (task.project_code !== project.code) throw scannerError(409, 'project_mismatch');
+    if ((task.service_code ?? '') !== String(payload.service ?? '').trim()) {
+      throw scannerError(409, 'service_mismatch');
+    }
+    return { task, created: false };
+  }
+
+  // Сервис тоже только ручной: пустой код → задача без сервиса; непустой неизвестный → ошибка.
+  const serviceId = await requireService(c, project.id, payload.service);
   const role = await c.query(`SELECT id FROM roles WHERE code = 'PROGRAMMER'`);
   const programmerRoleId = role.rows[0]?.id ?? null;
 
@@ -224,7 +242,7 @@ export async function findOrCreateScannerTask(c, payload) {
      VALUES ($1, $2, $3, $4, 'CODING', $5, 'scanner')
      ON CONFLICT (id) DO NOTHING
      RETURNING id`,
-    [payload.taskId, projectId, serviceId, payload.title, programmerRoleId],
+    [payload.taskId, project.id, serviceId, payload.title, programmerRoleId],
   );
   if (ins.rowCount) {
     await c.query(
@@ -241,39 +259,31 @@ export async function findOrCreateScannerTask(c, payload) {
   return { task: created.rows[0], created: ins.rowCount > 0 };
 }
 
-// Найти проект по коду или создать минимальный (code=name). Идемпотентно.
-async function ensureProject(c, code) {
-  const found = await c.query('SELECT id FROM projects WHERE code = $1', [code]);
-  if (found.rowCount) return found.rows[0].id;
-  const ins = await c.query(
-    `INSERT INTO projects (code, name) VALUES ($1, $1)
-     ON CONFLICT (code) DO NOTHING RETURNING id`,
-    [code],
+// Найти проект по code | name | root_path. Проекты создаются ТОЛЬКО вручную,
+// поэтому при отсутствии — ошибка (а не авто-создание). Возвращает { id, code }.
+async function requireProject(c, ref) {
+  const v = String(ref ?? '').trim();
+  if (!v) throw scannerError(422, 'project_required');
+  const r = await c.query(
+    `SELECT id, code FROM projects
+      WHERE code = $1 OR name = $1 OR root_path = $1
+      ORDER BY created_at LIMIT 1`,
+    [v],
   );
-  if (ins.rowCount) return ins.rows[0].id;
-  const again = await c.query('SELECT id FROM projects WHERE code = $1', [code]);
-  return again.rows[0].id;
+  if (!r.rowCount) throw scannerError(404, 'project_not_registered');
+  return r.rows[0];
 }
 
-// Найти сервис по (project, service_code) или создать минимальный. Пустой код
-// сервиса → null (задача без привязки к сервису). Идемпотентно.
-async function ensureService(c, projectId, serviceCode) {
+// Найти сервис по (project, service_code). Сервисы тоже только ручные: пустой код
+// → null (задача без сервиса); непустой неизвестный код → ошибка (не авто-создание).
+async function requireService(c, projectId, serviceCode) {
   const code = String(serviceCode ?? '').trim();
   if (!code) return null;
-  const found = await c.query(
+  const r = await c.query(
     'SELECT id FROM services WHERE project_id = $1 AND service_code = $2', [projectId, code],
   );
-  if (found.rowCount) return found.rows[0].id;
-  const ins = await c.query(
-    `INSERT INTO services (project_id, service_code, service_name) VALUES ($1, $2, $2)
-     ON CONFLICT (project_id, service_code) DO NOTHING RETURNING id`,
-    [projectId, code],
-  );
-  if (ins.rowCount) return ins.rows[0].id;
-  const again = await c.query(
-    'SELECT id FROM services WHERE project_id = $1 AND service_code = $2', [projectId, code],
-  );
-  return again.rows[0].id;
+  if (!r.rowCount) throw scannerError(404, 'service_not_registered');
+  return r.rows[0].id;
 }
 
 /**
@@ -562,6 +572,16 @@ const LLM_FLOW_PAIRS = LLM_ROLE_CODES.flatMap((code) =>
 // слот вечно: по таймауту снимаем захват и помечаем прогон TIMEOUT.
 const ROLE_TIMEOUT_MS = Number(process.env.RUNNER_ROLE_TIMEOUT_MS || 15 * 60 * 1000);
 
+// Задача, выданная Claude (PROGRAMMER) через файловый мост, помечается
+// assigned_agent_id, но НЕ создаёт agent_run RUNNING. Если completion от Claude
+// не вернулся (сессия прервалась, Scanner был недоступен, слот очищен без
+// доставки), задача навсегда зависает в CODING: фидер её не переподаёт (нужен
+// assigned_agent_id IS NULL), а runner роль PROGRAMMER не ведёт. По таймауту
+// освобождаем назначение — фидер переподаст её, как только слот освободится.
+const CLAUDE_ASSIGN_TIMEOUT_MS = Number(
+  process.env.RUNNER_CLAUDE_TIMEOUT_MS || ROLE_TIMEOUT_MS,
+);
+
 /**
  * Stage 3: один шаг фонового runner. Для каждой ИИ-роли:
  *   1) claim задачи в отдельной транзакции (FOR UPDATE SKIP LOCKED + пометка
@@ -599,6 +619,58 @@ async function resetStaleClaims(c) {
      UPDATE tasks SET assigned_agent_id = NULL
        WHERE id IN (SELECT task_id FROM stale) AND status NOT IN ('DONE','CANCELLED')`,
     [ROLE_TIMEOUT_MS],
+  );
+  await releaseStaleClaudeClaims(c);
+}
+
+// Освободить осиротевшие задачи Claude/PROGRAMMER: статус CODING под ролью
+// PROGRAMMER с назначенным агентом, у которых последнее AGENT_ASSIGNED старше
+// timeoutMs. У такого назначения нет agent_run RUNNING, поэтому resetStaleClaims
+// его не ловит. Снимаем assigned_agent_id (фидер переподаст задачу в свободный
+// слот) и пишем диагностическое событие. Re-feed безопасен: фидер пишет только
+// в пустой слот, а acceptScannerCompletion идемпотентен.
+// timeoutMs=0 (стартовая реконсиляция) освобождает назначение немедленно: при
+// перезапуске процесса активной сессии Разработчика в полёте уже нет.
+async function releaseStaleClaudeClaims(c, timeoutMs = CLAUDE_ASSIGN_TIMEOUT_MS, reason = 'claude_assignment_timeout') {
+  const r = await c.query(
+    `WITH stale AS (
+       SELECT t.id, t.current_role_id, t.status
+         FROM tasks t
+         JOIN roles r ON r.id = t.current_role_id
+        WHERE r.code = 'PROGRAMMER'
+          AND t.status = 'CODING'
+          AND t.assigned_agent_id IS NOT NULL
+          AND COALESCE(
+                (SELECT max(te.created_at) FROM task_events te
+                  WHERE te.task_id = t.id AND te.event_type = 'AGENT_ASSIGNED'),
+                t.updated_at
+              ) <= now() - ($1::bigint * interval '1 millisecond')
+     ), released AS (
+       UPDATE tasks SET assigned_agent_id = NULL
+        WHERE id IN (SELECT id FROM stale)
+        RETURNING id, current_role_id, status
+     )
+     INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     SELECT id, 'STATUS_CHANGED', status, status, current_role_id,
+            jsonb_build_object('runner', true, 'released', true, 'reason', $2::text)
+       FROM released
+     RETURNING task_id`,
+    [Math.max(0, Number(timeoutMs) || 0), reason],
+  );
+  return r.rowCount;
+}
+
+/**
+ * Стартовая реконсиляция (вызывается один раз при запуске оркестратора).
+ * Полный перезапуск программы означает, что активной сессии Разработчика в
+ * полёте нет, поэтому немедленно (timeoutMs=0) освобождаем все осиротевшие
+ * Programmer-назначения — фидер переподаст их в свободный слот, не дожидаясь
+ * 15-минутного таймаута. Безопасно: фидер пишет только в пустой слот.
+ * Возвращает число освобождённых задач.
+ */
+export async function reconcileOnStartup(s) {
+  return withClient(clientConfig(s), async (c) =>
+    releaseStaleClaudeClaims(c, 0, 'orchestrator_restart_reconcile'),
   );
 }
 

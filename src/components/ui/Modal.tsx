@@ -14,7 +14,12 @@ type Size = 'sm' | 'md' | 'lg' | 'xl';
 
 interface ModalProps {
   open: boolean;
-  /** Запрос на закрытие (крестик, Esc, клик по фону). */
+  /**
+   * Запрос на закрытие. Вызывается ТОЛЬКО по явному нажатию пользователя на
+   * видимую кнопку внутри окна (крестик, «Отмена», «Закрыть»). Закрытие по клику
+   * на фон, по `Escape` или потере фокуса намеренно не поддерживается —
+   * см. общее правило в корневом `TASKS.md`.
+   */
   onClose: () => void;
   title: string;
   subtitle?: ReactNode;
@@ -22,8 +27,6 @@ interface ModalProps {
   children: ReactNode;
   footer?: ReactNode;
   footerStart?: ReactNode;
-  /** Закрывать ли по клику на фон (по умолчанию да). */
-  dismissOnBackdrop?: boolean;
 }
 
 const FOCUSABLE =
@@ -38,7 +41,6 @@ export function Modal({
   children,
   footer,
   footerStart,
-  dismissOnBackdrop = true,
 }: ModalProps) {
   const dialogRef = useRef<HTMLDivElement>(null);
   const titleId = useId();
@@ -63,42 +65,32 @@ export function Modal({
     };
   }, [open]);
 
-  const onKeyDown = useCallback(
-    (e: React.KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.stopPropagation();
-        onClose();
-        return;
-      }
-      if (e.key !== 'Tab') return;
-      const node = dialogRef.current;
-      if (!node) return;
-      const items = Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
-        (el) => el.offsetParent !== null || el === document.activeElement,
-      );
-      if (items.length === 0) return;
-      const first = items[0]!;
-      const last = items[items.length - 1]!;
-      if (e.shiftKey && document.activeElement === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && document.activeElement === last) {
-        e.preventDefault();
-        first.focus();
-      }
-    },
-    [onClose],
-  );
+  // Только удержание фокуса внутри окна (focus trap). Escape намеренно НЕ закрывает
+  // модальное окно — закрытие выполняется лишь явной кнопкой внутри окна.
+  const onKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key !== 'Tab') return;
+    const node = dialogRef.current;
+    if (!node) return;
+    const items = Array.from(node.querySelectorAll<HTMLElement>(FOCUSABLE)).filter(
+      (el) => el.offsetParent !== null || el === document.activeElement,
+    );
+    if (items.length === 0) return;
+    const first = items[0]!;
+    const last = items[items.length - 1]!;
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }, []);
 
   if (!open) return null;
 
   return createPortal(
-    <div
-      className={styles.scrim}
-      onMouseDown={(e) => {
-        if (dismissOnBackdrop && e.target === e.currentTarget) onClose();
-      }}
-    >
+    // Клик по фону намеренно не закрывает окно: закрытие — только явной кнопкой внутри.
+    <div className={styles.scrim}>
       <div
         ref={dialogRef}
         className={cn(styles.dialog, styles[size])}

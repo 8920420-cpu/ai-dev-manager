@@ -74,6 +74,57 @@
   margin-top: var(--space-6);
 }
 
+.toggleRow {
+  flex: 1 1 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  /* Выровнять под поле названия (handle + number + их gap). */
+  padding-left: calc(2 * 26px + 2 * var(--space-3));
+}
+
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkbox {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+.disabledBadge {
+  display: inline-flex;
+  align-items: center;
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-md);
+  background: var(--surface-3, var(--primary-soft));
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+}
+
+/* Отключённый этап остаётся видимым (название, роль, папка, drag), но визуально приглушён.
+   Не полагаемся только на цвет — рядом есть текстовый бейдж «Отключён». */
+.disabledRow {
+  opacity: 0.7;
+  border-style: dashed;
+}
+
+@media (max-width: 600px) {
+  .toggleRow {
+    padding-left: 0;
+  }
+}
+
 .scanBlock {
   flex: 1 1 100%;
   display: flex;

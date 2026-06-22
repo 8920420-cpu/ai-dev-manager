@@ -11,7 +11,8 @@ export interface RoleConnection {
 
 /**
  * Именованное дополнительное подключение к базе данных.
- * ⚠️ Хранится локально (localStorage) — БЕЗ пароля/секретов (см. databasesApi).
+ * Источник истины — сервер (databasesApi → /api/additional-databases). Пароль/секрет
+ * хранится только на сервере и не приходит клиенту (см. databasesApi, флаг hasSecret).
  * Основная (рабочая) БД PostgreSQL живёт на реальном backend (см. settingsApi).
  */
 export interface DatabaseConnection {
@@ -23,6 +24,28 @@ export interface DatabaseConnection {
   database: string;
   user: string;
   sslMode: PgSslMode;
+}
+
+/**
+ * Реально подключённая БД, как её отдаёт backend `GET /api/databases`.
+ * БЕЗ пароля (hasPassword). Доступна только для чтения — параметры задаются
+ * на сервере (основная PostgreSQL — в секции выше / через переменные окружения).
+ */
+export interface ConnectedDatabase {
+  id: string;
+  kind: 'primary';
+  name: string;
+  host: string;
+  port: number;
+  database: string;
+  user: string;
+  sslMode: PgSslMode;
+  hasPassword: boolean;
+  status: {
+    connected: boolean;
+    tables: number | null;
+    error: string | null;
+  };
 }
 
 export type PgSslMode = 'disable' | 'require' | 'verify-full';

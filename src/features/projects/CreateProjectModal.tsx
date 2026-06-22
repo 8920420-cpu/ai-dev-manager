@@ -6,9 +6,10 @@ import {
   Stepper,
   useToast,
 } from '../../components/ui';
-import { projectsApi } from '../../api/projectsApi';
-import { required } from '../../lib/validation';
-import type { CreateProjectInput, Project } from '../../types/project';
+import { projectsApi, ProjectConflictError } from '../../api/projectsApi';
+import { isScannerRole } from '../../data/presets';
+import { isAbsolutePath, required } from '../../lib/validation';
+import { isStageEnabled, type CreateProjectInput, type Project } from '../../types/project';
 import { StepBasics } from './StepBasics';
 import { StepStagesRoles } from './StepStagesRoles';
 import { StepDatabase } from './StepDatabase';
@@ -38,10 +39,12 @@ interface FieldErrors {
   name?: string | null;
   path?: string | null;
   stages: Record<string, string>;
+  /** Ошибки обязательной папки Scanner по id этапа. */
+  scans: Record<string, string>;
   general?: string | null;
 }
 
-const EMPTY_ERRORS: FieldErrors = { stages: {} };
+const EMPTY_ERRORS: FieldErrors = { stages: {}, scans: {} };
 
 export function CreateProjectModal({
   open,
@@ -100,17 +103,41 @@ export function CreateProjectModal({
 
   const validateStages = (): boolean => {
     const stageErrors: Record<string, string> = {};
+    const scanErrors: Record<string, string> = {};
     for (const stage of state.stages) {
       if (stage.name.trim().length === 0) {
         stageErrors[stage.id] = 'Укажите название этапа';
+      }
+      // Папка Scanner обязательна только для ВКЛЮЧЁННОГО этапа с ролью SCANNER.
+      // Признак Scanner — канонический код роли, не название этапа.
+      const role = state.roles.find((r) => r.id === stage.roleIds[0]);
+      const isScannerStage = role ? isScannerRole(role) : false;
+      if (isStageEnabled(stage) && isScannerStage) {
+        const path = (stage.scanPath ?? '').trim();
+        if (!path) {
+          scanErrors[stage.id] = 'Укажите папку для отслеживания (обязательно для Scanner).';
+        } else if (!isAbsolutePath(path)) {
+          scanErrors[stage.id] =
+            'Укажите абсолютный путь (например, C:\\projects\\app или /home/user/app).';
+        }
       }
     }
     let general: string | null = null;
     if (state.stages.length === 0) {
       general = 'Добавьте хотя бы один этап.';
     }
-    setErrors((prev) => ({ ...prev, stages: stageErrors, general }));
-    return Object.keys(stageErrors).length === 0 && !general;
+    setErrors((prev) => ({ ...prev, stages: stageErrors, scans: scanErrors, general }));
+    const firstScanError = state.stages.find((s) => scanErrors[s.id]);
+    if (firstScanError) {
+      // Перевести фокус на первое некорректное поле папки Scanner.
+      const id = `stage-scan-${firstScanError.id}`;
+      queueMicrotask(() => document.getElementById(id)?.focus());
+    }
+    return (
+      Object.keys(stageErrors).length === 0 &&
+      Object.keys(scanErrors).length === 0 &&
+      !general
+    );
   };
 
   const goNext = () => {
@@ -145,6 +172,8 @@ export function CreateProjectModal({
           stages: state.stages,
           roles: state.roles,
           databaseId: state.databaseId ?? undefined,
+          // Токен optimistic concurrency.
+          updatedAt: editProject.updatedAt,
         });
         onCreated(updated);
         toast.success('Проект обновлён');
@@ -161,10 +190,14 @@ export function CreateProjectModal({
         toast.success('Проект создан');
       }
       onClose();
-    } catch {
-      toast.error(
-        isEdit ? 'Не удалось сохранить проект' : 'Не удалось создать проект',
-      );
+    } catch (err) {
+      if (err instanceof ProjectConflictError) {
+        toast.error(err.message);
+      } else {
+        toast.error(
+          isEdit ? 'Не удалось сохранить проект' : 'Не удалось создать проект',
+        );
+      }
       setSubmitting(false);
     }
   };
@@ -205,7 +238,6 @@ export function CreateProjectModal({
             : 'Подключите локальную папку и настройте пайплайн.'
         }
         size="lg"
-        dismissOnBackdrop={!dirty}
         footer={footer}
         footerStart={<Stepper steps={STEPS} current={step} />}
       >
@@ -227,6 +259,7 @@ export function CreateProjectModal({
             stages={state.stages}
             roles={state.roles}
             stageErrors={errors.stages}
+            scanErrors={errors.scans}
             generalError={errors.general}
             onAddStage={() => dispatch({ type: 'addStage' })}
             onRemoveStage={(stageId) => dispatch({ type: 'removeStage', stageId })}
@@ -239,9 +272,13 @@ export function CreateProjectModal({
             onSetStageRole={(stageId, roleId) =>
               dispatch({ type: 'setStageRole', stageId, roleId })
             }
+            onSetStageEnabled={(stageId, enabled) =>
+              dispatch({ type: 'setStageEnabled', stageId, enabled })
+            }
             onSetStageScanPath={(stageId, scanPath) =>
               dispatch({ type: 'setStageScanPath', stageId, scanPath })
             }
+            onApplyDefaults={() => dispatch({ type: 'applyDefaultStages' })}
           />
         )}
         {step === 2 && (

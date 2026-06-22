@@ -28,10 +28,38 @@ import {
 } from './connectors.js';
 import { getProjectStages, saveProjectStages } from './stages.js';
 import { getTaskStatistics } from './taskStats.js';
-import { upsertProjectByPath, listProjects } from './projects.js';
+import {
+  listProjectsRich,
+  getProject,
+  createOrUpsertProject,
+  updateProject,
+  setProjectStatus,
+  deleteProject,
+} from './projects.js';
+import { listDatabases } from './databases.js';
+import {
+  listAdditionalDatabases,
+  getAdditionalDatabase,
+  createAdditionalDatabase,
+  updateAdditionalDatabase,
+  deleteAdditionalDatabase,
+} from './additionalDatabases.js';
+import { listRoleConnectors, saveRoleConnectors } from './roleConnectors.js';
+import { importLegacy } from './importLegacy.js';
+import { pickFolder } from './fsPicker.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const FRONTEND_DIR = process.env.FRONTEND_DIR || resolve(__dirname, '../../frontend');
+// Единый фронтенд — React/Vite SPA из корня репозитория (src/ → dist/).
+// В Docker-образе сборка лежит рядом, в /app/frontend (см. Dockerfile:
+// COPY --from=frontend /web/dist ./frontend). При локальном запуске backend без
+// Docker этого каталога нет — тогда берём корневой dist/. Переопределяется через
+// FRONTEND_DIR. Старая plain-HTML страница удалена — фронтенд в проекте один.
+const FRONTEND_DIR =
+  process.env.FRONTEND_DIR ||
+  [resolve(__dirname, '../../frontend'), resolve(__dirname, '../../../dist')].find((d) =>
+    existsSync(d),
+  ) ||
+  resolve(__dirname, '../../frontend');
 
 // Необязательная защита API. Если задан ORCHESTRATOR_API_TOKEN, все /api/*
 // требуют заголовок Authorization: Bearer <token> (или X-Api-Token: <token>).
@@ -99,11 +127,27 @@ async function serveStatic(res, pathname) {
   res.end(await readFile(file));
 }
 
-// Разбор путей /api/projects/:projectId/(stages|task-statistics).
+// Разбор путей /api/projects/:projectId[/(stages|task-statistics|status)].
+// Без суффикса → item (GET :id / PUT :id / DELETE :id).
 function matchProjectRoute(pathname) {
-  const m = pathname.match(/^\/api\/projects\/([^/]+)\/(stages|task-statistics)$/);
+  const m = pathname.match(/^\/api\/projects\/([^/]+)(?:\/(stages|task-statistics|status))?$/);
   if (!m) return null;
-  return { id: decodeURIComponent(m[1]), kind: m[2] };
+  return { id: decodeURIComponent(m[1]), kind: m[2] || 'item' };
+}
+
+// Разбор путей /api/additional-databases[/:id].
+function matchAdditionalDbRoute(pathname) {
+  if (pathname === '/api/additional-databases') return { kind: 'collection' };
+  const m = pathname.match(/^\/api\/additional-databases\/([^/]+)$/);
+  if (!m) return null;
+  return { kind: 'item', id: decodeURIComponent(m[1]) };
+}
+
+// If-Match (optimistic concurrency) → updatedAt для updateProject.
+function ifMatch(req) {
+  const h = req.headers['if-match'];
+  if (!h) return null;
+  return String(h).replace(/^"+|"+$/g, '') || null; // снять кавычки ETag-формата
 }
 
 // Разбор путей /api/integrations[/:id[/exchanges|/invoke]].
@@ -148,6 +192,10 @@ export function createApp() {
         if (req.method === 'GET' && p === '/api/db/status')
           return sendJson(res, 200, await getStatus(await loadSettings()));
 
+        // Перечень подключённых БД с живым статусом — для карточек в UI.
+        if (req.method === 'GET' && p === '/api/databases')
+          return sendJson(res, 200, await listDatabases(await loadSettings()));
+
         if (req.method === 'POST' && p === '/api/scanner/task-completed')
           return sendJson(
             res,
@@ -182,17 +230,78 @@ export function createApp() {
             await releaseHostTask(await loadSettings(), (await readBody(req)).taskId),
           );
 
-        // --- Проекты: регистрация/привязка по папке (root_path) ---
+        // --- Проекты: rich-список + идемпотентная регистрация по папке ---
         if (p === '/api/projects') {
-          if (req.method === 'GET') return sendJson(res, 200, await listProjects(await loadSettings()));
+          if (req.method === 'GET') return sendJson(res, 200, await listProjectsRich(await loadSettings()));
           if (req.method === 'POST')
-            return sendJson(res, 200, await upsertProjectByPath(await loadSettings(), await readBody(req)));
+            return sendJson(res, 200, await createOrUpsertProject(await loadSettings(), await readBody(req)));
           return sendJson(res, 405, { error: 'method_not_allowed' });
         }
 
-        // --- Проекты: этапы пайплайна (stage-config) и статистика задач ---
+        // --- Доп. БД (additional_databases) — секрет не отдаётся ---
+        const adb = matchAdditionalDbRoute(p);
+        if (adb) {
+          if (adb.kind === 'collection') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await listAdditionalDatabases(await loadSettings()));
+            if (req.method === 'POST')
+              return sendJson(res, 201, await createAdditionalDatabase(await loadSettings(), await readBody(req)));
+          } else {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await getAdditionalDatabase(await loadSettings(), adb.id));
+            if (req.method === 'PUT')
+              return sendJson(res, 200, await updateAdditionalDatabase(await loadSettings(), adb.id, await readBody(req)));
+            if (req.method === 'DELETE')
+              return sendJson(res, 200, await deleteAdditionalDatabase(await loadSettings(), adb.id));
+          }
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Назначения «роль → коннектор» (role_connectors) ---
+        if (p === '/api/role-connectors') {
+          if (req.method === 'GET') return sendJson(res, 200, await listRoleConnectors(await loadSettings()));
+          if (req.method === 'PUT')
+            return sendJson(res, 200, await saveRoleConnectors(await loadSettings(), await readBody(req)));
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Нативный выбор папки на хосте backend (абсолютный путь) ---
+        if (p === '/api/fs/pick-folder') {
+          if (req.method === 'POST') return sendJson(res, 200, await pickFolder());
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Идемпотентный импорт legacy-данных (localStorage → сервер) ---
+        if (p === '/api/import/legacy') {
+          if (req.method === 'POST')
+            return sendJson(res, 200, await importLegacy(await loadSettings(), await readBody(req)));
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Проекты: rich CRUD + этапы (stage-config) + статистика задач ---
         const proj = matchProjectRoute(p);
         if (proj) {
+          if (proj.kind === 'item') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await getProject(await loadSettings(), proj.id));
+            if (req.method === 'PUT') {
+              const body = await readBody(req);
+              if (body.updatedAt === undefined) body.updatedAt = ifMatch(req);
+              return sendJson(res, 200, await updateProject(await loadSettings(), proj.id, body));
+            }
+            if (req.method === 'DELETE')
+              return sendJson(res, 200, await deleteProject(await loadSettings(), proj.id));
+            return sendJson(res, 405, { error: 'method_not_allowed' });
+          }
+          if (proj.kind === 'status') {
+            if (req.method === 'PATCH')
+              return sendJson(
+                res,
+                200,
+                await setProjectStatus(await loadSettings(), proj.id, (await readBody(req)).status),
+              );
+            return sendJson(res, 405, { error: 'method_not_allowed' });
+          }
           if (proj.kind === 'stages') {
             if (req.method === 'GET')
               return sendJson(res, 200, await getProjectStages(await loadSettings(), proj.id));

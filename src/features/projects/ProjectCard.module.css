@@ -107,6 +107,10 @@
   color: var(--text-secondary);
 }
 
+.metaMuted {
+  color: var(--text-muted);
+}
+
 .footer {
   display: flex;
   align-items: center;

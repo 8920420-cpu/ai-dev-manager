@@ -1,6 +1,7 @@
 import { watch } from 'node:fs';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { basename, dirname, resolve } from 'node:path';
+import { checkWatchDirectory, resolveDocumentPath } from './paths.js';
 
 const COMPLETED_STATUSES = new Set(['выполнено', 'done', 'completed']);
 
@@ -8,13 +9,42 @@ const COMPLETED_STATUSES = new Set(['выполнено', 'done', 'completed']);
  * Наблюдает за JSON-документом, находя новые завершённые задачи.
  * Успешно переданные task id сохраняются отдельно, поэтому повторная запись
  * документа или перезапуск процесса не запускают цепочку второй раз.
+ *
+ * Адресация: один watcher отвечает за один документ одного `projectId+stageId`.
+ * `watchDirectory` — корень наблюдения, `documentName` — относительное имя
+ * (default `claude-tasks.json`). Legacy-режим принимает готовый `documentPath`.
  */
 export class TaskScanner {
-  constructor({ documentPath, statePath, dispatch, debounceMs = 150, fallbackMs = 5000, clearOnDispatch = true, log = console } = {}) {
-    if (!documentPath) throw new Error('documentPath is required');
+  constructor({
+    documentPath,
+    watchDirectory,
+    documentName = 'claude-tasks.json',
+    statePath,
+    dispatch,
+    debounceMs = 150,
+    fallbackMs = 5000,
+    clearOnDispatch = true,
+    log = console,
+    projectId = null,
+    stageId = null,
+  } = {}) {
     if (typeof dispatch !== 'function') throw new Error('dispatch must be a function');
-    this.documentPath = resolve(documentPath);
+    if (documentPath) {
+      // Legacy/одиночный режим: каталог наблюдения — родитель документа.
+      this.documentPath = resolve(documentPath);
+      this.watchDirectory = dirname(this.documentPath);
+    } else if (watchDirectory) {
+      // Канонический режим: безопасный резолв документа внутри watchDirectory
+      // (бросает ScannerConfigError на traversal/абсолютную подстановку).
+      const resolved = resolveDocumentPath(watchDirectory, documentName);
+      this.watchDirectory = resolved.watchDirectory;
+      this.documentPath = resolved.documentPath;
+    } else {
+      throw new Error('documentPath or watchDirectory is required');
+    }
     this.documentName = basename(this.documentPath);
+    this.projectId = projectId;
+    this.stageId = stageId;
     this.statePath = resolve(statePath ?? `${this.documentPath}.scanner-state.json`);
     this.dispatch = dispatch;
     // После подтверждённой доставки удалить завершённую запись из документа,
@@ -29,6 +59,51 @@ export class TaskScanner {
     this.debounceTimer = null;
     this.fallbackTimer = null;
     this.scanning = false;
+    // readiness: pending → watching | error(code). Состояние конфигурации,
+    // а не задачи: ошибка означает «watcher не стартовал по этой причине».
+    this.ready = { state: 'pending', code: null };
+  }
+
+  // Идентификатор watcher для readiness/state-изоляции и логов.
+  get key() {
+    return `${this.projectId ?? '-'}::${this.stageId ?? '-'}::${this.documentPath}`;
+  }
+
+  readiness() {
+    return {
+      projectId: this.projectId,
+      stageId: this.stageId,
+      watchDirectory: this.watchDirectory,
+      documentPath: this.documentPath,
+      state: this.ready.state,
+      code: this.ready.code,
+    };
+  }
+
+  /**
+   * Проверить доступность каталога наблюдения перед стартом. Возвращает
+   * { ok, code }. Не бросает: вызывающий (supervisor) решает, стартовать ли.
+   */
+  async ensureReady() {
+    const result = await checkWatchDirectory(this.watchDirectory, this.documentPath);
+    if (!result.ok) {
+      this.ready = { state: 'error', code: result.code };
+      return result;
+    }
+    return { ok: true };
+  }
+
+  /**
+   * Старт с предварительной проверкой каталога. Если каталог недоступен —
+   * watcher НЕ запускается, readiness переходит в error со стабильным кодом,
+   * возвращается { ok:false, code }. Канонический путь для supervisor.
+   */
+  async startChecked() {
+    const check = await this.ensureReady();
+    if (!check.ok) return check;
+    this.start();
+    this.ready = { state: 'watching', code: null };
+    return { ok: true };
   }
 
   async scanOnce() {
@@ -42,7 +117,10 @@ export class TaskScanner {
 
       for (const task of completed) {
         if (state.dispatched[task.id]) continue;
-        const payload = normalizeTask(task, this.documentPath);
+        const payload = normalizeTask(task, this.documentPath, {
+          projectId: this.projectId,
+          stageId: this.stageId,
+        });
         // Сначала подтверждённая запись в БД (dispatch), и только потом —
         // удаление из файла. Падение между ними безопасно: БД идемпотентна
         // (scanner_dispatches), повторный проход вернёт duplicate и доудалит.
@@ -89,6 +167,9 @@ export class TaskScanner {
     this.fallbackTimer = null;
     if (this.watcher) this.watcher.close();
     this.watcher = null;
+    // Отключённый/снятый watcher больше не «наблюдает»: фиксируем в readiness,
+    // чтобы health не показывал остановленный watcher активным.
+    if (this.ready.state === 'watching') this.ready = { state: 'stopped', code: null };
   }
 
   // Дебаунс: одно сохранение файла на разных платформах рождает несколько
@@ -184,13 +265,13 @@ function isCompletedTask(task) {
   return COMPLETED_STATUSES.has(String(task.status ?? '').trim().toLocaleLowerCase('ru-RU'));
 }
 
-function normalizeTask(task, sourceDocument) {
+function normalizeTask(task, sourceDocument, { projectId = null, stageId = null } = {}) {
   const required = (key) => {
     const value = String(task[key] ?? '').trim();
     if (!value) throw new Error(`Completed task ${task.id} must have ${key}`);
     return value;
   };
-  return {
+  const payload = {
     completionKey: required('id'),
     taskId: required('id'),
     project: required('project'),
@@ -203,4 +284,9 @@ function normalizeTask(task, sourceDocument) {
     sourceDocument,
     nextRole: 'TASK_REVIEWER',
   };
+  // Атрибуция события: какой watcher (проект/этап) его произвёл. Позволяет
+  // оркестратору не смешивать события разных проектов из одинаковых документов.
+  if (projectId != null) payload.projectId = projectId;
+  if (stageId != null) payload.stageId = stageId;
+  return payload;
 }

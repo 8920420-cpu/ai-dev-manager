@@ -107,7 +107,7 @@ export function validateStages(stages) {
 // --- DB-слой ---------------------------------------------------------------
 
 // Разрешить :projectId как UUID или как code проекта. 404, если не найден.
-async function resolveProjectId(c, projectId) {
+export async function resolveProjectId(c, projectId) {
   const ref = String(projectId ?? '').trim();
   if (!ref) throw httpError(422, 'project_id_required');
   const r = await c.query(
@@ -183,7 +183,7 @@ function stageContract(row, roleRows) {
   return out;
 }
 
-async function readStages(c, projectDbId) {
+export async function readStages(c, projectDbId) {
   const stages = await c.query(
     `SELECT id, position, name, enabled, watch_directory
        FROM project_stages WHERE project_id = $1 ORDER BY position`,
@@ -211,6 +211,67 @@ export async function getProjectStages(s, projectId) {
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
+ * Нормализовать сырой массив этапов из запроса в форму записи + провалидировать.
+ * Чистая (кроме loadRoleMaps) подготовка: резолвит ссылки на роли, проверяет
+ * enabled+SCANNER+watchDirectory. Бросает HTTP 422 при ошибке валидации.
+ * Возвращает нормализованные этапы (готовы к saveStagesRows).
+ */
+export async function normalizeStagesInput(c, rawStages) {
+  const list = Array.isArray(rawStages) ? rawStages : [];
+  const roleMaps = await loadRoleMaps(c);
+
+  // Нормализация + резолв ролей до валидации.
+  const normalized = list.map((stage, index) => {
+    const { roleIds, roleCodes } = resolveStageRoles(stage, roleMaps);
+    const provided = stage?.id != null ? String(stage.id) : null;
+    return {
+      id: provided && UUID_RE.test(provided) ? provided : null,
+      name: String(stage?.name ?? '').trim(),
+      enabled: stage?.enabled !== false,
+      position: index,
+      // scanner.watchDirectory имеет приоритет; допускаем и плоское поле.
+      watchDirectory: normalizeWatchDirectory(stage?.scanner?.watchDirectory ?? stage?.watchDirectory),
+      roleIds,
+      roleCodes,
+    };
+  });
+
+  const errors = validateStages(normalized);
+  if (errors.length) {
+    throw httpError(422, 'stage_validation_failed', { code: 'stage_validation_failed', errors });
+  }
+  return normalized;
+}
+
+/**
+ * Записать нормализованные этапы в РАМКАХ уже открытой транзакции (без BEGIN/
+ * COMMIT). Полная замена набора этапов проекта (project_stages не имеет внешних
+ * ссылок из задач — delete+insert безопасен). Возвращает прочитанные этапы.
+ * Используется и stages.js (saveProjectStages), и projects.js (общая транзакция).
+ */
+export async function saveStagesRows(c, projectDbId, normalized) {
+  await c.query('DELETE FROM project_stages WHERE project_id = $1', [projectDbId]);
+  for (const stage of normalized) {
+    const ins = await c.query(
+      `INSERT INTO project_stages (id, project_id, position, name, enabled, watch_directory)
+       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6)
+       RETURNING id`,
+      [stage.id, projectDbId, stage.position, stage.name, stage.enabled, stage.watchDirectory],
+    );
+    const stageId = ins.rows[0].id;
+    let pos = 0;
+    for (const roleId of stage.roleIds) {
+      await c.query(
+        `INSERT INTO project_stage_roles (stage_id, role_id, position) VALUES ($1, $2, $3)
+         ON CONFLICT (stage_id, role_id) DO NOTHING`,
+        [stageId, roleId, pos++],
+      );
+    }
+  }
+  return readStages(c, projectDbId);
+}
+
+/**
  * PUT — сохранить (создать/обновить) полный упорядоченный список этапов.
  * Клиент всегда присылает полный список, включая отключённые этапы с их
  * папкой — поэтому отключение/повторное включение не теряет настройки.
@@ -221,52 +282,11 @@ export async function saveProjectStages(s, projectId, input) {
   const rawStages = Array.isArray(input?.stages) ? input.stages : [];
   return withClient(clientConfig(s), async (c) => {
     const projectDbId = await resolveProjectId(c, projectId);
-    const roleMaps = await loadRoleMaps(c);
-
-    // Нормализация + резолв ролей до валидации.
-    const normalized = rawStages.map((stage, index) => {
-      const { roleIds, roleCodes } = resolveStageRoles(stage, roleMaps);
-      const provided = stage?.id != null ? String(stage.id) : null;
-      return {
-        id: provided && UUID_RE.test(provided) ? provided : null,
-        name: String(stage?.name ?? '').trim(),
-        enabled: stage?.enabled !== false,
-        position: index,
-        // scanner.watchDirectory имеет приоритет; допускаем и плоское поле.
-        watchDirectory: normalizeWatchDirectory(stage?.scanner?.watchDirectory ?? stage?.watchDirectory),
-        roleIds,
-        roleCodes,
-      };
-    });
-
-    const errors = validateStages(normalized);
-    if (errors.length) {
-      throw httpError(422, 'stage_validation_failed', { code: 'stage_validation_failed', errors });
-    }
+    const normalized = await normalizeStagesInput(c, rawStages);
 
     await c.query('BEGIN');
     try {
-      // Полная замена набора этапов проекта в одной транзакции (project_stages
-      // не имеет внешних ссылок из задач — delete+insert безопасен).
-      await c.query('DELETE FROM project_stages WHERE project_id = $1', [projectDbId]);
-      for (const stage of normalized) {
-        const ins = await c.query(
-          `INSERT INTO project_stages (id, project_id, position, name, enabled, watch_directory)
-           VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6)
-           RETURNING id`,
-          [stage.id, projectDbId, stage.position, stage.name, stage.enabled, stage.watchDirectory],
-        );
-        const stageId = ins.rows[0].id;
-        let pos = 0;
-        for (const roleId of stage.roleIds) {
-          await c.query(
-            `INSERT INTO project_stage_roles (stage_id, role_id, position) VALUES ($1, $2, $3)
-             ON CONFLICT (stage_id, role_id) DO NOTHING`,
-            [stageId, roleId, pos++],
-          );
-        }
-      }
-      const saved = await readStages(c, projectDbId);
+      const saved = await saveStagesRows(c, projectDbId, normalized);
       await c.query('COMMIT');
       return { projectId: projectDbId, stages: saved };
     } catch (error) {

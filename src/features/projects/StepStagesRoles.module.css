@@ -16,6 +16,13 @@
   gap: var(--space-1);
 }
 
+.sectionHeadRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
 .sectionTitle {
   margin: 0;
   font-size: var(--text-md);

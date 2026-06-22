@@ -1,7 +1,7 @@
 import { ExternalLink, Folder, Layers, Pencil, Trash2, Users } from 'lucide-react';
 import { Card, Menu, ProjectStatusBadge } from '../../components/ui';
 import type { MenuItem } from '../../components/ui';
-import { countAssignedRoles, type Project } from '../../types/project';
+import { countAssignedRoles, isStageEnabled, type Project } from '../../types/project';
 import { formatDate, plural } from '../../lib/format';
 import styles from './ProjectCard.module.css';
 
@@ -15,6 +15,7 @@ interface ProjectCardProps {
 /** Карточка подключённого проекта в сетке. */
 export function ProjectCard({ project, onOpen, onEdit, onDelete }: ProjectCardProps) {
   const stagesCount = project.stages.length;
+  const disabledCount = project.stages.filter((s) => !isStageEnabled(s)).length;
   const rolesCount = countAssignedRoles(project);
 
   const menuItems: MenuItem[] = [
@@ -65,6 +66,12 @@ export function ProjectCard({ project, onOpen, onEdit, onDelete }: ProjectCardPr
           <dt className={styles.srOnly}>Этапы</dt>
           <dd className={styles.metaValue}>
             {stagesCount} {plural(stagesCount, ['этап', 'этапа', 'этапов'])}
+            {disabledCount > 0 && (
+              <span className={styles.metaMuted}>
+                {', '}
+                {disabledCount} {plural(disabledCount, ['отключён', 'отключены', 'отключено'])}
+              </span>
+            )}
           </dd>
         </div>
         <div className={styles.metaItem}>

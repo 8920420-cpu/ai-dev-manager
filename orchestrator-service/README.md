@@ -1,6 +1,7 @@
 # orchestrator-service
 
-Микросервис AI Orchestrator, разделённый на **бэкенд** и **фронтенд**.
+Микросервис AI Orchestrator: **бэкенд** (REST API) + раздача единого
+React/Vite-фронтенда из корня репозитория (`src/` → `dist/`).
 
 ```
 orchestrator-service/
@@ -9,28 +10,33 @@ orchestrator-service/
 │   ├── src/
 │   │   ├── config.js   # настройки подключения (файл/env)
 │   │   ├── db.js       # ensureDatabase / runMigrations / seed / status
-│   │   └── server.js   # REST API + раздача фронтенда
+│   │   └── server.js   # REST API + раздача фронтенда (React-сборка)
 │   ├── db/             # SQL-миграции, seed, DATA_MODEL.md
 │   └── config/         # db.settings.json (создаётся через UI, в .gitignore)
-├── frontend/           # GUI: index.html, styles.css, app.js
-└── Dockerfile          # один образ: бэкенд раздаёт фронтенд
+└── Dockerfile          # один образ: backend собирает React (src/) и раздаёт его
 ```
+
+Фронтенд в проекте **один** — React/Vite SPA в корне (`src/`). Dockerfile
+собирает его и кладёт рядом с backend (`/app/frontend`); при локальном запуске
+backend без Docker отдаётся корневой `dist/` (или каталог из `FRONTEND_DIR`).
 
 ## Что делает
 
 1. **Автосоздание БД.** При старте (`AUTO_INIT≠false`) проверяет наличие БД
    `orchestrator_db` и **создаёт её, если нет**, затем накатывает миграции
    (идемпотентно, через таблицу `_schema_migrations`).
-2. **Графический экран настроек.** На `/` — форма с полями хост/путь, порт,
-   база, логин, пароль и кнопками «Проверить подключение», «Сохранить»,
-   «Создать БД и миграции», «Загрузить примеры». Внизу — состояние БД.
+2. **Графический интерфейс.** На `/` — React-приложение (Проекты, Интеграции,
+   Настройки → Роли/Базы данных). В Docker оно уже собрано в образ; при локальной
+   разработке UI поднимается отдельно через Vite (`npm run dev` в корне, порт 4186,
+   с прокси `/api` на backend).
 
 ## Запуск (на хосте)
 
 ```bash
+# backend (API). UI в dev поднимается отдельно через Vite (npm run dev в корне).
 cd orchestrator-service/backend
 npm install
-PORT=4186 npm start        # UI: http://localhost:4186/
+PORT=4186 npm start        # API: http://localhost:4186/api/...
 ```
 
 Настройки сохраняются в `backend/config/db.settings.json`. По умолчанию:
@@ -57,6 +63,7 @@ docker run -d --name orchestrator-service -p 4186:80 \
 | POST | `/api/db/init` | создать БД (если нет) + миграции |
 | POST | `/api/db/seed` | загрузить примеры данных |
 | GET  | `/api/db/status` | состояние БД (таблицы, миграции, счётчики) |
+| GET  | `/api/databases` | список подключённых БД с живым статусом (без пароля) |
 
 ## Переменные окружения
 
