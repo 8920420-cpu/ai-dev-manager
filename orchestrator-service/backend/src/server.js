@@ -1,0 +1,208 @@
+// HTTP-сервер: REST API настроек/БД + раздача фронтенда (../../frontend).
+import { createServer } from 'node:http';
+import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { dirname, resolve, join, extname, normalize } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { loadSettings, saveSettings, resolveSettings, redactSettings } from './config.js';
+import {
+  testConnection,
+  bootstrap,
+  runSeed,
+  getStatus,
+  acceptScannerCompletion,
+  claimNextClaudeTask,
+  releaseClaudeTask,
+  claimNextHostTask,
+  completeHostTask,
+  releaseHostTask,
+} from './db.js';
+import {
+  listConnectors,
+  getConnector,
+  createConnector,
+  updateConnector,
+  deleteConnector,
+  listExchanges,
+  invokeConnector,
+} from './connectors.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+const FRONTEND_DIR = process.env.FRONTEND_DIR || resolve(__dirname, '../../frontend');
+
+// Необязательная защита API. Если задан ORCHESTRATOR_API_TOKEN, все /api/*
+// требуют заголовок Authorization: Bearer <token> (или X-Api-Token: <token>).
+// По умолчанию выключено, чтобы не ломать локальную разработку, но в любом
+// сетевом развёртывании токен обязателен — API создаёт БД и меняет настройки.
+const API_TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
+
+function isAuthorized(req) {
+  if (!API_TOKEN) return true;
+  const auth = req.headers['authorization'];
+  if (auth && auth.startsWith('Bearer ') && auth.slice(7) === API_TOKEN) return true;
+  if (req.headers['x-api-token'] === API_TOKEN) return true;
+  return false;
+}
+
+const MIME = {
+  '.html': 'text/html; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.js': 'application/javascript; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+};
+
+function sendJson(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', (c) => {
+      data += c;
+      if (data.length > 1e6) reject(new Error('payload too large'));
+    });
+    req.on('end', () => {
+      if (!data) return resolve({});
+      try {
+        resolve(JSON.parse(data));
+      } catch {
+        reject(new Error('invalid JSON body'));
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+async function serveStatic(res, pathname) {
+  let rel = pathname === '/' ? '/index.html' : pathname;
+  rel = normalize(rel).replace(/^(\.\.[/\\])+/, ''); // защита от path traversal
+  const file = join(FRONTEND_DIR, rel);
+  if (!file.startsWith(FRONTEND_DIR) || !existsSync(file)) {
+    // SPA-фолбэк на index.html
+    const index = join(FRONTEND_DIR, 'index.html');
+    if (existsSync(index)) {
+      res.writeHead(200, { 'Content-Type': MIME['.html'] });
+      return res.end(await readFile(index));
+    }
+    res.writeHead(404);
+    return res.end('Not found');
+  }
+  const type = MIME[extname(file)] || 'application/octet-stream';
+  res.writeHead(200, { 'Content-Type': type });
+  res.end(await readFile(file));
+}
+
+// Разбор путей /api/integrations[/:id[/exchanges|/invoke]].
+function matchIntegrationRoute(pathname) {
+  if (pathname === '/api/integrations') return { kind: 'collection' };
+  const m = pathname.match(/^\/api\/integrations\/([^/]+)(?:\/(exchanges|invoke))?$/);
+  if (!m) return null;
+  const id = decodeURIComponent(m[1]);
+  if (m[2] === 'exchanges') return { kind: 'exchanges', id };
+  if (m[2] === 'invoke') return { kind: 'invoke', id };
+  return { kind: 'item', id };
+}
+
+export function createApp() {
+  return createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    const p = url.pathname;
+    try {
+      // --- API ---
+      if (p.startsWith('/api/') || p === '/health') {
+        if (req.method === 'GET' && p === '/health') return sendJson(res, 200, { status: 'ok' });
+
+        // /health открыт для healthcheck; всё остальное под /api требует токен,
+        // если он сконфигурирован.
+        if (!isAuthorized(req)) return sendJson(res, 401, { error: 'unauthorized' });
+
+        if (req.method === 'GET' && p === '/api/settings')
+          return sendJson(res, 200, redactSettings(await loadSettings()));
+
+        if (req.method === 'POST' && p === '/api/settings')
+          return sendJson(res, 200, redactSettings(await saveSettings(await readBody(req))));
+
+        if (req.method === 'POST' && p === '/api/db/test')
+          return sendJson(res, 200, await testConnection(await resolveSettings(await readBody(req))));
+
+        if (req.method === 'POST' && p === '/api/db/init')
+          return sendJson(res, 200, await bootstrap(await resolveSettings(await readBody(req))));
+
+        if (req.method === 'POST' && p === '/api/db/seed')
+          return sendJson(res, 200, await runSeed(await resolveSettings(await readBody(req))));
+
+        if (req.method === 'GET' && p === '/api/db/status')
+          return sendJson(res, 200, await getStatus(await loadSettings()));
+
+        if (req.method === 'POST' && p === '/api/scanner/task-completed')
+          return sendJson(
+            res,
+            200,
+            await acceptScannerCompletion(await loadSettings(), await readBody(req)),
+          );
+
+        // Обратный мост БД → файл: выдать Scanner-фидеру следующую задачу для Claude.
+        if (req.method === 'GET' && p === '/api/runner/next-claude-task')
+          return sendJson(res, 200, await claimNextClaudeTask(await loadSettings()));
+
+        // Откат захвата, если фидер не смог записать файл.
+        if (req.method === 'POST' && p === '/api/runner/release-claude-task')
+          return sendJson(
+            res,
+            200,
+            await releaseClaudeTask(await loadSettings(), (await readBody(req)).taskId),
+          );
+
+        // Host-мост: роли действия (PIPELINE_SERVICE/GIT_INTEGRATOR) исполняет
+        // нативный host-runner — здесь он берёт задачу и сдаёт результат.
+        if (req.method === 'GET' && p === '/api/runner/next-host-task')
+          return sendJson(res, 200, await claimNextHostTask(await loadSettings(), url.searchParams.get('role')));
+
+        if (req.method === 'POST' && p === '/api/runner/host-task-completed')
+          return sendJson(res, 200, await completeHostTask(await loadSettings(), await readBody(req)));
+
+        if (req.method === 'POST' && p === '/api/runner/release-host-task')
+          return sendJson(
+            res,
+            200,
+            await releaseHostTask(await loadSettings(), (await readBody(req)).taskId),
+          );
+
+        // --- Интеграции (коннекторы AI) + журнал обмена ---
+        const intg = matchIntegrationRoute(p);
+        if (intg) {
+          if (intg.kind === 'collection') {
+            if (req.method === 'GET') return sendJson(res, 200, { integrations: await listConnectors() });
+            if (req.method === 'POST')
+              return sendJson(res, 201, await createConnector(await readBody(req)));
+          } else if (intg.kind === 'item') {
+            if (req.method === 'GET') return sendJson(res, 200, await getConnector(intg.id));
+            if (req.method === 'PUT')
+              return sendJson(res, 200, await updateConnector(intg.id, await readBody(req)));
+            if (req.method === 'DELETE') return sendJson(res, 200, await deleteConnector(intg.id));
+          } else if (intg.kind === 'exchanges') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, { exchanges: await listExchanges(intg.id) });
+          } else if (intg.kind === 'invoke') {
+            if (req.method === 'POST')
+              return sendJson(res, 200, await invokeConnector(intg.id, await readBody(req)));
+          }
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        return sendJson(res, 404, { error: 'not_found' });
+      }
+
+      // --- Static frontend ---
+      if (req.method === 'GET') return await serveStatic(res, p);
+      res.writeHead(405);
+      res.end('Method not allowed');
+    } catch (e) {
+      sendJson(res, e.statusCode || 500, { ok: false, error: e.message });
+    }
+  });
+}

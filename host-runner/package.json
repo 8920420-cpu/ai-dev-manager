@@ -1,0 +1,17 @@
+{
+  "name": "host-runner",
+  "version": "1.0.0",
+  "description": "Нативный исполнитель host-ролей (PIPELINE_SERVICE/GIT_INTEGRATOR): docker/git на хосте по заданиям оркестратора.",
+  "type": "module",
+  "bin": {
+    "host-runner": "bin/host-runner.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/host-runner.js",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}
