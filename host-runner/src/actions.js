@@ -46,6 +46,26 @@ async function git(repoRoot, args) {
   return pexec('git', ['-C', repoRoot, ...args], { maxBuffer: 8 << 20 });
 }
 
+// Гарантировать, что репозиторий существует: если каталог ещё не git-репо —
+// инициализировать его и задать минимальную identity, иначе commit упадёт.
+// Так GIT_INTEGRATOR самодостаточен: ему не нужен заранее созданный репозиторий.
+async function ensureRepo(repoRoot) {
+  try {
+    await git(repoRoot, ['rev-parse', '--is-inside-work-tree']);
+    return { created: false };
+  } catch {
+    // не репозиторий — инициализируем ниже
+  }
+  await git(repoRoot, ['init']);
+  const email = await git(repoRoot, ['config', 'user.email']).catch(() => ({ stdout: '' }));
+  if (!String(email.stdout).trim()) {
+    await git(repoRoot, ['config', 'user.email', process.env.GIT_AUTHOR_EMAIL || 'ai-dev-manager@local']);
+    await git(repoRoot, ['config', 'user.name', process.env.GIT_AUTHOR_NAME || 'AI Dev Manager']);
+  }
+  await git(repoRoot, ['config', 'commit.gpgsign', 'false']).catch(() => {});
+  return { created: true };
+}
+
 /**
  * GIT_INTEGRATOR: добавить ТОЛЬКО файлы текущей задачи и сделать один локальный
  * коммит. Без push, reset, clean и --no-verify (как требует роль git-integrator).
@@ -58,6 +78,9 @@ export async function runGitAction(task, opts = {}) {
   if (files.length === 0) {
     return { success: true, output: { commit: null, files: [], note: 'no_changed_files' } };
   }
+
+  // Репозиторий может быть ещё не создан — инициализируем автоматически.
+  const repo = await ensureRepo(repoRoot);
 
   await git(repoRoot, ['add', '--', ...files]);
   const staged = await git(repoRoot, ['diff', '--cached', '--name-only']);
@@ -81,7 +104,13 @@ export async function runGitAction(task, opts = {}) {
   const branch = await git(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => ({ stdout: '' }));
   return {
     success: true,
-    output: { commit: head.stdout.trim(), branch: branch.stdout.trim(), files: stagedFiles, pushed: false },
+    output: {
+      commit: head.stdout.trim(),
+      branch: branch.stdout.trim(),
+      files: stagedFiles,
+      pushed: false,
+      repoInitialized: repo.created,
+    },
   };
 }
 
