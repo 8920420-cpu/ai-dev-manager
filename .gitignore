@@ -1,0 +1,14 @@
+# Зависимости
+node_modules/
+
+# Сборка фронтенда (генерируется npm run build / Docker frontend stage)
+dist/
+*.tsbuildinfo
+
+# Временные артефакты прогонов (pipeline-runner, тесты)
+.tmp/
+**/.tmp/
+*.log
+
+# Локальные настройки Claude Code (не для репозитория)
+.claude/settings.local.json

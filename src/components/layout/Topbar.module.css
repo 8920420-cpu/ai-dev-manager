@@ -1,0 +1,53 @@
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: var(--topbar-h, 60px);
+  padding: 0 var(--space-5);
+  background: color-mix(in srgb, var(--surface) 85%, transparent);
+  backdrop-filter: saturate(1.4) blur(8px);
+  border-bottom: 1px solid var(--border);
+}
+.left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+.right {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+.pageTitle {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+}
+.iconBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-h-md);
+  height: var(--control-h-md);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  border: 1px solid transparent;
+}
+.iconBtn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+/* Гамбургер только на мобильных */
+.left > .iconBtn {
+  display: none;
+}
+@media (max-width: 1024px) {
+  .left > .iconBtn {
+    display: inline-flex;
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "tester-service",
+  "version": "1.0.0",
+  "description": "Микросервис роли «Тестировщик»: технический исполнитель проверки задачи. Запускает Pipeline Runner и возвращает результат оркестратору. Не анализирует код, не исправляет ошибки.",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": "./src/index.js",
+  "bin": {
+    "tester-service": "bin/tester-service.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/tester-service.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "pipeline-runner": "file:../pipeline-runner"
+  },
+  "license": "MIT"
+}

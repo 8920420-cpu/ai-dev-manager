@@ -1,0 +1,18 @@
+{
+  "name": "pipeline-runner",
+  "version": "1.0.0",
+  "description": "Universal, language-agnostic pipeline runner driven entirely by .pipeline.json",
+  "type": "module",
+  "bin": {
+    "pipeline-runner": "bin/pipeline-runner.js"
+  },
+  "exports": "./src/index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "test": "node --test",
+    "example": "node bin/pipeline-runner.js --config example/.pipeline.json"
+  },
+  "license": "MIT"
+}

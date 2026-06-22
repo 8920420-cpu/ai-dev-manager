@@ -1,0 +1,11 @@
+{
+  "name": "Example_Service",
+  "workingDirectory": ".",
+  "timeoutMinutes": 5,
+  "stages": {
+    "prepare": ["echo preparing"],
+    "test": ["echo running tests"],
+    "build": ["echo building image"],
+    "smoke": ["echo smoke ok"]
+  }
+}

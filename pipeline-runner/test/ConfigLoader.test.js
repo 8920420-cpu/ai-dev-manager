@@ -1,0 +1,135 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { writeFileSync } from 'node:fs';
+import path from 'node:path';
+
+import { ConfigLoader, ConfigError } from '../src/ConfigLoader.js';
+import { tmpDir } from './helpers.js';
+
+const loader = new ConfigLoader();
+
+test('validate принимает корректный конфиг и нормализует поля', () => {
+  const cfg = loader.validate(
+    {
+      name: 'Catalog_Service',
+      workingDirectory: '.',
+      timeoutMinutes: 30,
+      stages: { test: ['go test ./...'], build: ['docker compose build'] },
+    },
+    path.resolve('/proj/.pipeline.json'),
+  );
+
+  assert.equal(cfg.name, 'Catalog_Service');
+  assert.equal(cfg.timeoutMinutes, 30);
+  assert.equal(cfg.workingDirectory, path.resolve('/proj'));
+  assert.equal(cfg.configPath, path.resolve('/proj/.pipeline.json'));
+  assert.deepEqual(
+    cfg.stages.map((s) => s.name),
+    ['test', 'build'],
+  );
+});
+
+test('validate сохраняет порядок этапов из JSON', () => {
+  const cfg = loader.validate({
+    stages: { terraform: [], deploy: [], check: [] },
+  });
+  assert.deepEqual(
+    cfg.stages.map((s) => s.name),
+    ['terraform', 'deploy', 'check'],
+  );
+});
+
+test('validate подставляет значения по умолчанию', () => {
+  const cfg = loader.validate({ stages: { build: ['echo hi'] } });
+  assert.equal(cfg.name, 'pipeline');
+  assert.equal(cfg.timeoutMinutes, null);
+});
+
+test('validate требует объект stages', () => {
+  assert.throws(() => loader.validate({}), ConfigError);
+  assert.throws(() => loader.validate({ stages: [] }), ConfigError);
+  assert.throws(() => loader.validate(null), ConfigError);
+});
+
+test('validate требует массив команд в этапе', () => {
+  assert.throws(() => loader.validate({ stages: { test: 'go test' } }), ConfigError);
+});
+
+test('validate: старый формат массива даёт enabled=true', () => {
+  const cfg = loader.validate({ stages: { build: ['echo hi'] } });
+  assert.equal(cfg.stages[0].enabled, true);
+  assert.deepEqual(cfg.stages[0].commands, ['echo hi']);
+});
+
+test('validate: объектный формат этапа с enabled', () => {
+  const cfg = loader.validate({
+    stages: {
+      build: { commands: ['echo hi'], enabled: true },
+      smoke: { commands: ['curl x'], enabled: false },
+    },
+  });
+  assert.deepEqual(
+    cfg.stages.map((s) => [s.name, s.enabled]),
+    [
+      ['build', true],
+      ['smoke', false],
+    ],
+  );
+  assert.deepEqual(cfg.stages[1].commands, ['curl x']);
+});
+
+test('validate: объектный формат без enabled => true (обратная совместимость)', () => {
+  const cfg = loader.validate({ stages: { build: { commands: ['echo hi'] } } });
+  assert.equal(cfg.stages[0].enabled, true);
+});
+
+test('validate: объектный этап требует массив commands', () => {
+  assert.throws(() => loader.validate({ stages: { build: { commands: 'echo' } } }), ConfigError);
+  assert.throws(() => loader.validate({ stages: { build: { enabled: true } } }), ConfigError);
+});
+
+test('validate: enabled должно быть boolean', () => {
+  assert.throws(
+    () => loader.validate({ stages: { build: { commands: [], enabled: 'yes' } } }),
+    ConfigError,
+  );
+});
+
+test('validate: отключённый этап с пустыми командами допустим', () => {
+  const cfg = loader.validate({ stages: { smoke: { commands: [], enabled: false } } });
+  assert.equal(cfg.stages[0].enabled, false);
+  assert.deepEqual(cfg.stages[0].commands, []);
+});
+
+test('validate требует строковые команды', () => {
+  assert.throws(() => loader.validate({ stages: { test: [123] } }), ConfigError);
+});
+
+test('validate отклоняет пустой набор этапов', () => {
+  assert.throws(() => loader.validate({ stages: {} }), ConfigError);
+});
+
+test('validate проверяет timeoutMinutes', () => {
+  assert.throws(() => loader.validate({ stages: { a: [] }, timeoutMinutes: -1 }), ConfigError);
+  assert.throws(() => loader.validate({ stages: { a: [] }, timeoutMinutes: 'x' }), ConfigError);
+});
+
+test('load читает файл и парсит JSON', async (t) => {
+  const dir = tmpDir(t);
+  const file = path.join(dir, '.pipeline.json');
+  writeFileSync(file, JSON.stringify({ name: 'X', stages: { test: ['echo hi'] } }));
+  const cfg = await loader.load(file);
+  assert.equal(cfg.name, 'X');
+  assert.equal(cfg.workingDirectory, path.resolve(dir));
+});
+
+test('load бросает ConfigError на отсутствующем файле', async () => {
+  await assert.rejects(() => loader.load('/no/such/.pipeline.json'), ConfigError);
+});
+
+test('load бросает ConfigError на битом JSON', async (t) => {
+  const dir = tmpDir(t);
+  const file = path.join(dir, '.pipeline.json');
+  writeFileSync(file, '{ not json');
+  await assert.rejects(() => loader.load(file), ConfigError);
+});

@@ -1,0 +1,71 @@
+services:
+  orchestrator-service:
+    build:
+      # Контекст — корень репозитория: образ собирает React-фронтенд из src/
+      # и кладёт его в backend (см. orchestrator-service/Dockerfile).
+      context: .
+      dockerfile: orchestrator-service/Dockerfile
+    image: orchestrator-service:latest
+    container_name: orchestrator-service
+    ports:
+      - "4186:80"
+    environment:
+      # Общая точка входа в БД. По умолчанию — Postgres на shared-network
+      # (infra-postgres-1:5432). Если в окружении есть PgBouncer -> HAProxy ->
+      # Patroni leader, переопределите PGHOST/PGPORT через .env (pgbouncer:6432).
+      PGHOST: "${PGHOST:-infra-postgres-1}"
+      PGPORT: "${PGPORT:-5432}"
+      PGUSER: "${PGUSER:-postgres}"
+      # Не храните секреты в репозитории: задайте PGPASSWORD в .env или окружении.
+      PGPASSWORD: "${PGPASSWORD:-postgres}"
+      PGDATABASE: orchestrator_db
+      AUTO_INIT: "true"
+      # Фоновый runner продвигает автоматические роли по БД (false — выключить).
+      RUNNER_ENABLED: "true"
+      RUNNER_INTERVAL_MS: "3000"
+      # Задайте токен, чтобы закрыть /api/* при сетевом доступе (пусто = выключено).
+      ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+    networks:
+      - default
+      - shared-network
+    restart: unless-stopped
+    healthcheck:
+      # 127.0.0.1, а не localhost: в alpine localhost резолвится в IPv6 ::1,
+      # а сервер слушает IPv4 0.0.0.0 — иначе healthcheck даёт Connection refused.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  scanner-service:
+    build:
+      context: .
+      dockerfile: scanner-service/Dockerfile
+    image: scanner-service:latest
+    container_name: scanner-service
+    environment:
+      SCANNER_DOCUMENT: /workspace/claude-tasks.json
+      SCANNER_STATE: /workspace/.scanner-state.json
+      SCANNER_ENDPOINT: http://orchestrator-service/api/scanner/task-completed
+      SCANNER_DEBOUNCE_MS: "150"
+      # bind-mount в Docker не пробрасывает события fs.watch с хоста —
+      # резервный опрос ловит изменения, которые watcher пропустил.
+      SCANNER_FALLBACK_MS: "5000"
+      # Stage 1: после доставки удалять завершённую запись, освобождая слот.
+      SCANNER_CLEAR_ON_DISPATCH: "true"
+      # Stage 2: обратный мост — наполнять пустой слот следующей задачей из БД.
+      FEEDER_ENABLED: "true"
+      FEEDER_INTERVAL_MS: "3000"
+      ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+    volumes:
+      - ./runtime:/workspace
+    depends_on:
+      orchestrator-service:
+        condition: service_healthy
+    restart: unless-stopped
+
+networks:
+  shared-network:
+    name: shared-network
+    external: true
