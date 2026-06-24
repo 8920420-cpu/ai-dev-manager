@@ -4,6 +4,7 @@ import { Button, Input, Select, useToast } from '../../components/ui';
 import { cn } from '../../lib/cn';
 import { fsAccess } from '../../api/fsAccess';
 import { isScannerRole } from '../../data/presets';
+import { taskStatusLabel } from '../../data/taskStatuses';
 import type { Role, Stage } from '../../types/project';
 import styles from './StageRow.module.css';
 
@@ -14,6 +15,16 @@ interface StageRowProps {
   error?: string | null;
   /** Ошибка обязательной папки Scanner (показывается у поля папки). */
   scanError?: string | null;
+  /** Ошибка статуса задач Scanner (обязателен/дубликат). */
+  statusError?: string | null;
+  /** Доступные статусы для дропдауна (занятые другими сканерами исключены). */
+  statusOptions: string[];
+  /**
+   * Скрыть поле «Отслеживаемая папка» у Scanner-этапа. Используется в редакторе
+   * единой «Схемы разработки»: папку Scanner задаёт не схема, а каждый проект
+   * (его «папка документов» — projects.docs_path).
+   */
+  hideScanPath?: boolean;
   canRemove: boolean;
   /** Над этой строкой сейчас держат перетаскиваемый этап. */
   dropTarget: boolean;
@@ -23,6 +34,7 @@ interface StageRowProps {
   onSetRole: (roleId: string | null) => void;
   onToggleEnabled: (enabled: boolean) => void;
   onSetScanPath: (scanPath: string) => void;
+  onSetStatus: (taskStatus: string) => void;
   onRemove: () => void;
   onDragStart: () => void;
   onDragEnter: () => void;
@@ -37,6 +49,9 @@ export function StageRow({
   roles,
   error,
   scanError,
+  statusError,
+  statusOptions,
+  hideScanPath = false,
   canRemove,
   dropTarget,
   dragging,
@@ -44,6 +59,7 @@ export function StageRow({
   onSetRole,
   onToggleEnabled,
   onSetScanPath,
+  onSetStatus,
   onRemove,
   onDragStart,
   onDragEnter,
@@ -156,41 +172,93 @@ export function StageRow({
             className={styles.checkbox}
             checked={enabled}
             onChange={(e) => onToggleEnabled(e.target.checked)}
-            aria-label={`Этап «${stageLabel}» включён`}
+            aria-label={`Включить этап «${stageLabel}»`}
           />
           <span>Включён</span>
         </label>
         {!enabled && (
-          <span className={styles.disabledBadge}>Отключён — этап будет пропущен</span>
+          // Текстовый статус (не только цвет): этап отключён, но остаётся в пайплайне.
+          <span className={styles.disabledBadge}>
+            Отключён — роль не вызывается (этап сохранён в пайплайне)
+          </span>
         )}
       </div>
 
+      {/* Статус задач для НЕ-Scanner этапа с ролью: по нему резолвер маршрута
+          ведёт задачу. Для Scanner статус показывается внутри scanBlock ниже. */}
+      {!isScanner && enabled && selectedRoleId !== '' && (
+        <div className={styles.statusBlock}>
+          <div className={styles.statusField}>
+            <Select
+              id={`stage-status-${stage.id}`}
+              label="Статус задач"
+              value={stage.taskStatus ?? ''}
+              onChange={(e) => onSetStatus(e.target.value)}
+              error={statusError ?? undefined}
+              required={enabled}
+              helper="Статус задачи на этом этапе (task_status). Резолвер маршрута ведёт задачу по статусам этапов."
+              aria-label={`Статус задач: ${stageLabel}`}
+            >
+              <option value="">— выберите статус —</option>
+              {statusOptions.map((status) => (
+                <option key={status} value={status}>
+                  {taskStatusLabel(status)}
+                </option>
+              ))}
+            </Select>
+          </div>
+        </div>
+      )}
+
       {isScanner && (
         <div className={styles.scanBlock}>
-          <div className={styles.scanField}>
-            <Input
-              id={`stage-scan-${stage.id}`}
-              label="Отслеживаемая папка сканера"
-              value={stage.scanPath ?? ''}
-              onChange={(e) => onSetScanPath(e.target.value)}
-              placeholder="C:\\projects\\my-app\\src или /home/user/my-app/src"
-              helper="Папка, изменения в которой отслеживает сканер. «Выбрать папку» открывает системный диалог и подставляет полный путь; если backend недоступен — впишите путь вручную."
-              error={scanError ?? undefined}
+          {!hideScanPath && (
+            <>
+              <div className={styles.scanField}>
+                <Input
+                  id={`stage-scan-${stage.id}`}
+                  label="Отслеживаемая папка сканера"
+                  value={stage.scanPath ?? ''}
+                  onChange={(e) => onSetScanPath(e.target.value)}
+                  placeholder="C:\\projects\\my-app\\src или /home/user/my-app/src"
+                  helper="Папка, изменения в которой отслеживает сканер. «Выбрать папку» открывает системный диалог и подставляет полный путь; если backend недоступен — впишите путь вручную."
+                  error={scanError ?? undefined}
+                  required={enabled}
+                  mono
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              </div>
+              <div className={styles.scanBtn}>
+                <Button
+                  variant="secondary"
+                  leftIcon={<FolderOpen size={18} aria-hidden="true" />}
+                  onClick={handlePickFolder}
+                  title="Открыть системный диалог выбора папки"
+                >
+                  Выбрать папку
+                </Button>
+              </div>
+            </>
+          )}
+          <div className={styles.statusField}>
+            <Select
+              id={`stage-status-${stage.id}`}
+              label="Статус задач сканера"
+              value={stage.taskStatus ?? ''}
+              onChange={(e) => onSetStatus(e.target.value)}
+              error={statusError ?? undefined}
               required={enabled}
-              mono
-              autoComplete="off"
-              spellCheck={false}
-            />
-          </div>
-          <div className={styles.scanBtn}>
-            <Button
-              variant="secondary"
-              leftIcon={<FolderOpen size={18} aria-hidden="true" />}
-              onClick={handlePickFolder}
-              title="Открыть системный диалог выбора папки"
+              helper="Сканер забирает только задачи с этим статусом. Статус, занятый другим этапом Scanner, недоступен — нельзя обслуживать один статус двумя сканерами."
+              aria-label={`Статус задач сканера: ${stageLabel}`}
             >
-              Выбрать папку
-            </Button>
+              <option value="">— выберите статус —</option>
+              {statusOptions.map((status) => (
+                <option key={status} value={status}>
+                  {taskStatusLabel(status)}
+                </option>
+              ))}
+            </Select>
           </div>
         </div>
       )}

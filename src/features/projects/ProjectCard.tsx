@@ -1,8 +1,11 @@
-import { ExternalLink, Folder, Layers, Pencil, Trash2, Users } from 'lucide-react';
-import { Card, Menu, ProjectStatusBadge } from '../../components/ui';
+import { useState } from 'react';
+import { ExternalLink, Folder, Layers, Pencil, Radar, Trash2, Users } from 'lucide-react';
+import { Card, Menu, ProjectStatusBadge, useToast } from '../../components/ui';
 import type { MenuItem } from '../../components/ui';
+import { projectsApi } from '../../api/projectsApi';
 import { countAssignedRoles, isStageEnabled, type Project } from '../../types/project';
 import { formatDate, plural } from '../../lib/format';
+import { cn } from '../../lib/cn';
 import styles from './ProjectCard.module.css';
 
 interface ProjectCardProps {
@@ -10,13 +13,37 @@ interface ProjectCardProps {
   onOpen: (project: Project) => void;
   onEdit: (project: Project) => void;
   onDelete: (project: Project) => void;
+  /** Вызывается, когда проект изменён прямо на карточке (тумблер Scanner). */
+  onUpdated: (project: Project) => void;
 }
 
 /** Карточка подключённого проекта в сетке. */
-export function ProjectCard({ project, onOpen, onEdit, onDelete }: ProjectCardProps) {
+export function ProjectCard({ project, onOpen, onEdit, onDelete, onUpdated }: ProjectCardProps) {
+  const toast = useToast();
+  const [scannerPending, setScannerPending] = useState(false);
   const stagesCount = project.stages.length;
   const disabledCount = project.stages.filter((s) => !isStageEnabled(s)).length;
   const rolesCount = countAssignedRoles(project);
+  const scannerOn = project.scannerEnabled === true;
+
+  const toggleScanner = async () => {
+    if (scannerPending) return;
+    const next = !scannerOn;
+    setScannerPending(true);
+    try {
+      const updated = await projectsApi.setScanner(project.id, next);
+      onUpdated(updated);
+      if (next && !updated.docsPath) {
+        toast.info('Scanner включён. Укажите «папку документов» проекта, чтобы приём заработал.');
+      } else {
+        toast.success(next ? 'Scanner включён: приём задач из папки' : 'Scanner выключен');
+      }
+    } catch {
+      toast.error('Не удалось изменить состояние Scanner');
+    } finally {
+      setScannerPending(false);
+    }
+  };
 
   const menuItems: MenuItem[] = [
     {
@@ -82,6 +109,26 @@ export function ProjectCard({ project, onOpen, onEdit, onDelete }: ProjectCardPr
           </dd>
         </div>
       </dl>
+
+      <div className={styles.scannerRow}>
+        <button
+          type="button"
+          role="switch"
+          aria-checked={scannerOn}
+          className={cn(styles.scannerToggle, scannerOn && styles.scannerOn)}
+          onClick={toggleScanner}
+          disabled={scannerPending}
+          title={
+            scannerOn
+              ? 'Scanner отслеживает папку проекта и забирает задачи. Нажмите, чтобы выключить.'
+              : 'Scanner не отслеживает проект. Нажмите, чтобы включить приём задач из папки.'
+          }
+        >
+          <Radar size={15} aria-hidden="true" />
+          <span className={styles.scannerLabel}>Scanner</span>
+          <span className={styles.scannerState}>{scannerOn ? 'вкл' : 'выкл'}</span>
+        </button>
+      </div>
 
       <div className={styles.footer}>
         <ProjectStatusBadge status={project.status} />

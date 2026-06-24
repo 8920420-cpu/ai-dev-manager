@@ -15,8 +15,6 @@ export interface WizardState {
   status: ProjectStatus;
   roles: Role[];
   stages: Stage[];
-  /** Выбранная БД (PRIMARY_DB_ID или id доп. подключения); null — не выбрана. */
-  databaseId: string | null;
 }
 
 export type WizardAction =
@@ -30,10 +28,10 @@ export type WizardAction =
   | { type: 'setStageRole'; stageId: string; roleId: string | null }
   | { type: 'setStageEnabled'; stageId: string; enabled: boolean }
   | { type: 'setStageScanPath'; stageId: string; scanPath: string }
+  | { type: 'setStageStatus'; stageId: string; taskStatus: string }
   | { type: 'applyDefaultStages' }
   | { type: 'addRole'; name: string }
   | { type: 'removeRole'; roleId: string }
-  | { type: 'setDatabase'; databaseId: string | null }
   | { type: 'reset'; state: WizardState };
 
 /**
@@ -76,7 +74,6 @@ export function buildPresetState(): WizardState {
     status: 'active',
     roles,
     stages: buildPresetStages(roles),
-    databaseId: null,
   };
 }
 
@@ -94,7 +91,6 @@ export function buildStateFromProject(project: Project): WizardState {
       // Старые данные без enabled читаются как включённые.
       enabled: isStageEnabled(s),
     })),
-    databaseId: project.databaseId ?? null,
   };
 }
 
@@ -167,12 +163,20 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
           s.id === action.stageId ? { ...s, scanPath: action.scanPath } : s,
         ),
       };
+    case 'setStageStatus':
+      return {
+        ...state,
+        stages: state.stages.map((s) =>
+          // Пустой выбор → снять статус (undefined), иначе сохранить выбранный.
+          s.id === action.stageId
+            ? { ...s, taskStatus: action.taskStatus || undefined }
+            : s,
+        ),
+      };
     case 'applyDefaultStages':
       // Пересобрать этапы в стандартном порядке с ролями по умолчанию.
       // Роли проекта сохраняются как есть; перезаписываются только этапы.
       return { ...state, stages: buildPresetStages(state.roles) };
-    case 'setDatabase':
-      return { ...state, databaseId: action.databaseId };
     case 'addRole': {
       const name = action.name.trim();
       if (!name) return state;

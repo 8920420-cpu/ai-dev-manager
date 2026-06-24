@@ -111,6 +111,61 @@
   color: var(--text-muted);
 }
 
+.scannerRow {
+  display: flex;
+}
+
+.scannerToggle {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full, 999px);
+  background: var(--surface-2);
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.scannerToggle:hover:not(:disabled) {
+  border-color: var(--primary, #2563eb);
+}
+
+.scannerToggle:disabled {
+  opacity: 0.6;
+  cursor: progress;
+}
+
+.scannerToggle:focus-visible {
+  outline: 2px solid var(--primary, #2563eb);
+  outline-offset: 2px;
+}
+
+.scannerLabel {
+  font-weight: var(--weight-medium);
+}
+
+.scannerState {
+  font-variant: small-caps;
+  color: var(--text-muted);
+}
+
+/* Включённое состояние — акцентный «зелёный» вид. */
+.scannerOn {
+  background: var(--success-soft, rgba(22, 163, 74, 0.12));
+  border-color: var(--success, #16a34a);
+  color: var(--success, #16a34a);
+}
+
+.scannerOn .scannerState {
+  color: var(--success, #16a34a);
+  font-weight: var(--weight-semibold);
+}
+
 .footer {
   display: flex;
   align-items: center;

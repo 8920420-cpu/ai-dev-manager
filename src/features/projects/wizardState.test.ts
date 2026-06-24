@@ -35,7 +35,7 @@ describe('wizardReducer / пресеты P0.1', () => {
 
   it('setStageEnabled переключает флаг, не трогая остальные настройки', () => {
     const state = buildPresetState();
-    const scanner = findStageByName(state, 'Scanner');
+    const scanner = findStageByName(state, 'Programmer');
     // зададим путь, затем отключим
     const withPath = wizardReducer(state, {
       type: 'setStageScanPath',
@@ -66,7 +66,7 @@ describe('wizardReducer / пресеты P0.1', () => {
 
   it('смена роли не очищает scanPath', () => {
     const state = buildPresetState();
-    const scanner = findStageByName(state, 'Scanner');
+    const scanner = findStageByName(state, 'Architect');
     const withPath = wizardReducer(state, {
       type: 'setStageScanPath',
       stageId: scanner.id,
@@ -86,7 +86,7 @@ describe('wizardReducer / пресеты P0.1', () => {
 
   it('reorder сохраняет enabled и scanPath этапов', () => {
     const base = buildPresetState();
-    const scanner = findStageByName(base, 'Scanner');
+    const scanner = findStageByName(base, 'Programmer');
     const prepared = wizardReducer(
       wizardReducer(base, { type: 'setStageScanPath', stageId: scanner.id, scanPath: '/w' }),
       { type: 'setStageEnabled', stageId: scanner.id, enabled: false },
@@ -105,6 +105,7 @@ describe('wizardReducer / пресеты P0.1', () => {
       name: 'Legacy',
       path: '/p',
       status: 'active',
+      pauseReason: null,
       roles: [
         // роль без кода, но с пресетным именем
         { id: 'r1', name: 'Scanner' } as never,
