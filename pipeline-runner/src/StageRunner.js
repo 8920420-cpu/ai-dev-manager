@@ -1,6 +1,13 @@
 import { round } from './util.js';
 
 /**
+ * Ограничение «хвоста» вывода команды, который попадает в structured-результат.
+ * Полный вывод пишется в pipeline.log; в summary уходит только безопасный
+ * фрагмент фиксированного размера (без неограниченного вывода/секретов).
+ */
+const LOG_TAIL_LIMIT = 2000;
+
+/**
  * StageRunner — единственная ответственность: выполнить ОДИН этап,
  * то есть последовательно прогнать его команды и остановиться на первой ошибке.
  */
@@ -44,12 +51,26 @@ export class StageRunner {
       }
 
       this.logger.info(`$ ${command}`);
+      // Безопасный фрагмент: храним только ограниченный «хвост» вывода команды,
+      // чтобы передать его оркестратору без неограниченного объёма/секретов.
+      // Полный вывод по-прежнему пишется только в pipeline.log.
+      let tail = '';
+      const appendTail = (s) => {
+        tail += s;
+        if (tail.length > LOG_TAIL_LIMIT) tail = tail.slice(tail.length - LOG_TAIL_LIMIT);
+      };
       const res = await this.executor.run(command, {
         cwd: ctx.cwd,
         env: ctx.env,
         timeoutMs,
-        onStdout: (s) => this.logger.raw(s),
-        onStderr: (s) => this.logger.raw(s),
+        onStdout: (s) => {
+          appendTail(s);
+          this.logger.raw(s);
+        },
+        onStderr: (s) => {
+          appendTail(s);
+          this.logger.raw(s);
+        },
       });
 
       const ok = res.exitCode === 0 && !res.timedOut && !res.error;
@@ -66,6 +87,7 @@ export class StageRunner {
         durationSeconds: res.durationSeconds,
         timedOut: res.timedOut,
         ...(res.error ? { error: res.error } : {}),
+        ...(tail ? { logFragment: tail } : {}),
       });
 
       if (!ok) {

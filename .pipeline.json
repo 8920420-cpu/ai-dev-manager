@@ -3,15 +3,24 @@
   "workingDirectory": ".",
   "timeoutMinutes": 15,
   "stages": {
-    "build": [
-      "docker compose build"
-    ],
-    "deploy": [
-      "docker compose up -d"
-    ],
-    "smoke": [
-      "curl -f --retry 15 --retry-delay 2 --retry-connrefused --retry-all-errors http://localhost:4186/health",
-      "curl -f --retry 5 --retry-delay 2 --retry-all-errors http://localhost:4186/"
-    ]
+    "build": {
+      "enabled": true,
+      "commands": [
+        "docker compose build"
+      ]
+    },
+    "deploy": {
+      "enabled": true,
+      "commands": [
+        "docker compose up -d"
+      ]
+    },
+    "smoke": {
+      "enabled": true,
+      "commands": [
+        "curl -f --retry 15 --retry-delay 2 --retry-connrefused --retry-all-errors http://localhost:4186/health",
+        "curl -f --retry 5 --retry-delay 2 --retry-all-errors http://localhost:4186/"
+      ]
+    }
   }
 }

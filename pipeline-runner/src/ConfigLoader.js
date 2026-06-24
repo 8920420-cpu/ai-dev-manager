@@ -6,7 +6,7 @@ import path from 'node:path';
  * .pipeline.json, превратив его в нормализованный объект конфигурации.
  *
  * Загрузчик НЕ знает ни про языки, ни про структуру проектов — он лишь
- * проверяет общий контракт «stages = { имя: [команды] }».
+ * проверяет общий контракт «stages = { имя: { commands: [...], enabled } }».
  */
 export class ConfigLoader {
   /**
@@ -79,47 +79,47 @@ export class ConfigLoader {
   }
 
   /**
-   * Нормализовать один этап. Поддерживаются две формы:
-   *   1) массив команд (старый формат) — этап всегда включён;
-   *   2) объект { commands: string[], enabled?: boolean, ... } — расширенный
-   *      формат с управлением активностью. Незнакомые поля (например, scanner)
-   *      runner безопасно игнорирует: их семантика принадлежит другому
-   *      потребителю контракта.
+   * Нормализовать один этап. Канонический формат — ТОЛЬКО объект:
+   *   { "commands": string[], "enabled": true|false, ... }
+   * `commands` обязателен (массив строк), `enabled` обязателен (boolean).
+   * Незнакомые поля (например, scanner) runner безопасно игнорирует: их
+   * семантика принадлежит другому потребителю контракта.
    *
-   * Обратная совместимость: отсутствие `enabled` эквивалентно `true`.
+   * Старый формат (массив команд) и объект без `enabled` БОЛЬШЕ НЕ
+   * поддерживаются (LEGACY-PIPELINE-CONFIG-001): они отклоняются ConfigError
+   * до запуска команд — с указанием этапа и инструкцией миграции.
    *
    * @returns {{name: string, commands: string[], enabled: boolean}}
    */
   #normalizeStage(name, value) {
-    let commands;
-    let enabled = true;
-
-    if (Array.isArray(value)) {
-      commands = value;
-    } else if (value && typeof value === 'object') {
-      if (!Array.isArray(value.commands)) {
-        throw new ConfigError(`Этап "${name}": поле "commands" должно быть массивом команд`);
-      }
-      commands = value.commands;
-      if (value.enabled != null) {
-        if (typeof value.enabled !== 'boolean') {
-          throw new ConfigError(`Этап "${name}": поле "enabled" должно быть boolean`);
-        }
-        enabled = value.enabled;
-      }
-    } else {
+    if (Array.isArray(value) || !value || typeof value !== 'object') {
       throw new ConfigError(
-        `Этап "${name}" должен быть массивом команд или объектом { commands, enabled }`,
+        `Этап "${name}" должен быть объектом { "commands": [...], "enabled": true|false }. ` +
+          `Старый формат (массив команд) больше не поддерживается — оберните команды: ` +
+          `"${name}": { "commands": [...], "enabled": true }.`,
       );
     }
 
-    commands.forEach((cmd, i) => {
+    if (!Array.isArray(value.commands)) {
+      throw new ConfigError(
+        `Этап "${name}": поле "commands" обязательно и должно быть массивом команд`,
+      );
+    }
+
+    if (typeof value.enabled !== 'boolean') {
+      throw new ConfigError(
+        `Этап "${name}": поле "enabled" обязательно и должно быть boolean (true|false). ` +
+          `Неявное включение отсутствующего "enabled" удалено (LEGACY-PIPELINE-CONFIG-001).`,
+      );
+    }
+
+    value.commands.forEach((cmd, i) => {
       if (typeof cmd !== 'string') {
         throw new ConfigError(`Этап "${name}", команда #${i + 1} должна быть строкой`);
       }
     });
 
-    return { name, commands: [...commands], enabled };
+    return { name, commands: [...value.commands], enabled: value.enabled };
   }
 }
 

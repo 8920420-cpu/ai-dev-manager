@@ -3,9 +3,11 @@ import assert from 'node:assert/strict';
 import { writeFileSync, readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 
+import { mkdirSync } from 'node:fs';
 import { runPipeline } from '../src/index.js';
 import { Logger } from '../src/Logger.js';
-import { tmpDir } from './helpers.js';
+import { ServicePipelineTask } from '../src/ServicePipelineTask.js';
+import { tmpDir, stageMap } from './helpers.js';
 
 /**
  * Сквозной тест: реальный конфиг-файл + реальные процессы (echo / exit),
@@ -16,7 +18,7 @@ const quietLogger = (logPath) => new Logger(logPath, { echo: false });
 
 function writeConfig(dir, cfg) {
   const file = path.join(dir, '.pipeline.json');
-  writeFileSync(file, JSON.stringify(cfg, null, 2));
+  writeFileSync(file, JSON.stringify({ ...cfg, stages: stageMap(cfg.stages) }, null, 2));
   return file;
 }
 
@@ -95,4 +97,77 @@ test('сквозной прогон с падением: failedStage и оста
   const summary = JSON.parse(readFileSync(path.join(runDir, 'summary.json'), 'utf8'));
   assert.equal(summary.status, 'failed');
   assert.equal(summary.stages.length, 2); // deploy не выполнялся
+});
+
+// ── Сервисный режим PIPELINE_SERVICE через реальный shell ────────────────────
+
+function writeServiceConfig(projectsRoot, projectRel, serviceRel, cfg) {
+  const dir = path.join(projectsRoot, projectRel, serviceRel);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    path.join(dir, '.pipeline.json'),
+    JSON.stringify({ ...cfg, stages: stageMap(cfg.stages) }, null, 2),
+  );
+  return dir;
+}
+
+function serviceClaim(projectRel, serviceRel, serviceId, serviceName) {
+  return {
+    id: 'int-task',
+    role: 'PIPELINE_SERVICE',
+    pipeline: {
+      projectId: 'proj-uuid',
+      projectCode: 'PS',
+      serviceId,
+      serviceCode: serviceId,
+      serviceName,
+      projectRoot: projectRel,
+      repositoryPath: serviceRel,
+      workingDirectory: `${projectRel}/${serviceRel}`,
+      pipelineConfigRef: `${projectRel}/${serviceRel}/.pipeline.json`,
+    },
+  };
+}
+
+test('сервисный режим: реальный прогон сервиса A, безопасный фрагмент лога ограничен', async (t) => {
+  const root = tmpDir(t);
+  writeServiceConfig(root, 'PS', 'services/catalog', {
+    name: 'Catalog_Service',
+    workingDirectory: '.',
+    timeoutMinutes: 5,
+    stages: { test: ['echo CATALOG_OK'] },
+  });
+
+  const task = new ServicePipelineTask({
+    projectsRoot: root,
+    runnerDeps: { createLogger: quietLogger },
+  });
+  const result = await task.run(serviceClaim('PS', 'services/catalog', 'svc-A', 'Catalog Service'));
+
+  assert.equal(result.success, true);
+  assert.equal(result.roleCode, 'PIPELINE_SERVICE');
+  assert.equal(result.output.summary.serviceId, 'svc-A');
+  const action = result.output.summary.actions[0];
+  assert.equal(action.status, 'success');
+  assert.equal(action.exitCode, 0);
+  // безопасный фрагмент лога присутствует и ограничен по размеру
+  if (action.logFragment != null) {
+    assert.ok(action.logFragment.length <= 2100);
+    assert.match(action.logFragment, /CATALOG_OK/);
+  }
+});
+
+test('сервисный режим: реальное падение → success=false и failedStage', async (t) => {
+  const root = tmpDir(t);
+  writeServiceConfig(root, 'PS', 'services/catalog', {
+    name: 'Catalog_Service',
+    workingDirectory: '.',
+    stages: { test: ['echo ok'], build: ['exit 3'] },
+  });
+
+  const task = new ServicePipelineTask({ projectsRoot: root, runnerDeps: { createLogger: quietLogger } });
+  const result = await task.run(serviceClaim('PS', 'services/catalog', 'svc-A', 'Catalog Service'));
+
+  assert.equal(result.success, false);
+  assert.equal(result.output.failedStage, 'build');
 });

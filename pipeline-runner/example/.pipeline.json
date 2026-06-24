@@ -3,9 +3,9 @@
   "workingDirectory": ".",
   "timeoutMinutes": 5,
   "stages": {
-    "prepare": ["echo preparing"],
-    "test": ["echo running tests"],
-    "build": ["echo building image"],
-    "smoke": ["echo smoke ok"]
+    "prepare": { "enabled": true, "commands": ["echo preparing"] },
+    "test": { "enabled": true, "commands": ["echo running tests"] },
+    "build": { "enabled": true, "commands": ["echo building image"] },
+    "smoke": { "enabled": true, "commands": ["echo smoke ok"] }
   }
 }

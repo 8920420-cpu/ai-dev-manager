@@ -106,9 +106,12 @@ export class PipelineRunner {
     await logger.close();
 
     const reportPath = toReturnPath(reportDir);
+    // summary возвращаем всегда: сервисный слой (ServicePipelineTask) строит из
+    // него структурированный результат для оркестратора. Поле дополнительно к
+    // прежнему контракту — обратная совместимость сохранена.
     return status === 'success'
-      ? { success: true, runId, reportPath }
-      : { success: false, failedStage, runId, reportPath };
+      ? { success: true, runId, reportPath, summary }
+      : { success: false, failedStage, runId, reportPath, summary };
   }
 }
 

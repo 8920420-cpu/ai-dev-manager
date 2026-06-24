@@ -7,6 +7,18 @@ export { StageRunner } from './StageRunner.js';
 export { CommandExecutor } from './CommandExecutor.js';
 export { Logger } from './Logger.js';
 export { ResultWriter } from './ResultWriter.js';
+export {
+  ServicePipelineTask,
+  PipelineTaskError,
+  runServicePipeline,
+  resolveServicePaths,
+  isServiceRelPathSafe,
+  isInsideRoot,
+  safeLogFragment,
+  PIPELINE_ROLE_CODE,
+  DEFAULT_PIPELINE_CONFIG_FILENAME,
+  SAFE_LOG_FRAGMENT_LIMIT,
+} from './ServicePipelineTask.js';
 
 /**
  * Высокоуровневая точка входа: загрузить конфиг и выполнить pipeline.
