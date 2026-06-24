@@ -1,7 +1,7 @@
 // HTTP-сервер: REST API настроек/БД + раздача фронтенда (../../frontend).
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve, join, extname, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadSettings, saveSettings, resolveSettings, redactSettings } from './config.js';
@@ -10,7 +10,9 @@ import {
   bootstrap,
   runSeed,
   getStatus,
+  getAppliedMigrations,
   acceptScannerCompletion,
+  acceptScannerIntake,
   claimNextClaudeTask,
   releaseClaudeTask,
   claimNextHostTask,
@@ -26,7 +28,7 @@ import {
   listExchanges,
   invokeConnector,
 } from './connectors.js';
-import { getProjectStages, saveProjectStages } from './stages.js';
+import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
 import {
   listProjectsRich,
@@ -34,6 +36,7 @@ import {
   createOrUpsertProject,
   updateProject,
   setProjectStatus,
+  setProjectScanner,
   deleteProject,
 } from './projects.js';
 import { listDatabases } from './databases.js';
@@ -45,10 +48,55 @@ import {
   deleteAdditionalDatabase,
 } from './additionalDatabases.js';
 import { listRoleConnectors, saveRoleConnectors } from './roleConnectors.js';
+import {
+  listTools,
+  getTool,
+  createTool,
+  updateTool,
+  deleteTool,
+  getRoleCapabilities,
+  saveRoleCapabilities,
+  getRoleTools,
+  saveRoleTools,
+} from './tools.js';
+import { listRoles, getRole, updateRole, listAvailableSkills, uploadSkill } from './roles.js';
+import {
+  listFields,
+  createField,
+  updateField,
+  deleteField,
+  getRoleFields,
+  saveRoleFields,
+} from './fields.js';
+import {
+  listRoleGroups,
+  createRoleGroup,
+  updateRoleGroup,
+  deleteRoleGroup,
+} from './roleGroups.js';
+import {
+  listConnections,
+  getConnection,
+  createConnection,
+  updateConnection,
+  deleteConnection,
+  testConnectionById,
+} from './databaseConnections.js';
 import { importLegacy } from './importLegacy.js';
 import { pickFolder } from './fsPicker.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Версия сервиса из package.json — для healthcheck-эндпоинта /api/version
+// (быстрая диагностика развёртывания: какая версия и какие миграции накатаны).
+const SERVICE_VERSION = (() => {
+  try {
+    return JSON.parse(readFileSync(resolve(__dirname, '../package.json'), 'utf8')).version || '0.0.0';
+  } catch {
+    return '0.0.0';
+  }
+})();
+
 // Единый фронтенд — React/Vite SPA из корня репозитория (src/ → dist/).
 // В Docker-образе сборка лежит рядом, в /app/frontend (см. Dockerfile:
 // COPY --from=frontend /web/dist ./frontend). При локальном запуске backend без
@@ -130,12 +178,13 @@ async function serveStatic(res, pathname) {
 // Разбор путей /api/projects/:projectId[/(stages|task-statistics|status)].
 // Без суффикса → item (GET :id / PUT :id / DELETE :id).
 function matchProjectRoute(pathname) {
-  const m = pathname.match(/^\/api\/projects\/([^/]+)(?:\/(stages|task-statistics|status))?$/);
+  const m = pathname.match(/^\/api\/projects\/([^/]+)(?:\/(task-statistics|status|scanner))?$/);
   if (!m) return null;
   return { id: decodeURIComponent(m[1]), kind: m[2] || 'item' };
 }
 
-// Разбор путей /api/additional-databases[/:id].
+// Разбор путей /api/additional-databases[/:id]. DEPRECATED (legacy):
+// единый контракт — /api/database-connections (DATABASE-CONNECTIONS-001).
 function matchAdditionalDbRoute(pathname) {
   if (pathname === '/api/additional-databases') return { kind: 'collection' };
   const m = pathname.match(/^\/api\/additional-databases\/([^/]+)$/);
@@ -143,11 +192,57 @@ function matchAdditionalDbRoute(pathname) {
   return { kind: 'item', id: decodeURIComponent(m[1]) };
 }
 
+// Разбор путей /api/database-connections[/:id[/test]] — единая модель подключений.
+function matchDbConnectionRoute(pathname) {
+  if (pathname === '/api/database-connections') return { kind: 'collection' };
+  const m = pathname.match(/^\/api\/database-connections\/([^/]+)(?:\/(test))?$/);
+  if (!m) return null;
+  const id = decodeURIComponent(m[1]);
+  if (m[2] === 'test') return { kind: 'test', id };
+  return { kind: 'item', id };
+}
+
 // If-Match (optimistic concurrency) → updatedAt для updateProject.
 function ifMatch(req) {
   const h = req.headers['if-match'];
   if (!h) return null;
   return String(h).replace(/^"+|"+$/g, '') || null; // снять кавычки ETag-формата
+}
+
+// Разбор путей /api/roles[/:code[/fields]]. role-connectors сюда не попадает.
+function matchRoleRoute(pathname) {
+  if (pathname === '/api/roles') return { kind: 'collection' };
+  const m = pathname.match(/^\/api\/roles\/([^/]+)(?:\/(fields|capabilities|tools))?$/);
+  if (!m) return null;
+  const code = decodeURIComponent(m[1]);
+  if (m[2] === 'fields') return { kind: 'fields', code };
+  if (m[2] === 'capabilities') return { kind: 'capabilities', code };
+  if (m[2] === 'tools') return { kind: 'role-tools', code };
+  return { kind: 'item', code };
+}
+
+// Разбор путей /api/tools[/:id] — реестр инструментов.
+function matchToolRoute(pathname) {
+  if (pathname === '/api/tools') return { kind: 'collection' };
+  const m = pathname.match(/^\/api\/tools\/([^/]+)$/);
+  if (!m) return null;
+  return { kind: 'item', id: decodeURIComponent(m[1]) };
+}
+
+// Разбор путей /api/fields[/:id] — глобальный справочник полей.
+function matchFieldRoute(pathname) {
+  if (pathname === '/api/fields') return { kind: 'collection' };
+  const m = pathname.match(/^\/api\/fields\/([^/]+)$/);
+  if (!m) return null;
+  return { kind: 'item', id: decodeURIComponent(m[1]) };
+}
+
+// Разбор путей /api/role-groups[/:id] — смысловые группы ролей.
+function matchRoleGroupRoute(pathname) {
+  if (pathname === '/api/role-groups') return { kind: 'collection' };
+  const m = pathname.match(/^\/api\/role-groups\/([^/]+)$/);
+  if (!m) return null;
+  return { kind: 'item', id: decodeURIComponent(m[1]) };
 }
 
 // Разбор путей /api/integrations[/:id[/exchanges|/invoke]].
@@ -170,8 +265,24 @@ export function createApp() {
       if (p.startsWith('/api/') || p === '/health') {
         if (req.method === 'GET' && p === '/health') return sendJson(res, 200, { status: 'ok' });
 
-        // /health открыт для healthcheck; всё остальное под /api требует токен,
-        // если он сконфигурирован.
+        // Healthcheck версии: версия сервиса + сводка применённых миграций.
+        // Открыт (как /health) — нужен мониторингу/деплою без токена для быстрой
+        // диагностики «какая версия и до какой миграции накатан экземпляр».
+        if (req.method === 'GET' && p === '/api/version') {
+          const mig = await getAppliedMigrations(await loadSettings());
+          return sendJson(res, 200, {
+            service: 'orchestrator-service',
+            version: SERVICE_VERSION,
+            migrations: {
+              count: mig.count,
+              latest: mig.migrations.length ? mig.migrations[mig.migrations.length - 1].filename : null,
+              applied: mig.migrations.map((m) => m.filename),
+            },
+          });
+        }
+
+        // /health и /api/version открыты для healthcheck; всё остальное под /api
+        // требует токен, если он сконфигурирован.
         if (!isAuthorized(req)) return sendJson(res, 401, { error: 'unauthorized' });
 
         if (req.method === 'GET' && p === '/api/settings')
@@ -192,6 +303,10 @@ export function createApp() {
         if (req.method === 'GET' && p === '/api/db/status')
           return sendJson(res, 200, await getStatus(await loadSettings()));
 
+        // Список реально применённых миграций БД (из таблицы _schema_migrations).
+        if (req.method === 'GET' && p === '/api/db/migrations')
+          return sendJson(res, 200, await getAppliedMigrations(await loadSettings()));
+
         // Перечень подключённых БД с живым статусом — для карточек в UI.
         if (req.method === 'GET' && p === '/api/databases')
           return sendJson(res, 200, await listDatabases(await loadSettings()));
@@ -201,6 +316,15 @@ export function createApp() {
             res,
             200,
             await acceptScannerCompletion(await loadSettings(), await readBody(req)),
+          );
+
+        // Интейк из файловой очереди tasks/*.md: импорт задачи со статусом
+        // «выполнено» в БД (идемпотентно по external_id) → дальше runner ведёт цепочку.
+        if (req.method === 'POST' && p === '/api/scanner/task-intake')
+          return sendJson(
+            res,
+            200,
+            await acceptScannerIntake(await loadSettings(), await readBody(req)),
           );
 
         // Обратный мост БД → файл: выдать Scanner-фидеру следующую задачу для Claude.
@@ -229,6 +353,14 @@ export function createApp() {
             200,
             await releaseHostTask(await loadSettings(), (await readBody(req)).taskId),
           );
+
+        // --- Единая «Схема разработки» (общий конвейер ролей для всех проектов) ---
+        if (p === '/api/development-scheme') {
+          if (req.method === 'GET') return sendJson(res, 200, await getScheme(await loadSettings()));
+          if (req.method === 'PUT')
+            return sendJson(res, 200, await saveScheme(await loadSettings(), await readBody(req)));
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
 
         // --- Проекты: rich-список + идемпотентная регистрация по папке ---
         if (p === '/api/projects') {
@@ -262,6 +394,124 @@ export function createApp() {
           if (req.method === 'GET') return sendJson(res, 200, await listRoleConnectors(await loadSettings()));
           if (req.method === 'PUT')
             return sendJson(res, 200, await saveRoleConnectors(await loadSettings(), await readBody(req)));
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Единые подключения к БД (database_connections) — секрет не отдаётся ---
+        const dbc = matchDbConnectionRoute(p);
+        if (dbc) {
+          if (dbc.kind === 'collection') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await listConnections(await loadSettings()));
+            if (req.method === 'POST')
+              return sendJson(res, 201, await createConnection(await loadSettings(), await readBody(req)));
+          } else if (dbc.kind === 'item') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await getConnection(await loadSettings(), dbc.id));
+            if (req.method === 'PUT')
+              return sendJson(res, 200, await updateConnection(await loadSettings(), dbc.id, await readBody(req)));
+            if (req.method === 'DELETE')
+              return sendJson(res, 200, await deleteConnection(await loadSettings(), dbc.id));
+          } else if (dbc.kind === 'test') {
+            if (req.method === 'POST')
+              return sendJson(res, 200, await testConnectionById(await loadSettings(), dbc.id));
+          }
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Доступные skill-файлы (только внутри настроенного каталога skills) ---
+        if (p === '/api/skills') {
+          if (req.method === 'GET') return sendJson(res, 200, await listAvailableSkills());
+          if (req.method === 'POST') return sendJson(res, 201, await uploadSkill(await readBody(req)));
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Смысловые группы ролей (role_groups) ---
+        const roleGroupRoute = matchRoleGroupRoute(p);
+        if (roleGroupRoute) {
+          if (roleGroupRoute.kind === 'collection') {
+            if (req.method === 'GET') return sendJson(res, 200, await listRoleGroups(await loadSettings()));
+            if (req.method === 'POST')
+              return sendJson(res, 201, await createRoleGroup(await loadSettings(), await readBody(req)));
+          } else {
+            if (req.method === 'PUT')
+              return sendJson(
+                res,
+                200,
+                await updateRoleGroup(await loadSettings(), roleGroupRoute.id, await readBody(req)),
+              );
+            if (req.method === 'DELETE')
+              return sendJson(res, 200, await deleteRoleGroup(await loadSettings(), roleGroupRoute.id));
+          }
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Карточка роли (description/prompt/skills/группа) ---
+        const roleRoute = matchRoleRoute(p);
+        if (roleRoute) {
+          if (roleRoute.kind === 'collection') {
+            if (req.method === 'GET') return sendJson(res, 200, await listRoles(await loadSettings()));
+            return sendJson(res, 405, { error: 'method_not_allowed' });
+          }
+          if (roleRoute.kind === 'fields') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await getRoleFields(await loadSettings(), roleRoute.code));
+            if (req.method === 'PUT')
+              return sendJson(res, 200, await saveRoleFields(await loadSettings(), roleRoute.code, await readBody(req)));
+            return sendJson(res, 405, { error: 'method_not_allowed' });
+          }
+          if (roleRoute.kind === 'capabilities') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await getRoleCapabilities(await loadSettings(), roleRoute.code));
+            if (req.method === 'PUT')
+              return sendJson(res, 200, await saveRoleCapabilities(await loadSettings(), roleRoute.code, await readBody(req)));
+            return sendJson(res, 405, { error: 'method_not_allowed' });
+          }
+          if (roleRoute.kind === 'role-tools') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await getRoleTools(await loadSettings(), roleRoute.code));
+            if (req.method === 'PUT')
+              return sendJson(res, 200, await saveRoleTools(await loadSettings(), roleRoute.code, await readBody(req)));
+            return sendJson(res, 405, { error: 'method_not_allowed' });
+          }
+          if (req.method === 'GET')
+            return sendJson(res, 200, await getRole(await loadSettings(), roleRoute.code));
+          if (req.method === 'PUT')
+            return sendJson(res, 200, await updateRole(await loadSettings(), roleRoute.code, await readBody(req)));
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Реестр инструментов (tools): builtin + mcp ---
+        const toolRoute = matchToolRoute(p);
+        if (toolRoute) {
+          if (toolRoute.kind === 'collection') {
+            if (req.method === 'GET') return sendJson(res, 200, await listTools(await loadSettings()));
+            if (req.method === 'POST')
+              return sendJson(res, 201, await createTool(await loadSettings(), await readBody(req)));
+          } else {
+            if (req.method === 'GET')
+              return sendJson(res, 200, await getTool(await loadSettings(), toolRoute.id));
+            if (req.method === 'PUT')
+              return sendJson(res, 200, await updateTool(await loadSettings(), toolRoute.id, await readBody(req)));
+            if (req.method === 'DELETE')
+              return sendJson(res, 200, await deleteTool(await loadSettings(), toolRoute.id));
+          }
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Глобальный справочник полей (fields) ---
+        const fieldRoute = matchFieldRoute(p);
+        if (fieldRoute) {
+          if (fieldRoute.kind === 'collection') {
+            if (req.method === 'GET') return sendJson(res, 200, await listFields(await loadSettings()));
+            if (req.method === 'POST')
+              return sendJson(res, 201, await createField(await loadSettings(), await readBody(req)));
+          } else {
+            if (req.method === 'PUT')
+              return sendJson(res, 200, await updateField(await loadSettings(), fieldRoute.id, await readBody(req)));
+            if (req.method === 'DELETE')
+              return sendJson(res, 200, await deleteField(await loadSettings(), fieldRoute.id));
+          }
           return sendJson(res, 405, { error: 'method_not_allowed' });
         }
 
@@ -302,14 +552,12 @@ export function createApp() {
               );
             return sendJson(res, 405, { error: 'method_not_allowed' });
           }
-          if (proj.kind === 'stages') {
-            if (req.method === 'GET')
-              return sendJson(res, 200, await getProjectStages(await loadSettings(), proj.id));
-            if (req.method === 'PUT')
+          if (proj.kind === 'scanner') {
+            if (req.method === 'PATCH')
               return sendJson(
                 res,
                 200,
-                await saveProjectStages(await loadSettings(), proj.id, await readBody(req)),
+                await setProjectScanner(await loadSettings(), proj.id, (await readBody(req)).enabled),
               );
             return sendJson(res, 405, { error: 'method_not_allowed' });
           }
