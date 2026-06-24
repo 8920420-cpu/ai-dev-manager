@@ -1,41 +1,138 @@
 // Движок авто-ролей: превращает auto-роль из ROLE_FLOW в реальный вызов ИИ.
-// Для роли загружается её промт (roles/<role>.md) как system, собирается
-// контекст задачи, вызывается коннектор (DeepSeek/OpenAI-совместимый) в
-// JSON-режиме, ответ нормализуется в вердикт и по нему решается переход.
+// Промт роли берётся из БД (roles.prompt) как system, собирается контекст
+// задачи, вызывается коннектор (DeepSeek/OpenAI-совместимый) в JSON-режиме,
+// ответ нормализуется в вердикт и по нему решается переход.
 //
 // Здесь только «мышление» роли и чистые функции решения. Запись в БД и сами
 // переходы делает db.js (advanceOne), чтобы держать сетевой вызов вне
 // транзакции. Чистые функции (parseVerdict/normalizeVerdict/decideTransition)
 // покрыты юнит-тестами без сети и без Postgres.
-import { readFile } from 'node:fs/promises';
-import { dirname, resolve, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
 import { ROLE_FLOW } from './rolePipeline.js';
-import { invoke as llmInvoke } from './llmConnector.js';
+import { invoke as llmInvoke, invokeChat } from './llmConnector.js';
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
+// Максимум итераций tool-loop (сколько раз роль может вызвать инструменты подряд).
+const TOOL_MAX_ITERS = Number(process.env.ROLE_TOOL_MAX_ITERS || 8);
 
-// В контейнере промты лежат в /app/roles (Dockerfile COPY + ENV ROLES_DIR);
-// при локальном запуске node — в корне репозитория (../../../roles).
-export const ROLES_DIR = process.env.ROLES_DIR || resolve(__dirname, '../../../roles');
+/**
+ * Прогон рассуждающей роли с инструментами (function calling). Ведёт диалог:
+ * модель ↔ инструменты (tools-service) до финального текстового ответа. Возвращает
+ * { text, iterations, toolCalls } — text парсится в вердикт вызывающим.
+ */
+// Fallback-парсер текстовых вызовов инструментов. Некоторые модели (в т.ч.
+// DeepSeek) эмитят вызов не в поле tool_calls, а текстом в content в формате
+// invoke/parameter (с возможным «мусором»-разделителем вроде ｜｜DSML｜｜). Достаём
+// имя инструмента и параметры. Возвращает [{ name, args }].
+export function parseTextToolCalls(content) {
+  const text = String(content ?? '');
+  const out = [];
+  const invokeRe = /invoke\s+name="([^"]+)"([\s\S]*?)(?:<\/[^>]*invoke>|$)/gi;
+  let m;
+  while ((m = invokeRe.exec(text)) !== null) {
+    const name = m[1];
+    const inner = m[2] ?? '';
+    const args = {};
+    const paramRe = /parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)(?:<\/[^>]*parameter>|<\｜|$)/gi;
+    let p;
+    while ((p = paramRe.exec(inner)) !== null) {
+      args[p[1]] = p[2].replace(/<\/?[^>]*>/g, '').trim();
+    }
+    out.push({ name, args });
+  }
+  return out;
+}
+
+async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
+  const messages = [
+    { role: 'system', content: system },
+    { role: 'user', content: user },
+  ];
+  let iterations = 0;
+  let toolCalls = 0;
+  let text = '';
+  for (let i = 0; i < TOOL_MAX_ITERS; i += 1) {
+    iterations += 1;
+    const { message } = await invokeChat(conn, { messages, tools: toolSchemas });
+    const native = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
+    const content = String(message?.content ?? '');
+
+    if (native.length) {
+      // Нативный OpenAI-протокол tool_calls.
+      messages.push({ role: 'assistant', content, tool_calls: native });
+      for (const call of native) {
+        toolCalls += 1;
+        let args = {};
+        try {
+          args = call?.function?.arguments ? JSON.parse(call.function.arguments) : {};
+        } catch {
+          args = {};
+        }
+        let resultText;
+        try {
+          resultText = JSON.stringify(await executeTool(call?.function?.name, args));
+        } catch (e) {
+          resultText = JSON.stringify({ error: e.message, code: e.code || 'tool_error' });
+        }
+        messages.push({ role: 'tool', tool_call_id: call?.id, content: resultText });
+      }
+      continue;
+    }
+
+    // Fallback: вызовы инструментов текстом в content (DeepSeek и пр.).
+    const textCalls = parseTextToolCalls(content);
+    if (textCalls.length) {
+      messages.push({ role: 'assistant', content });
+      const results = [];
+      for (const call of textCalls) {
+        toolCalls += 1;
+        let resultText;
+        try {
+          resultText = JSON.stringify(await executeTool(call.name, call.args));
+        } catch (e) {
+          resultText = JSON.stringify({ error: e.message, code: e.code || 'tool_error' });
+        }
+        results.push(`Результат ${call.name}(${JSON.stringify(call.args)}):\n${resultText}`);
+      }
+      messages.push({
+        role: 'user',
+        content: `${results.join('\n\n')}\n\nИспользуй эти реальные данные. Если данных достаточно — верни финальный JSON-вердикт; иначе запроси ещё инструменты.`,
+      });
+      continue;
+    }
+
+    // Нет вызовов — это финальный ответ.
+    text = content.trim();
+    break;
+  }
+  // Модель упёрлась в инструменты и не дала вердикт — просим финал без инструментов.
+  if (!text) {
+    const { message } = await invokeChat(conn, { messages, tools: [] });
+    text = String(message?.content ?? '').trim();
+  }
+  return { text, iterations, toolCalls };
+}
+// composeRoleSystemPrompt импортируется по call-time (внутри runReasoningRole):
+// статический импорт замкнул бы цикл roleEngine → roles → db → roleEngine, из-за
+// которого db.js на этапе загрузки обращается к ещё не инициализированному
+// LLM_ROLE_CODES (TDZ). Динамический import рвёт цикл на этапе загрузки модуля.
 
 // Сколько раз задача может вернуться в CODING через провал ревью/анализа,
 // прежде чем мы остановимся и пометим BLOCKED (защита от бесконечной траты).
 export const MAX_REWORK = Number(process.env.RUNNER_MAX_REWORK || 3);
 
-// Код роли -> файл промта в roles/. Роли без файла (PIPELINE_SERVICE,
-// GIT_INTEGRATOR) обслуживает host-мост, а не ИИ-движок.
-export const ROLE_PROMPT_FILES = {
-  ARCHITECT: 'architect.md',
-  DECOMPOSER: 'decomposer.md',
-  TASK_REVIEWER: 'reviewer.md',
-  FAILURE_ANALYST: 'failure-analyst.md',
-  DOCUMENTATION_AUDITOR: 'documentation-auditor.md',
-  DOCUMENTATION_KEEPER: 'documentation-keeper.md',
-};
-
-// Роли, которые ИИ-движок исполняет «рассуждением» (есть промт).
-export const LLM_ROLE_CODES = Object.keys(ROLE_PROMPT_FILES);
+// Роли, которые ИИ-движок исполняет «рассуждением»: их продвигает runner через
+// вызов модели по сохранённому в БД промту. Остальные роли цепочки исполняются
+// вне ИИ (PROGRAMMER/SCANNER — файловый мост, PIPELINE_SERVICE/GIT_INTEGRATOR —
+// host-мост) и здесь не перечислены. Каждый код обязан присутствовать в ROLE_FLOW.
+export const LLM_ROLE_CODES = [
+  // Приёмщик задач — первая рассуждающая роль: классифицирует входящий запрос.
+  'TASK_INTAKE_OFFICER',
+  'ARCHITECT',
+  'DECOMPOSER',
+  'TASK_REVIEWER',
+  'FAILURE_ANALYST',
+  'DOCUMENTATION_AUDITOR',
+  'DOCUMENTATION_KEEPER',
+];
 
 // Роли реального действия — их выполняет host-мост (docker/git), не ИИ.
 export const HOST_ROLE_CODES = ['PIPELINE_SERVICE', 'GIT_INTEGRATOR'];
@@ -66,35 +163,43 @@ export function summarizePriorRuns(rows = []) {
     });
 }
 
-export async function loadRolePrompt(roleCode, { dir = ROLES_DIR } = {}) {
-  const file = ROLE_PROMPT_FILES[roleCode];
-  if (!file) throw new Error(`no prompt file for role ${roleCode}`);
-  return readFile(join(dir, file), 'utf8');
-}
-
 // Единый JSON-контракт вердикта, дописывается к промту роли. Коннектор уже в
 // JSON-режиме, но просим явный обязательный JSON, иначе DeepSeek может отдать
 // прозу. Поля совпадают с YAML-форматами промтов, плюс ok-нормализация.
-export function buildVerdictInstruction() {
-  return [
+//
+// PIPELINE-DYNAMIC-ROUTE-001: поле next_role УБРАНО — роль не указывает соседа,
+// маршрут задаёт оркестратор по этапам проекта. ROLE-FIELD-CONTRACT-001: если у
+// роли объявлены исходящие поля (outputFields), просим заполнить блок "fields".
+export function buildVerdictInstruction(outputFields = []) {
+  const fields = Array.isArray(outputFields) ? outputFields : [];
+  const lines = [
     'Верни ОТВЕТ СТРОГО как JSON-объект (valid json), без markdown и текста вокруг.',
     'Структура: {',
     '  "status": "<статус из раздела «Формат результата» твоей роли>",',
     '  "summary": "<краткий вывод на русском>",',
-    '  "next_role": "<код следующей роли или DONE/USER>",',
     '  "findings": ["<ключевые замечания, если есть>"]',
-    '}',
-    'status обязателен и должен точно соответствовать допустимым статусам роли.',
-  ].join('\n');
+  ];
+  if (fields.length) {
+    const spec = fields.map((f) => `"${f.key}": <значение${f.name ? ` — ${f.name}` : ''}>`).join(', ');
+    lines.push(`  ,"fields": { ${spec} }`);
+  }
+  lines.push('}');
+  lines.push('status обязателен и должен точно соответствовать допустимым статусам роли.');
+  lines.push('НЕ указывай следующую роль — маршрут определяет оркестратор по этапам проекта.');
+  if (fields.length) {
+    lines.push('Поля в "fields" — контракт твоего этапа: заполни КАЖДОЕ обязательное поле непустым значением.');
+  }
+  return lines.join('\n');
 }
 
 // Пользовательский payload: компактный контекст задачи + требование вердикта.
-export function buildUserPayload(roleCode, context) {
+// outputFields — объявленные исходящие поля роли (контракт), если есть.
+export function buildUserPayload(roleCode, context, outputFields = []) {
   return [
     `Задача роли ${roleCode}. Контекст задачи (JSON):`,
     JSON.stringify(context, null, 2),
     '',
-    buildVerdictInstruction(),
+    buildVerdictInstruction(outputFields),
   ].join('\n');
 }
 
@@ -141,7 +246,63 @@ export function normalizeVerdict(roleCode, parsed) {
   let ok = null;
   if (SUCCESS_STATUSES.has(status)) ok = true;
   else if (FAILURE_STATUSES.has(status)) ok = false;
-  return { ok, status, summary, nextRoleHint, findings };
+  // ROLE-FIELD-CONTRACT-001: значения исходящих полей роли (карточка задачи).
+  const fields = parsed.fields && typeof parsed.fields === 'object' && !Array.isArray(parsed.fields)
+    ? parsed.fields
+    : {};
+  return { ok, status, summary, nextRoleHint, findings, fields };
+}
+
+/**
+ * PIPELINE-DYNAMIC-ROUTE-001 — АБСТРАКТНЫЙ исход роли (без знания соседей).
+ * Возвращает { outcome, ... } для projectRoute.resolveTransition:
+ *   FORWARD — задача идёт дальше по маршруту проекта;
+ *   REWORK  — назад к ближайшей предшествующей роли-исполнителю;
+ *   BRANCH  — к роли заданного типа/кода (документация/архитектура/анализ);
+ *   BLOCK   — остановка (blockStatus).
+ * branchFallback — что делать, если ветки нет в маршруте проекта:
+ *   'rework' (провал гейта без аналитика → на доработку) | 'forward' (необяз.).
+ * reworkCount — сколько раз задача возвращалась в доработку (защита от цикла).
+ */
+export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = MAX_REWORK } = {}) {
+  const forward = { outcome: 'FORWARD', agentRunStatus: 'SUCCESS', reason: 'ok' };
+  const block = (reason, blockStatus = 'BLOCKED') => ({
+    outcome: 'BLOCK', blockStatus, agentRunStatus: 'FAILED', reason,
+  });
+  const rework = (reason = 'rework') => ({ outcome: 'REWORK', agentRunStatus: 'SUCCESS', reason });
+  const branch = (branchKind, branchRole, reason, branchFallback = 'forward') => ({
+    outcome: 'BRANCH', branchKind, branchRole, branchFallback, agentRunStatus: 'SUCCESS', reason,
+  });
+
+  switch (roleCode) {
+    case 'TASK_REVIEWER':
+    case 'REVIEWER':
+      // Гейт качества: дальше только при явном APPROVED. Провал — на анализ
+      // причины (а если аналитика нет в маршруте — на доработку исполнителю).
+      if (verdict.ok === true) return forward;
+      if (reworkCount >= maxRework) return block('max_rework_exceeded');
+      return branch('analyst', 'FAILURE_ANALYST', 'review_failed', 'rework');
+    case 'FAILURE_ANALYST':
+      if (verdict.ok === false && ['INCONCLUSIVE', 'INFRASTRUCTURE_BLOCKED'].includes(verdict.status)) {
+        return block(verdict.status.toLowerCase());
+      }
+      if (reworkCount >= maxRework) return block('max_rework_exceeded');
+      return rework('diagnosed');
+    case 'ARCHITECT':
+    case 'DECOMPOSER':
+      if (verdict.ok === false) return block(verdict.status.toLowerCase() || 'blocked');
+      return forward;
+    case 'DOCUMENTATION_AUDITOR':
+      if (verdict.status === 'BLOCKED') return block('docs_blocked');
+      if (verdict.status === 'UPDATE_REQUIRED') return branch('dockeeper', 'DOCUMENTATION_KEEPER', 'docs_update_required', 'forward');
+      if (verdict.status === 'ARCHITECT_REVIEW_REQUIRED') return branch('design', 'ARCHITECT', 'docs_architect_review', 'forward');
+      return forward;
+    case 'DOCUMENTATION_KEEPER':
+      if (verdict.status === 'BLOCKED') return block('docs_blocked');
+      return forward;
+    default:
+      return verdict.ok === false ? block('role_failed') : forward;
+  }
 }
 
 // Чистое решение о переходе по вердикту. Не трогает БД.
@@ -196,9 +357,28 @@ export function decideTransition(roleCode, verdict, { reworkCount = 0, maxRework
       if (verdict.ok === false) return block(verdict.status.toLowerCase() || 'blocked');
       return proceed();
     case 'DOCUMENTATION_AUDITOR':
+      // Аудитор не гейт корректности, но МАРШРУТИЗИРУЕТ по вердикту (поле
+      // next_role модели движок не читает — решение принимаем здесь по статусу):
+      //   UPDATE_REQUIRED           → Documentation Keeper (обновить документы);
+      //   ARCHITECT_REVIEW_REQUIRED → Architect (незапланированное арх. изменение);
+      //   NO_CHANGES / прочее       → Git Integrator (документы актуальны);
+      //   BLOCKED                   → остановка.
+      if (verdict.status === 'BLOCKED') return block('docs_blocked');
+      if (verdict.status === 'UPDATE_REQUIRED') {
+        return {
+          toStatus: 'COMMIT', nextRole: 'DOCUMENTATION_KEEPER', done: false,
+          blocked: false, agentRunStatus: 'SUCCESS', reason: 'docs_update_required',
+        };
+      }
+      if (verdict.status === 'ARCHITECT_REVIEW_REQUIRED') {
+        return {
+          toStatus: 'ARCHITECTURE', nextRole: 'ARCHITECT', done: false,
+          blocked: false, agentRunStatus: 'SUCCESS', reason: 'docs_architect_review',
+        };
+      }
+      return proceed(); // NO_CHANGES и любой разборчивый ответ → Git Integrator
     case 'DOCUMENTATION_KEEPER':
-      // Документация не гейт корректности: при любом разборчивом ответе идём
-      // дальше; только явный BLOCKED останавливает.
+      // Keeper обновил документы → Git Integrator; противоречивое задание → стоп.
       if (verdict.status === 'BLOCKED') return block('docs_blocked');
       return proceed();
     default:
@@ -242,9 +422,12 @@ function rowToConn(row) {
  *
  * @returns {{ verdict, response, promptText, connectorId, exchangeId, durationMs }}
  */
-export async function runReasoningRole(client, { roleCode, context }, { dir = ROLES_DIR } = {}) {
-  const system = await loadRolePrompt(roleCode, { dir });
-  const user = buildUserPayload(roleCode, context);
+export async function runReasoningRole(client, { roleCode, context, outputFields = [], toolSchemas = [], executeTool = null }) {
+  // System-промт = сохранённый в БД prompt роли + содержимое подключённых
+  // skills в зафиксированном порядке.
+  const { composeRoleSystemPrompt } = await import('./roles.js');
+  const system = await composeRoleSystemPrompt(client, roleCode);
+  const user = buildUserPayload(roleCode, context, outputFields);
   const row = await pickConnectorRow(client, `runner:${roleCode}`);
   if (!row) {
     const e = new Error('no_enabled_connector');
@@ -252,6 +435,8 @@ export async function runReasoningRole(client, { roleCode, context }, { dir = RO
     throw e;
   }
   const conn = rowToConn(row);
+  // Инструменты роли используем, только если есть схемы И исполнитель.
+  const useTools = Array.isArray(toolSchemas) && toolSchemas.length > 0 && typeof executeTool === 'function';
 
   const promptText = `${system}\n\n${user}`;
   const ins = await client.query(
@@ -262,7 +447,20 @@ export async function runReasoningRole(client, { roleCode, context }, { dir = RO
   const exchangeId = ins.rows[0].id;
 
   try {
-    const { text, httpStatus, durationMs } = await llmInvoke(conn, { system, user });
+    let text;
+    let httpStatus = null;
+    let durationMs = null;
+    if (useTools) {
+      const started = Date.now();
+      const loop = await runToolLoop(conn, { system, user, toolSchemas, executeTool });
+      text = loop.text;
+      durationMs = Date.now() - started;
+    } else {
+      const r = await llmInvoke(conn, { system, user });
+      text = r.text;
+      httpStatus = r.httpStatus;
+      durationMs = r.durationMs;
+    }
     await client.query(
       `UPDATE prompt_exchanges SET response = $2, status = 'завершен', http_status = $3, duration_ms = $4
         WHERE id = $1`,
