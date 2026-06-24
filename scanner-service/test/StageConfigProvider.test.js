@@ -9,43 +9,42 @@ import {
   createSnapshotStageConfigProvider,
 } from '../src/StageConfigProvider.js';
 
-const project = (id, stages) => ({ id, stages });
-const scannerStage = (id, watchDirectory, { enabled = true } = {}) => ({
-  id,
-  name: 'Scanner',
-  enabled,
-  roleCodes: ['SCANNER'],
-  scanner: { watchDirectory },
-});
+// Scanner следит за «папкой документов» проекта (docs_path), если приём включён
+// тумблером (scannerEnabled). По одному watcher на проект.
+const project = (id, docsPath, scannerEnabled = true) => ({ id, docsPath, scannerEnabled });
 
-test('берёт только включённые SCANNER-этапы с папкой', () => {
+test('берёт по одному watcher на проект с папкой документов и включённым приёмом', () => {
   const configs = stageConfigsFromProjects([
-    project('p1', [
-      { id: 's-prog', name: 'Programmer', enabled: true, roleCodes: ['PROGRAMMER'] }, // не Scanner
-      scannerStage('s-scan', 'K:\\proj\\ps\\tasks'),
-    ]),
-    project('p2', [scannerStage('s-scan2', '/srv/orch/tasks')]),
+    project('p1', 'K:\\proj\\ps\\docs'),
+    project('p2', '/srv/orch/docs'),
   ]);
   assert.deepEqual(configs, [
-    { projectId: 'p1', stageId: 's-scan', watchDirectory: 'K:\\proj\\ps\\tasks', documentName: 'claude-tasks.json' },
-    { projectId: 'p2', stageId: 's-scan2', watchDirectory: '/srv/orch/tasks', documentName: 'claude-tasks.json' },
+    { projectId: 'p1', stageId: 'docs', watchDirectory: 'K:\\proj\\ps\\docs', documentName: 'claude-tasks.json' },
+    { projectId: 'p2', stageId: 'docs', watchDirectory: '/srv/orch/docs', documentName: 'claude-tasks.json' },
   ]);
 });
 
-test('пропускает отключённый Scanner и Scanner без папки', () => {
+test('пропускает проект без папки документов', () => {
   const configs = stageConfigsFromProjects([
-    project('p1', [
-      scannerStage('s-off', '/srv/x', { enabled: false }),
-      scannerStage('s-nodir', ''),
-    ]),
+    project('p1', ''),
+    project('p2', null),
+    { id: 'p3', scannerEnabled: true }, // docsPath отсутствует
+  ]);
+  assert.equal(configs.length, 0);
+});
+
+test('пропускает проект с выключенным приёмом (scannerEnabled=false)', () => {
+  const configs = stageConfigsFromProjects([
+    project('p1', '/w/docs', false),
+    { id: 'p2', docsPath: '/w/docs2' }, // scannerEnabled отсутствует → выключено
   ]);
   assert.equal(configs.length, 0);
 });
 
 test('разные проекты дают разные watchDirectory', () => {
   const configs = stageConfigsFromProjects([
-    project('ps', [scannerStage('a', '/ps/tasks')]),
-    project('orch', [scannerStage('b', '/orch/tasks')]),
+    project('ps', '/ps/docs'),
+    project('orch', '/orch/docs'),
   ]);
   assert.notEqual(configs[0].watchDirectory, configs[1].watchDirectory);
   assert.deepEqual(configs.map((c) => c.projectId), ['ps', 'orch']);
@@ -57,13 +56,13 @@ test('API-провайдер парсит ответ /api/projects', async () =>
     return {
       ok: true,
       status: 200,
-      text: async () => JSON.stringify({ projects: [project('p1', [scannerStage('s', '/w/tasks')])] }),
+      text: async () => JSON.stringify({ projects: [project('p1', '/w/docs')] }),
     };
   };
   const provider = createApiStageConfigProvider({ projectsEndpoint: 'http://orch/api/projects', fetchImpl });
   const configs = await provider();
   assert.deepEqual(configs, [
-    { projectId: 'p1', stageId: 's', watchDirectory: '/w/tasks', documentName: 'claude-tasks.json' },
+    { projectId: 'p1', stageId: 'docs', watchDirectory: '/w/docs', documentName: 'claude-tasks.json' },
   ]);
 });
 
@@ -77,10 +76,10 @@ test('snapshot-провайдер читает форму projects', async (t) =
   const dir = await mkdtemp(join(tmpdir(), 'snap-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const file = join(dir, 'snapshot.json');
-  await writeFile(file, JSON.stringify({ projects: [project('p1', [scannerStage('s', '/w/tasks')])] }), 'utf8');
+  await writeFile(file, JSON.stringify({ projects: [project('p1', '/w/docs')] }), 'utf8');
   const provider = createSnapshotStageConfigProvider({ snapshotPath: file });
   assert.deepEqual(await provider(), [
-    { projectId: 'p1', stageId: 's', watchDirectory: '/w/tasks', documentName: 'claude-tasks.json' },
+    { projectId: 'p1', stageId: 'docs', watchDirectory: '/w/docs', documentName: 'claude-tasks.json' },
   ]);
 });
 
@@ -90,11 +89,11 @@ test('snapshot-провайдер читает прямую форму watchers'
   const file = join(dir, 'snapshot.json');
   await writeFile(
     file,
-    JSON.stringify({ watchers: [{ projectId: 'p1', stageId: 's', watchDirectory: '/w/tasks' }] }),
+    JSON.stringify({ watchers: [{ projectId: 'p1', stageId: 'docs', watchDirectory: '/w/docs' }] }),
     'utf8',
   );
   const provider = createSnapshotStageConfigProvider({ snapshotPath: file });
   assert.deepEqual(await provider(), [
-    { projectId: 'p1', stageId: 's', watchDirectory: '/w/tasks', documentName: 'claude-tasks.json' },
+    { projectId: 'p1', stageId: 'docs', watchDirectory: '/w/docs', documentName: 'claude-tasks.json' },
   ]);
 });

@@ -1,19 +1,22 @@
 // Провайдеры конфигурации watcher'ов Scanner.
 //
-// Источник истины — orchestrator-service: какие этапы включены и какая у них
-// папка наблюдения. Признак Scanner — ВСЕГДА код роли `SCANNER` (P0.1), а не
-// отображаемое имя этапа. Провайдер возвращает плоский список желаемых watcher'ов
-// `{ projectId, stageId, watchDirectory, documentName }`, адресуемых по
-// `projectId + stageId`. Документ внутри папки — `documentName` (default
-// `claude-tasks.json`); существование папки проверяет supervisor, не провайдер.
+// Источник истины — orchestrator-service. Scanner больше НЕ входит в движение по
+// ролям: это отдельная роль‑приёмник, которая следит за «папкой документов»
+// проекта (`projects.docs_path`) и принимает оттуда задачи. Поэтому watcher
+// строится по `project.docsPath` — по одному на проект с заданной папкой.
+// Провайдер возвращает плоский список `{ projectId, stageId, watchDirectory,
+// documentName }`, адресуемых по `projectId + stageId`. Документ внутри папки —
+// `documentName` (default `claude-tasks.json`); существование папки проверяет
+// supervisor, не провайдер.
 import { readFile } from 'node:fs/promises';
 
-export const SCANNER_ROLE_CODE = 'SCANNER';
+// Идентификатор watcher'а приёма из папки документов (один на проект).
+const DOCS_STAGE_ID = 'docs';
 const DEFAULT_DOCUMENT_NAME = 'claude-tasks.json';
 
 /**
  * Преобразовать ответ `GET /api/projects` (rich-список) в список watcher'ов.
- * Берём только этапы с ролью SCANNER, enabled !== false и непустой папкой.
+ * Берём по одному watcher'у на проект с непустой папкой документов (`docsPath`).
  * Чистая функция — удобно тестировать и переиспользовать для snapshot.
  */
 export function stageConfigsFromProjects(projects) {
@@ -22,20 +25,16 @@ export function stageConfigsFromProjects(projects) {
   for (const project of list) {
     const projectId = project?.id ?? project?.projectId ?? null;
     if (projectId == null) continue;
-    const stages = Array.isArray(project?.stages) ? project.stages : [];
-    for (const stage of stages) {
-      const roleCodes = Array.isArray(stage?.roleCodes) ? stage.roleCodes : [];
-      if (!roleCodes.includes(SCANNER_ROLE_CODE)) continue;
-      if (stage?.enabled === false) continue; // отключённый этап — без watcher
-      const watchDirectory = trimOrNull(stage?.scanner?.watchDirectory ?? stage?.watchDirectory);
-      if (!watchDirectory) continue; // включённый Scanner без папки — конфиг-ошибка владельца контракта
-      configs.push({
-        projectId: String(projectId),
-        stageId: String(stage?.id ?? ''),
-        watchDirectory,
-        documentName: trimOrNull(stage?.scanner?.documentName) ?? DEFAULT_DOCUMENT_NAME,
-      });
-    }
+    // Приём включается тумблером на карточке проекта (scanner_enabled).
+    if (project?.scannerEnabled !== true && project?.scanner_enabled !== true) continue;
+    const watchDirectory = trimOrNull(project?.docsPath ?? project?.docs_path);
+    if (!watchDirectory) continue; // проект без папки документов — без watcher
+    configs.push({
+      projectId: String(projectId),
+      stageId: DOCS_STAGE_ID,
+      watchDirectory,
+      documentName: trimOrNull(project?.documentName) ?? DEFAULT_DOCUMENT_NAME,
+    });
   }
   return configs;
 }

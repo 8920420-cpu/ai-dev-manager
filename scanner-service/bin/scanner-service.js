@@ -1,9 +1,10 @@
 #!/usr/bin/env node
 import process from 'node:process';
 import { createServer } from 'node:http';
-import { join, resolve } from 'node:path';
+import { join, resolve, dirname } from 'node:path';
 import { TaskScanner } from '../src/TaskScanner.js';
 import { TaskFeeder } from '../src/TaskFeeder.js';
+import { TaskIntake } from '../src/TaskIntake.js';
 import { ScannerSupervisor } from '../src/ScannerSupervisor.js';
 import {
   createApiStageConfigProvider,
@@ -63,8 +64,8 @@ function buildSupervisor() {
 
 // --- Legacy одиночный watcher + обратный мост (fallback) -------------------
 function buildLegacy() {
-  const documentPath = resolve(process.env.SCANNER_DOCUMENT || 'runtime/claude-tasks.json');
-  const statePath = resolve(process.env.SCANNER_STATE || 'runtime/.scanner-state.json');
+  const documentPath = resolve(process.env.SCANNER_DOCUMENT || 'tasks/claude-tasks.json');
+  const statePath = resolve(process.env.SCANNER_STATE || 'tasks/.scanner-state.json');
   const endpoint = process.env.SCANNER_ENDPOINT || 'http://localhost:4186/api/scanner/task-completed';
   const base = endpoint.replace(/\/api\/scanner\/task-completed$/, '');
   const nextEndpoint = process.env.FEEDER_NEXT_ENDPOINT || `${base}/api/runner/next-claude-task`;
@@ -83,7 +84,24 @@ function buildLegacy() {
   const feeder = feederEnabled
     ? new TaskFeeder({ documentPath, ...createHttpFeed({ nextEndpoint, releaseEndpoint, token }) })
     : null;
-  return { documentPath, scanner, feeder, nextEndpoint, feederIntervalMs };
+
+  // Интейк из Markdown-очередей сервисов: tasks/<service>.md, задачи с маркером
+  // `[x]` → БД, после чего секция вырезается из файла. Включается заданием
+  // проекта-владельца (SCANNER_INTAKE_PROJECT). Папка очередей по умолчанию —
+  // каталог документа (та же tasks/, где лежит claude-tasks.json).
+  const intakeProject = String(process.env.SCANNER_INTAKE_PROJECT ?? '').trim();
+  const intakeIntervalMs = Number(process.env.SCANNER_INTAKE_INTERVAL_MS || 5000);
+  const intake = intakeProject
+    ? new TaskIntake({
+        tasksDir: process.env.SCANNER_INTAKE_DIR
+          ? resolve(process.env.SCANNER_INTAKE_DIR)
+          : dirname(documentPath),
+        project: intakeProject,
+        intake: createHttpDispatch({ endpoint: `${base}/api/scanner/task-intake`, token }),
+      })
+    : null;
+
+  return { documentPath, scanner, feeder, nextEndpoint, feederIntervalMs, intake, intakeIntervalMs };
 }
 
 // --- Health/readiness HTTP -------------------------------------------------
@@ -112,11 +130,12 @@ if (apiBase && process.env.SCANNER_DOCUMENT) {
 }
 
 if (mode === 'legacy') {
-  const { documentPath, scanner, feeder, nextEndpoint, feederIntervalMs } = buildLegacy();
+  const { documentPath, scanner, feeder, nextEndpoint, feederIntervalMs, intake, intakeIntervalMs } = buildLegacy();
   if (once) {
     const scan = await scanner.scanOnce();
     const feed = feeder ? await feeder.feedOnce() : null;
-    console.log(JSON.stringify({ scan, feed }));
+    const intakeResult = intake ? await intake.scanOnce() : null;
+    console.log(JSON.stringify({ scan, feed, intake: intakeResult }));
   } else {
     console.log(`Scanner (legacy single watcher) watches ${documentPath}`);
     scanner.start();
@@ -128,10 +147,19 @@ if (mode === 'legacy') {
       feederTimer = setInterval(feedTick, feederIntervalMs);
       feederTimer.unref?.();
     }
-    startHealthServer(() => ({ status: 'ok', mode: 'legacy', watcher: { documentPath } }));
+    let intakeTimer = null;
+    if (intake) {
+      console.log(`Intake scans ${intake.tasksDir} (project ${intake.project}) every ${intakeIntervalMs}ms`);
+      const intakeTick = () => intake.scanOnce().catch((e) => console.error(`Intake failed: ${e.message}`));
+      void intakeTick();
+      intakeTimer = setInterval(intakeTick, intakeIntervalMs);
+      intakeTimer.unref?.();
+    }
+    startHealthServer(() => ({ status: 'ok', mode: 'legacy', watcher: { documentPath }, intake: intake ? { tasksDir: intake.tasksDir, project: intake.project } : null }));
     const stop = () => {
       scanner.stop();
       if (feederTimer) clearInterval(feederTimer);
+      if (intakeTimer) clearInterval(intakeTimer);
       process.exit(0);
     };
     process.on('SIGINT', stop);

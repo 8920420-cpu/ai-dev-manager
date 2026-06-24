@@ -284,6 +284,11 @@ function normalizeTask(task, sourceDocument, { projectId = null, stageId = null 
     sourceDocument,
     nextRole: 'TASK_REVIEWER',
   };
+  // ROLE-FIELD-CONTRACT-001: если задача в документе несёт значения полей
+  // карточки (объект fields), пробрасываем их — оркестратор положит в карточку.
+  if (task.fields && typeof task.fields === 'object' && !Array.isArray(task.fields)) {
+    payload.fields = task.fields;
+  }
   // Атрибуция события: какой watcher (проект/этап) его произвёл. Позволяет
   // оркестратору не смешивать события разных проектов из одинаковых документов.
   if (projectId != null) payload.projectId = projectId;
