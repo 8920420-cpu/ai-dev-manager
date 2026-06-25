@@ -30,7 +30,7 @@ import {
 } from './connectors.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
-import { getTaskTree } from './taskTree.js';
+import { getTaskTree, getTaskStatusCounts } from './taskTree.js';
 import {
   listProjectsRich,
   getProject,
@@ -270,15 +270,24 @@ export function createApp() {
         // Открыт (как /health) — нужен мониторингу/деплою без токена для быстрой
         // диагностики «какая версия и до какой миграции накатан экземпляр».
         if (req.method === 'GET' && p === '/api/version') {
-          const mig = await getAppliedMigrations(await loadSettings());
-          return sendJson(res, 200, {
-            service: 'orchestrator-service',
-            version: SERVICE_VERSION,
-            migrations: {
+          // Healthcheck не должен падать, если БД недоступна: версию сервиса
+          // отдаём всегда (она нужна для диагностики деплоя в т.ч. при упавшей
+          // БД), а недоступность миграций фиксируем в migrations.error.
+          let migrations = { count: 0, latest: null, applied: [] };
+          try {
+            const mig = await getAppliedMigrations(await loadSettings());
+            migrations = {
               count: mig.count,
               latest: mig.migrations.length ? mig.migrations[mig.migrations.length - 1].filename : null,
               applied: mig.migrations.map((m) => m.filename),
-            },
+            };
+          } catch (err) {
+            migrations.error = err.code || err.message || 'db_unavailable';
+          }
+          return sendJson(res, 200, {
+            service: 'orchestrator-service',
+            version: SERVICE_VERSION,
+            migrations,
           });
         }
 
@@ -358,6 +367,10 @@ export function createApp() {
         // Дерево задач для UI: Проект → Задача → Подзадача (read-only).
         if (req.method === 'GET' && p === '/api/tasks/tree')
           return sendJson(res, 200, await getTaskTree(await loadSettings()));
+
+        // Счётчики задач по статусам (этапам) для «Схемы разработки» (read-only).
+        if (req.method === 'GET' && p === '/api/tasks/stats')
+          return sendJson(res, 200, await getTaskStatusCounts(await loadSettings()));
 
         // --- Единая «Схема разработки» (общий конвейер ролей для всех проектов) ---
         if (p === '/api/development-scheme') {

@@ -32,6 +32,22 @@ test('GET /health открыт без токена', async (t) => {
   assert.equal(res.status, 200);
 });
 
+test('GET /api/version открыт без токена и всегда отдаёт версию', async (t) => {
+  const base = await startServer(t);
+  const res = await fetch(`${base}/api/version`);
+  assert.equal(res.status, 200, 'healthcheck доступен без токена');
+  const body = await res.json();
+  assert.equal(body.service, 'orchestrator-service');
+  assert.equal(typeof body.version, 'string');
+  assert.ok(body.version.length > 0, 'версия сервиса не пустая');
+  // Контракт устойчивости: даже когда БД недоступна (в тесте подключения нет),
+  // эндпоинт возвращает 200 с версией, а блок migrations присутствует и валиден.
+  assert.ok(body.migrations && typeof body.migrations === 'object');
+  assert.equal(typeof body.migrations.count, 'number');
+  assert.ok(Array.isArray(body.migrations.applied));
+  assert.ok('latest' in body.migrations);
+});
+
 test('GET /api/settings без токена → 401', async (t) => {
   const base = await startServer(t);
   const res = await fetch(`${base}/api/settings`);
