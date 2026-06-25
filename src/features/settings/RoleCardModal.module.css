@@ -1,0 +1,153 @@
+/* Карточка роли в модальном окне. */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.skills {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.skillsHead {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.skillsTitle {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.skillList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.skillRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+}
+
+.skillName {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.addRow {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-3);
+}
+
+.addSelect {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.addBtn {
+  flex: 0 0 auto;
+}
+
+.uploadRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+}
+
+.fileInput {
+  display: none;
+}
+
+.uploadHint {
+  flex: 1 1 220px;
+  min-width: 0;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.hiddenToggle {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+}
+
+.checkbox {
+  margin-top: 3px;
+  flex: 0 0 auto;
+}
+
+.hiddenText {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.hiddenLabel {
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.hiddenHint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+@media (max-width: 640px) {
+  .addRow {
+    flex-direction: column;
+    align-items: stretch;
+  }
+}
+
+/* Чекбоксы уровней доступа и MCP-инструментов. */
+.capRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-1) 0 var(--space-2);
+}
+
+.capItem {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  cursor: pointer;
+}

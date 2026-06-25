@@ -9,12 +9,29 @@ import { validateFieldConsistency } from './fieldsContract.js';
 // Канонический код роли-сканера. Единственный источник признака Scanner.
 export const SCANNER_ROLE_CODE = 'SCANNER';
 
+// FORK-JOIN-001: тип узла блок-схемы. 'stage' — обычный этап (роль+статус);
+// управляющие узлы fork/join/condition несут логику ветвления, не роль.
+export const STAGE_KINDS = new Set(['stage', 'fork', 'join', 'condition']);
+export const CONTROL_KINDS = new Set(['fork', 'join', 'condition']);
+
+// Нормализовать тип узла: неизвестное/пустое значение → 'stage'.
+export function normalizeKind(value) {
+  const k = String(value ?? '').trim().toLowerCase();
+  return STAGE_KINDS.has(k) ? k : 'stage';
+}
+
+const UUID_KEY_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+function normalizeKey(value) {
+  const k = String(value ?? '').trim();
+  return UUID_KEY_RE.test(k) ? k : null;
+}
+
 // Допустимые значения task_status (зеркало enum task_status в БД). Используются
 // и валидацией статуса Scanner-этапа, и фронтендом (через /api контракт).
 export const TASK_STATUSES = [
   'BACKLOG', 'READY', 'ARCHITECTURE', 'DECOMPOSITION', 'CODING', 'TESTING',
   'FAILURE_ANALYSIS', 'REVIEW', 'COMMIT', 'DEPLOY', 'DONE', 'BLOCKED',
-  'FAILED', 'CANCELLED',
+  'FAILED', 'CANCELLED', 'WAITING_FOR_CHILDREN',
 ];
 const TASK_STATUS_SET = new Set(TASK_STATUSES);
 
@@ -242,6 +259,10 @@ function stageContract(row, roleRows) {
   const taskStatus = normalizeTaskStatus(row.task_status);
   const out = {
     id: row.id,
+    // FORK-JOIN-001: тип узла + стабильный ключ + пара fork→join.
+    kind: row.kind ?? 'stage',
+    stageKey: row.stage_key ?? null,
+    joinKey: row.join_key ?? null,
     name: row.name,
     enabled: row.enabled,
     position: row.position,
@@ -263,7 +284,7 @@ function stageContract(row, roleRows) {
 
 export async function readStages(c, projectDbId) {
   const stages = await c.query(
-    `SELECT id, position, name, enabled, watch_directory, task_status
+    `SELECT id, position, name, enabled, watch_directory, task_status, kind, stage_key, join_key
        FROM project_stages WHERE project_id = $1 ORDER BY position`,
     [projectDbId],
   );
@@ -304,6 +325,10 @@ export async function normalizeStagesInput(c, rawStages, { requireScannerWatch =
     const provided = stage?.id != null ? String(stage.id) : null;
     return {
       id: provided && UUID_RE.test(provided) ? provided : null,
+      // FORK-JOIN-001: тип узла + стабильный ключ + пара fork→join.
+      kind: normalizeKind(stage?.kind),
+      stageKey: normalizeKey(stage?.stageKey),
+      joinKey: normalizeKey(stage?.joinKey),
       name: String(stage?.name ?? '').trim(),
       // LEGACY-STAGE-DEFAULTS: отсутствие enabled (или не явный false) = включён.
       // Нормализуем к boolean, чтобы в БД (NOT NULL) попал явный true/false.
@@ -377,10 +402,13 @@ export async function saveStagesRows(c, projectDbId, normalized) {
   await c.query('DELETE FROM project_stages WHERE project_id = $1', [projectDbId]);
   for (const stage of normalized) {
     const ins = await c.query(
-      `INSERT INTO project_stages (id, project_id, position, name, enabled, watch_directory, task_status)
-       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7::task_status)
+      `INSERT INTO project_stages
+         (id, project_id, position, name, enabled, watch_directory, task_status, kind, stage_key, join_key)
+       VALUES (COALESCE($1::uuid, gen_random_uuid()), $2, $3, $4, $5, $6, $7::task_status,
+               $8, COALESCE($9::uuid, gen_random_uuid()), $10::uuid)
        RETURNING id`,
-      [stage.id, projectDbId, stage.position, stage.name, stage.enabled, stage.watchDirectory, stage.taskStatus],
+      [stage.id, projectDbId, stage.position, stage.name, stage.enabled, stage.watchDirectory,
+       stage.taskStatus, stage.kind ?? 'stage', stage.stageKey, stage.joinKey ?? null],
     );
     const stageId = ins.rows[0].id;
     let pos = 0;

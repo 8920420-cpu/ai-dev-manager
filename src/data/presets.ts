@@ -1,14 +1,15 @@
 /** Пресеты этапов и ролей для мастера создания проекта. */
 
 // Последовательность этапов по умолчанию (пользователь может изменить в любой момент):
-// Architect → Decomposer → Programmer → Scanner → Task Reviewer → Pipeline Service →
-// Failure Analyst (только если ошибка) → Documentation Auditor →
+// Task Intake Officer → Architect → Decomposer → Programmer → Task Reviewer →
+// Pipeline Service → Failure Analyst (только если ошибка) → Documentation Auditor →
 // Documentation Keeper (если нужен) → Git Integrator → Done.
+// Scanner в движение по ролям НЕ входит: это отдельная роль-приёмник из папок.
 export const PRESET_STAGE_NAMES = [
+  'Task Intake Officer',
   'Architect',
   'Decomposer',
   'Programmer',
-  'Scanner',
   'Task Reviewer',
   'Pipeline Service',
   'Failure Analyst (только если ошибка)',
@@ -23,6 +24,7 @@ export const PRESET_STAGE_NAMES = [
  * надёжный признак роли; отображаемое `name` не используется для логики.
  */
 export const PRESET_ROLES = [
+  { name: 'Task Intake Officer', code: 'TASK_INTAKE_OFFICER' },
   { name: 'Architect', code: 'ARCHITECT' },
   { name: 'Decomposer', code: 'DECOMPOSER' },
   { name: 'Programmer', code: 'PROGRAMMER' },
@@ -66,10 +68,10 @@ export function isScannerRole(role: { code?: string; name: string }): boolean {
 
 /** Рекомендованное соответствие «этап → роль» по умолчанию. */
 export const DEFAULT_STAGE_ROLE_MAP: Record<string, string[]> = {
+  'Task Intake Officer': ['Task Intake Officer'],
   Architect: ['Architect'],
   Decomposer: ['Decomposer'],
   Programmer: ['Programmer'],
-  Scanner: ['Scanner'],
   'Task Reviewer': ['Task Reviewer'],
   'Pipeline Service': ['Pipeline Service'],
   'Failure Analyst (только если ошибка)': ['Failure Analyst'],

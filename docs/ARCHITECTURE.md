@@ -57,7 +57,7 @@ Done
 2. **Снимок контекста.** Создаётся `context_snapshots` (промт, версии карт,
    зависимости, `.pipeline.json`).
 3. **Запуск Programmer.** Для Claude Code задача публикуется в
-   `runtime/claude-tasks.json`; завершение отмечается статусом `выполнено`.
+   `tasks/claude-tasks.json`; завершение отмечается статусом `выполнено`.
 4. **Scanner bridge.** scanner-service передаёт completion ровно один раз,
    сверяет задачу/проект/сервис через API и направляет её Task Reviewer.
 5. **Тестирование.** tester-service запускает pipeline-runner; результаты →

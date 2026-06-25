@@ -23,9 +23,31 @@ export interface Role {
   code?: string;
 }
 
+/**
+ * Тип узла блок-схемы (FORK-JOIN-001). 'stage' — обычный этап (роль + статус);
+ * управляющие узлы: 'fork' (разделить на параллельные ветки), 'join' (объединить
+ * ветки барьером), 'condition' (ветвление по исходу).
+ */
+export type StageKind = 'stage' | 'fork' | 'join' | 'condition';
+
+/** Ребро графа блок-схемы: связь между узлами по стабильному ключу. */
+export interface SchemeEdge {
+  fromKey: string;
+  toKey: string;
+  /** Метка ветки для узла condition (исход); null — безусловная связь. */
+  condition?: string | null;
+  position?: number;
+}
+
 /** Этап проекта с назначенными ролями. */
 export interface Stage {
   id: string;
+  /** Тип узла блок-схемы (по умолчанию 'stage'). */
+  kind?: StageKind;
+  /** Стабильный ключ узла для ссылок рёбер (UUID); переживает реордер. */
+  stageKey?: string;
+  /** Для узла fork: ключ парного узла join, снимающего барьер. */
+  joinKey?: string;
   name: string;
   /** id назначенных ролей (одна или несколько). */
   roleIds: string[];

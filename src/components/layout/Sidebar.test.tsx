@@ -123,9 +123,8 @@ describe('Sidebar — сворачиваемые категории навига
     expect(disclosure('Настройки')).toHaveAttribute('aria-expanded', 'true');
     expect(disclosure('Проекты')).toHaveAttribute('aria-expanded', 'false');
     expect(screen.queryByText('Проект Альфа')).not.toBeInTheDocument();
-    // показались дочерние пункты «Настройки»
+    // показался дочерний пункт «Настройки» (раздел «Базы данных» удалён)
     expect(screen.getByText('Роли')).toBeInTheDocument();
-    expect(screen.getByText('Базы данных')).toBeInTheDocument();
   });
 
   it('aria-controls связывает кнопку с подсписком по id', async () => {

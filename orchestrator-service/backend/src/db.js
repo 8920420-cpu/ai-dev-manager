@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { ROLE_FLOW, fastForwardHiddenRoles } from './rolePipeline.js';
 import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK } from './roleEngine.js';
 import { buildRoute, resolveTransition, forwardFrom, routeIsUsable } from './projectRoute.js';
+import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey } from './graphRoute.js';
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
 import { buildPipelineClaimContract } from './pipelineDispatch.js';
 
@@ -285,12 +286,29 @@ export async function acceptScannerIntake(s, input) {
 
       const role = await entryRole(c);
 
+      // FORK-JOIN-001: в граф-схеме (есть рёбра) задача отслеживает узел —
+      // стартует на узле с ролью-приёмщиком. В линейной схеме — NULL (по позиции).
+      const hasEdges = (await c.query(
+        'SELECT 1 FROM project_stage_edges WHERE project_id = $1 LIMIT 1', [project.id],
+      )).rowCount > 0;
+      let entryStageKey = null;
+      if (hasEdges) {
+        const es = await c.query(
+          `SELECT ps.stage_key FROM project_stages ps
+             JOIN project_stage_roles psr ON psr.stage_id = ps.id
+            WHERE ps.project_id = $1 AND psr.role_id = $2 AND ps.enabled = true
+            ORDER BY ps.position LIMIT 1`,
+          [project.id, role.id],
+        );
+        entryStageKey = es.rows[0]?.stage_key ?? null;
+      }
+
       const ins = await c.query(
         `INSERT INTO tasks
-           (project_id, service_id, external_id, title, description, status, current_role_id, created_by)
-         VALUES ($1, $2, $3, $4, $5, 'BACKLOG', $6, 'scanner-intake')
+           (project_id, service_id, external_id, title, description, status, current_role_id, current_stage_key, created_by)
+         VALUES ($1, $2, $3, $4, $5, 'BACKLOG', $6, $7::uuid, 'scanner-intake')
          RETURNING id`,
-        [project.id, serviceId, payload.externalId, payload.title, payload.description, role.id],
+        [project.id, serviceId, payload.externalId, payload.title, payload.description, role.id, entryStageKey],
       );
       const taskId = ins.rows[0].id;
 
@@ -898,6 +916,88 @@ async function loadProjectRoute(c, projectId) {
   );
 }
 
+// FORK-JOIN-001: узлы проекта по стабильному ключу (для граф-маршрутизации и
+// подметателей fork/join). Первая роль этапа — исполнитель/gate узла.
+async function loadProjectNodes(c, projectId) {
+  const stages = await c.query(
+    `SELECT id, stage_key, kind, join_key, name, enabled, task_status::text AS task_status
+       FROM project_stages WHERE project_id = $1 ORDER BY position`,
+    [projectId],
+  );
+  if (!stages.rowCount) return [];
+  const roles = await c.query(
+    `SELECT psr.stage_id, psr.role_id, r.code, psr.position
+       FROM project_stage_roles psr JOIN roles r ON r.id = psr.role_id
+      WHERE psr.stage_id = ANY($1::uuid[]) ORDER BY psr.position, r.code`,
+    [stages.rows.map((s) => s.id)],
+  );
+  const firstRole = new Map();
+  for (const row of roles.rows) {
+    if (!firstRole.has(row.stage_id)) firstRole.set(row.stage_id, { roleId: row.role_id, roleCode: row.code });
+  }
+  return stages.rows.map((s) => ({
+    stageKey: s.stage_key,
+    kind: s.kind ?? 'stage',
+    joinKey: s.join_key ?? null,
+    name: s.name,
+    enabled: s.enabled,
+    status: s.task_status,
+    roleId: firstRole.get(s.id)?.roleId ?? null,
+    roleCode: firstRole.get(s.id)?.roleCode ?? null,
+  }));
+}
+
+// Загрузить рёбра графа проекта (для граф-маршрутизации). [] — линейный проект.
+async function loadProjectEdges(c, projectId) {
+  const r = await c.query(
+    `SELECT from_key, to_key, condition, position
+       FROM project_stage_edges WHERE project_id = $1 ORDER BY from_key, position`,
+    [projectId],
+  );
+  return r.rows.map((e) => ({
+    fromKey: e.from_key, toKey: e.to_key, condition: e.condition ?? null, position: e.position,
+  }));
+}
+
+// Построить граф проекта (узлы + рёбра) для graphRoute. null — нет рёбер (линейный).
+async function loadProjectGraph(c, projectId) {
+  const edges = await loadProjectEdges(c, projectId);
+  if (!edges.length) return null;
+  const nodes = await loadProjectNodes(c, projectId);
+  return { graph: buildGraph(nodes, edges), nodes };
+}
+
+/**
+ * FORK-JOIN-001: граф-переход для задачи с current_stage_key. Возвращает контракт
+ * как resolveTransition, плюс nextStageKey. Узлы fork/join несут gate-роль —
+ * задача «садится» на них, а дальше её обрабатывает подметатель.
+ */
+async function resolveGraphTransition(c, claimed, decision) {
+  if (decision.outcome === 'BLOCK') {
+    return { nextRole: null, toStatus: decision.blockStatus || 'BLOCKED', done: false, blocked: true, via: 'graph', nextStageKey: claimed.current_stage_key };
+  }
+  const loaded = await loadProjectGraph(c, claimed.project_id);
+  if (!loaded) {
+    // Рёбра исчезли (схему переписали в линейную) — фолбэк на позиционный резолвер.
+    const route = await loadProjectRoute(c, claimed.project_id);
+    return { ...resolveTransition(route, claimed.role_code, decision), nextStageKey: null };
+  }
+  const nextKey = nextNodeKey(loaded.graph, claimed.current_stage_key, decision);
+  if (!nextKey) {
+    return { nextRole: null, toStatus: 'DONE', done: true, blocked: false, via: 'graph', nextStageKey: null };
+  }
+  const node = nodeByKey(loaded.graph, nextKey);
+  return {
+    nextRole: node?.roleCode ?? null,
+    // gate-узлы (fork/join) не имеют статуса — сохраняем текущий статус задачи.
+    toStatus: node?.status || claimed.status,
+    done: false,
+    blocked: false,
+    via: 'graph',
+    nextStageKey: nextKey,
+  };
+}
+
 // Кэш наличия таблицы role_fields (контракт необязателен — может не быть миграции).
 let _roleFieldsTablePresent;
 async function roleFieldsTablePresent(c) {
@@ -943,6 +1043,10 @@ export async function advanceAutomatedTasks(s, { max = Number(process.env.RUNNER
     // Пропускаемые роли (ROLE-GROUPS-001 / per-project) прокручиваются до первой
     // активной роли ДО любого claim — за пропущенные роли не создаётся agent/host run.
     await advanceSkippedStageRoles(c);
+    // FORK-JOIN-001: расщепление в fork и снятие барьера в join — до claim, чтобы
+    // дети попадали в очередь, а родитель не клеймился на gate-узле.
+    await advanceForkNodes(c);
+    await advanceJoinNodes(c);
     const applied = [];
     for (let i = 0; i < max; i += 1) {
       const claimed = await claimLlmRoleTask(c);
@@ -990,7 +1094,7 @@ async function advanceSkippedStageRoles(c) {
        FROM tasks t JOIN roles r ON r.id = t.current_role_id
       WHERE t.project_id = ANY($1::uuid[])
         AND t.assigned_agent_id IS NULL
-        AND t.status NOT IN ('DONE','CANCELLED')`,
+        AND t.status NOT IN ('DONE','CANCELLED','WAITING_FOR_CHILDREN')`,
     [[...byProject.keys()]],
   );
 
@@ -1043,6 +1147,195 @@ async function advanceSkippedStageRoles(c) {
     }
   }
   return moved;
+}
+
+/**
+ * FORK-JOIN-001 (Phase 4) — расщепление в узле fork. Родитель (parent_task_id IS
+ * NULL), доехавший до узла kind='fork' (current_stage_key), порождает по подзадаче
+ * на каждую исходящую ветку и паркуется на парном join в WAITING_FOR_CHILDREN.
+ * Идемпотентно: расщепляем только если детей ещё нет. Один txn на родителя.
+ */
+export async function advanceForkNodes(c) {
+  const parents = await c.query(
+    `SELECT t.id, t.project_id, t.title, t.description, t.service_id,
+            t.status::text AS status, t.current_role_id, t.current_stage_key, t.data_card,
+            ps.join_key
+       FROM tasks t
+       JOIN project_stages ps
+         ON ps.project_id = t.project_id AND ps.stage_key = t.current_stage_key AND ps.kind = 'fork'
+      WHERE t.assigned_agent_id IS NULL
+        AND t.parent_task_id IS NULL
+        AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
+        AND NOT EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id)
+      FOR UPDATE OF t SKIP LOCKED`,
+  );
+  let forked = 0;
+  for (const p of parents.rows) {
+    const loaded = await loadProjectGraph(c, p.project_id);
+    if (!loaded) continue;
+    const branchKeys = forkBranchKeys(loaded.graph, p.current_stage_key);
+    const branches = branchKeys.map((k) => nodeByKey(loaded.graph, k)).filter((n) => n && n.roleId);
+    if (!branches.length) continue;
+    const joinGate = await c.query(`SELECT id FROM roles WHERE code = 'JOIN_GATE'`);
+    const joinGateId = joinGate.rows[0]?.id ?? null;
+    const card = p.data_card && typeof p.data_card === 'object' ? p.data_card : {};
+    await c.query('BEGIN');
+    try {
+      const childIds = [];
+      for (const b of branches) {
+        const ins = await c.query(
+          `INSERT INTO tasks (project_id, service_id, parent_task_id, title, description,
+                              status, current_role_id, current_stage_key, created_by, data_card)
+           VALUES ($1, $2, $3, $4, $5, $6::task_status, $7, $8::uuid, 'fork', $9::jsonb)
+           RETURNING id`,
+          [p.project_id, p.service_id, p.id, `${p.title} [${b.name || 'ветка'}]`, p.description,
+           b.status, b.roleId, b.stageKey, JSON.stringify(card)],
+        );
+        const childId = ins.rows[0].id;
+        childIds.push(childId);
+        await c.query(
+          `INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)
+           ON CONFLICT (task_id, depends_on_task_id) DO NOTHING`,
+          [p.id, childId],
+        );
+      }
+      // Паркуем родителя на парном join (барьер снимет advanceJoinNodes).
+      await c.query(
+        `UPDATE tasks SET status = 'WAITING_FOR_CHILDREN', current_role_id = $2,
+                current_stage_key = $3::uuid, assigned_agent_id = NULL WHERE id = $1`,
+        [p.id, joinGateId, p.join_key],
+      );
+      await c.query(
+        `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+         VALUES ($1, 'STATUS_CHANGED', $2::task_status, 'WAITING_FOR_CHILDREN', $3, $4::jsonb)`,
+        [p.id, p.status, p.current_role_id,
+         JSON.stringify({ runner: true, reason: 'fork_spawned', children: childIds, branches: branchKeys })],
+      );
+      await c.query('COMMIT');
+      forked += 1;
+    } catch (error) {
+      await c.query('ROLLBACK');
+      throw error;
+    }
+  }
+  return forked;
+}
+
+/**
+ * FORK-JOIN-001 (Phase 5) — узел join. Двухшаговый подметатель:
+ *  (1) дочерняя задача, доехавшая до узла kind='join', завершается (ветка сдала
+ *      результат) → DONE;
+ *  (2) родитель в WAITING_FOR_CHILDREN на узле join, у которого ВСЕ дети
+ *      терминальны: при упавшей ветке → BLOCKED; иначе слить data_card детей и
+ *      продвинуть родителя за join по рёбрам (нет рёбер → DONE).
+ * Идемпотентно (предикаты статуса + SKIP LOCKED). Только UPDATE, без DELETE.
+ */
+export async function advanceJoinNodes(c) {
+  let advanced = 0;
+  // (1) Дети на join → DONE.
+  const kids = await c.query(
+    `SELECT t.id, t.status::text AS status, t.current_role_id
+       FROM tasks t
+       JOIN project_stages ps
+         ON ps.project_id = t.project_id AND ps.stage_key = t.current_stage_key AND ps.kind = 'join'
+      WHERE t.parent_task_id IS NOT NULL
+        AND t.assigned_agent_id IS NULL
+        AND t.status NOT IN ('DONE','CANCELLED','FAILED')
+      FOR UPDATE OF t SKIP LOCKED`,
+  );
+  for (const k of kids.rows) {
+    await c.query('BEGIN');
+    try {
+      const upd = await c.query(
+        `UPDATE tasks SET status = 'DONE', current_role_id = NULL, assigned_agent_id = NULL
+          WHERE id = $1 AND status NOT IN ('DONE','CANCELLED','FAILED')`,
+        [k.id],
+      );
+      if (upd.rowCount) {
+        await c.query(
+          `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+           VALUES ($1, 'TASK_DONE', $2::task_status, 'DONE', $3, $4::jsonb)`,
+          [k.id, k.status, k.current_role_id, JSON.stringify({ runner: true, reason: 'branch_reached_join' })],
+        );
+        advanced += 1;
+      }
+      await c.query('COMMIT');
+    } catch (error) {
+      await c.query('ROLLBACK');
+      throw error;
+    }
+  }
+
+  // (2) Родители на join со всеми терминальными детьми → снять барьер.
+  const parents = await c.query(
+    `SELECT t.id, t.project_id, t.status::text AS status, t.current_role_id, t.current_stage_key, t.data_card
+       FROM tasks t
+       JOIN project_stages ps
+         ON ps.project_id = t.project_id AND ps.stage_key = t.current_stage_key AND ps.kind = 'join'
+      WHERE t.parent_task_id IS NULL
+        AND t.status = 'WAITING_FOR_CHILDREN'
+        AND t.assigned_agent_id IS NULL
+        AND EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id)
+        AND NOT EXISTS (
+              SELECT 1 FROM tasks ch
+               WHERE ch.parent_task_id = t.id AND ch.status NOT IN ('DONE','CANCELLED','FAILED'))
+      FOR UPDATE OF t SKIP LOCKED`,
+  );
+  for (const p of parents.rows) {
+    const childRows = await c.query(
+      `SELECT status::text AS status, data_card FROM tasks WHERE parent_task_id = $1`,
+      [p.id],
+    );
+    const failed = childRows.rows.some((ch) => ch.status === 'FAILED' || ch.status === 'CANCELLED');
+    await c.query('BEGIN');
+    try {
+      if (failed) {
+        // Политика all-DONE-required: упавшая ветка → родитель BLOCKED (всплывает пользователю).
+        await c.query(
+          `UPDATE tasks SET status = 'BLOCKED', assigned_agent_id = NULL WHERE id = $1`,
+          [p.id],
+        );
+        await c.query(
+          `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+           VALUES ($1, 'STATUS_CHANGED', 'WAITING_FOR_CHILDREN', 'BLOCKED', $2, $3::jsonb)`,
+          [p.id, p.current_role_id, JSON.stringify({ runner: true, reason: 'join_child_failed' })],
+        );
+        await c.query('COMMIT');
+        advanced += 1;
+        continue;
+      }
+      // Слить карточки детей в родителя (накопительная карточка).
+      let merged = p.data_card && typeof p.data_card === 'object' ? { ...p.data_card } : {};
+      for (const ch of childRows.rows) {
+        if (ch.data_card && typeof ch.data_card === 'object') merged = { ...merged, ...ch.data_card };
+      }
+      // Продвинуть родителя за join по рёбрам графа.
+      const loaded = await loadProjectGraph(c, p.project_id);
+      const nextKey = loaded ? nextNodeKey(loaded.graph, p.current_stage_key, { outcome: 'FORWARD' }) : null;
+      const nextNode = nextKey ? nodeByKey(loaded.graph, nextKey) : null;
+      const done = !nextNode;
+      const nextRoleId = nextNode?.roleId ?? null;
+      const toStatus = done ? 'DONE' : (nextNode.status || p.status);
+      await c.query(
+        `UPDATE tasks SET status = $2::task_status, current_role_id = $3,
+                current_stage_key = $4::uuid, assigned_agent_id = NULL,
+                data_card = data_card || $5::jsonb WHERE id = $1`,
+        [p.id, toStatus, nextRoleId, nextKey, JSON.stringify(merged)],
+      );
+      await c.query(
+        `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+         VALUES ($1, $2, 'WAITING_FOR_CHILDREN', $3::task_status, $4, $5::jsonb)`,
+        [p.id, done ? 'TASK_DONE' : 'STATUS_CHANGED', toStatus, p.current_role_id,
+         JSON.stringify({ runner: true, reason: 'join_completed', nextStageKey: nextKey })],
+      );
+      await c.query('COMMIT');
+      advanced += 1;
+    } catch (error) {
+      await c.query('ROLLBACK');
+      throw error;
+    }
+  }
+  return advanced;
 }
 
 // Снять зависшие захваты: agent_run RUNNING старше таймаута → TIMEOUT, слот свободен.
@@ -1126,7 +1419,7 @@ async function claimLlmRoleTask(c) {
   try {
     const picked = await c.query(
       `SELECT t.id, t.title, t.description, t.status::text AS status, t.project_id,
-              t.data_card, r.code AS role_code, r.id AS role_id
+              t.data_card, t.current_stage_key, t.parent_task_id, r.code AS role_code, r.id AS role_id
          FROM tasks t
          JOIN roles r ON r.id = t.current_role_id
          JOIN projects p ON p.id = t.project_id
@@ -1298,7 +1591,11 @@ async function processClaimedRole(c, claimed) {
   if (missingOut.length && decision.outcome !== 'BLOCK') {
     decision = { outcome: 'REWORK', agentRunStatus: 'SUCCESS', reason: `missing_outputs:${missingOut.join(',')}` };
   }
-  const resolved = resolveTransition(route, claimed.role_code, decision);
+  // FORK-JOIN-001: задача с current_stage_key идёт ПО РЁБРАМ графа (граф-режим);
+  // без него — прежняя позиционная маршрутизация (линейные схемы не затронуты).
+  const resolved = claimed.current_stage_key
+    ? await resolveGraphTransition(c, claimed, decision)
+    : resolveTransition(route, claimed.role_code, decision);
   return finalizeRole(c, claimed, { ...result, decision, resolved, cardValues });
 }
 
@@ -1319,8 +1616,9 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
 
     await c.query(
       `UPDATE tasks SET status = $2::task_status, current_role_id = $3, assigned_agent_id = NULL,
-              data_card = data_card || $4::jsonb WHERE id = $1`,
-      [claimed.id, resolved.toStatus, nextRoleId, JSON.stringify(cardValues || {})],
+              data_card = data_card || $4::jsonb, current_stage_key = $5::uuid WHERE id = $1`,
+      // FORK-JOIN-001: в граф-режиме переносим текущий узел; в линейном — остаётся NULL.
+      [claimed.id, resolved.toStatus, nextRoleId, JSON.stringify(cardValues || {}), resolved.nextStageKey ?? null],
     );
     await c.query(
       `UPDATE agent_runs SET status = $2::agent_run_status, finished_at = now(), output_json = $3::jsonb WHERE id = $1`,

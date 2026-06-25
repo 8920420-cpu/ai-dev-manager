@@ -5,9 +5,10 @@ import styles from './Topbar.module.css';
 
 const TITLES: Record<RouteKey, string> = {
   projects: 'Проекты',
+  'development-scheme': 'Схема разработки',
   integrations: 'Интеграции',
   'settings-roles': 'Настройки · Роли',
-  'settings-databases': 'Настройки · Базы данных',
+  'settings-tools': 'Настройки · Инструменты',
 };
 
 interface TopbarProps {

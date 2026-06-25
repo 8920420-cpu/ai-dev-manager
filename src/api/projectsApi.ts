@@ -13,6 +13,7 @@ import type {
   ProjectStatus,
   Role,
   Stage,
+  StageKind,
 } from '../types/project';
 
 /** Событие изменения списка проектов — чтобы сайдбар мог обновиться. */
@@ -26,14 +27,19 @@ function emitProjectsChanged(): void {
 
 // --- Серверный контракт (rich) --------------------------------------------
 
-interface RichStage {
+export interface RichStage {
   id: string;
   name: string;
   enabled?: boolean;
   position?: number;
   roleIds?: string[];
   roleCodes?: string[];
-  scanner?: { watchDirectory?: string } | null;
+  taskStatus?: string | null;
+  scanner?: { watchDirectory?: string; taskStatus?: string | null } | null;
+  /** FORK-JOIN-001: тип узла + стабильный ключ + пара fork→join. */
+  kind?: StageKind;
+  stageKey?: string | null;
+  joinKey?: string | null;
 }
 
 interface RichRole {
@@ -50,7 +56,12 @@ interface RichProject {
   /** Алиас path для совместимости с dbProjectsApi. */
   rootPath?: string;
   status?: ProjectStatus;
-  databaseId?: string | null;
+  /** Причина паузы (когда status === 'paused'). */
+  pauseReason?: string | null;
+  /** Папка документов проекта (за ней следит Scanner). */
+  docsPath?: string | null;
+  /** Включён ли автоприём задач Scanner. */
+  scannerEnabled?: boolean;
   stages?: RichStage[];
   roles?: RichRole[];
   createdAt?: string;
@@ -59,13 +70,18 @@ interface RichProject {
 
 // --- Маппинг сервер → фронт -------------------------------------------------
 
-function mapStage(stage: RichStage): Stage {
+export function mapStage(stage: RichStage): Stage {
   return {
     id: stage.id,
+    kind: stage.kind ?? 'stage',
+    stageKey: stage.stageKey ?? undefined,
+    joinKey: stage.joinKey ?? undefined,
     name: stage.name,
     roleIds: stage.roleIds ?? [],
     enabled: stage.enabled !== false,
     scanPath: stage.scanner?.watchDirectory || undefined,
+    // Статус этапа: плоское поле (единая схема) приоритетнее scanner-блока (проект).
+    taskStatus: stage.taskStatus || stage.scanner?.taskStatus || undefined,
   };
 }
 
@@ -80,9 +96,11 @@ function fromRich(rich: RichProject): Project {
     name: rich.name ?? '',
     path: rich.path ?? rich.rootPath ?? '',
     status: rich.status ?? 'active',
+    pauseReason: rich.pauseReason ?? null,
     stages: (rich.stages ?? []).map(mapStage),
     roles: (rich.roles ?? []).map(mapRole),
-    databaseId: rich.databaseId ?? undefined,
+    docsPath: rich.docsPath ?? undefined,
+    scannerEnabled: rich.scannerEnabled === true,
     createdAt: rich.createdAt ?? now,
     updatedAt: rich.updatedAt ?? now,
   };
@@ -99,8 +117,12 @@ interface StagePayload {
   id?: string;
   name: string;
   enabled: boolean;
-  scanner: { watchDirectory: string };
+  scanner: { watchDirectory: string; taskStatus: string };
   roleCodes: string[];
+  /** FORK-JOIN-001: тип узла + стабильный ключ + пара fork→join. */
+  kind?: StageKind;
+  stageKey?: string;
+  joinKey?: string;
 }
 
 /**
@@ -108,7 +130,7 @@ interface StagePayload {
  * (через справочник ролей input.roles, у пресетных ролей есть code).
  * Локальные id этапов (stage_xxx) на сервер не отправляются — только uuid.
  */
-function toStagePayload(stages: Stage[], roles: Role[]): StagePayload[] {
+export function toStagePayload(stages: Stage[], roles: Role[]): StagePayload[] {
   const codeById = new Map(roles.map((r) => [r.id, r.code]));
   return stages.map((stage) => {
     const roleCodes = stage.roleIds
@@ -117,10 +139,13 @@ function toStagePayload(stages: Stage[], roles: Role[]): StagePayload[] {
     const payload: StagePayload = {
       name: stage.name,
       enabled: stage.enabled !== false,
-      scanner: { watchDirectory: stage.scanPath ?? '' },
+      scanner: { watchDirectory: stage.scanPath ?? '', taskStatus: stage.taskStatus ?? '' },
       roleCodes,
+      kind: stage.kind ?? 'stage',
     };
     if (looksLikeUuid(stage.id)) payload.id = stage.id;
+    if (stage.stageKey) payload.stageKey = stage.stageKey;
+    if (stage.joinKey) payload.joinKey = stage.joinKey;
     return payload;
   });
 }
@@ -137,6 +162,51 @@ function isConflict(err: unknown): boolean {
   if (err instanceof ApiError && err.status === 409) return true;
   if (err instanceof Error && /project_conflict/i.test(err.message)) return true;
   return false;
+}
+
+/** Одна ошибка валидации/согласованности этапов с сервера. */
+export interface StageSaveErrorItem {
+  /** id этапа (для ошибок валидации этапа). */
+  stageId?: string | null;
+  /** код роли (для ошибок согласованности контрактов полей). */
+  roleCode?: string;
+  /** ключ поля (для ошибок согласованности контрактов полей). */
+  field?: string;
+  code: string;
+  message?: string;
+}
+
+/**
+ * Ошибка сохранения этапов проекта: валидация (`stage_validation_failed`) или
+ * несогласованность контрактов полей (`stage_field_inconsistent`). Несёт список
+ * детальных ошибок для показа рядом с формой этапов.
+ */
+export class StageSaveError extends Error {
+  code: 'stage_validation_failed' | 'stage_field_inconsistent';
+  errors: StageSaveErrorItem[];
+  constructor(
+    code: 'stage_validation_failed' | 'stage_field_inconsistent',
+    errors: StageSaveErrorItem[],
+    message?: string,
+  ) {
+    super(message || code);
+    this.name = 'StageSaveError';
+    this.code = code;
+    this.errors = errors;
+  }
+}
+
+/** Распознать 422-ошибку сохранения этапов и вернуть типизированную ошибку (или null). */
+export function asStageSaveError(err: unknown): StageSaveError | null {
+  if (!(err instanceof ApiError) || err.status !== 422) return null;
+  const body = err.body as
+    | { code?: string; error?: string; errors?: StageSaveErrorItem[] }
+    | undefined;
+  const code = body?.code;
+  if (code === 'stage_validation_failed' || code === 'stage_field_inconsistent') {
+    return new StageSaveError(code, body?.errors ?? [], body?.error);
+  }
+  return null;
 }
 
 export const projectsApi = {
@@ -156,8 +226,7 @@ export const projectsApi = {
       name: input.name.trim(),
       path: input.path.trim(),
       status: 'active' as ProjectStatus,
-      databaseId: input.databaseId ?? null,
-      stages: toStagePayload(input.stages, input.roles),
+      docsPath: input.docsPath?.trim() ?? null,
     };
     const created = fromRich(await http.post<RichProject>('/api/projects', body));
     emitProjectsChanged();
@@ -169,10 +238,7 @@ export const projectsApi = {
     if (patch.name !== undefined) body.name = patch.name.trim();
     if (patch.path !== undefined) body.path = patch.path.trim();
     if (patch.status !== undefined) body.status = patch.status;
-    if (patch.databaseId !== undefined) body.databaseId = patch.databaseId ?? null;
-    if (patch.stages !== undefined) {
-      body.stages = toStagePayload(patch.stages, patch.roles ?? []);
-    }
+    if (patch.docsPath !== undefined) body.docsPath = patch.docsPath?.trim() ?? null;
     // Токен optimistic concurrency.
     if (patch.updatedAt !== undefined) body.updatedAt = patch.updatedAt;
 
@@ -186,6 +252,16 @@ export const projectsApi = {
       if (isConflict(err)) throw new ProjectConflictError();
       throw err;
     }
+  },
+
+  async setScanner(id: string, enabled: boolean): Promise<Project> {
+    const updated = fromRich(
+      await http.patch<RichProject>(`/api/projects/${encodeURIComponent(id)}/scanner`, {
+        enabled,
+      }),
+    );
+    emitProjectsChanged();
+    return updated;
   },
 
   async setStatus(id: string, status: ProjectStatus): Promise<Project> {

@@ -7,12 +7,8 @@
 // Существующие экспортируемые функции (upsertProjectByPath/listProjects и helpers)
 // СОХРАНЕНЫ — их зовёт server.js и монитор задач.
 import { withClient, clientConfig } from './db.js';
-import {
-  resolveProjectId,
-  readStages,
-  normalizeStagesInput,
-  saveStagesRows,
-} from './stages.js';
+import { resolveProjectId, readStages } from './stages.js';
+import { applySchemeToProject } from './developmentScheme.js';
 
 function httpError(statusCode, message, extra) {
   const error = new Error(message);
@@ -92,7 +88,11 @@ export function mapProjectRow(row, { stages = [], roles = [] } = {}) {
     path,
     rootPath: path, // алиас совместимости
     status: row.status ?? 'active',
-    databaseId: row.database_ref ?? null,
+    pauseReason: row.pause_reason ?? null,
+    // Папка документов проекта («карта», за которой следит Scanner).
+    docsPath: row.docs_path ?? null,
+    // Включён ли автоматический приём задач Scanner из папки документов.
+    scannerEnabled: row.scanner_enabled === true,
     stages,
     roles,
     createdAt: toIso(row.created_at),
@@ -109,7 +109,7 @@ function mapProject(row) {
 // --- DB-слой ----------------------------------------------------------------
 
 const PROJECT_COLUMNS =
-  'id, code, name, root_path, status, database_ref, created_at, updated_at';
+  'id, code, name, root_path, status, pause_reason, docs_path, scanner_enabled, created_at, updated_at';
 
 // Подобрать свободный code: SLUG, затем SLUG_2, SLUG_3, …
 async function uniqueCode(c, base) {
@@ -244,9 +244,13 @@ function pickProjectFields(input, { partial }) {
   if (!partial || input?.status !== undefined) {
     if (input?.status !== undefined) out.status = String(input.status);
   }
-  if (input?.databaseId !== undefined) {
-    const v = input.databaseId;
-    out.database_ref = v === null || v === '' ? null : String(v);
+  // Папка документов проекта: нормализуем путь; пустое → null.
+  if (input?.docsPath !== undefined) {
+    out.docs_path = normalizeRootPath(input.docsPath);
+  }
+  // Переключатель приёма задач Scanner.
+  if (input?.scannerEnabled !== undefined) {
+    out.scanner_enabled = input.scannerEnabled === true;
   }
   return out;
 }
@@ -254,9 +258,10 @@ function pickProjectFields(input, { partial }) {
 /**
  * POST /api/projects — создать ИЛИ идемпотентно привязать по root_path.
  * Если проект с таким path уже есть — обновить переданные поля; иначе создать
- * (авто-code). stages (если переданы) сохраняются той же валидацией в общей
- * транзакции. Возврат: RichProject (с id и rootPath). Обратная совместимость:
- * вход {name,path} монитора задач получает объект с id+rootPath.
+ * (авто-code). Этапы пайплайна больше НЕ принимаются от клиента: единая «Схема
+ * разработки» материализуется в project_stages этого проекта (Scanner-этапу
+ * подставляется docs_path). Возврат: RichProject. Обратная совместимость: вход
+ * {name,path} монитора задач получает объект с id+rootPath.
  */
 export async function createOrUpsertProject(s, input) {
   const rootPath = normalizeRootPath(input?.path ?? input?.rootPath);
@@ -268,17 +273,13 @@ export async function createOrUpsertProject(s, input) {
   }
 
   return withClient(clientConfig(s), async (c) => {
-    // Нормализуем этапы (с валидацией) ДО транзакции записи, чтобы при ошибке
-    // ничего не писать. resolveProjectId здесь не нужен — проект может ещё не быть.
-    const hasStages = Array.isArray(input?.stages);
-    const normalizedStages = hasStages ? await normalizeStagesInput(c, input.stages) : null;
-
     await c.query('BEGIN');
     try {
       const existing = await c.query(
         `SELECT ${PROJECT_COLUMNS} FROM projects WHERE root_path = $1`, [rootPath],
       );
       let row;
+      let isNew = false;
       if (existing.rowCount) {
         // Обновить только переданные поля.
         const fields = pickProjectFields(input, { partial: true });
@@ -288,18 +289,21 @@ export async function createOrUpsertProject(s, input) {
       } else {
         const name = String(input?.name ?? '').trim() || basename(rootPath) || rootPath;
         const code = await uniqueCode(c, name);
+        const docsPath = normalizeRootPath(input?.docsPath);
         const ins = await c.query(
-          `INSERT INTO projects (code, name, root_path, status, database_ref)
+          `INSERT INTO projects (code, name, root_path, status, docs_path)
            VALUES ($1, $2, $3, COALESCE($4, 'active'), $5)
            RETURNING ${PROJECT_COLUMNS}`,
-          [code, name, rootPath, status ?? null,
-           input?.databaseId === undefined ? null : (input.databaseId || null)],
+          [code, name, rootPath, status ?? null, docsPath],
         );
         row = ins.rows[0];
+        isNew = true;
       }
 
-      if (hasStages) {
-        await saveStagesRows(c, row.id, normalizedStages);
+      // Материализуем единую схему: для нового проекта всегда; для существующего —
+      // если изменилась папка документов (Scanner следит за docs_path).
+      if (isNew || input?.docsPath !== undefined) {
+        await applySchemeToProject(c, row.id, row.docs_path);
       }
 
       const rich = await buildRich(c, await reloadRow(c, row.id));
@@ -339,13 +343,12 @@ async function reloadRow(c, id) {
 }
 
 /**
- * PUT /api/projects/:id — обновить name/path/status/databaseId/stages/roles.
+ * PUT /api/projects/:id — обновить name/path/status/docsPath.
  * Optimistic concurrency: patch.updatedAt (или If-Match, переданный server.js
  * как input.updatedAt) при несовпадении с текущим updated_at → 409
  * project_conflict. Валидация статуса → 422 project_invalid_status.
- * roles в проекте — глобальные (read-only), поэтому patch.roles игнорируется
- * как набор данных проекта (это не отклонение: контракт описывает roles как
- * ГЛОБАЛЬНЫЕ; назначение ролей этапам идёт через stages.roleCodes).
+ * Этапы пайплайна задаёт единая «Схема разработки» (не проект): при изменении
+ * docsPath переприменяем схему, чтобы Scanner следил за новой папкой документов.
  */
 export async function updateProject(s, idOrRef, patch) {
   const status = patch?.status !== undefined ? String(patch.status) : undefined;
@@ -362,14 +365,14 @@ export async function updateProject(s, idOrRef, patch) {
       throw httpError(409, 'project_conflict', { code: 'project_conflict' });
     }
 
-    const hasStages = Array.isArray(patch?.stages);
-    const normalizedStages = hasStages ? await normalizeStagesInput(c, patch.stages) : null;
-
     await c.query('BEGIN');
     try {
       const fields = pickProjectFields(patch, { partial: true });
       const row = await applyProjectUpdate(c, current.id, fields);
-      if (hasStages) await saveStagesRows(c, row.id, normalizedStages);
+      // Папка документов изменилась → Scanner должен следить за новой папкой.
+      if (patch?.docsPath !== undefined) {
+        await applySchemeToProject(c, row.id, row.docs_path);
+      }
       const rich = await buildRich(c, await reloadRow(c, row.id));
       await c.query('COMMIT');
       return rich;
@@ -391,7 +394,24 @@ export async function setProjectStatus(s, idOrRef, status) {
   return withClient(clientConfig(s), async (c) => {
     const current = await findProjectRow(c, idOrRef);
     if (!current) throw httpError(404, 'project_not_found', { code: 'project_not_found' });
-    const row = await applyProjectUpdate(c, current.id, { status: String(status) });
+    // Снятие паузы (status != paused) очищает причину паузы.
+    const fields = String(status) === 'paused'
+      ? { status: 'paused' }
+      : { status: String(status), pause_reason: null };
+    const row = await applyProjectUpdate(c, current.id, fields);
+    return buildRich(c, row);
+  });
+}
+
+/**
+ * PATCH /api/projects/:id/scanner — включить/выключить приём задач Scanner.
+ * Лёгкое действие с карточки (без токена optimistic concurrency). Возврат: RichProject.
+ */
+export async function setProjectScanner(s, idOrRef, enabled) {
+  return withClient(clientConfig(s), async (c) => {
+    const current = await findProjectRow(c, idOrRef);
+    if (!current) throw httpError(404, 'project_not_found', { code: 'project_not_found' });
+    const row = await applyProjectUpdate(c, current.id, { scanner_enabled: enabled === true });
     return buildRich(c, row);
   });
 }

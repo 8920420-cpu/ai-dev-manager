@@ -263,6 +263,68 @@ export async function invoke(conn, input, { timeoutMs = DEFAULT_TIMEOUT_MS } = {
   return { text, httpStatus: res.status, durationMs };
 }
 
+/**
+ * Чат с поддержкой инструментов (function calling). messages — массив
+ * { role, content, tool_calls?, tool_call_id? } в формате OpenAI. tools — список
+ * function-схем. Возвращает { message, httpStatus, durationMs }, где message —
+ * ответ ассистента (content и/или tool_calls). Для НЕ-OpenAI-совместимых
+ * коннекторов tools не поддерживаются — деградируем до обычного invoke (без tools).
+ */
+export async function invokeChat(conn, { messages, tools = [] }, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
+  let endpoint = String(conn.endpoint ?? '').trim();
+  if (endpoint === '') throw new Error(`connector "${conn.name}": empty endpoint`);
+
+  if (!usesOpenAIChatAPI(endpoint)) {
+    const sys = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n');
+    const usr = messages.filter((m) => m.role !== 'system').map((m) => m.content).join('\n\n');
+    const { text, httpStatus, durationMs } = await invoke(conn, { system: sys, user: usr }, { timeoutMs });
+    return { message: { role: 'assistant', content: text, tool_calls: [] }, httpStatus, durationMs };
+  }
+
+  endpoint = normalizeChatCompletionsEndpoint(endpoint);
+  const model = defaultModelForEndpoint(endpoint, conn.model);
+  const req = { model, messages, temperature: 0, max_tokens: openAIMaxTokens() };
+  // С tools НЕ включаем response_format json_object — он конфликтует с tool_calls.
+  if (Array.isArray(tools) && tools.length) {
+    req.tools = tools;
+    req.tool_choice = 'auto';
+  }
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const headers = { 'Content-Type': 'application/json' };
+  const token = String(conn.accessToken ?? '').trim();
+  if (token !== '') headers['Authorization'] = 'Bearer ' + token;
+
+  const started = Date.now();
+  let res;
+  try {
+    res = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(req), signal: controller.signal });
+  } catch (e) {
+    clearTimeout(timer);
+    if (e?.name === 'AbortError') throw new Error(`connector "${conn.name}": AI response timeout (${timeoutMs}ms)`);
+    throw new Error(`connector "${conn.name}": request failed: ${e.message}`);
+  } finally {
+    clearTimeout(timer);
+  }
+  const raw = await res.text();
+  const durationMs = Date.now() - started;
+  if (res.status < 200 || res.status >= 300) {
+    const err = new Error(`connector "${conn.name}": HTTP ${res.status}: ${truncateErrBody(raw)}`);
+    err.httpStatus = res.status;
+    throw err;
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return { message: { role: 'assistant', content: raw, tool_calls: [] }, httpStatus: res.status, durationMs };
+  }
+  const message = parsed?.choices?.[0]?.message ?? { role: 'assistant', content: '' };
+  if (!Array.isArray(message.tool_calls)) message.tool_calls = [];
+  return { message, httpStatus: res.status, durationMs };
+}
+
 // Экспорт внутренних чистых функций для тестов.
 export const _internal = {
   usesOpenAIChatAPI,

@@ -8,6 +8,8 @@ import styles from './StepBasics.module.css';
 interface StepBasicsProps {
   name: string;
   path: string;
+  /** Папка с документами проекта («карта»; за ней следит Scanner). */
+  docsPath: string;
   status: ProjectStatus;
   /** Показывать ли выбор статуса (режим редактирования). */
   showStatus?: boolean;
@@ -15,6 +17,7 @@ interface StepBasicsProps {
   pathError?: string | null;
   onNameChange: (value: string) => void;
   onPathChange: (value: string) => void;
+  onDocsPathChange: (value: string) => void;
   onStatusChange: (value: ProjectStatus) => void;
 }
 
@@ -29,39 +32,43 @@ const STATUS_VALUES: ProjectStatus[] = ['active', 'paused', 'draft', 'archived']
 export function StepBasics({
   name,
   path,
+  docsPath,
   status,
   showStatus = false,
   nameError,
   pathError,
   onNameChange,
   onPathChange,
+  onDocsPathChange,
   onStatusChange,
 }: StepBasicsProps) {
   const toast = useToast();
-  const supported = fsAccess.isDirectoryPickerSupported();
-  const [hint, setHint] = useState<PickHint>(() =>
-    supported ? { kind: 'none' } : { kind: 'unsupported' },
-  );
+  const [hint, setHint] = useState<PickHint>({ kind: 'none' });
 
-  const handlePick = async () => {
-    if (!supported) {
-      setHint({ kind: 'unsupported' });
-      return;
-    }
+  // Открыть системный выбор папки и записать абсолютный путь через apply().
+  // current — текущее значение поля (чтобы не затирать ручной ввод именем папки).
+  const pickInto = async (apply: (value: string) => void, current: string) => {
     try {
+      // fsAccess сам перебирает способы: host-runner мост (даёт абсолютный путь
+      // даже без браузерного picker) → backend → браузерный picker.
       const picked = await fsAccess.pickFolder();
       if (!picked) return; // пользователь отменил
-      setHint({ kind: 'picked', folder: picked.name });
-      // absolutePath обычно null — подставляем имя как подсказку, поле остаётся редактируемым.
       if (picked.absolutePath) {
-        onPathChange(picked.absolutePath);
-      } else if (!path.trim()) {
-        onPathChange(picked.name);
+        apply(picked.absolutePath);
+        setHint({ kind: 'none' });
+      } else {
+        // Браузерный picker отдаёт только имя — поле остаётся для ручного ввода.
+        setHint({ kind: 'picked', folder: picked.name });
+        if (!current.trim()) apply(picked.name);
       }
     } catch {
-      toast.error('Не удалось открыть выбор папки');
+      setHint({ kind: 'unsupported' });
+      toast.error('Не удалось открыть выбор папки — введите путь вручную');
     }
   };
+
+  const handlePick = () => pickInto(onPathChange, path);
+  const handlePickDocs = () => pickInto(onDocsPathChange, docsPath);
 
   return (
     <div className={styles.step}>
@@ -97,7 +104,6 @@ export function StepBasics({
               variant="secondary"
               leftIcon={<FolderOpen size={18} aria-hidden="true" />}
               onClick={handlePick}
-              disabled={!supported}
             >
               Выбрать папку
             </Button>
@@ -118,6 +124,32 @@ export function StepBasics({
             папке проекта вручную.
           </Callout>
         )}
+      </div>
+
+      <div className={styles.pathBlock}>
+        <div className={styles.pathRow}>
+          <div className={styles.pathInput}>
+            <Input
+              label="Папка документов проекта"
+              value={docsPath}
+              onChange={(e) => onDocsPathChange(e.target.value)}
+              placeholder="C:\\projects\\my-app\\docs или /home/user/my-app/docs"
+              mono
+              helper="Папка с файлами, описывающими проект (его «карта»). За этой папкой следит Scanner — из неё принимаются новые задачи. Можно оставить пустым."
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <div className={styles.pickBtn}>
+            <Button
+              variant="secondary"
+              leftIcon={<FolderOpen size={18} aria-hidden="true" />}
+              onClick={handlePickDocs}
+            >
+              Выбрать папку
+            </Button>
+          </div>
+        </div>
       </div>
 
       {showStatus && (

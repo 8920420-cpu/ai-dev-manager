@@ -1,5 +1,10 @@
+// DEPRECATED (DATABASE-CONNECTIONS-001 / ORCHESTRATOR-P1.4): единый контракт —
+// `databaseConnections.js` + `/api/database-connections`. Этот legacy-модуль —
+// переходный алиас над таблицей database_connections, удаляется после перехода
+// всех потребителей (INTEGRATION-P3.1).
+//
 // LEGACY-BUSINESS-STORAGE-API-001 — дополнительные подключения к БД.
-// Глобальный справочник доп. подключений (additional_databases). secret (пароль)
+// Глобальный справочник доп. подключений (database_connections). secret (пароль)
 // хранится ТОЛЬКО на сервере и НИКОГДА не возвращается клиенту — в ответах лишь
 // флаг hasSecret. Образец редакции — databases.js/connectors.js (hasPassword/hasToken).
 import { withClient, clientConfig } from './db.js';
@@ -22,7 +27,7 @@ function toIso(value) {
 }
 
 /**
- * ЧИСТАЯ редакция строки additional_databases → контракт записи. secret НИКОГДА
+ * ЧИСТАЯ редакция строки database_connections → контракт записи. secret НИКОГДА
  * не попадает в результат: вместо него флаг hasSecret. db_user → user, ssl_mode
  * → sslMode. Тестируется без БД.
  */
@@ -61,13 +66,13 @@ function normalizeInput(input, { partial = false } = {}) {
 
 export async function listAdditionalDatabases(s) {
   return withClient(clientConfig(s), async (c) => {
-    const r = await c.query(`SELECT ${COLUMNS} FROM additional_databases ORDER BY lower(name), created_at`);
+    const r = await c.query(`SELECT ${COLUMNS} FROM database_connections ORDER BY lower(name), created_at`);
     return { databases: r.rows.map(redactAdditionalDb) };
   });
 }
 
 async function getRow(c, id) {
-  const r = await c.query(`SELECT ${COLUMNS} FROM additional_databases WHERE id = $1`, [id]);
+  const r = await c.query(`SELECT ${COLUMNS} FROM database_connections WHERE id = $1`, [id]);
   if (!r.rowCount) throw httpError(404, 'additional_database_not_found', { code: 'additional_database_not_found' });
   return r.rows[0];
 }
@@ -81,7 +86,7 @@ export async function createAdditionalDatabase(s, input) {
   if (!v.name) throw httpError(422, 'additional_database_name_required', { code: 'additional_database_name_required' });
   return withClient(clientConfig(s), async (c) => {
     const r = await c.query(
-      `INSERT INTO additional_databases (name, host, port, database, db_user, ssl_mode, secret)
+      `INSERT INTO database_connections (name, host, port, database, db_user, ssl_mode, secret)
        VALUES ($1, $2, $3, $4, $5, $6, $7)
        RETURNING ${COLUMNS}`,
       [v.name, v.host ?? '', v.port ?? 5432, v.database ?? '', v.db_user ?? '',
@@ -103,7 +108,7 @@ export async function updateAdditionalDatabase(s, id, input) {
     const sets = keys.map((k, i) => `${k} = $${i + 2}`);
     const params = [id, ...keys.map((k) => v[k])];
     const r = await c.query(
-      `UPDATE additional_databases SET ${sets.join(', ')}, updated_at = now()
+      `UPDATE database_connections SET ${sets.join(', ')}, updated_at = now()
         WHERE id = $1 RETURNING ${COLUMNS}`,
       params,
     );
@@ -113,7 +118,7 @@ export async function updateAdditionalDatabase(s, id, input) {
 
 export async function deleteAdditionalDatabase(s, id) {
   return withClient(clientConfig(s), async (c) => {
-    const r = await c.query('DELETE FROM additional_databases WHERE id = $1', [id]);
+    const r = await c.query('DELETE FROM database_connections WHERE id = $1', [id]);
     if (!r.rowCount) throw httpError(404, 'additional_database_not_found', { code: 'additional_database_not_found' });
     return { deleted: true };
   });

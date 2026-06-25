@@ -6,9 +6,8 @@ import {
   decideTransition,
   buildVerdictInstruction,
   buildUserPayload,
-  loadRolePrompt,
   summarizePriorRuns,
-  ROLE_PROMPT_FILES,
+  LLM_ROLE_CODES,
 } from '../src/roleEngine.js';
 
 test('parseVerdict: чистый JSON', () => {
@@ -97,6 +96,38 @@ test('decideTransition: ARCHITECT BLOCKED => BLOCKED, READY => DECOMPOSITION', (
   assert.equal(ok.nextRole, 'DECOMPOSER');
 });
 
+test('decideTransition: DOCUMENTATION_AUDITOR UPDATE_REQUIRED => DOCUMENTATION_KEEPER', () => {
+  const d = decideTransition('DOCUMENTATION_AUDITOR', { ok: null, status: 'UPDATE_REQUIRED' });
+  assert.equal(d.toStatus, 'COMMIT');
+  assert.equal(d.nextRole, 'DOCUMENTATION_KEEPER');
+  assert.equal(d.blocked, false);
+  assert.equal(d.agentRunStatus, 'SUCCESS');
+});
+
+test('decideTransition: DOCUMENTATION_AUDITOR ARCHITECT_REVIEW_REQUIRED => ARCHITECT', () => {
+  const d = decideTransition('DOCUMENTATION_AUDITOR', { ok: null, status: 'ARCHITECT_REVIEW_REQUIRED' });
+  assert.equal(d.toStatus, 'ARCHITECTURE');
+  assert.equal(d.nextRole, 'ARCHITECT');
+});
+
+test('decideTransition: DOCUMENTATION_AUDITOR NO_CHANGES => GIT_INTEGRATOR', () => {
+  const d = decideTransition('DOCUMENTATION_AUDITOR', { ok: null, status: 'NO_CHANGES' });
+  assert.equal(d.toStatus, 'COMMIT');
+  assert.equal(d.nextRole, 'GIT_INTEGRATOR');
+});
+
+test('decideTransition: DOCUMENTATION_AUDITOR BLOCKED => BLOCKED', () => {
+  const d = decideTransition('DOCUMENTATION_AUDITOR', { ok: false, status: 'BLOCKED' });
+  assert.equal(d.blocked, true);
+  assert.equal(d.reason, 'docs_blocked');
+});
+
+test('decideTransition: DOCUMENTATION_KEEPER UPDATED => GIT_INTEGRATOR', () => {
+  const d = decideTransition('DOCUMENTATION_KEEPER', { ok: true, status: 'UPDATED' });
+  assert.equal(d.toStatus, 'COMMIT');
+  assert.equal(d.nextRole, 'GIT_INTEGRATOR');
+});
+
 test('decideTransition: GIT_INTEGRATOR success => DONE (done=true)', () => {
   const d = decideTransition('GIT_INTEGRATOR', { ok: true, status: 'DONE' });
   assert.equal(d.toStatus, 'DONE');
@@ -109,11 +140,6 @@ test('buildVerdictInstruction/buildUserPayload содержат JSON-контр�
   const payload = buildUserPayload('TASK_REVIEWER', { taskId: 'x', title: 'T' });
   assert.match(payload, /TASK_REVIEWER/);
   assert.match(payload, /"title": "T"/);
-});
-
-test('loadRolePrompt читает реальный промт роли', async () => {
-  const text = await loadRolePrompt('TASK_REVIEWER');
-  assert.match(text, /Task Reviewer/);
 });
 
 test('summarizePriorRuns: компактный список из agent_runs', () => {
@@ -135,9 +161,30 @@ test('summarizePriorRuns: пустой и без output_json', () => {
   ]);
 });
 
-test('ROLE_PROMPT_FILES покрывает 6 рассуждающих ролей', () => {
-  assert.deepEqual(Object.keys(ROLE_PROMPT_FILES).sort(), [
+test('parseTextToolCalls: разбирает текстовый вызов инструмента (DeepSeek DSML)', async () => {
+  const { parseTextToolCalls } = await import('../src/roleEngine.js');
+  const content = [
+    'Посмотрю карту API.',
+    '<｜｜DSML｜｜tool_calls>',
+    '<｜｜DSML｜｜invoke name="read_file">',
+    '<｜｜DSML｜｜parameter name="path" string="true">docs/API_MAP.md</｜｜DSML｜｜parameter>',
+    '</｜｜DSML｜｜invoke>',
+    '</｜｜DSML｜｜tool_calls>',
+  ].join('\n');
+  const calls = parseTextToolCalls(content);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, 'read_file');
+  assert.equal(calls[0].args.path, 'docs/API_MAP.md');
+});
+
+test('parseTextToolCalls: нет вызовов → пустой массив', async () => {
+  const { parseTextToolCalls } = await import('../src/roleEngine.js');
+  assert.deepEqual(parseTextToolCalls('{"status":"READY"}'), []);
+});
+
+test('LLM_ROLE_CODES покрывает 7 рассуждающих ролей (вкл. Приёмщика задач)', () => {
+  assert.deepEqual([...LLM_ROLE_CODES].sort(), [
     'ARCHITECT', 'DECOMPOSER', 'DOCUMENTATION_AUDITOR',
-    'DOCUMENTATION_KEEPER', 'FAILURE_ANALYST', 'TASK_REVIEWER',
+    'DOCUMENTATION_KEEPER', 'FAILURE_ANALYST', 'TASK_INTAKE_OFFICER', 'TASK_REVIEWER',
   ]);
 });

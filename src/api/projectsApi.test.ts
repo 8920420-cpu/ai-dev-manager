@@ -22,7 +22,6 @@ vi.mock('./http', async () => {
 
 import { projectsApi, ProjectConflictError, PROJECTS_CHANGED_EVENT } from './projectsApi';
 import { ApiError } from './http';
-import type { CreateProjectInput } from '../types/project';
 
 beforeEach(() => {
   get.mockReset();
@@ -33,7 +32,7 @@ beforeEach(() => {
 });
 
 describe('projectsApi.list — маппинг RichProject → Project', () => {
-  it('маппит path/status/databaseId/stages(scanPath)/roles и сортирует по updatedAt', async () => {
+  it('маппит path/status/docsPath/stages(scanPath)/roles и сортирует по updatedAt', async () => {
     get.mockResolvedValue({
       projects: [
         {
@@ -41,7 +40,7 @@ describe('projectsApi.list — маппинг RichProject → Project', () => {
           name: 'Старый',
           path: 'C:/a',
           status: 'paused',
-          databaseId: null,
+          docsPath: null,
           stages: [],
           roles: [],
           createdAt: '2026-01-01T00:00:00.000Z',
@@ -52,7 +51,7 @@ describe('projectsApi.list — маппинг RichProject → Project', () => {
           name: 'Новый',
           path: 'C:/b',
           status: 'active',
-          databaseId: 'primary-postgres',
+          docsPath: 'C:/b/docs',
           stages: [
             {
               id: 'st-1',
@@ -76,89 +75,66 @@ describe('projectsApi.list — маппинг RichProject → Project', () => {
     expect(list.map((p) => p.name)).toEqual(['Новый', 'Старый']);
     const fresh = list[0]!;
     expect(fresh.path).toBe('C:/b');
-    expect(fresh.databaseId).toBe('primary-postgres');
+    expect(fresh.docsPath).toBe('C:/b/docs');
     expect(fresh.stages[0]!.scanPath).toBe('C:/watch');
     expect(fresh.stages[0]!.roleIds).toEqual(['glob-uuid-scanner']);
     expect(fresh.roles[0]!.code).toBe('SCANNER');
   });
 });
 
-describe('projectsApi.create — преобразование этапов и отсутствие proj_*', () => {
-  it('шлёт stages с roleCodes (через input.roles), не отправляет локальные id/proj_*', async () => {
+describe('projectsApi.create — основные поля проекта (без этапов/БД)', () => {
+  it('шлёт name/path/docsPath (с trim), этапы НЕ отправляет', async () => {
     post.mockResolvedValue({
       id: 'srv-uuid',
       name: 'Проект',
       path: 'C:/p',
       status: 'active',
+      docsPath: 'C:/p/docs',
       stages: [],
       roles: [],
       createdAt: 'x',
       updatedAt: 'y',
     });
 
-    const input: CreateProjectInput = {
+    const created = await projectsApi.create({
       name: '  Проект  ',
       path: '  C:/p  ',
-      roles: [
-        { id: 'role_local_1', name: 'Programmer', code: 'PROGRAMMER' },
-        { id: 'role_local_2', name: 'Scanner', code: 'SCANNER' },
-      ],
-      stages: [
-        { id: 'stage_local_1', name: 'Кодинг', enabled: true, roleIds: ['role_local_1'] },
-        {
-          id: 'stage_local_2',
-          name: 'Скан',
-          enabled: true,
-          roleIds: ['role_local_2'],
-          scanPath: 'C:/w',
-        },
-      ],
-      databaseId: 'primary-postgres',
-    };
-
-    const created = await projectsApi.create(input);
+      docsPath: '  C:/p/docs  ',
+    });
     expect(created.id).toBe('srv-uuid');
 
     const [path, body] = post.mock.calls[0]! as [string, Record<string, unknown>];
     expect(path).toBe('/api/projects');
     expect(body.name).toBe('Проект'); // trim
     expect(body.path).toBe('C:/p');
-    expect(body.databaseId).toBe('primary-postgres');
-
-    const stages = body.stages as Array<Record<string, unknown>>;
-    expect(stages).toHaveLength(2);
-    // Локальные stage_/role_ id НЕ уходят на сервер.
-    const serialized = JSON.stringify(body);
-    expect(serialized).not.toContain('proj_');
-    expect(serialized).not.toContain('stage_local');
-    expect(serialized).not.toContain('role_local');
-    // roleIds преобразованы в roleCodes.
-    expect(stages[0]!.roleCodes).toEqual(['PROGRAMMER']);
-    expect(stages[1]!.roleCodes).toEqual(['SCANNER']);
-    expect((stages[1]!.scanner as { watchDirectory: string }).watchDirectory).toBe('C:/w');
+    expect(body.docsPath).toBe('C:/p/docs');
+    // Этапы пайплайна в проекте больше не задаются.
+    expect(body.stages).toBeUndefined();
   });
 
   it('диспатчит событие PROJECTS_CHANGED_EVENT', async () => {
     post.mockResolvedValue({ id: 'x', name: 'n', path: 'p', stages: [], roles: [] });
     const handler = vi.fn();
     window.addEventListener(PROJECTS_CHANGED_EVENT, handler);
-    await projectsApi.create({ name: 'n', path: 'p', roles: [], stages: [] });
+    await projectsApi.create({ name: 'n', path: 'p' });
     expect(handler).toHaveBeenCalled();
     window.removeEventListener(PROJECTS_CHANGED_EVENT, handler);
   });
 });
 
 describe('projectsApi.update — optimistic concurrency и 409', () => {
-  it('шлёт updatedAt в теле PUT', async () => {
+  it('шлёт updatedAt и docsPath в теле PUT', async () => {
     put.mockResolvedValue({ id: 'id1', name: 'n', path: 'p', stages: [], roles: [] });
     await projectsApi.update('id1', {
       name: 'Имя',
+      docsPath: 'C:/docs',
       updatedAt: '2026-03-03T00:00:00.000Z',
     });
     const [path, body] = put.mock.calls[0]! as [string, Record<string, unknown>];
     expect(path).toBe('/api/projects/id1');
     expect(body.updatedAt).toBe('2026-03-03T00:00:00.000Z');
     expect(body.name).toBe('Имя');
+    expect(body.docsPath).toBe('C:/docs');
   });
 
   it('бросает ProjectConflictError при HTTP 409', async () => {

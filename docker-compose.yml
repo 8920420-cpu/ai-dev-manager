@@ -25,6 +25,8 @@ services:
       RUNNER_INTERVAL_MS: "3000"
       # Задайте токен, чтобы закрыть /api/* при сетевом доступе (пусто = выключено).
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      # Микросервис инструментов (builtin-чтение проекта + MCP для Claude Code).
+      TOOLS_SERVICE_URL: "http://tools-service:4188"
     networks:
       - default
       - shared-network
@@ -33,6 +35,29 @@ services:
       # 127.0.0.1, а не localhost: в alpine localhost резолвится в IPv6 ::1,
       # а сервер слушает IPv4 0.0.0.0 — иначе healthcheck даёт Connection refused.
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  tools-service:
+    build:
+      context: .
+      dockerfile: tools-service/Dockerfile
+    image: tools-service:latest
+    container_name: tools-service
+    environment:
+      TOOLS_SERVICE_PORT: "4188"
+      ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+    volumes:
+      # Корни проектов для builtin-инструментов. Проект ai-dev-manager имеет
+      # root_path "ai-dev-manager" → внутри контейнера он резолвится в
+      # /app/ai-dev-manager (WORKDIR /app). rw — чтобы работали write/edit/delete
+      # (для read-only ролей запись недоступна по уровню доступа).
+      - ./:/app/ai-dev-manager:rw
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4188/health"]
       interval: 30s
       timeout: 3s
       retries: 3
@@ -57,9 +82,18 @@ services:
       # Stage 2: обратный мост — наполнять пустой слот следующей задачей из БД.
       FEEDER_ENABLED: "true"
       FEEDER_INTERVAL_MS: "3000"
+      # Интейк (SCANNER-INTAKE-001): импорт задач из Markdown-очередей
+      # tasks/<service>.md (секции с маркером `[x]`) в БД с вырезанием секции.
+      # Включается заданием проекта-владельца; папка задач — каталог /workspace.
+      # Значение — code|name|root_path проекта (root_path стабильнее всего).
+      SCANNER_INTAKE_PROJECT: "${SCANNER_INTAKE_PROJECT:-ai-dev-manager}"
+      SCANNER_INTAKE_INTERVAL_MS: "5000"
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
     volumes:
-      - ./runtime:/workspace
+      # Единая эталонная папка задач проекта. Файл-мост claude-tasks.json и
+      # state-файл сканера лежат прямо в tasks/, чтобы не «бегать» по проекту:
+      # одна папка — один источник истины для очереди и слота Programmer.
+      - ./tasks:/workspace
     depends_on:
       orchestrator-service:
         condition: service_healthy

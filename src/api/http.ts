@@ -6,10 +6,13 @@
 
 export class ApiError extends Error {
   status: number;
-  constructor(message: string, status: number) {
+  /** Распарсенное тело ответа об ошибке (для структурированных кодов/деталей). */
+  body: unknown;
+  constructor(message: string, status: number, body?: unknown) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -63,7 +66,7 @@ async function request<T>(
       (data as { error?: string; message?: string } | undefined)?.error ||
       (data as { message?: string } | undefined)?.message ||
       `Ошибка сервера (${res.status})`;
-    throw new ApiError(msg, res.status);
+    throw new ApiError(msg, res.status, data);
   }
 
   return data as T;

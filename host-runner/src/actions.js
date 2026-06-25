@@ -25,7 +25,12 @@ export async function runPipelineAction(task, opts = {}) {
     const dir = opts.pipelineDir ?? process.env.HOST_PIPELINE_DIR ?? path.join(repoRoot, 'pipeline-runner');
     const cmd = opts.pipelineCmd ?? process.env.HOST_PIPELINE_CMD ?? 'node --test';
     config = loader.validate(
-      { name: task.service || 'host-pipeline', workingDirectory: dir, timeoutMinutes: 15, stages: { 'unit-tests': [cmd] } },
+      {
+        name: task.service || 'host-pipeline',
+        workingDirectory: dir,
+        timeoutMinutes: 15,
+        stages: { 'unit-tests': { commands: [cmd], enabled: true } },
+      },
       path.join(dir, '.pipeline.json'),
     );
   }

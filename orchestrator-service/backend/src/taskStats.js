@@ -22,6 +22,7 @@ export const STAGE_BY_STATUS = {
   BLOCKED: { stageCode: 'BLOCKED', stageName: 'Заблокировано' },
   FAILED: { stageCode: 'FAILED', stageName: 'Ошибка' },
   CANCELLED: { stageCode: 'CANCELLED', stageName: 'Отменено' },
+  WAITING_FOR_CHILDREN: { stageCode: 'WAITING_FOR_CHILDREN', stageName: 'Ожидает подзадачи' },
 };
 
 // Терминальные статусы: жизненный цикл завершён, длительности фиксируются.

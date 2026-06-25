@@ -1,0 +1,54 @@
+/* Модальное окно «Настройки этапа» (открывается из карточки блок-схемы). */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.enabledRow {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.checkbox {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+.enabledText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.enabledTitle {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.enabledHint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.scanField {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.scanBtn {
+  align-self: flex-start;
+}

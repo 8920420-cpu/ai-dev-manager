@@ -7,7 +7,16 @@ import {
   roleCanonicalCode,
 } from '../../data/presets';
 import { isStageEnabled } from '../../types/project';
-import type { Project, ProjectStatus, Role, Stage } from '../../types/project';
+import type { Project, ProjectStatus, Role, Stage, StageKind } from '../../types/project';
+
+/** Стабильный ключ узла (UUID) для ссылок рёбер блок-схемы. */
+function newStageKey(): string {
+  // crypto.randomUUID есть в браузере и в node (jsdom-тесты) — даёт UUID-формат,
+  // который требует backend (normalizeKey). Фолбэк на случай отсутствия.
+  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
+  return c?.randomUUID ? c.randomUUID() : makeId('key').replace(/[^0-9a-f]/gi, '').padEnd(32, '0').slice(0, 32)
+    .replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
+}
 
 export interface WizardState {
   name: string;
@@ -22,6 +31,7 @@ export type WizardAction =
   | { type: 'setPath'; value: string }
   | { type: 'setStatus'; value: ProjectStatus }
   | { type: 'addStage' }
+  | { type: 'addNode'; kind: StageKind }
   | { type: 'removeStage'; stageId: string }
   | { type: 'renameStage'; stageId: string; name: string }
   | { type: 'reorderStage'; from: number; to: number }
@@ -107,9 +117,32 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
         ...state,
         stages: [
           ...state.stages,
-          { id: makeId('stage'), name: '', roleIds: [], enabled: true },
+          { id: makeId('stage'), kind: 'stage', stageKey: newStageKey(), name: '', roleIds: [], enabled: true },
         ],
       };
+    case 'addNode': {
+      // FORK-JOIN-001: добавить управляющий узел (fork/join/condition) или этап.
+      const labels: Record<StageKind, string> = {
+        stage: '',
+        fork: 'Разделить',
+        join: 'Объединить',
+        condition: 'Условие',
+      };
+      return {
+        ...state,
+        stages: [
+          ...state.stages,
+          {
+            id: makeId('stage'),
+            kind: action.kind,
+            stageKey: newStageKey(),
+            name: labels[action.kind],
+            roleIds: [],
+            enabled: true,
+          },
+        ],
+      };
+    }
     case 'removeStage':
       return {
         ...state,

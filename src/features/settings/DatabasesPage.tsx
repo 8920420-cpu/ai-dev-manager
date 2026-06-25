@@ -1,22 +1,20 @@
 import { PageHeader } from '../../components/ui';
-import { ConnectedDatabasesSection } from './ConnectedDatabasesSection';
-import { DatabasesSection } from './DatabasesSection';
-import { LegacyImportSection } from './LegacyImportSection';
-import { PostgresSection } from './PostgresSection';
+import { DatabaseConnectionsSection } from './DatabaseConnectionsSection';
 import styles from './settings.module.css';
 
-/** Раздел «Настройки → Базы данных»: подключённые БД, основная PostgreSQL + дополнительные подключения. */
+/**
+ * Раздел «Настройки → Базы данных»: единый список подключений к БД.
+ * Без категорий «основная»/«дополнительная» и без переноса локальных данных —
+ * любая БД создаётся через кнопку «Подключить» (см. DATABASE-CONNECTIONS-001).
+ */
 export function DatabasesPage() {
   return (
     <div className={styles.page}>
       <PageHeader
         title="Базы данных"
-        description="Параметры подключения к базам данных. Основная PostgreSQL хранится на сервере; дополнительные подключения можно выбрать при настройке проекта."
+        description="Подключения к базам данных, доступные для выбора в проектах. Каждое подключение создаётся кнопкой «Подключить»."
       />
-      <ConnectedDatabasesSection />
-      <PostgresSection />
-      <DatabasesSection />
-      <LegacyImportSection />
+      <DatabaseConnectionsSection />
     </div>
   );
 }

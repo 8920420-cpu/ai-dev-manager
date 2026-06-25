@@ -7,7 +7,8 @@ import {
 import { StageSaveError, type StageSaveErrorItem } from '../../api/projectsApi';
 import { isStageEnabled, type Role, type Stage } from '../../types/project';
 import { wizardReducer, type WizardState } from '../projects/wizardState';
-import { StepStagesRoles } from '../projects/StepStagesRoles';
+import { SchemeFlowchart } from './SchemeFlowchart';
+import { deriveSchemeEdges } from './deriveEdges';
 import styles from './scheme.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
@@ -97,7 +98,10 @@ export function DevelopmentSchemePage() {
     setSaving(true);
     setSaveErrors([]);
     try {
-      const saved = await developmentSchemeApi.save(state.stages, state.roles);
+      // FORK-JOIN-001: рёбра выводятся из порядка узлов + маркеров fork/join
+      // (joinKey проставляется на fork). Без fork/join — edges пуст (линейная схема).
+      const derived = deriveSchemeEdges(state.stages);
+      const saved = await developmentSchemeApi.save(derived.stages, state.roles, derived.edges);
       dispatch({ type: 'reset', state: toWizardState(saved) });
       toast.success('Схема разработки сохранена и применена ко всем проектам');
     } catch (err) {
@@ -140,7 +144,7 @@ export function DevelopmentSchemePage() {
 
       {loadState === 'ready' && (
         <>
-          <StepStagesRoles
+          <SchemeFlowchart
             stages={state.stages}
             roles={state.roles}
             stageErrors={errors.stages}
@@ -150,6 +154,7 @@ export function DevelopmentSchemePage() {
             saveErrors={saveErrors}
             hideScanPath
             onAddStage={() => dispatch({ type: 'addStage' })}
+            onAddNode={(kind) => dispatch({ type: 'addNode', kind })}
             onRemoveStage={(stageId) => dispatch({ type: 'removeStage', stageId })}
             onRenameStage={(stageId, name) => dispatch({ type: 'renameStage', stageId, name })}
             onReorderStage={(from, to) => dispatch({ type: 'reorderStage', from, to })}

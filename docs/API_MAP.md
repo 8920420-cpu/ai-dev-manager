@@ -7,7 +7,7 @@
 ### `POST /api/scanner/task-completed`
 
 Scanner вызывает endpoint после появления `status: "выполнено"` в
-`runtime/claude-tasks.json`.
+`tasks/claude-tasks.json`.
 
 ```json
 {

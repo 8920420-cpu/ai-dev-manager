@@ -26,7 +26,7 @@ FROM (VALUES
     ('claude_programmer',     'Claude Programmer',           'anthropic', 'claude-opus-4-8',   'PROGRAMMER'),
     ('local_scanner',         'Local Task Scanner',           'local',     'scanner-service',   'SCANNER'),
     ('codex_task_reviewer',   'Codex Task Reviewer',         'openai',    'gpt-5-codex',       'TASK_REVIEWER'),
-    ('claude_pipeline',       'Claude Pipeline Service',     'anthropic', 'claude-sonnet-4-6', 'PIPELINE_SERVICE'),
+    ('local_pipeline',        'Local Pipeline Runner',       'local',     'pipeline-runner',   'PIPELINE_SERVICE'),
     ('claude_analyst',        'Claude Failure Analyst',      'anthropic', 'claude-opus-4-8',   'FAILURE_ANALYST'),
     ('codex_doc_auditor',     'Codex Documentation Auditor', 'openai',    'gpt-5-codex',       'DOCUMENTATION_AUDITOR'),
     ('claude_doc_keeper',     'Claude Documentation Keeper', 'anthropic', 'claude-sonnet-4-6', 'DOCUMENTATION_KEEPER'),

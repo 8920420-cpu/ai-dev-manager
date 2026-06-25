@@ -31,7 +31,7 @@ FROM (VALUES
     ('claude_programmer',        'Claude Programmer',           'anthropic', 'claude-opus-4-8',  'PROGRAMMER'),
     ('local_scanner',            'Local Task Scanner',           'local',     'scanner-service',  'SCANNER'),
     ('codex_task_reviewer',      'Codex Task Reviewer',         'openai',    'gpt-5-codex',      'TASK_REVIEWER'),
-    ('claude_pipeline',          'Claude Pipeline Service',     'anthropic', 'claude-sonnet-4-6','PIPELINE_SERVICE'),
+    ('local_pipeline',           'Local Pipeline Runner',       'local',     'pipeline-runner',  'PIPELINE_SERVICE'),
     ('claude_analyst',           'Claude Failure Analyst',      'anthropic', 'claude-opus-4-8',  'FAILURE_ANALYST'),
     ('codex_doc_auditor',        'Codex Documentation Auditor', 'openai',    'gpt-5-codex',      'DOCUMENTATION_AUDITOR'),
     ('claude_doc_keeper',        'Claude Documentation Keeper', 'anthropic', 'claude-sonnet-4-6','DOCUMENTATION_KEEPER'),
@@ -39,6 +39,38 @@ FROM (VALUES
 ) AS v(code, name, provider, model, role_code)
 JOIN roles r ON r.code = v.role_code
 ON CONFLICT (code) DO NOTHING;
+
+-- ---------------------------------------------------------------------
+-- Role groups (смысловые группы экрана «Роли») + раскладка пресетных ролей.
+-- На чистой установке роли создаются выше (после миграций), поэтому раскладку
+-- проставляем здесь. Идемпотентно: группа — по имени, привязка — только если
+-- у роли ещё нет группы (не перетираем пользовательскую раскладку).
+-- ---------------------------------------------------------------------
+INSERT INTO role_groups (name, sort_order) VALUES
+    ('Аналитика и планирование', 10),
+    ('Разработка',               20),
+    ('Контроль качества',        30),
+    ('Документация и структура', 40),
+    ('Интеграция и доставка',    50)
+ON CONFLICT (lower(name)) DO NOTHING;
+
+UPDATE roles r SET group_id = g.id
+  FROM role_groups g
+ WHERE r.group_id IS NULL
+   AND g.name = CASE r.code
+     WHEN 'ARCHITECT'             THEN 'Аналитика и планирование'
+     WHEN 'DECOMPOSER'            THEN 'Аналитика и планирование'
+     WHEN 'PROGRAMMER'            THEN 'Разработка'
+     WHEN 'SCANNER'               THEN 'Разработка'
+     WHEN 'TASK_REVIEWER'         THEN 'Контроль качества'
+     WHEN 'PIPELINE_SERVICE'      THEN 'Контроль качества'
+     WHEN 'FAILURE_ANALYST'       THEN 'Контроль качества'
+     WHEN 'DOCUMENTATION_AUDITOR' THEN 'Документация и структура'
+     WHEN 'DOCUMENTATION_KEEPER'  THEN 'Документация и структура'
+     WHEN 'STRUCTURE_KEEPER'      THEN 'Документация и структура'
+     WHEN 'GIT_INTEGRATOR'        THEN 'Интеграция и доставка'
+     ELSE NULL
+   END;
 
 -- ---------------------------------------------------------------------
 -- Prompts (версия 1, активная — по одной на роль)

@@ -30,6 +30,7 @@ import {
 } from './connectors.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
+import { getTaskTree } from './taskTree.js';
 import {
   listProjectsRich,
   getProject,
@@ -353,6 +354,10 @@ export function createApp() {
             200,
             await releaseHostTask(await loadSettings(), (await readBody(req)).taskId),
           );
+
+        // Дерево задач для UI: Проект → Задача → Подзадача (read-only).
+        if (req.method === 'GET' && p === '/api/tasks/tree')
+          return sendJson(res, 200, await getTaskTree(await loadSettings()));
 
         // --- Единая «Схема разработки» (общий конвейер ролей для всех проектов) ---
         if (p === '/api/development-scheme') {

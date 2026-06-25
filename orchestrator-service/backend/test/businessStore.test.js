@@ -32,14 +32,14 @@ test('validateStatus: только active|paused|draft|archived валидны',
 
 // --- projects: mapProjectRow -----------------------------------------------
 
-test('mapProjectRow: path = root_path, есть алиас rootPath, databaseId = database_ref', () => {
+test('mapProjectRow: path = root_path, есть алиас rootPath, docsPath = docs_path', () => {
   const row = {
     id: 'uuid-1',
     code: 'MY_PROJ',
     name: 'Мой проект',
     root_path: 'K:\\projects\\my',
     status: 'paused',
-    database_ref: 'primary-postgres',
+    docs_path: 'K:\\projects\\my\\docs',
     created_at: new Date('2026-01-01T10:00:00Z'),
     updated_at: new Date('2026-01-02T11:00:00Z'),
   };
@@ -50,17 +50,17 @@ test('mapProjectRow: path = root_path, есть алиас rootPath, databaseId 
   assert.equal(out.path, 'K:\\projects\\my');
   assert.equal(out.rootPath, 'K:\\projects\\my'); // алиас совместимости
   assert.equal(out.status, 'paused');
-  assert.equal(out.databaseId, 'primary-postgres');
+  assert.equal(out.docsPath, 'K:\\projects\\my\\docs');
   assert.deepEqual(out.stages, [{ id: 's1' }]);
   assert.deepEqual(out.roles, [{ id: 'r1', code: 'PROGRAMMER', name: 'Programmer' }]);
   assert.equal(out.createdAt, '2026-01-01T10:00:00.000Z');
   assert.equal(out.updatedAt, '2026-01-02T11:00:00.000Z');
 });
 
-test('mapProjectRow: значения по умолчанию (status=active, databaseId=null, пустые stages/roles)', () => {
+test('mapProjectRow: значения по умолчанию (status=active, docsPath=null, пустые stages/roles)', () => {
   const out = mapProjectRow({ id: 'u', code: 'C', name: 'N', root_path: null });
   assert.equal(out.status, 'active');
-  assert.equal(out.databaseId, null);
+  assert.equal(out.docsPath, null);
   assert.equal(out.path, null);
   assert.equal(out.rootPath, null);
   assert.deepEqual(out.stages, []);

@@ -16,7 +16,7 @@
 | `review/` | review | `[R]` | Код готов, идёт ревью. |
 | `qa/` | qa | — | Проверка: тесты/pipeline/smoke. |
 | `blocked/` | blocked | `[!]` | Заблокировано; в теле обязателен раздел причины. |
-| `done/` | done | `[x]` | Завершено и проверено. |
+| `done/` | done | `[x]` | Programmer закончил → сигнал Scanner забрать задачу в БД и вырезать секцию. |
 | `archive/` | archive | — | История и legacy-постановки. |
 
 ## Обязательные поля task-файла
@@ -30,10 +30,31 @@ YAML-frontmatter обязан содержать: `id`, `status`, `service`, `pr
 При переходе задачи на следующую стадию её файл перемещается в соответствующую папку, а поле `status`
 во frontmatter обновляется синхронно. Один файл = одна задача.
 
+## Очереди сервисов и Scanner
+
+Помимо стадий-папок, задачи живут в **Markdown-очередях по сервису** — `tasks/<service>.md`
+(`orchestrator-service.md`, `frontend.md`, …). Внутри список задач секциями
+`### [маркер] PX.Y <ID> — <title>`, файл начинается с frontmatter с кодом сервиса:
+
+```
+---
+service: ORCHESTRATOR
+---
+# orchestrator-service
+…
+### [ ] P0.1 PIPELINE-STAGE-CONFIG-001 — контракт …
+```
+
+Когда Programmer заканчивает задачу, он ставит её маркер в `[x]`. Scanner (intake) находит секции
+`[x]`, отправляет их оркестратору (`POST /api/scanner/task-intake` → `externalId = <SERVICE>-<PX.Y>`,
+`service` из frontmatter) и **вырезает секцию из файла**. Дальше задача живёт только в БД
+(`REVIEW` → … → `DONE`); остальные стадии не отражаются перемещением файла. Идемпотентность —
+по `UNIQUE (project_id, external_id)` в БД.
+
 ## Прямая постановка (пока роли до Programmer не работают)
 
 Задачу пишут сразу в `ready/` со `status: ready` — её забирает Programmer. Для прямой постановки через
-слот `runtime/claude-tasks.json` используется `status: "готово к работе"` (см. раздел «Прямая постановка
+слот `tasks/claude-tasks.json` используется `status: "готово к работе"` (см. раздел «Прямая постановка
 задачи» в корневом [TASKS.md](../TASKS.md)).
 
 ## Архив legacy-постановок

@@ -200,11 +200,14 @@ export async function listExchanges(connectorId, { limit = 200 } = {}) {
 
 /**
  * Вызвать ИИ через коннектор и записать обмен в журнал.
- * input: { system?, user?, prompt?, isManual? } — prompt = user (совместимость).
+ * Канонический контракт: input = { system?, user?, isManual? }. Единственное
+ * пользовательское поле — `user`; legacy-alias `input.prompt` удалён
+ * (см. tasks → ORCHESTRATOR-P2.2). Старый payload `{ prompt }` без `user`/`system`
+ * получает стабильную 422-ошибку `prompt_required`, а не молчаливо принимается.
  * Жизненный цикл записи: Создан → отправлен → завершен/ошибка (как в источнике).
  */
 export async function invokeConnector(connectorId, input = {}) {
-  const user = String(input.user ?? input.prompt ?? '').trim();
+  const user = String(input.user ?? '').trim();
   const system = String(input.system ?? '').trim();
   if (user === '' && system === '') throw httpError(422, 'prompt_required');
   const isManual = input.isManual !== false; // вызовы через UI считаем ручными

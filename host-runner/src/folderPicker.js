@@ -6,18 +6,35 @@
 import { spawn } from 'node:child_process';
 import { platform } from 'node:os';
 
-// STA-поток + TopMost-форма, чтобы диалог не уходил за окна. Путь печатаем в
-// UTF-8, чтобы корректно отдавать кириллицу (K:\Роботы\…).
+// STA-поток + видимый-но-прозрачный TopMost owner, чтобы системный диалог НЕ
+// уходил за окно браузера. Раньше owner-форма только создавалась (TopMost), но
+// не показывалась и не активировалась — у модального диалога не было реального
+// переднего родителя, и он открывался ЗА браузером (пользователь не видел его и
+// думал, что «ничего не происходит»). Show()+Activate() невидимой формы делает
+// её активным передним окном, поэтому FolderBrowserDialog всплывает поверх всех.
+// Путь печатаем в UTF-8, чтобы корректно отдавать кириллицу (K:\Роботы\…).
 const PS_SCRIPT = `
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
-$owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true; ShowInTaskbar = $false }
+Add-Type -AssemblyName System.Drawing
+$owner = New-Object System.Windows.Forms.Form
+$owner.StartPosition = 'Manual'
+$owner.Location = New-Object System.Drawing.Point(-3000, -3000)
+$owner.Size = New-Object System.Drawing.Size(1, 1)
+$owner.ShowInTaskbar = $false
+$owner.TopMost = $true
+$owner.Opacity = 0
+$owner.Show()
+$owner.Activate()
+[System.Windows.Forms.Application]::DoEvents()
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.Description = 'Выберите папку для сканера'
 $dialog.ShowNewFolderButton = $true
-if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+$result = $dialog.ShowDialog($owner)
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
   [Console]::Out.Write($dialog.SelectedPath)
 }
+$owner.Close()
 $owner.Dispose()
 `;
 

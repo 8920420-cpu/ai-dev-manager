@@ -17,6 +17,7 @@ import type { Project } from '../../types/project';
 import { ProjectCard } from './ProjectCard';
 import { CreateProjectModal } from './CreateProjectModal';
 import { ProjectMonitor } from './ProjectMonitor';
+import { ProjectPauseBanner } from './ProjectPauseBanner';
 import styles from './ConnectedProjectsPage.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
@@ -116,6 +117,7 @@ export function ConnectedProjectsPage() {
   if (monitorProject) {
     return (
       <div className={styles.page}>
+        <ProjectPauseBanner project={monitorProject} onResumed={handleSaved} />
         <ProjectMonitor
           project={monitorProject}
           onBack={() => setMonitorProject(null)}
@@ -188,6 +190,7 @@ export function ConnectedProjectsPage() {
               onOpen={handleOpenProject}
               onEdit={openEdit}
               onDelete={setDeleteTarget}
+              onUpdated={handleSaved}
             />
           ))}
         </div>
