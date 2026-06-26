@@ -87,7 +87,10 @@ export async function runGitAction(task, opts = {}) {
   // Репозиторий может быть ещё не создан — инициализируем автоматически.
   const repo = await ensureRepo(repoRoot);
 
-  await git(repoRoot, ['add', '--', ...files]);
+  // -A: чтобы git зафиксировал не только модификации/добавления, но и УДАЛЕНИЯ
+  // перечисленных путей. Без -A `git add -- <удалённый файл>` падает с
+  // fatal: pathspec ... did not match any files и роняет весь коммит задачи.
+  await git(repoRoot, ['add', '-A', '--', ...files]);
   const staged = await git(repoRoot, ['diff', '--cached', '--name-only']);
   const stagedFiles = staged.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
   if (stagedFiles.length === 0) {

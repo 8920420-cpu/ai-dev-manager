@@ -1,9 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { Database, FileText, Plus, Trash2, Upload } from 'lucide-react';
 import {
+  Badge,
   Button,
   Callout,
   ConfirmDialog,
+  ConnectionBadge,
   LoadingBlock,
   Modal,
   Select,
@@ -12,6 +14,8 @@ import {
 } from '../../components/ui';
 import { rolesApi } from '../../api/rolesApi';
 import { toolsApi } from '../../api/toolsApi';
+import { integrationsApi } from '../../api/integrationsApi';
+import { roleConnectionsApi } from '../../api/roleConnectionsApi';
 import {
   TOOL_CAPABILITIES,
   TOOL_CAPABILITY_LABEL,
@@ -22,6 +26,7 @@ import {
   type Tool,
   type ToolCapability,
 } from '../../types/settings';
+import type { Integration } from '../../types/integration';
 import { RoleFieldsModal } from './RoleFieldsModal';
 import styles from './RoleCardModal.module.css';
 
@@ -56,6 +61,12 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
   const loadedCaps = useRef<string>('[]');
   const loadedMcp = useRef<string>('[]');
 
+  // Назначение интеграции (коннектора) роли — перенесено сюда из бывшей секции
+  // «Роли и подключения». Источник истины — roleConnectionsApi (/api/role-connectors).
+  const [integrations, setIntegrations] = useState<Integration[]>([]);
+  const [integrationId, setIntegrationId] = useState<string>('');
+  const loadedIntegration = useRef<string>('');
+
   const [available, setAvailable] = useState<SkillFile[]>([]);
   const [loadingSkills, setLoadingSkills] = useState(false);
   const [skillsError, setSkillsError] = useState(false);
@@ -81,6 +92,8 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
     setSaving(false);
     setConfirmClose(false);
     setFieldsOpen(false);
+    setIntegrationId('');
+    loadedIntegration.current = '';
 
     const ctrl = new AbortController();
     setLoadingSkills(true);
@@ -116,6 +129,20 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
         /* инструменты недоступны — карточка остаётся рабочей без них */
       });
 
+    // Интеграции (коннекторы) + текущее назначение для этой роли.
+    Promise.all([integrationsApi.list(), roleConnectionsApi.list()])
+      .then(([intgs, assignments]) => {
+        if (ctrl.signal.aborted) return;
+        setIntegrations(intgs);
+        const current = assignments.find((a) => a.role === role.code);
+        const value = current?.integrationId ?? '';
+        setIntegrationId(value);
+        loadedIntegration.current = value;
+      })
+      .catch(() => {
+        /* интеграции недоступны — карточка остаётся рабочей без них */
+      });
+
     return () => ctrl.abort();
   }, [open, role]);
 
@@ -127,9 +154,10 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
       groupId !== (role.groupId ?? '') ||
       JSON.stringify(skills) !== JSON.stringify(role.skills ?? []) ||
       JSON.stringify([...capabilities].sort()) !== loadedCaps.current ||
-      JSON.stringify([...mcpToolIds].sort()) !== loadedMcp.current
+      JSON.stringify([...mcpToolIds].sort()) !== loadedMcp.current ||
+      integrationId !== loadedIntegration.current
     );
-  }, [role, description, prompt, groupId, skills, capabilities, mcpToolIds]);
+  }, [role, description, prompt, groupId, skills, capabilities, mcpToolIds, integrationId]);
 
   function toggleCapability(cap: ToolCapability) {
     setCapabilities((prev) => (prev.includes(cap) ? prev.filter((c) => c !== cap) : [...prev, cap]));
@@ -140,6 +168,11 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
   }
 
   const mcpTools = useMemo(() => allTools.filter((t) => t.kind === 'mcp'), [allTools]);
+
+  const selectedIntegration = useMemo(
+    () => integrations.find((i) => i.id === integrationId),
+    [integrations, integrationId],
+  );
 
   /** Skills, которые ещё не подключены к роли (можно добавить). */
   const addableSkills = useMemo(
@@ -211,6 +244,12 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
       // Уровни доступа и назначенные MCP-инструменты сохраняем отдельными вызовами.
       await toolsApi.saveCapabilities(role.code, capabilities);
       await toolsApi.saveRoleTools(role.code, mcpToolIds);
+      // Назначение интеграции сохраняем только при изменении. PUT — upsert по
+      // коду роли (см. roleConnectors.js), прочие назначения не затрагиваются.
+      if (integrationId !== loadedIntegration.current) {
+        await roleConnectionsApi.saveAll([roleConnectionsApi.make(role.code, integrationId)]);
+        loadedIntegration.current = integrationId;
+      }
       onSaved(saved);
       toast.success(`Роль «${saved.name}» сохранена`);
       onClose();
@@ -273,6 +312,38 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
                 </option>
               ))}
             </Select>
+
+            <div className={styles.integrationRow}>
+              <div className={styles.integrationSelect}>
+                <Select
+                  label="Интеграция (коннектор)"
+                  value={integrationId}
+                  onChange={(e) => setIntegrationId(e.target.value)}
+                  disabled={integrations.length === 0}
+                  helper="Коннектор AI-провайдера, через который роль обращается к модели."
+                >
+                  <option value="">— не назначено —</option>
+                  {integrations.map((intg) => (
+                    <option key={intg.id} value={intg.id}>
+                      {intg.name}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+              <div className={styles.integrationStatus}>
+                {selectedIntegration ? (
+                  <ConnectionBadge state={selectedIntegration.status ?? 'unknown'} />
+                ) : (
+                  <Badge tone="neutral">Не назначено</Badge>
+                )}
+              </div>
+            </div>
+
+            {integrations.length === 0 && (
+              <Callout tone="info" title="Нет доступных интеграций">
+                Добавьте коннекторы в разделе «Интеграции», чтобы назначить их роли.
+              </Callout>
+            )}
 
             <Textarea
               label="Рабочий промт"

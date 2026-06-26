@@ -40,6 +40,7 @@ test('mapProjectRow: path = root_path, есть алиас rootPath, docsPath = 
     root_path: 'K:\\projects\\my',
     status: 'paused',
     docs_path: 'K:\\projects\\my\\docs',
+    tasks_path: 'K:\\projects\\my\\tasks',
     created_at: new Date('2026-01-01T10:00:00Z'),
     updated_at: new Date('2026-01-02T11:00:00Z'),
   };
@@ -51,6 +52,7 @@ test('mapProjectRow: path = root_path, есть алиас rootPath, docsPath = 
   assert.equal(out.rootPath, 'K:\\projects\\my'); // алиас совместимости
   assert.equal(out.status, 'paused');
   assert.equal(out.docsPath, 'K:\\projects\\my\\docs');
+  assert.equal(out.tasksPath, 'K:\\projects\\my\\tasks');
   assert.deepEqual(out.stages, [{ id: 's1' }]);
   assert.deepEqual(out.roles, [{ id: 'r1', code: 'PROGRAMMER', name: 'Programmer' }]);
   assert.equal(out.createdAt, '2026-01-01T10:00:00.000Z');
@@ -61,6 +63,7 @@ test('mapProjectRow: значения по умолчанию (status=active, do
   const out = mapProjectRow({ id: 'u', code: 'C', name: 'N', root_path: null });
   assert.equal(out.status, 'active');
   assert.equal(out.docsPath, null);
+  assert.equal(out.tasksPath, null);
   assert.equal(out.path, null);
   assert.equal(out.rootPath, null);
   assert.deepEqual(out.stages, []);

@@ -30,6 +30,19 @@ test('parseVerdict: не-объект и мусор => null', () => {
   assert.equal(parseVerdict(''), null);
 });
 
+// SILENT-FAIL-GUARD-001 (B): ответ DeepSeek с tool-call разметкой DSML (без финального
+// JSON) НЕ должен распознаваться как вердикт → parsed=null → роль помечается «не выполнен».
+test('parseVerdict: DeepSeek DSML tool-calls без JSON => null (триггер failRoleUnparsed)', () => {
+  const dsml = [
+    '<｜｜DSML｜｜tool_calls>',
+    '<｜｜DSML｜｜invoke name="read_file">',
+    '<｜｜DSML｜｜parameter name="path" string="true">src/types/settings.ts</｜｜DSML｜｜parameter>',
+    '</｜｜DSML｜｜invoke>',
+    '</｜｜DSML｜｜tool_calls>',
+  ].join('\n');
+  assert.equal(parseVerdict(dsml), null);
+});
+
 test('normalizeVerdict: успех/провал/неизвестно', () => {
   assert.equal(normalizeVerdict('TASK_REVIEWER', { status: 'APPROVED' }).ok, true);
   assert.equal(normalizeVerdict('TASK_REVIEWER', { status: 'NEEDS_FIX' }).ok, false);

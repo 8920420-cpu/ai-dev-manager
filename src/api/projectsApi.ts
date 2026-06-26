@@ -58,8 +58,10 @@ interface RichProject {
   status?: ProjectStatus;
   /** Причина паузы (когда status === 'paused'). */
   pauseReason?: string | null;
-  /** Папка документов проекта (за ней следит Scanner). */
+  /** Папка документов проекта («карта»). */
   docsPath?: string | null;
+  /** Папка задач проекта (за ней следит Scanner). */
+  tasksPath?: string | null;
   /** Включён ли автоприём задач Scanner. */
   scannerEnabled?: boolean;
   stages?: RichStage[];
@@ -100,6 +102,7 @@ function fromRich(rich: RichProject): Project {
     stages: (rich.stages ?? []).map(mapStage),
     roles: (rich.roles ?? []).map(mapRole),
     docsPath: rich.docsPath ?? undefined,
+    tasksPath: rich.tasksPath ?? undefined,
     scannerEnabled: rich.scannerEnabled === true,
     createdAt: rich.createdAt ?? now,
     updatedAt: rich.updatedAt ?? now,
@@ -227,6 +230,7 @@ export const projectsApi = {
       path: input.path.trim(),
       status: 'active' as ProjectStatus,
       docsPath: input.docsPath?.trim() ?? null,
+      tasksPath: input.tasksPath?.trim() ?? null,
     };
     const created = fromRich(await http.post<RichProject>('/api/projects', body));
     emitProjectsChanged();
@@ -239,6 +243,7 @@ export const projectsApi = {
     if (patch.path !== undefined) body.path = patch.path.trim();
     if (patch.status !== undefined) body.status = patch.status;
     if (patch.docsPath !== undefined) body.docsPath = patch.docsPath?.trim() ?? null;
+    if (patch.tasksPath !== undefined) body.tasksPath = patch.tasksPath?.trim() ?? null;
     // Токен optimistic concurrency.
     if (patch.updatedAt !== undefined) body.updatedAt = patch.updatedAt;
 

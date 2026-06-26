@@ -30,7 +30,8 @@ import {
 } from './connectors.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
-import { getTaskTree, getTaskStatusCounts } from './taskTree.js';
+import { getTaskTree, getTaskStatusCounts, getTasksByStage, getTaskHistory } from './taskTree.js';
+import { openTaskEventsStream, publishTaskChange } from './taskEvents.js';
 import {
   listProjectsRich,
   getProject,
@@ -116,11 +117,13 @@ const FRONTEND_DIR =
 // сетевом развёртывании токен обязателен — API создаёт БД и меняет настройки.
 const API_TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
 
-function isAuthorized(req) {
+function isAuthorized(req, { allowQueryToken = false } = {}) {
   if (!API_TOKEN) return true;
   const auth = req.headers['authorization'];
+  const url = new URL(req.url || '/', 'http://localhost');
   if (auth && auth.startsWith('Bearer ') && auth.slice(7) === API_TOKEN) return true;
   if (req.headers['x-api-token'] === API_TOKEN) return true;
+  if (allowQueryToken && url.searchParams.get('token') === API_TOKEN) return true;
   return false;
 }
 
@@ -293,7 +296,12 @@ export function createApp() {
 
         // /health и /api/version открыты для healthcheck; всё остальное под /api
         // требует токен, если он сконфигурирован.
-        if (!isAuthorized(req)) return sendJson(res, 401, { error: 'unauthorized' });
+        if (!isAuthorized(req, { allowQueryToken: p === '/api/tasks/events' }))
+          return sendJson(res, 401, { error: 'unauthorized' });
+
+        if (req.method === 'GET' && p === '/api/tasks/events') {
+          return openTaskEventsStream(req, res);
+        }
 
         if (req.method === 'GET' && p === '/api/settings')
           return sendJson(res, 200, redactSettings(await loadSettings()));
@@ -321,48 +329,56 @@ export function createApp() {
         if (req.method === 'GET' && p === '/api/databases')
           return sendJson(res, 200, await listDatabases(await loadSettings()));
 
-        if (req.method === 'POST' && p === '/api/scanner/task-completed')
-          return sendJson(
-            res,
-            200,
-            await acceptScannerCompletion(await loadSettings(), await readBody(req)),
-          );
+        if (req.method === 'POST' && p === '/api/scanner/task-completed') {
+          const result = await acceptScannerCompletion(await loadSettings(), await readBody(req));
+          publishTaskChange('scanner_task_completed', { taskId: result?.task?.id ?? result?.taskId ?? null });
+          return sendJson(res, 200, result);
+        }
 
         // Интейк из файловой очереди tasks/*.md: импорт задачи со статусом
         // «выполнено» в БД (идемпотентно по external_id) → дальше runner ведёт цепочку.
-        if (req.method === 'POST' && p === '/api/scanner/task-intake')
-          return sendJson(
-            res,
-            200,
-            await acceptScannerIntake(await loadSettings(), await readBody(req)),
-          );
+        if (req.method === 'POST' && p === '/api/scanner/task-intake') {
+          const result = await acceptScannerIntake(await loadSettings(), await readBody(req));
+          publishTaskChange('scanner_task_intake', { taskId: result?.taskId ?? result?.id ?? null });
+          return sendJson(res, 200, result);
+        }
 
         // Обратный мост БД → файл: выдать Scanner-фидеру следующую задачу для Claude.
-        if (req.method === 'GET' && p === '/api/runner/next-claude-task')
-          return sendJson(res, 200, await claimNextClaudeTask(await loadSettings()));
+        if (req.method === 'GET' && p === '/api/runner/next-claude-task') {
+          const result = await claimNextClaudeTask(await loadSettings());
+          if (result?.task) publishTaskChange('claude_task_claimed', { taskId: result.task.id ?? null });
+          return sendJson(res, 200, result);
+        }
 
         // Откат захвата, если фидер не смог записать файл.
-        if (req.method === 'POST' && p === '/api/runner/release-claude-task')
-          return sendJson(
-            res,
-            200,
-            await releaseClaudeTask(await loadSettings(), (await readBody(req)).taskId),
-          );
+        if (req.method === 'POST' && p === '/api/runner/release-claude-task') {
+          const taskId = (await readBody(req)).taskId;
+          const result = await releaseClaudeTask(await loadSettings(), taskId);
+          publishTaskChange('claude_task_released', { taskId });
+          return sendJson(res, 200, result);
+        }
 
         // Host-мост: роли действия (PIPELINE_SERVICE/GIT_INTEGRATOR) исполняет
         // нативный host-runner — здесь он берёт задачу и сдаёт результат.
-        if (req.method === 'GET' && p === '/api/runner/next-host-task')
-          return sendJson(res, 200, await claimNextHostTask(await loadSettings(), url.searchParams.get('role')));
+        if (req.method === 'GET' && p === '/api/runner/next-host-task') {
+          const result = await claimNextHostTask(await loadSettings(), url.searchParams.get('role'));
+          if (result?.task) publishTaskChange('host_task_claimed', { taskId: result.task.id ?? null });
+          return sendJson(res, 200, result);
+        }
 
-        if (req.method === 'POST' && p === '/api/runner/host-task-completed')
-          return sendJson(res, 200, await completeHostTask(await loadSettings(), await readBody(req)));
+        if (req.method === 'POST' && p === '/api/runner/host-task-completed') {
+          const body = await readBody(req);
+          const result = await completeHostTask(await loadSettings(), body);
+          publishTaskChange('host_task_completed', { taskId: body.taskId ?? null });
+          return sendJson(res, 200, result);
+        }
 
-        if (req.method === 'POST' && p === '/api/runner/release-host-task')
-          return sendJson(
-            res,
-            200,
-            await releaseHostTask(await loadSettings(), (await readBody(req)).taskId),
-          );
+        if (req.method === 'POST' && p === '/api/runner/release-host-task') {
+          const taskId = (await readBody(req)).taskId;
+          const result = await releaseHostTask(await loadSettings(), taskId);
+          publishTaskChange('host_task_released', { taskId });
+          return sendJson(res, 200, result);
+        }
 
         // Дерево задач для UI: Проект → Задача → Подзадача (read-only).
         if (req.method === 'GET' && p === '/api/tasks/tree')
@@ -371,6 +387,22 @@ export function createApp() {
         // Счётчики задач по статусам (этапам) для «Схемы разработки» (read-only).
         if (req.method === 'GET' && p === '/api/tasks/stats')
           return sendJson(res, 200, await getTaskStatusCounts(await loadSettings()));
+
+        // Задачи, прошедшие через конкретный этап схемы, и его результат (read-only).
+        if (req.method === 'GET' && p === '/api/tasks/by-stage')
+          return sendJson(
+            res,
+            200,
+            await getTasksByStage(await loadSettings(), url.searchParams.get('roleId')),
+          );
+
+        // Хронология задачи: что сделала каждая роль по конкретной задаче (read-only).
+        if (req.method === 'GET' && p === '/api/tasks/history')
+          return sendJson(
+            res,
+            200,
+            await getTaskHistory(await loadSettings(), url.searchParams.get('taskId')),
+          );
 
         // --- Единая «Схема разработки» (общий конвейер ролей для всех проектов) ---
         if (p === '/api/development-scheme') {

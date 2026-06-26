@@ -1,0 +1,23 @@
+{
+  "name": "mcp-service",
+  "version": "1.0.0",
+  "description": "MCP-сервер AI Dev Manager: тонкий адаптер MCP → HTTP API поверх tools-service и orchestrator-service (stdio + опциональный HTTP/SSE).",
+  "type": "module",
+  "main": "bin/mcp-service.js",
+  "bin": {
+    "mcp-service": "bin/mcp-service.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/mcp-service.js",
+    "start:http": "node bin/mcp-service.js --http",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.23.8"
+  },
+  "license": "MIT"
+}

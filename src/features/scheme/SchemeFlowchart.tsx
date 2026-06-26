@@ -26,6 +26,7 @@ const KIND_META: Record<Exclude<StageKind, 'stage'>, { label: string; hint: stri
   condition: { label: 'Условие', hint: 'Ветвление по исходу: задача идёт по одной из веток' },
 };
 import { StageSettingsModal } from './StageSettingsModal';
+import { StageTasksModal } from './StageTasksModal';
 import { TasksTreeModal } from './TasksTreeModal';
 import styles from './SchemeFlowchart.module.css';
 
@@ -43,6 +44,8 @@ interface SchemeFlowchartProps {
   generalError?: string | null;
   /** Скрыть поле папки Scanner (единая схема — папка берётся из проекта). */
   hideScanPath?: boolean;
+  /** Число задач по статусам (этапам) для бейджа-счётчика на карточке. */
+  taskCounts?: Record<string, number>;
   onAddStage: () => void;
   /** FORK-JOIN-001: добавить узел блок-схемы заданного типа (fork/join/condition/stage). */
   onAddNode?: (kind: StageKind) => void;
@@ -70,6 +73,7 @@ export function SchemeFlowchart({
   saveErrors,
   generalError,
   hideScanPath = false,
+  taskCounts = {},
   onAddStage,
   onAddNode,
   onRemoveStage,
@@ -85,7 +89,8 @@ export function SchemeFlowchart({
   const [overIndex, setOverIndex] = useState<number | null>(null);
   const [dragEnabledIndex, setDragEnabledIndex] = useState<number | null>(null);
   const [openStageId, setOpenStageId] = useState<string | null>(null);
-  const [tasksOpen, setTasksOpen] = useState(false);
+  const [tasksStageId, setTasksStageId] = useState<string | null>(null);
+  const [treeOpen, setTreeOpen] = useState(false);
   const [confirmDefaults, setConfirmDefaults] = useState(false);
 
   const handleDrop = (target: number) => {
@@ -130,6 +135,11 @@ export function SchemeFlowchart({
   const openStage = stages.find((s) => s.id === openStageId) ?? null;
   const openIndex = openStage ? stages.findIndex((s) => s.id === openStage.id) : -1;
 
+  const tasksStage = stages.find((s) => s.id === tasksStageId) ?? null;
+  const tasksStageIndex = tasksStage ? stages.findIndex((s) => s.id === tasksStage.id) : -1;
+  const tasksStageName =
+    tasksStage?.name.trim() || (tasksStage ? `Этап ${tasksStageIndex + 1}` : '');
+
   return (
     <div className={styles.wrap}>
       {generalError && (
@@ -168,14 +178,24 @@ export function SchemeFlowchart({
             чтобы изменить порядок.
           </p>
         </div>
-        <Button
-          variant="ghost"
-          size="sm"
-          leftIcon={<Wand2 size={16} aria-hidden="true" />}
-          onClick={() => setConfirmDefaults(true)}
-        >
-          По умолчанию
-        </Button>
+        <div className={styles.headActions}>
+          <Button
+            variant="ghost"
+            size="sm"
+            leftIcon={<ListTree size={16} aria-hidden="true" />}
+            onClick={() => setTreeOpen(true)}
+          >
+            Все задачи
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            leftIcon={<Wand2 size={16} aria-hidden="true" />}
+            onClick={() => setConfirmDefaults(true)}
+          >
+            По умолчанию
+          </Button>
+        </div>
       </div>
 
       {onAddNode && (
@@ -235,6 +255,8 @@ export function SchemeFlowchart({
           );
           const stageLabel =
             stage.name.trim() || (control ? KIND_META[kind].label : `Этап ${index + 1}`);
+          // Число задач сейчас на этом этапе (по статусу этапа, по всем проектам).
+          const taskCount = stage.taskStatus ? taskCounts[stage.taskStatus] ?? 0 : 0;
 
           return (
             <li key={stage.id} className={styles.nodeWrap}>
@@ -354,10 +376,16 @@ export function SchemeFlowchart({
                       <button
                         type="button"
                         className={styles.tasksBtn}
-                        onClick={() => setTasksOpen(true)}
+                        onClick={() => setTasksStageId(stage.id)}
                       >
                         <ListTree size={15} aria-hidden="true" />
                         Задачи
+                        <span
+                          className={cn(styles.taskCount, taskCount > 0 && styles.taskCountActive)}
+                          title={`Задач на этом этапе сейчас: ${taskCount}`}
+                        >
+                          {taskCount}
+                        </span>
                       </button>
                     </div>
                   </>
@@ -401,7 +429,14 @@ export function SchemeFlowchart({
         />
       )}
 
-      <TasksTreeModal open={tasksOpen} onClose={() => setTasksOpen(false)} />
+      <StageTasksModal
+        open={tasksStage !== null}
+        onClose={() => setTasksStageId(null)}
+        roleId={tasksStage?.roleIds[0] ?? null}
+        stageName={tasksStageName}
+      />
+
+      <TasksTreeModal open={treeOpen} onClose={() => setTreeOpen(false)} />
 
       <ConfirmDialog
         open={confirmDefaults}

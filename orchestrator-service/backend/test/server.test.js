@@ -54,6 +54,26 @@ test('GET /api/settings без токена → 401', async (t) => {
   assert.equal(res.status, 401);
 });
 
+test('GET /api/tasks/events без токена → 401', async (t) => {
+  const base = await startServer(t);
+  const res = await fetch(`${base}/api/tasks/events`);
+  assert.equal(res.status, 401);
+});
+
+test('GET /api/tasks/events с query-токеном открывает event-stream', async (t) => {
+  const base = await startServer(t);
+  const ctrl = new AbortController();
+  t.after(() => ctrl.abort());
+  const res = await fetch(`${base}/api/tasks/events?token=test-token`, { signal: ctrl.signal });
+  assert.equal(res.status, 200);
+  assert.match(res.headers.get('content-type') || '', /^text\/event-stream/);
+  const reader = res.body.getReader();
+  const { value } = await reader.read();
+  const text = new TextDecoder().decode(value);
+  assert.match(text, /event: ready/);
+  await reader.cancel();
+});
+
 test('GET /api/settings с токеном → 200 и без пароля', async (t) => {
   await saveSettings({ password: 'super-secret' });
   const base = await startServer(t);

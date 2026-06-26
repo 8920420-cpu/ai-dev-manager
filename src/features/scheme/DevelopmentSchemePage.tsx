@@ -4,6 +4,7 @@ import {
   developmentSchemeApi,
   type DevelopmentScheme,
 } from '../../api/developmentSchemeApi';
+import { subscribeTaskChanges, tasksApi } from '../../api/tasksApi';
 import { StageSaveError, type StageSaveErrorItem } from '../../api/projectsApi';
 import { isStageEnabled, type Role, type Stage } from '../../types/project';
 import { wizardReducer, type WizardState } from '../projects/wizardState';
@@ -68,6 +69,7 @@ export function DevelopmentSchemePage() {
   });
   const [errors, setErrors] = useState<SchemeErrors>(EMPTY_ERRORS);
   const [saveErrors, setSaveErrors] = useState<StageSaveErrorItem[]>([]);
+  const [taskCounts, setTaskCounts] = useState<Record<string, number>>({});
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(async () => {
@@ -81,9 +83,31 @@ export function DevelopmentSchemePage() {
     }
   }, []);
 
+  // Счётчики задач по этапам (статусам) — обновляем при загрузке и периодически.
+  const loadCounts = useCallback(async (signal?: AbortSignal) => {
+    try {
+      const stats = await tasksApi.stats(signal);
+      if (!signal?.aborted) setTaskCounts(stats.byStatus);
+    } catch {
+      /* счётчики некритичны — молча игнорируем */
+    }
+  }, []);
+
   useEffect(() => {
     void load();
   }, [load]);
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    void loadCounts(ctrl.signal);
+    const unsubscribe = subscribeTaskChanges(() => void loadCounts());
+    const id = setInterval(() => void loadCounts(), 30000);
+    return () => {
+      ctrl.abort();
+      unsubscribe();
+      clearInterval(id);
+    };
+  }, [loadCounts]);
 
   const handleSave = async () => {
     const next = validateScheme(state.stages);
@@ -153,6 +177,7 @@ export function DevelopmentSchemePage() {
             generalError={errors.general}
             saveErrors={saveErrors}
             hideScanPath
+            taskCounts={taskCounts}
             onAddStage={() => dispatch({ type: 'addStage' })}
             onAddNode={(kind) => dispatch({ type: 'addNode', kind })}
             onRemoveStage={(stageId) => dispatch({ type: 'removeStage', stageId })}

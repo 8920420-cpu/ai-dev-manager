@@ -437,6 +437,84 @@ describe('ProjectMonitor — live-длительности', () => {
   });
 });
 
+describe('ProjectMonitor — вид «По ролям» от конфигурации проекта (FRONTEND-P0.2)', () => {
+  // Проект с двумя назначенными ролями на включённых этапах.
+  const ROLE_ARCH = { id: 'r-arch', name: 'Архитектор', code: 'ARCHITECT' };
+  const ROLE_PROG = { id: 'r-prog', name: 'Разработчик', code: 'PROGRAMMER' };
+  const PROJECT_WITH_ROLES: Project = {
+    ...PROJECT,
+    roles: [ROLE_ARCH, ROLE_PROG],
+    stages: [
+      { id: 's1', name: 'Архитектура', roleIds: ['r-arch'], enabled: true },
+      { id: 's2', name: 'Разработка', roleIds: ['r-prog'], enabled: true },
+    ],
+  };
+
+  it('показывает в панели ролей только роли, назначенные включённым этапам', async () => {
+    render(<ProjectMonitor project={PROJECT_WITH_ROLES} onBack={vi.fn()} />);
+    await waitFor(() => expect(getStatsMock).toHaveBeenCalled());
+
+    // Вид «По ролям» открыт по умолчанию — обе назначенные роли видны.
+    const rolesTable = (await screen.findByRole('region', { name: 'Таблица по ролям' }));
+    expect(within(rolesTable).getByText('Архитектор')).toBeInTheDocument();
+    expect(within(rolesTable).getByText('Разработчик')).toBeInTheDocument();
+    // PROGRAMMER → CODING: счётчик из byStage.CODING = 3.
+    const progRow = within(rolesTable).getByText('Разработчик').closest('tr') as HTMLElement;
+    expect(within(progRow).getByText('3')).toBeInTheDocument();
+  });
+
+  it('после удаления роли из этапов (re-render проекта) она исчезает из панели ролей', async () => {
+    const { rerender } = render(<ProjectMonitor project={PROJECT_WITH_ROLES} onBack={vi.fn()} />);
+    await waitFor(() => expect(getStatsMock).toHaveBeenCalled());
+    expect(await screen.findByText('Разработчик')).toBeInTheDocument();
+
+    // Удаляем «Разработчик» из этапов проекта и обновляем prop без перезагрузки.
+    const PROJECT_WITHOUT_PROG: Project = {
+      ...PROJECT_WITH_ROLES,
+      stages: [{ id: 's1', name: 'Архитектура', roleIds: ['r-arch'], enabled: true }],
+    };
+    rerender(<ProjectMonitor project={PROJECT_WITHOUT_PROG} onBack={vi.fn()} />);
+
+    await waitFor(() => expect(screen.queryByText('Разработчик')).not.toBeInTheDocument());
+    // Архитектор остаётся — не задет удалением соседней роли.
+    expect(screen.getByText('Архитектор')).toBeInTheDocument();
+  });
+
+  it('отключённый этап не показывает свою роль, но историческая строка задачи остаётся читаемой', async () => {
+    const PROJECT_PROG_DISABLED: Project = {
+      ...PROJECT_WITH_ROLES,
+      stages: [
+        { id: 's1', name: 'Архитектура', roleIds: ['r-arch'], enabled: true },
+        { id: 's2', name: 'Разработка', roleIds: ['r-prog'], enabled: false },
+      ],
+    };
+    const user = setupUser();
+    render(<ProjectMonitor project={PROJECT_PROG_DISABLED} onBack={vi.fn()} />);
+    await waitFor(() => expect(getStatsMock).toHaveBeenCalled());
+
+    // В панели ролей роли отключённого этапа нет.
+    const rolesTable = await screen.findByRole('region', { name: 'Таблица по ролям' });
+    expect(within(rolesTable).queryByText('Разработчик')).not.toBeInTheDocument();
+    expect(within(rolesTable).getByText('Архитектор')).toBeInTheDocument();
+
+    // Но историческая строка задачи в этапе CODING всё ещё показывает stageName из API.
+    await switchToTasks(user);
+    const taskRow = screen.getByText('Задача один').closest('tr') as HTMLElement;
+    expect(within(taskRow).getAllByText('Разработка').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('роль, не назначенная ни одному этапу, не воскресает из статической таблицы', async () => {
+    // Проект вообще без этапов: статический ROLE_PIPELINE НЕ должен подставить роли.
+    render(<ProjectMonitor project={PROJECT} onBack={vi.fn()} />);
+    await waitFor(() => expect(getStatsMock).toHaveBeenCalled());
+    const rolesTable = await screen.findByRole('region', { name: 'Таблица по ролям' });
+    // Ни одна из «дефолтных» ролей не появилась.
+    expect(within(rolesTable).queryByText('Архитектор')).not.toBeInTheDocument();
+    expect(within(rolesTable).queryByText('Разработчик')).not.toBeInTheDocument();
+    expect(within(rolesTable).queryByText('Ревьюер')).not.toBeInTheDocument();
+  });
+});
+
 describe('ProjectMonitor — отмена устаревших запросов при смене проекта', () => {
   it('при смене проекта перезагружает данные нового проекта (register с новой папкой)', async () => {
     const onBack = vi.fn();

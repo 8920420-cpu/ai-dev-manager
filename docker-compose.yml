@@ -46,6 +46,10 @@ services:
       dockerfile: tools-service/Dockerfile
     image: tools-service:latest
     container_name: tools-service
+    ports:
+      # Публикуем 4188 на хост, чтобы локальный MCP-клиент (Claude Code/VS Code
+      # через .mcp.json) мог обращаться к builtin-инструментам tools-service.
+      - "4188:4188"
     environment:
       TOOLS_SERVICE_PORT: "4188"
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
@@ -58,6 +62,46 @@ services:
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4188/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  mcp-service:
+    build:
+      context: ./mcp-service
+      dockerfile: Dockerfile
+    image: mcp-service:latest
+    container_name: mcp-service
+    ports:
+      # HTTP/SSE-режим MCP: health на /health и Streamable MCP на /mcp.
+      - "4190:4190"
+    environment:
+      MCP_SERVICE_PORT: "4190"
+      # PROJECT_ROOT — это корень, который mcp-service ПЕРЕДАЁТ в tools-service как
+      # `root`; tools-service резолвит его в своём контейнере (mount ./:/app/ai-dev-manager).
+      # Поэтому путь должен совпадать с тем, что видит tools-service, а не mcp-service.
+      PROJECT_ROOT: "/app/ai-dev-manager"
+      # orchestrator-service внутри сети слушает порт 80 (ports 4186:80).
+      ORCHESTRATOR_URL: "http://orchestrator-service"
+      TOOLS_SERVICE_URL: "http://tools-service:4188"
+      ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      # Dev-режим: разрешаем запись/удаление/мутации оркестратора.
+      MCP_ENABLE_WRITE: "1"
+      MCP_ENABLE_DELETE: "1"
+      MCP_ENABLE_ORCHESTRATOR_MUTATIONS: "1"
+    volumes:
+      # Зарезервировано на будущее (прямой доступ к файлам). Сейчас файловые
+      # операции выполняет tools-service; путь совпадает с его mount.
+      - ./:/app/ai-dev-manager:ro
+    depends_on:
+      orchestrator-service:
+        condition: service_healthy
+      tools-service:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4190/health"]
       interval: 30s
       timeout: 3s
       retries: 3

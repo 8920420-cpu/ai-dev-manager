@@ -24,11 +24,18 @@ import {
   type TaskTreeSubtask,
   type TaskTreeTask,
 } from '../../api/tasksApi';
+import { TaskChangesModal } from './TaskChangesModal';
 import styles from './TasksTreeModal.module.css';
 
 interface TasksTreeModalProps {
   open: boolean;
   onClose: () => void;
+}
+
+/** Выбранная задача (для окна «что сделала каждая роль»). */
+interface SelectedTask {
+  id: string;
+  title: string;
 }
 
 type LoadState = 'loading' | 'error' | 'ready';
@@ -43,14 +50,16 @@ function statusTone(status: string): BadgeTone {
 }
 
 /**
- * Модальное дерево задач (read-only), открывается по кнопке «Задачи» на карточке
- * этапа. Три уровня: Проект (категория) → Задача (подкатегория) → Подзадача.
- * Узлы сворачиваются/разворачиваются; проекты раскрыты по умолчанию.
+ * Модальное дерево задач (read-only). Три уровня: Проект (категория) → Задача
+ * (подкатегория) → Подзадача. Узлы сворачиваются/разворачиваются; проекты раскрыты
+ * по умолчанию. Клик по строке задачи/подзадачи открывает окно «что сделала каждая
+ * роль» ({@link TaskChangesModal}); раскрытие подзадач — отдельной кнопкой-шевроном.
  */
 export function TasksTreeModal({ open, onClose }: TasksTreeModalProps) {
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [tree, setTree] = useState<TaskTree | null>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [selected, setSelected] = useState<SelectedTask | null>(null);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoadState('loading');
@@ -145,11 +154,19 @@ export function TasksTreeModal({ open, onClose }: TasksTreeModalProps) {
                 project={project}
                 expanded={expanded}
                 onToggle={toggle}
+                onSelect={setSelected}
               />
             ))}
           </ul>
         </>
       )}
+
+      <TaskChangesModal
+        open={selected !== null}
+        onClose={() => setSelected(null)}
+        taskId={selected?.id ?? null}
+        taskTitle={selected?.title ?? ''}
+      />
     </Modal>
   );
 }
@@ -158,10 +175,12 @@ function ProjectNode({
   project,
   expanded,
   onToggle,
+  onSelect,
 }: {
   project: TaskTreeProject;
   expanded: Set<string>;
   onToggle: (key: string) => void;
+  onSelect: (task: SelectedTask) => void;
 }) {
   const key = `p:${project.id}`;
   const isOpen = expanded.has(key);
@@ -193,6 +212,7 @@ function ProjectNode({
               task={task}
               expanded={expanded}
               onToggle={onToggle}
+              onSelect={onSelect}
             />
           ))}
         </ul>
@@ -205,10 +225,12 @@ function TaskNode({
   task,
   expanded,
   onToggle,
+  onSelect,
 }: {
   task: TaskTreeTask;
   expanded: Set<string>;
   onToggle: (key: string) => void;
+  onSelect: (task: SelectedTask) => void;
 }) {
   const key = `t:${task.id}`;
   const isOpen = expanded.has(key);
@@ -216,29 +238,43 @@ function TaskNode({
 
   return (
     <li className={styles.node} role="treeitem" aria-expanded={hasSubs ? isOpen : undefined}>
-      <button
-        type="button"
-        className={styles.row}
-        onClick={() => onToggle(key)}
-        disabled={!hasSubs}
-      >
-        <ChevronRight
-          size={16}
-          className={cn(styles.chevron, isOpen && styles.chevronOpen, !hasSubs && styles.chevronHidden)}
-          aria-hidden="true"
-        />
-        <Workflow size={15} className={styles.taskIcon} aria-hidden="true" />
-        <span className={styles.label} title={task.title}>
-          {task.title}
-        </span>
-        {hasSubs && <span className={styles.count}>{task.subtasks.length}</span>}
-        <Badge tone={statusTone(task.status)}>{taskStatusLabel(task.status)}</Badge>
-      </button>
+      {/* Шеврон — отдельная кнопка раскрытия; клик по строке открывает детали. */}
+      <div className={styles.rowWrap}>
+        {hasSubs ? (
+          <button
+            type="button"
+            className={styles.chevronBtn}
+            onClick={() => onToggle(key)}
+            aria-label={isOpen ? 'Свернуть подзадачи' : 'Раскрыть подзадачи'}
+          >
+            <ChevronRight
+              size={16}
+              className={cn(styles.chevron, isOpen && styles.chevronOpen)}
+              aria-hidden="true"
+            />
+          </button>
+        ) : (
+          <span className={styles.chevronHidden} aria-hidden="true" />
+        )}
+        <button
+          type="button"
+          className={styles.openBtn}
+          onClick={() => onSelect({ id: task.id, title: task.title })}
+          title={`Открыть результат работы ролей: ${task.title}`}
+        >
+          <Workflow size={15} className={styles.taskIcon} aria-hidden="true" />
+          <span className={styles.label} title={task.title}>
+            {task.title}
+          </span>
+          {hasSubs && <span className={styles.count}>{task.subtasks.length}</span>}
+          <Badge tone={statusTone(task.status)}>{taskStatusLabel(task.status)}</Badge>
+        </button>
+      </div>
 
       {isOpen && hasSubs && (
         <ul className={styles.children} role="group">
           {task.subtasks.map((sub) => (
-            <SubtaskNode key={sub.id} subtask={sub} />
+            <SubtaskNode key={sub.id} subtask={sub} onSelect={onSelect} />
           ))}
         </ul>
       )}
@@ -246,16 +282,29 @@ function TaskNode({
   );
 }
 
-function SubtaskNode({ subtask }: { subtask: TaskTreeSubtask }) {
+function SubtaskNode({
+  subtask,
+  onSelect,
+}: {
+  subtask: TaskTreeSubtask;
+  onSelect: (task: SelectedTask) => void;
+}) {
   return (
     <li className={styles.node} role="treeitem">
-      <div className={cn(styles.row, styles.leafRow)}>
+      <div className={styles.rowWrap}>
         <span className={styles.chevronHidden} aria-hidden="true" />
-        <SquareCheck size={15} className={styles.subIcon} aria-hidden="true" />
-        <span className={styles.label} title={subtask.title}>
-          {subtask.title}
-        </span>
-        <Badge tone={statusTone(subtask.status)}>{taskStatusLabel(subtask.status)}</Badge>
+        <button
+          type="button"
+          className={styles.openBtn}
+          onClick={() => onSelect({ id: subtask.id, title: subtask.title })}
+          title={`Открыть результат работы ролей: ${subtask.title}`}
+        >
+          <SquareCheck size={15} className={styles.subIcon} aria-hidden="true" />
+          <span className={styles.label} title={subtask.title}>
+            {subtask.title}
+          </span>
+          <Badge tone={statusTone(subtask.status)}>{taskStatusLabel(subtask.status)}</Badge>
+        </button>
       </div>
     </li>
   );

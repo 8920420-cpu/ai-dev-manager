@@ -112,6 +112,7 @@ Claude Code не меняет эту постановку и не разреза
 | pipeline-runner | `PIPELINE_RUNNER` | `pipeline-runner/` | этапы/статусы orchestrator-service | P1.2, P2.1 | P1.1 | — |
 | scanner-service | `SCANNER` | `scanner-service/` | контракт этапов/Scanner orchestrator-service | — | P1.1 | P1.2, P2.1 |
 | tester-service | `TESTER` | `tester-service/` | orchestrator-service, pipeline-runner | — | — | — |
+| mcp-service | `MCP` | `mcp-service/` | tools-service, orchestrator-service | P0.1 | — | — |
 | интеграция/выпуск | `INTEGRATION` | межсервисные E2E | сервисы соответствующего E2E | P2.1–P2.4, P3.1 | — | — |
 
 Зависимости между сервисами зафиксированы в [_orchestrator/dependencies.json](_orchestrator/dependencies.json),

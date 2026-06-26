@@ -1,9 +1,9 @@
 // Провайдеры конфигурации watcher'ов Scanner.
 //
 // Источник истины — orchestrator-service. Scanner больше НЕ входит в движение по
-// ролям: это отдельная роль‑приёмник, которая следит за «папкой документов»
-// проекта (`projects.docs_path`) и принимает оттуда задачи. Поэтому watcher
-// строится по `project.docsPath` — по одному на проект с заданной папкой.
+// ролям: это отдельная роль‑приёмник, которая следит за «папкой задач» проекта
+// (`projects.tasks_path`, с откатом на `docs_path`) и принимает оттуда задачи.
+// Поэтому watcher строится по `project.tasksPath` — по одному на проект с папкой.
 // Провайдер возвращает плоский список `{ projectId, stageId, watchDirectory,
 // documentName }`, адресуемых по `projectId + stageId`. Документ внутри папки —
 // `documentName` (default `claude-tasks.json`); существование папки проверяет
@@ -27,8 +27,12 @@ export function stageConfigsFromProjects(projects) {
     if (projectId == null) continue;
     // Приём включается тумблером на карточке проекта (scanner_enabled).
     if (project?.scannerEnabled !== true && project?.scanner_enabled !== true) continue;
-    const watchDirectory = trimOrNull(project?.docsPath ?? project?.docs_path);
-    if (!watchDirectory) continue; // проект без папки документов — без watcher
+    // Scanner следит за папкой задач проекта (tasks_path); если она не задана —
+    // откат на папку документов (docs_path) для обратной совместимости.
+    const watchDirectory = trimOrNull(
+      project?.tasksPath ?? project?.tasks_path ?? project?.docsPath ?? project?.docs_path,
+    );
+    if (!watchDirectory) continue; // проект без папки приёма задач — без watcher
     configs.push({
       projectId: String(projectId),
       stageId: DOCS_STAGE_ID,

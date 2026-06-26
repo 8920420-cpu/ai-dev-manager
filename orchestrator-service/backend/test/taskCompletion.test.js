@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { completeHostTaskTx } from '../src/db.js';
+import { completeHostTaskTx, acceptScannerCompletionTx, __resetRoleFieldsCacheForTests } from '../src/db.js';
 
 // Мини-клиент pg: отвечает по первому подходящему правилу (regex по SQL).
 // reply может быть функцией (hits, params) → { rows, rowCount }.
@@ -113,6 +113,69 @@ test('активная задача под другой ролью → 409 role_
   );
   assert.equal(c.calls.some((q) => /UPDATE tasks SET status/.test(q.sql)), false);
   assert.equal(c.calls.some((q) => /ROLLBACK/.test(q.sql)), true, 'транзакция откатана');
+});
+
+// ───── Строгий режим контракта полей при сдаче Programmer ─────
+// Базовые правила fake-клиента для acceptScannerCompletionTx: проект найден,
+// существующая задача в CODING под PROGRAMMER, dispatch вставлен (не дубль),
+// маршрут проекта пуст (фолбэк REVIEW/TASK_REVIEWER), таблица role_fields есть.
+const scannerBaseRules = () => [
+  { re: /SELECT id, code FROM projects/, reply: { rowCount: 1, rows: [{ id: 'proj-1', code: 'PS' }] } },
+  {
+    re: /FROM tasks t[\s\S]*FOR UPDATE OF t/,
+    reply: { rowCount: 1, rows: [{
+      id: TASK, status: 'CODING', project_id: 'proj-1', project_code: 'PS',
+      service_code: 'Catalog_Service', reviewer_role_id: 'rev-1',
+      current_role_id: 'role-prog', current_role_code: 'PROGRAMMER',
+    }] },
+  },
+  { re: /INSERT INTO scanner_dispatches/, reply: { rowCount: 1, rows: [{ id: 'disp-1' }] } },
+  { re: /FROM project_stages WHERE project_id/, reply: { rowCount: 0, rows: [] } },
+  { re: /to_regclass\('public\.role_fields'\)/, reply: { rowCount: 1, rows: [{ t: 'role_fields' }] } },
+  { re: /FROM role_fields rf/, reply: { rowCount: 1, rows: [{ direction: 'out', required: true, key: 'diff' }] } },
+];
+
+const scannerPayload = (over = {}) => ({
+  taskId: TASK, completionKey: 'k1', project: 'PS', service: 'Catalog_Service',
+  title: 'T', result: 'done', changedFiles: [], ...over,
+});
+
+test('сдача без обязательного поля контракта → 422 missing_required_fields, ROLLBACK', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(scannerBaseRules());
+  await assert.rejects(
+    () => acceptScannerCompletionTx(c, scannerPayload({ fields: {} })),
+    (e) => e.statusCode === 422 && e.code === 'missing_required_fields'
+      && Array.isArray(e.errors) && e.errors.includes('diff'),
+  );
+  assert.equal(c.calls.some((q) => /UPDATE tasks/.test(q.sql)), false, 'задача не продвигается');
+  assert.equal(c.calls.some((q) => /ROLLBACK/.test(q.sql)), true, 'транзакция откатана (dispatch тоже)');
+  assert.equal(c.calls.some((q) => /COMMIT/.test(q.sql)), false, 'без COMMIT');
+});
+
+test('сдача с заполненным обязательным полем → принята, переход к Reviewer', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(scannerBaseRules());
+  const res = await acceptScannerCompletionTx(c, scannerPayload({ fields: { diff: 'patch text' } }));
+  assert.equal(res.accepted, true);
+  assert.equal(res.duplicate, false);
+  assert.equal(res.nextRole, 'TASK_REVIEWER');
+  const upd = c.calls.find((q) => /UPDATE tasks/.test(q.sql));
+  assert.ok(upd, 'задача продвинута');
+  assert.equal(upd.params[1], 'REVIEW');
+  assert.equal(c.calls.some((q) => /COMMIT/.test(q.sql)), true, 'транзакция зафиксирована');
+});
+
+test('контракт без обязательных полей → требований нет, сдача проходит', async () => {
+  __resetRoleFieldsCacheForTests();
+  const rules = scannerBaseRules();
+  // role_fields без обязательных выходов (только необязательное поле).
+  rules[rules.length - 1] = { re: /FROM role_fields rf/, reply: { rowCount: 1, rows: [{ direction: 'out', required: false, key: 'notes' }] } };
+  const c = fakeClient(rules);
+  const res = await acceptScannerCompletionTx(c, scannerPayload({ fields: {} }));
+  assert.equal(res.accepted, true);
+  assert.equal(res.nextRole, 'TASK_REVIEWER');
+  assert.equal(c.calls.some((q) => /COMMIT/.test(q.sql)), true);
 });
 
 test('PIPELINE_SERVICE success → pipeline_runs + переход COMMIT (не терминал)', async () => {

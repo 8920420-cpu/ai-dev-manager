@@ -89,8 +89,10 @@ export function mapProjectRow(row, { stages = [], roles = [] } = {}) {
     rootPath: path, // алиас совместимости
     status: row.status ?? 'active',
     pauseReason: row.pause_reason ?? null,
-    // Папка документов проекта («карта», за которой следит Scanner).
+    // Папка документов проекта («карта» проекта: описание).
     docsPath: row.docs_path ?? null,
+    // Папка задач проекта — за ней следит Scanner (приём задач).
+    tasksPath: row.tasks_path ?? null,
     // Включён ли автоматический приём задач Scanner из папки документов.
     scannerEnabled: row.scanner_enabled === true,
     stages,
@@ -109,7 +111,7 @@ function mapProject(row) {
 // --- DB-слой ----------------------------------------------------------------
 
 const PROJECT_COLUMNS =
-  'id, code, name, root_path, status, pause_reason, docs_path, scanner_enabled, created_at, updated_at';
+  'id, code, name, root_path, status, pause_reason, docs_path, tasks_path, scanner_enabled, created_at, updated_at';
 
 // Подобрать свободный code: SLUG, затем SLUG_2, SLUG_3, …
 async function uniqueCode(c, base) {
@@ -248,6 +250,10 @@ function pickProjectFields(input, { partial }) {
   if (input?.docsPath !== undefined) {
     out.docs_path = normalizeRootPath(input.docsPath);
   }
+  // Папка задач проекта (за ней следит Scanner): нормализуем путь; пустое → null.
+  if (input?.tasksPath !== undefined) {
+    out.tasks_path = normalizeRootPath(input.tasksPath);
+  }
   // Переключатель приёма задач Scanner.
   if (input?.scannerEnabled !== undefined) {
     out.scanner_enabled = input.scannerEnabled === true;
@@ -290,20 +296,22 @@ export async function createOrUpsertProject(s, input) {
         const name = String(input?.name ?? '').trim() || basename(rootPath) || rootPath;
         const code = await uniqueCode(c, name);
         const docsPath = normalizeRootPath(input?.docsPath);
+        const tasksPath = normalizeRootPath(input?.tasksPath);
         const ins = await c.query(
-          `INSERT INTO projects (code, name, root_path, status, docs_path)
-           VALUES ($1, $2, $3, COALESCE($4, 'active'), $5)
+          `INSERT INTO projects (code, name, root_path, status, docs_path, tasks_path)
+           VALUES ($1, $2, $3, COALESCE($4, 'active'), $5, $6)
            RETURNING ${PROJECT_COLUMNS}`,
-          [code, name, rootPath, status ?? null, docsPath],
+          [code, name, rootPath, status ?? null, docsPath, tasksPath],
         );
         row = ins.rows[0];
         isNew = true;
       }
 
       // Материализуем единую схему: для нового проекта всегда; для существующего —
-      // если изменилась папка документов (Scanner следит за docs_path).
-      if (isNew || input?.docsPath !== undefined) {
-        await applySchemeToProject(c, row.id, row.docs_path);
+      // если изменилась папка задач/документов (Scanner следит за папкой задач,
+      // с откатом на папку документов, если задачи не заданы).
+      if (isNew || input?.tasksPath !== undefined || input?.docsPath !== undefined) {
+        await applySchemeToProject(c, row.id, row.tasks_path ?? row.docs_path);
       }
 
       const rich = await buildRich(c, await reloadRow(c, row.id));
@@ -343,12 +351,13 @@ async function reloadRow(c, id) {
 }
 
 /**
- * PUT /api/projects/:id — обновить name/path/status/docsPath.
+ * PUT /api/projects/:id — обновить name/path/status/docsPath/tasksPath.
  * Optimistic concurrency: patch.updatedAt (или If-Match, переданный server.js
  * как input.updatedAt) при несовпадении с текущим updated_at → 409
  * project_conflict. Валидация статуса → 422 project_invalid_status.
  * Этапы пайплайна задаёт единая «Схема разработки» (не проект): при изменении
- * docsPath переприменяем схему, чтобы Scanner следил за новой папкой документов.
+ * папки задач (или документов) переприменяем схему, чтобы Scanner следил за
+ * новой папкой приёма задач.
  */
 export async function updateProject(s, idOrRef, patch) {
   const status = patch?.status !== undefined ? String(patch.status) : undefined;
@@ -369,9 +378,10 @@ export async function updateProject(s, idOrRef, patch) {
     try {
       const fields = pickProjectFields(patch, { partial: true });
       const row = await applyProjectUpdate(c, current.id, fields);
-      // Папка документов изменилась → Scanner должен следить за новой папкой.
-      if (patch?.docsPath !== undefined) {
-        await applySchemeToProject(c, row.id, row.docs_path);
+      // Папка задач/документов изменилась → Scanner должен следить за новой папкой
+      // (приоритет — папка задач, откат на папку документов).
+      if (patch?.tasksPath !== undefined || patch?.docsPath !== undefined) {
+        await applySchemeToProject(c, row.id, row.tasks_path ?? row.docs_path);
       }
       const rich = await buildRich(c, await reloadRow(c, row.id));
       await c.query('COMMIT');

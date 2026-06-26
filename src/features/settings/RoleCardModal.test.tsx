@@ -26,6 +26,23 @@ vi.mock('../../api/toolsApi', () => ({
   },
 }));
 
+const intgList = vi.fn();
+vi.mock('../../api/integrationsApi', () => ({
+  integrationsApi: {
+    list: (...a: unknown[]) => intgList(...a),
+  },
+}));
+
+const rcList = vi.fn();
+const rcSaveAll = vi.fn();
+vi.mock('../../api/roleConnectionsApi', () => ({
+  roleConnectionsApi: {
+    list: (...a: unknown[]) => rcList(...a),
+    saveAll: (...a: unknown[]) => rcSaveAll(...a),
+    make: (role = '', integrationId = '') => ({ id: 'rc1', role, integrationId }),
+  },
+}));
+
 const GROUPS: RoleGroup[] = [
   { id: 'g1', name: 'Разработка', sortOrder: 10 },
   { id: 'g2', name: 'Контроль качества', sortOrder: 20 },
@@ -56,6 +73,15 @@ beforeEach(() => {
   saveCapabilities.mockResolvedValue([]);
   saveRoleTools.mockReset();
   saveRoleTools.mockResolvedValue([]);
+  intgList.mockReset();
+  intgList.mockResolvedValue([
+    { id: 'int1', name: 'DeepSeek', status: 'success' },
+    { id: 'int2', name: 'OpenAI' },
+  ]);
+  rcList.mockReset();
+  rcList.mockResolvedValue([]);
+  rcSaveAll.mockReset();
+  rcSaveAll.mockResolvedValue([]);
   listSkills.mockResolvedValue([
     { id: 'a.md', name: 'a.md' },
     { id: 'b.md', name: 'b.md' },
@@ -116,6 +142,39 @@ describe('RoleCardModal — карточка роли', () => {
     expect(code).toBe('PROGRAMMER');
     expect(patch).toMatchObject({ groupId: 'g2', skills: ['b.md'], prompt: '' });
     expect(onSaved).toHaveBeenCalled();
+  });
+
+  it('подставляет текущее назначение интеграции роли', async () => {
+    rcList.mockResolvedValue([{ id: 'rc-x', role: 'PROGRAMMER', integrationId: 'int2' }]);
+    renderModal();
+    const select = (await screen.findByLabelText(/Интеграция \(коннектор\)/i)) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('int2'));
+  });
+
+  it('назначает интеграцию роли и сохраняет назначение через role-connectors', async () => {
+    const user = userEvent.setup();
+    update.mockResolvedValue(ROLE);
+    renderModal();
+    await waitFor(() => expect(intgList).toHaveBeenCalled());
+
+    await user.selectOptions(screen.getByLabelText(/Интеграция \(коннектор\)/i), 'int1');
+    await user.click(screen.getByRole('button', { name: /^Сохранить$/i }));
+
+    await waitFor(() => expect(rcSaveAll).toHaveBeenCalled());
+    const [items] = rcSaveAll.mock.calls[0]!;
+    expect(items).toEqual([{ id: 'rc1', role: 'PROGRAMMER', integrationId: 'int1' }]);
+  });
+
+  it('не дёргает role-connectors, если интеграция не менялась', async () => {
+    const user = userEvent.setup();
+    update.mockResolvedValue(ROLE);
+    renderModal();
+    await waitFor(() => expect(intgList).toHaveBeenCalled());
+
+    await user.click(screen.getByRole('button', { name: /^Сохранить$/i }));
+
+    await waitFor(() => expect(update).toHaveBeenCalled());
+    expect(rcSaveAll).not.toHaveBeenCalled();
   });
 
   it('не закрывается по Escape (правило проекта)', async () => {

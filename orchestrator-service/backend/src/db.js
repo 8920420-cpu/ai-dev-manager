@@ -164,7 +164,15 @@ export async function getAppliedMigrations(s) {
  */
 export async function acceptScannerCompletion(s, input) {
   const payload = normalizeScannerCompletion(input);
-  return withClient(clientConfig(s), async (c) => {
+  return withClient(clientConfig(s), (c) => acceptScannerCompletionTx(c, payload));
+}
+
+/**
+ * Транзакционное ядро приёма завершения Programmer (тестируется с fake-клиентом).
+ * payload уже нормализован normalizeScannerCompletion.
+ */
+export async function acceptScannerCompletionTx(c, payload) {
+  {
     await c.query('BEGIN');
     try {
       // Задачи может не быть в БД (её завели прямо в документе Claude) — тогда
@@ -205,10 +213,21 @@ export async function acceptScannerCompletion(s, input) {
 
       // Поля Programmer → кумулятивная карточка задачи.
       const progContract = await loadRoleContract(c, fromRole);
-      const { values: progCardValues } = extractOutputs(
+      const { values: progCardValues, missingRequired } = extractOutputs(
         payload.fields ?? { result: payload.result, changedFiles: payload.changedFiles },
         progContract.outputs,
       );
+      // Строгий режим контракта роли: вернуть задачу нельзя, пока заполнены не все
+      // обязательные исходящие поля. «Настройка» — сам контракт (role_fields): если
+      // обязательных полей у роли нет, missingRequired пуст и сдача проходит без
+      // требований. ROLLBACK откатит и запись scanner_dispatches, чтобы повтор с
+      // заполненными полями не считался дублем.
+      if (missingRequired.length) {
+        const err = scannerError(422, 'missing_required_fields');
+        err.code = 'missing_required_fields';
+        err.errors = missingRequired;
+        throw err;
+      }
 
       await c.query(
         `UPDATE tasks
@@ -237,7 +256,7 @@ export async function acceptScannerCompletion(s, input) {
       await c.query('ROLLBACK');
       throw error;
     }
-  });
+  }
 }
 
 // Роль входа задачи в конвейер: Приёмщик задач (TASK_INTAKE_OFFICER), иначе первая
@@ -539,6 +558,10 @@ export async function claimNextClaudeTask(s) {
       const { buildMcpConfig } = await import('./toolsClient.js');
       const progTools = await getToolsForRole(c, 'PROGRAMMER');
       const mcpConfig = progTools.mcp.length ? await buildMcpConfig(progTools.mcp) : { mcpServers: {} };
+      // Контракт роли: требования, которые Claude ОБЯЗАН выполнить перед сдачей.
+      // Те же поля строго проверяет acceptScannerCompletion (нельзя вернуть без них).
+      const progContract = await loadRoleContract(c, 'PROGRAMMER');
+      const requiredFields = progContract.outputs.filter((f) => f.required).map((f) => f.key);
       await c.query(
         `INSERT INTO task_events (task_id, event_type, to_status, role_id, payload_json)
          VALUES ($1, 'AGENT_ASSIGNED', 'CODING', $2, $3::jsonb)`,
@@ -557,6 +580,30 @@ export async function claimNextClaudeTask(s) {
           // Инструменты для Claude Code: MCP-конфиг и разрешённые уровни доступа.
           capabilities: progTools.capabilities,
           mcpConfig,
+          // Требования контракта роли: ключи полей, которые обязательно вернуть
+          // в fields при сдаче (orchestrator_complete_scanner_task). Пусто — нет требований.
+          requiredFields,
+          // ЖЁСТКОЕ УСЛОВИЕ сдачи: задача остаётся claimed в статусе CODING, пока
+          // исполнитель не вернёт результат во внешнюю систему. Чтобы пайплайн НЕ
+          // тормозил, исполнитель ОБЯЗАН СРАЗУ после внесения изменений вызвать
+          // orchestrator_complete_scanner_task. Все обязательные параметры заранее
+          // подставлены здесь (completionKey идемпотентен, повтор безопасен) —
+          // придумывать ничего не нужно, рапорт делается немедленно.
+          completion: {
+            required: true,
+            tool: 'orchestrator_complete_scanner_task',
+            completionKey: `programmer-${row.id}`,
+            project: project_code,
+            service: service_code ?? '',
+            title: row.title,
+            sourceDocument: 'tasks/claude-tasks.json',
+            instruction:
+              'ОБЯЗАТЕЛЬНО: сразу после внесения изменений вызови ' +
+              'orchestrator_complete_scanner_task с этими taskId, completionKey, ' +
+              'project, service, title, sourceDocument; перечисли changedFiles и ' +
+              'result. Не оставляй задачу без рапорта — иначе она зависнет на этапе ' +
+              'Programmer (CODING) и затормозит весь пайплайн.',
+          },
         },
       };
     } catch (error) {
@@ -1006,6 +1053,12 @@ async function roleFieldsTablePresent(c) {
     _roleFieldsTablePresent = Boolean(reg.rows[0]?.t);
   }
   return _roleFieldsTablePresent;
+}
+
+// Только для тестов: сбросить кэш наличия role_fields (он глобален на процесс,
+// поэтому fake-клиенты разных тест-файлов могут зафиксировать чужое значение).
+export function __resetRoleFieldsCacheForTests() {
+  _roleFieldsTablePresent = undefined;
 }
 
 // Контракт одной роли: { inputs:[{key,required}], outputs:[{key,required}] }.
@@ -1583,6 +1636,14 @@ async function processClaimedRole(c, claimed) {
     return failRoleRun(c, claimed, error);
   }
 
+  // SILENT-FAIL-GUARD-001 (B): модель ответила, но без распознаваемого JSON-вердикта
+  // (напр. DeepSeek прислал tool-call разметку вместо финального JSON, либо упёрся в
+  // инструменты). НЕ считаем это успехом и НЕ продвигаем задачу вперёд — помечаем
+  // «не выполнен» (FAILED) с логированием причины, чтобы быстро находить поломку.
+  if (result.parsed === null) {
+    return failRoleUnparsed(c, claimed, result);
+  }
+
   const { values: cardValues, missingRequired: missingOut } = extractOutputs(result.verdict.fields, contract.outputs);
   let decision = decideOutcome(claimed.role_code, result.verdict, {
     reworkCount: claimed.reworkCount,
@@ -1723,6 +1784,42 @@ async function failRoleRun(c, claimed, err) {
     await c.query(`UPDATE tasks SET assigned_agent_id = NULL WHERE id = $1 AND status NOT IN ('DONE','CANCELLED')`, [claimed.id]);
     await c.query('COMMIT');
     return null;
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
+}
+
+// SILENT-FAIL-GUARD-001 (B): реасонинг-роль вернула ответ, но без распознаваемого
+// JSON-вердикта. Раньше такой случай молча уходил вперёд как успех (пустые поля).
+// Теперь помечаем задачу «не выполнен» (FAILED) и ПОДРОБНО логируем причину в трёх
+// местах для быстрой диагностики: agent_runs.error_text + output_json, событие
+// STATUS_CHANGED→FAILED с reason, а сырой ответ модели уже лежит в prompt_exchanges.
+async function failRoleUnparsed(c, claimed, result) {
+  const head = String(result?.response ?? '').replace(/\s+/g, ' ').trim().slice(0, 500);
+  const reason = 'verdict_unparsed';
+  const errorText = `verdict_unparsed: роль ${claimed.role_code} не вернула распознаваемый JSON-вердикт `
+    + `(ответ модели не распарсился; см. prompt_exchanges ${result?.exchangeId ?? ''})`;
+  await c.query('BEGIN');
+  try {
+    await c.query(
+      `UPDATE agent_runs SET status = 'FAILED', finished_at = now(), error_text = $2, output_json = $3::jsonb WHERE id = $1`,
+      [claimed.agentRunId, errorText, JSON.stringify({ reason, exchangeId: result?.exchangeId ?? null, responseHead: head })],
+    );
+    await c.query(
+      `UPDATE tasks SET status = 'FAILED', assigned_agent_id = NULL WHERE id = $1 AND status NOT IN ('DONE','CANCELLED')`,
+      [claimed.id],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'STATUS_CHANGED', $2::task_status, 'FAILED', $3, $4::jsonb)`,
+      [claimed.id, claimed.status, claimed.role_id, JSON.stringify({
+        runner: true, ai: true, reason, role: claimed.role_code,
+        exchangeId: result?.exchangeId ?? null, responseHead: head,
+      })],
+    );
+    await c.query('COMMIT');
+    return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: 'FAILED', reason };
   } catch (error) {
     await c.query('ROLLBACK');
     throw error;

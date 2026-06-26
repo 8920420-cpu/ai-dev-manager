@@ -182,13 +182,14 @@ export async function applyEdgesToProject(c, projectDbId) {
 
 /**
  * Материализовать единую схему в project_stages одного проекта. Scanner-этапу
- * подставляется папка проекта (docsPath). id этапов всегда новые (project_stages.id
- * — PK, не может совпадать у разных проектов). Вызывается в рамках открытой
- * транзакции (создание/обновление проекта, сохранение схемы).
+ * подставляется папка приёма задач проекта (watchPath — обычно tasks_path, с
+ * откатом на docs_path). id этапов всегда новые (project_stages.id — PK, не может
+ * совпадать у разных проектов). Вызывается в рамках открытой транзакции
+ * (создание/обновление проекта, сохранение схемы).
  */
-export async function applySchemeToProject(c, projectDbId, docsPath) {
+export async function applySchemeToProject(c, projectDbId, watchPath) {
   const scheme = await readGlobalStageRows(c);
-  const docs = docsPath ? String(docsPath).trim() || null : null;
+  const docs = watchPath ? String(watchPath).trim() || null : null;
   // FORK-JOIN-001: gate-роли узлов fork/join инжектируются при материализации,
   // чтобы задача могла «сесть» на узел (current_role_id), а подметатель её нашёл.
   const gateRoles = await c.query(
@@ -223,11 +224,12 @@ export async function applySchemeToProject(c, projectDbId, docsPath) {
 }
 
 // Переприменить схему ко всем проектам (после сохранения схемы). У каждого
-// проекта своя docs_path → своя папка Scanner.
+// проекта своя папка приёма задач → своя папка Scanner: приоритет — tasks_path,
+// откат на docs_path, если папка задач не задана.
 export async function applySchemeToAllProjects(c) {
-  const projects = await c.query('SELECT id, docs_path FROM projects');
+  const projects = await c.query('SELECT id, docs_path, tasks_path FROM projects');
   for (const p of projects.rows) {
-    await applySchemeToProject(c, p.id, p.docs_path);
+    await applySchemeToProject(c, p.id, p.tasks_path ?? p.docs_path);
   }
 }
 

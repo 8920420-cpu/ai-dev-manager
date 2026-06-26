@@ -9,10 +9,11 @@ import {
   type BadgeTone,
 } from '../../components/ui';
 import { taskStatisticsApi } from '../../api/taskStatisticsApi';
+import { subscribeTaskChanges } from '../../api/tasksApi';
 import { dbProjectsApi } from '../../api/dbProjectsApi';
 import { ApiError } from '../../api/http';
 import { formatDateTime, formatDuration, formatTime } from '../../lib/format';
-import type { Project } from '../../types/project';
+import { isStageEnabled, type Project } from '../../types/project';
 import type { TaskStatRow, TaskStatistics } from '../../types/taskStats';
 import styles from './ProjectMonitor.module.css';
 
@@ -68,18 +69,42 @@ function statusTone(status: string): BadgeTone {
   return STATUS_TONE[status] ?? 'neutral';
 }
 
-// Пайплайн ролей: роль → этап(ы), на которых она ответственна. Код этапа
-// совпадает с stageCode из summary.byStage (см. backend taskStats.STAGE_BY_STATUS).
-// Несколько этапов на роль (COMMIT+DEPLOY) суммируются.
-const ROLE_PIPELINE: { name: string; stages: string[]; tone: BadgeTone }[] = [
-  { name: 'Архитектор', stages: ['ARCHITECTURE'], tone: 'primary' },
-  { name: 'Декомпозер', stages: ['DECOMPOSITION'], tone: 'primary' },
-  { name: 'Разработчик', stages: ['CODING'], tone: 'primary' },
-  { name: 'Тестировщик', stages: ['TESTING'], tone: 'info' },
-  { name: 'Аналитик сбоев', stages: ['FAILURE_ANALYSIS'], tone: 'warning' },
-  { name: 'Ревьюер', stages: ['REVIEW'], tone: 'info' },
-  { name: 'Git-интегратор', stages: ['COMMIT', 'DEPLOY'], tone: 'success' },
-];
+// Канонический код роли → коды статусов (этапов), задачи которых она ведёт.
+// Источник истины — orchestrator-service `ROLE_FLOW.from` (rolePipeline.js);
+// stageCode совпадает со статусом (см. backend taskStats.STAGE_BY_STATUS).
+//
+// FRONTEND-P0.2: эта таблица — НЕ источник видимых ролей. Какие роли показывать,
+// решает актуальная конфигурация проекта (`project.stages` + `project.roles`);
+// карта нужна лишь для ПОДСЧЁТА задач уже видимой роли по `summary.byStage`.
+const ROLE_STAGE_CODES: Record<string, string[]> = {
+  TASK_INTAKE_OFFICER: ['BACKLOG', 'READY'],
+  ARCHITECT: ['ARCHITECTURE'],
+  DECOMPOSER: ['DECOMPOSITION'],
+  PROGRAMMER: ['CODING'],
+  SCANNER: ['CODING'],
+  TASK_REVIEWER: ['REVIEW'],
+  REVIEWER: ['REVIEW'],
+  PIPELINE_SERVICE: ['TESTING'],
+  TESTER: ['TESTING'],
+  FAILURE_ANALYST: ['FAILURE_ANALYSIS'],
+  DOCUMENTATION_AUDITOR: ['COMMIT'],
+  DOCUMENTATION_KEEPER: ['COMMIT'],
+  GIT_INTEGRATOR: ['COMMIT', 'DEPLOY'],
+  COMMITTER: ['COMMIT'],
+  DEPLOYER: ['DEPLOY'],
+};
+
+// Тон бейджа роли по коду её первого этапа (визуальная группировка).
+const STAGE_TONE: Record<string, BadgeTone> = {
+  ARCHITECTURE: 'primary',
+  DECOMPOSITION: 'primary',
+  CODING: 'primary',
+  TESTING: 'info',
+  REVIEW: 'info',
+  FAILURE_ANALYSIS: 'warning',
+  COMMIT: 'success',
+  DEPLOY: 'success',
+};
 
 // Этапы вне зоны ответственности ролей — показываем сводной строкой «Очередь».
 const QUEUE_STAGES = ['BACKLOG', 'READY'];
@@ -91,14 +116,36 @@ interface RoleStat {
   tone: BadgeTone;
 }
 
-// Свести byStage (по всему проекту) к строкам «по ролям».
-function buildRoleStats(byStage: Record<string, number>): RoleStat[] {
-  return ROLE_PIPELINE.map((role) => ({
-    name: role.name,
-    stageLabel: role.stages.map((s) => statusLabel(s)).join(' · '),
-    count: role.stages.reduce((acc, s) => acc + (byStage[s] ?? 0), 0),
-    tone: role.tone,
-  }));
+// Свести byStage к строкам «по ролям», беря ВИДИМЫЕ роли из актуальной
+// конфигурации проекта: только роли, назначенные включённым этапам-узлам.
+// Удалённая из этапов роль сюда не попадает (FRONTEND-P0.2).
+function buildRoleStats(
+  project: Pick<Project, 'stages' | 'roles'>,
+  byStage: Record<string, number>,
+): RoleStat[] {
+  const rolesById = new Map(project.roles.map((r) => [r.id, r]));
+  const seen = new Set<string>();
+  const out: RoleStat[] = [];
+  for (const stage of project.stages) {
+    if (!isStageEnabled(stage)) continue;
+    // Управляющие узлы блок-схемы (fork/join/condition) — не роли-исполнители.
+    if (stage.kind && stage.kind !== 'stage') continue;
+    for (const roleId of stage.roleIds) {
+      if (seen.has(roleId)) continue;
+      const role = rolesById.get(roleId);
+      if (!role) continue;
+      seen.add(roleId);
+      const codes = role.code ? (ROLE_STAGE_CODES[role.code] ?? []) : [];
+      const count = codes.reduce((acc, c) => acc + (byStage[c] ?? 0), 0);
+      out.push({
+        name: role.name,
+        stageLabel: codes.length ? codes.map((c) => statusLabel(c)).join(' · ') : stage.name,
+        count,
+        tone: (codes[0] ? STAGE_TONE[codes[0]] : undefined) ?? 'neutral',
+      });
+    }
+  }
+  return out;
 }
 
 type ViewMode = 'tasks' | 'roles';
@@ -207,6 +254,9 @@ export function ProjectMonitor({ project, onBack, onEdit, regionId = 'project-mo
   // Автообновление, только пока монитор открыт и вкладка видима.
   useEffect(() => {
     if (!apiId) return;
+    const unsubscribe = subscribeTaskChanges(() => {
+      if (document.visibilityState === 'visible') void load(offset, true);
+    });
     const id = window.setInterval(() => {
       if (document.visibilityState === 'visible') void load(offset, true);
     }, AUTO_REFRESH_MS);
@@ -215,6 +265,7 @@ export function ProjectMonitor({ project, onBack, onEdit, regionId = 'project-mo
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => {
+      unsubscribe();
       window.clearInterval(id);
       document.removeEventListener('visibilitychange', onVisible);
     };
@@ -260,9 +311,12 @@ export function ProjectMonitor({ project, onBack, onEdit, regionId = 'project-mo
   }, [rows, filterStage, filterStatus, sortKey]);
 
   const summary = data?.summary;
+  // Видимые роли — из актуальной конфигурации проекта (props), счётчики — из
+  // серверной byStage. Пересобирается при смене project.stages/roles (после
+  // сохранения редактирования) и при обновлении статистики (FRONTEND-P0.2).
   const roleStats = useMemo(
-    () => (summary ? buildRoleStats(summary.byStage ?? {}) : []),
-    [summary],
+    () => (summary ? buildRoleStats(project, summary.byStage ?? {}) : []),
+    [summary, project],
   );
   const queueCount = useMemo(
     () =>

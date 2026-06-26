@@ -17,6 +17,7 @@ interface FormState {
   name: string;
   path: string;
   docsPath: string;
+  tasksPath: string;
   status: ProjectStatus;
 }
 
@@ -25,14 +26,32 @@ function initialState(editProject?: Project | null): FormState {
     name: editProject?.name ?? '',
     path: editProject?.path ?? '',
     docsPath: editProject?.docsPath ?? '',
+    tasksPath: editProject?.tasksPath ?? '',
     status: editProject?.status ?? 'active',
   };
+}
+
+/** Имена подпапок 2-го уровня по умолчанию (внутри папки проекта). */
+const DEFAULT_DOCS_SUBDIR = 'docs';
+const DEFAULT_TASKS_SUBDIR = 'tasks';
+
+/**
+ * Путь подпапки 2-го уровня относительно папки проекта. Разделитель берётся из
+ * самого пути проекта (\ для Windows, иначе /). Пустая папка проекта → ''.
+ */
+function joinUnderProject(projectPath: string, subdir: string): string {
+  const base = projectPath.trim().replace(/[\\/]+$/, '');
+  if (!base) return '';
+  const sep = base.includes('\\') ? '\\' : '/';
+  return `${base}${sep}${subdir}`;
 }
 
 /**
  * Создание / редактирование проекта. Этапы пайплайна больше НЕ задаются в проекте
  * — они общие (раздел «Схема разработки»). Здесь — основные параметры проекта:
- * название, папка проекта, папка документов (за ней следит Scanner) и статус.
+ * название, папка проекта, подпапки документов и задач (за папкой задач следит
+ * Scanner) и статус. Пути подпапок по умолчанию подставляются относительно папки
+ * проекта.
  */
 export function CreateProjectModal({
   open,
@@ -68,7 +87,27 @@ export function CreateProjectModal({
     form.name !== initial.name ||
     form.path !== initial.path ||
     form.docsPath !== initial.docsPath ||
+    form.tasksPath !== initial.tasksPath ||
     form.status !== initial.status;
+
+  // Смена папки проекта: пути 2-го уровня (документы/задачи) по умолчанию
+  // указываются относительно неё. Пока пользователь не задал их вручную (поле
+  // пусто или ещё равно прежнему авто-значению) — переподставляем относительно
+  // новой папки проекта; ручной ввод не затираем.
+  const handlePathChange = (value: string) => {
+    setForm((f) => {
+      const next: FormState = { ...f, path: value };
+      const prevDocsDefault = joinUnderProject(f.path, DEFAULT_DOCS_SUBDIR);
+      const prevTasksDefault = joinUnderProject(f.path, DEFAULT_TASKS_SUBDIR);
+      if (!f.docsPath || f.docsPath === prevDocsDefault) {
+        next.docsPath = joinUnderProject(value, DEFAULT_DOCS_SUBDIR);
+      }
+      if (!f.tasksPath || f.tasksPath === prevTasksDefault) {
+        next.tasksPath = joinUnderProject(value, DEFAULT_TASKS_SUBDIR);
+      }
+      return next;
+    });
+  };
 
   const requestClose = () => {
     if (submitting) return;
@@ -104,6 +143,7 @@ export function CreateProjectModal({
           name: form.name.trim(),
           path: form.path.trim(),
           docsPath: form.docsPath.trim(),
+          tasksPath: form.tasksPath.trim(),
           status: form.status,
           updatedAt: token,
         });
@@ -114,6 +154,7 @@ export function CreateProjectModal({
           name: form.name,
           path: form.path,
           docsPath: form.docsPath,
+          tasksPath: form.tasksPath,
         };
         const created = await projectsApi.create(input);
         onCreated(created);
@@ -159,13 +200,15 @@ export function CreateProjectModal({
           name={form.name}
           path={form.path}
           docsPath={form.docsPath}
+          tasksPath={form.tasksPath}
           status={form.status}
           showStatus={isEdit}
           nameError={nameError}
           pathError={pathError}
           onNameChange={(value) => setForm((f) => ({ ...f, name: value }))}
-          onPathChange={(value) => setForm((f) => ({ ...f, path: value }))}
+          onPathChange={handlePathChange}
           onDocsPathChange={(value) => setForm((f) => ({ ...f, docsPath: value }))}
+          onTasksPathChange={(value) => setForm((f) => ({ ...f, tasksPath: value }))}
           onStatusChange={(value) => setForm((f) => ({ ...f, status: value }))}
         />
       </Modal>

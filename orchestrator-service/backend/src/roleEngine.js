@@ -103,8 +103,18 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
     text = content.trim();
     break;
   }
-  // Модель упёрлась в инструменты и не дала вердикт — просим финал без инструментов.
+  // Модель упёрлась в инструменты и не дала вердикт — жёстко просим финал без
+  // инструментов: на основе уже собранных данных вернуть ТОЛЬКО JSON-вердикт.
+  // Без этого «болтливые» модели (DeepSeek) бесконечно зовут read_file и роль
+  // падает в verdict_unparsed.
   if (!text) {
+    messages.push({
+      role: 'user',
+      content:
+        'Достаточно сбора информации. БОЛЬШЕ НЕ вызывай инструменты. На основе уже полученных '
+        + 'данных верни ТОЛЬКО финальный JSON-вердикт в требуемом формате — без разметки tool_calls, '
+        + 'без markdown и без пояснений вокруг JSON.',
+    });
     const { message } = await invokeChat(conn, { messages, tools: [] });
     text = String(message?.content ?? '').trim();
   }
@@ -466,8 +476,12 @@ export async function runReasoningRole(client, { roleCode, context, outputFields
         WHERE id = $1`,
       [exchangeId, text, httpStatus ?? null, durationMs ?? null],
     );
-    const verdict = normalizeVerdict(roleCode, parseVerdict(text));
-    return { verdict, response: text, promptText, connectorId: conn.id, exchangeId, durationMs };
+    // parsed === null означает, что в ответе модели не нашлось распознаваемого
+    // JSON-вердикта (напр. DeepSeek прислал tool-call разметку вместо финала).
+    // Вызывающий трактует это как «роль не выполнена», а не как успех.
+    const parsed = parseVerdict(text);
+    const verdict = normalizeVerdict(roleCode, parsed);
+    return { verdict, parsed, response: text, promptText, connectorId: conn.id, exchangeId, durationMs };
   } catch (e) {
     await client.query(
       `UPDATE prompt_exchanges SET status = 'ошибка', error = $2, http_status = $3, duration_ms = $4

@@ -8,8 +8,10 @@ import styles from './StepBasics.module.css';
 interface StepBasicsProps {
   name: string;
   path: string;
-  /** Папка с документами проекта («карта»; за ней следит Scanner). */
+  /** Папка с документами проекта («карта» проекта: описание). */
   docsPath: string;
+  /** Папка с задачами проекта (за ней следит Scanner — приём задач). */
+  tasksPath: string;
   status: ProjectStatus;
   /** Показывать ли выбор статуса (режим редактирования). */
   showStatus?: boolean;
@@ -18,6 +20,7 @@ interface StepBasicsProps {
   onNameChange: (value: string) => void;
   onPathChange: (value: string) => void;
   onDocsPathChange: (value: string) => void;
+  onTasksPathChange: (value: string) => void;
   onStatusChange: (value: ProjectStatus) => void;
 }
 
@@ -33,6 +36,7 @@ export function StepBasics({
   name,
   path,
   docsPath,
+  tasksPath,
   status,
   showStatus = false,
   nameError,
@@ -40,6 +44,7 @@ export function StepBasics({
   onNameChange,
   onPathChange,
   onDocsPathChange,
+  onTasksPathChange,
   onStatusChange,
 }: StepBasicsProps) {
   const toast = useToast();
@@ -69,6 +74,7 @@ export function StepBasics({
 
   const handlePick = () => pickInto(onPathChange, path);
   const handlePickDocs = () => pickInto(onDocsPathChange, docsPath);
+  const handlePickTasks = () => pickInto(onTasksPathChange, tasksPath);
 
   return (
     <div className={styles.step}>
@@ -135,7 +141,7 @@ export function StepBasics({
               onChange={(e) => onDocsPathChange(e.target.value)}
               placeholder="C:\\projects\\my-app\\docs или /home/user/my-app/docs"
               mono
-              helper="Папка с файлами, описывающими проект (его «карта»). За этой папкой следит Scanner — из неё принимаются новые задачи. Можно оставить пустым."
+              helper="Подпапка внутри папки проекта с файлами, описывающими проект (его «карта»). По умолчанию подставляется относительно папки проекта. Можно оставить пустым."
               autoComplete="off"
               spellCheck={false}
             />
@@ -145,6 +151,32 @@ export function StepBasics({
               variant="secondary"
               leftIcon={<FolderOpen size={18} aria-hidden="true" />}
               onClick={handlePickDocs}
+            >
+              Выбрать папку
+            </Button>
+          </div>
+        </div>
+      </div>
+
+      <div className={styles.pathBlock}>
+        <div className={styles.pathRow}>
+          <div className={styles.pathInput}>
+            <Input
+              label="Папка задач проекта"
+              value={tasksPath}
+              onChange={(e) => onTasksPathChange(e.target.value)}
+              placeholder="C:\\projects\\my-app\\tasks или /home/user/my-app/tasks"
+              mono
+              helper="Подпапка внутри папки проекта с задачами для этого проекта. За этой папкой следит Scanner — из неё принимаются новые задачи. По умолчанию подставляется относительно папки проекта. Можно оставить пустым."
+              autoComplete="off"
+              spellCheck={false}
+            />
+          </div>
+          <div className={styles.pickBtn}>
+            <Button
+              variant="secondary"
+              leftIcon={<FolderOpen size={18} aria-hidden="true" />}
+              onClick={handlePickTasks}
             >
               Выбрать папку
             </Button>

@@ -1,0 +1,17 @@
+{
+  "servers": {
+    "ai-dev-manager": {
+      "type": "stdio",
+      "command": "node",
+      "args": ["${workspaceFolder}/mcp-service/bin/mcp-service.js"],
+      "env": {
+        "PROJECT_ROOT": "ai-dev-manager",
+        "ORCHESTRATOR_URL": "http://localhost:4186",
+        "TOOLS_SERVICE_URL": "http://localhost:4188",
+        "MCP_ENABLE_WRITE": "1",
+        "MCP_ENABLE_DELETE": "1",
+        "MCP_ENABLE_ORCHESTRATOR_MUTATIONS": "1"
+      }
+    }
+  }
+}

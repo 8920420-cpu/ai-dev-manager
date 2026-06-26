@@ -135,6 +135,34 @@
   }
 }
 
+/* Назначение интеграции (коннектора) роли. */
+.integrationRow {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-3);
+}
+
+.integrationSelect {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.integrationStatus {
+  flex: 0 0 auto;
+  padding-bottom: var(--space-2);
+}
+
+@media (max-width: 640px) {
+  .integrationRow {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .integrationStatus {
+    padding-bottom: 0;
+  }
+}
+
 /* Чекбоксы уровней доступа и MCP-инструментов. */
 .capRow {
   display: flex;

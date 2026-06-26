@@ -21,6 +21,9 @@ let apiToken: string | null = null;
 export function setApiToken(token: string | null): void {
   apiToken = token;
 }
+export function getApiToken(): string | null {
+  return apiToken;
+}
 
 interface RequestOptions {
   /** Для отмены устаревших запросов (напр. при смене проекта). */
