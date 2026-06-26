@@ -87,10 +87,18 @@ export async function runGitAction(task, opts = {}) {
   // Репозиторий может быть ещё не создан — инициализируем автоматически.
   const repo = await ensureRepo(repoRoot);
 
-  // -A: чтобы git зафиксировал не только модификации/добавления, но и УДАЛЕНИЯ
-  // перечисленных путей. Без -A `git add -- <удалённый файл>` падает с
-  // fatal: pathspec ... did not match any files и роняет весь коммит задачи.
-  await git(repoRoot, ['add', '-A', '--', ...files]);
+  // Стейджим только те пути задачи, которые git реально видит как изменение
+  // (модификация / добавление / удаление). Путь, которого git не знает вовсе
+  // (уже закоммичен ранее, либо никогда не существовал), роняет `git add`
+  // с fatal: pathspec ... did not match any files и срывает весь коммит — а
+  // git add валится на ПЕРВОМ неизвестном пути, не доходя до остальных.
+  const status = await git(repoRoot, ['status', '--porcelain', '--', ...files]);
+  const dirty = files.filter((f) => status.stdout.includes(f));
+  if (dirty.length === 0) {
+    return { success: true, output: { commit: null, files: [], note: 'nothing_to_stage' } };
+  }
+  // -A: зафиксировать в т.ч. УДАЛЕНИЯ перечисленных путей.
+  await git(repoRoot, ['add', '-A', '--', ...dirty]);
   const staged = await git(repoRoot, ['diff', '--cached', '--name-only']);
   const stagedFiles = staged.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
   if (stagedFiles.length === 0) {
