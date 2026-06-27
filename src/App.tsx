@@ -3,14 +3,18 @@ import { ToastProvider } from './components/ui';
 import { RouterProvider, useRouter } from './app/router';
 import { AppShell } from './components/layout/AppShell';
 import { ConnectedProjectsPage } from './features/projects/ConnectedProjectsPage';
+import { TasksPage } from './features/tasks/TasksPage';
 import { DevelopmentSchemePage } from './features/scheme/DevelopmentSchemePage';
 import { IntegrationsPage } from './features/integrations/IntegrationsPage';
 import { RolesPage } from './features/settings/RolesPage';
 import { ToolsPage } from './features/settings/ToolsPage';
+import { ExecutionPage } from './features/settings/ExecutionPage';
 
 function CurrentPage() {
   const { route } = useRouter();
   switch (route) {
+    case 'tasks':
+      return <TasksPage />;
     case 'development-scheme':
       return <DevelopmentSchemePage />;
     case 'integrations':
@@ -19,6 +23,8 @@ function CurrentPage() {
       return <RolesPage />;
     case 'settings-tools':
       return <ToolsPage />;
+    case 'settings-execution':
+      return <ExecutionPage />;
     case 'projects':
     default:
       return <ConnectedProjectsPage />;

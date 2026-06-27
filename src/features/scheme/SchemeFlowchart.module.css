@@ -458,6 +458,45 @@
   font-weight: var(--weight-semibold);
 }
 
+/* ---- Параллельные ветки (fork → колонки → join) ---- */
+/* align-items: stretch — колонки-ветки тянутся до высоты самой длинной, чтобы
+   их блоки были выровнены по высоте независимо от числа узлов в ветке. */
+.branches {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  justify-content: center;
+  gap: var(--space-4);
+  width: 100%;
+  padding: var(--space-3) 0;
+}
+
+/* justify-content: center — узлы внутри ветки центрируются по вертикали, поэтому
+   одноузловая ветка (напр. Git Integrator) встаёт по центру высоты против
+   многоузловой соседки (Documentation Auditor → Documentation Keeper). */
+.branch {
+  flex: 1 1 0;
+  min-width: 240px;
+  max-width: 420px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-2) 0;
+}
+
+/* Внутри ветки карточки занимают всю ширину колонки. */
+.branch .node {
+  max-width: none;
+}
+
+@media (max-width: 720px) {
+  .branches {
+    flex-direction: column;
+    align-items: center;
+  }
+}
+
 /* ---- Узел «Добавить этап» ---- */
 .addNodeWrap {
   display: flex;

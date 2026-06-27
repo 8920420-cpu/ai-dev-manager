@@ -23,10 +23,19 @@ services:
       # Фоновый runner продвигает автоматические роли по БД (false — выключить).
       RUNNER_ENABLED: "true"
       RUNNER_INTERVAL_MS: "3000"
+      # Таймаут захвата роли: прогон без завершения дольше порога → TIMEOUT, слот
+      # свободен. Поднят до 30 мин (с 15) — снижает ложные TIMEOUT при скачках
+      # часов Docker-VM (см. patroni-single-node-flapping). RUNNER_CLAUDE_TIMEOUT_MS
+      # наследует это значение, если не задан отдельно.
+      RUNNER_ROLE_TIMEOUT_MS: "${RUNNER_ROLE_TIMEOUT_MS:-1800000}"
       # Задайте токен, чтобы закрыть /api/* при сетевом доступе (пусто = выключено).
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
       # Микросервис инструментов (builtin-чтение проекта + MCP для Claude Code).
       TOOLS_SERVICE_URL: "http://tools-service:4188"
+      # PROJECT-PATH-MAP-001: трансляция host root_path → путь внутри tools-service.
+      # root_path в БД — путь хоста (Windows), а tools-service монтирует родитель
+      # проектов в /projects. Префикс берём из PROJECTS_HOST_ROOT (.env).
+      TOOLS_PROJECT_PATH_MAP: "${PROJECTS_HOST_ROOT:-K:\\Роботы\\Golang\\git}=>/projects"
     networks:
       - default
       - shared-network
@@ -59,6 +68,11 @@ services:
       # /app/ai-dev-manager (WORKDIR /app). rw — чтобы работали write/edit/delete
       # (для read-only ролей запись недоступна по уровню доступа).
       - ./:/app/ai-dev-manager:rw
+      # PROJECT-PATH-MAP-001: родитель ВСЕХ проектов (PS, ai-dev-manager, …) на
+      # /projects. Оркестратор транслирует host root_path в этот путь (см.
+      # TOOLS_PROJECT_PATH_MAP), иначе роли не могут читать чужие проекты и валят
+      # задачу в BLOCKED. «../» от каталога compose = родитель репозитория.
+      - ../:/projects:rw
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4188/health"]
@@ -114,29 +128,28 @@ services:
     image: scanner-service:latest
     container_name: scanner-service
     environment:
-      SCANNER_DOCUMENT: /workspace/claude-tasks.json
-      SCANNER_STATE: /workspace/.scanner-state.json
-      SCANNER_ENDPOINT: http://orchestrator-service/api/scanner/task-completed
+      # API multi-watcher режим: папки наблюдения берутся из этапов проектов
+      # оркестратора (SCANNER_API_BASE). Legacy single-watcher/feeder удалён.
+      SCANNER_API_BASE: http://orchestrator-service
+      # Каталог exactly-once state-файлов watcher'ов (по projectId+stageId).
+      SCANNER_STATE_DIR: /workspace/scanner-state
       SCANNER_DEBOUNCE_MS: "150"
       # bind-mount в Docker не пробрасывает события fs.watch с хоста —
       # резервный опрос ловит изменения, которые watcher пропустил.
       SCANNER_FALLBACK_MS: "5000"
       # Stage 1: после доставки удалять завершённую запись, освобождая слот.
       SCANNER_CLEAR_ON_DISPATCH: "true"
-      # Stage 2: обратный мост — наполнять пустой слот следующей задачей из БД.
-      FEEDER_ENABLED: "true"
-      FEEDER_INTERVAL_MS: "3000"
       # Интейк (SCANNER-INTAKE-001): импорт задач из Markdown-очередей
       # tasks/<service>.md (секции с маркером `[x]`) в БД с вырезанием секции.
-      # Включается заданием проекта-владельца; папка задач — каталог /workspace.
+      # Включается заданием проекта-владельца; папка очередей — /workspace.
       # Значение — code|name|root_path проекта (root_path стабильнее всего).
       SCANNER_INTAKE_PROJECT: "${SCANNER_INTAKE_PROJECT:-ai-dev-manager}"
+      SCANNER_INTAKE_DIR: /workspace
       SCANNER_INTAKE_INTERVAL_MS: "5000"
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
     volumes:
-      # Единая эталонная папка задач проекта. Файл-мост claude-tasks.json и
-      # state-файл сканера лежат прямо в tasks/, чтобы не «бегать» по проекту:
-      # одна папка — один источник истины для очереди и слота Programmer.
+      # Эталонная папка задач проекта: Markdown-очереди интейка (tasks/<service>.md)
+      # и каталог state-файлов сканера. Одна папка — один источник истины.
       - ./tasks:/workspace
     depends_on:
       orchestrator-service:

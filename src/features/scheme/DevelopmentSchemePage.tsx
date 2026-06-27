@@ -6,7 +6,7 @@ import {
 } from '../../api/developmentSchemeApi';
 import { subscribeTaskChanges, tasksApi } from '../../api/tasksApi';
 import { StageSaveError, type StageSaveErrorItem } from '../../api/projectsApi';
-import { isStageEnabled, type Role, type Stage } from '../../types/project';
+import { isStageEnabled, type Role, type SchemeEdge, type Stage } from '../../types/project';
 import { wizardReducer, type WizardState } from '../projects/wizardState';
 import { SchemeFlowchart } from './SchemeFlowchart';
 import { deriveSchemeEdges } from './deriveEdges';
@@ -68,6 +68,8 @@ export function DevelopmentSchemePage() {
     stages: [] as Stage[],
   });
   const [errors, setErrors] = useState<SchemeErrors>(EMPTY_ERRORS);
+  // FORK-JOIN-001: рёбра сохранённой схемы — для параллельной раскладки fork/join.
+  const [edges, setEdges] = useState<SchemeEdge[]>([]);
   const [saveErrors, setSaveErrors] = useState<StageSaveErrorItem[]>([]);
   const [taskCounts, setTaskCounts] = useState<Record<string, number>>({});
   const [saving, setSaving] = useState(false);
@@ -77,6 +79,7 @@ export function DevelopmentSchemePage() {
     try {
       const scheme = await developmentSchemeApi.get();
       dispatch({ type: 'reset', state: toWizardState(scheme) });
+      setEdges(scheme.edges);
       setLoadState('ready');
     } catch {
       setLoadState('error');
@@ -127,6 +130,7 @@ export function DevelopmentSchemePage() {
       const derived = deriveSchemeEdges(state.stages);
       const saved = await developmentSchemeApi.save(derived.stages, state.roles, derived.edges);
       dispatch({ type: 'reset', state: toWizardState(saved) });
+      setEdges(saved.edges);
       toast.success('Схема разработки сохранена и применена ко всем проектам');
     } catch (err) {
       if (err instanceof StageSaveError) {
@@ -170,6 +174,7 @@ export function DevelopmentSchemePage() {
         <>
           <SchemeFlowchart
             stages={state.stages}
+            edges={edges}
             roles={state.roles}
             stageErrors={errors.stages}
             scanErrors={{}}
@@ -192,6 +197,9 @@ export function DevelopmentSchemePage() {
             }
             onSetStageStatus={(stageId, taskStatus) =>
               dispatch({ type: 'setStageStatus', stageId, taskStatus })
+            }
+            onSetStageJoinKey={(stageId, joinKey) =>
+              dispatch({ type: 'setStageJoinKey', stageId, joinKey })
             }
             onApplyDefaults={() => dispatch({ type: 'applyDefaultStages' })}
           />

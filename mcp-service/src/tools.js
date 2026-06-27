@@ -214,7 +214,10 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
     'orchestrator_claim_next_claude_task',
     {
       title: 'Взять следующую задачу Claude',
-      description: 'GET /api/runner/next-claude-task — захватить следующую задачу для Claude-исполнителя.',
+      description:
+        'GET /api/runner/next-claude-task — захватить следующую задачу для Claude-исполнителя. ' +
+        'После успешной сдачи результата исполнитель обязан очистить рабочий контекст сессии ' +
+        '(например, командой /clear в Claude Code), чтобы следующая задача не получила остатки контекста выполненной задачи.',
       inputSchema: {},
     },
     () => run(() => orchestratorClient.get('/api/runner/next-claude-task')),
@@ -240,14 +243,21 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
         description:
           'Завести новую задачу. Она создаётся под ролью «Приёмщик задач» (TASK_INTAKE_OFFICER) ' +
           'в статусе BACKLOG; дальше оркестратор сам ведёт её по цепочке (Приёмщик → Architect → …). ' +
+          'ОБЯЗАТЕЛЬНО укажи проект, к которому относится задача: задай projectPath — абсолютный путь ' +
+          'папки проекта, с которой работаешь (предпочтительно), либо project (code / name / root_path). ' +
+          'Без указания проекта задача не маршрутизируется и попадёт в «Неразобранные» у Приёмщика, где её ' +
+          'придётся вручную назначать на проект — не оставляй проект пустым. Backend сопоставит указанный ' +
+          'путь с зарегистрированным проектом по root_path. ВАЖНО: title и description передавай в корректной ' +
+          'UTF-8 — повреждённый текст (mojibake/«кракозябры»/«?») отклоняется с кодом corrupted_encoding. ' +
           'POST /api/scanner/task-intake. Идемпотентно по (project, externalId): повторный вызов ' +
           'вернёт duplicate, дубль не создаётся. Требует MCP_ENABLE_ORCHESTRATOR_MUTATIONS=1.',
         inputSchema: {
           externalId: z.string().describe('Уникальный ключ задачи в проекте (идемпотентность по project+externalId).'),
-          project: z.string().describe('Проект: code / name / root_path (должен быть зарегистрирован).'),
-          title: z.string().describe('Заголовок задачи.'),
+          projectPath: z.string().optional().describe('ОБЯЗАТЕЛЬНО указать проект: абсолютный путь папки проекта, с которой работаешь. Приоритетнее project; backend сопоставит его с зарегистрированным проектом по root_path. Не оставляй пустым.'),
+          project: z.string().optional().describe('Проект: code / name / root_path. Используй, если папку указать нельзя. Должен быть задан projectPath ИЛИ project — иначе задача станет «неразобранной».'),
+          title: z.string().describe('Заголовок задачи (корректная UTF-8, без «кракозябр»).'),
           service: z.string().optional().describe('Код сервиса (авто-регистрируется; можно пусто).'),
-          description: z.string().optional().describe('Исходный запрос пользователя — его прочитает Приёмщик.'),
+          description: z.string().optional().describe('Исходный запрос пользователя — его прочитает Приёмщик (корректная UTF-8).'),
           result: z.string().optional(),
           changedFiles: z.array(z.string()).optional(),
         },

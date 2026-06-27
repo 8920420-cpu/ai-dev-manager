@@ -25,12 +25,19 @@ interface StageSettingsModalProps {
   statusError?: string | null;
   /** Скрыть поле «Отслеживаемая папка» (в единой схеме папку задаёт проект). */
   hideScanPath?: boolean;
+  /**
+   * FORK-JOIN-001: доступные узлы join для выбора парного барьера у узла fork
+   * (только для kind === 'fork'). key — stageKey join-узла, label — его подпись.
+   */
+  joinOptions?: { key: string; label: string }[];
   canRemove: boolean;
   onRename: (name: string) => void;
   onSetRole: (roleId: string | null) => void;
   onToggleEnabled: (enabled: boolean) => void;
   onSetScanPath: (scanPath: string) => void;
   onSetStatus: (taskStatus: string) => void;
+  /** FORK-JOIN-001: задать/снять парный join для узла fork (null — авто). */
+  onSetJoinKey?: (joinKey: string | null) => void;
   onRemove: () => void;
 }
 
@@ -50,17 +57,20 @@ export function StageSettingsModal({
   scanError,
   statusError,
   hideScanPath = false,
+  joinOptions = [],
   canRemove,
   onRename,
   onSetRole,
   onToggleEnabled,
   onSetScanPath,
   onSetStatus,
+  onSetJoinKey,
   onRemove,
 }: StageSettingsModalProps) {
   const toast = useToast();
   const kind = stage.kind ?? 'stage';
   const control = kind !== 'stage';
+  const isFork = kind === 'fork';
   const stageLabel = stage.name.trim() || `Этап ${index + 1}`;
   const selectedRoleId = stage.roleIds[0] ?? '';
   const selectedRole = roles.find((r) => r.id === selectedRoleId);
@@ -147,6 +157,27 @@ export function StageSettingsModal({
             {roles.map((role) => (
               <option key={role.id} value={role.id}>
                 {role.name}
+              </option>
+            ))}
+          </Select>
+        )}
+
+        {isFork && onSetJoinKey && (
+          <Select
+            label="Парный узел join"
+            value={stage.joinKey ?? ''}
+            onChange={(e) => onSetJoinKey(e.target.value || null)}
+            disabled={joinOptions.length === 0}
+            helper={
+              joinOptions.length === 0
+                ? 'Добавьте в схему узел «Объединить (join)», чтобы выбрать барьер для этого разделения.'
+                : 'Узел join, на котором сходятся параллельные ветки этого fork. «Авто» — ближайший join ниже по схеме.'
+            }
+          >
+            <option value="">— авто (ближайший join) —</option>
+            {joinOptions.map((opt) => (
+              <option key={opt.key} value={opt.key}>
+                {opt.label}
               </option>
             ))}
           </Select>

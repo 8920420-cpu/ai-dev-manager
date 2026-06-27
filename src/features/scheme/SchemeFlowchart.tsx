@@ -1,4 +1,4 @@
-import { useState, type DragEvent } from 'react';
+import { Fragment, useState, type DragEvent } from 'react';
 import {
   AlertCircle,
   ArrowDown,
@@ -17,7 +17,8 @@ import { isScannerRole } from '../../data/presets';
 import { TASK_STATUSES, taskStatusLabel } from '../../data/taskStatuses';
 import { cn } from '../../lib/cn';
 import type { StageSaveErrorItem } from '../../api/projectsApi';
-import type { Role, Stage, StageKind } from '../../types/project';
+import type { Role, SchemeEdge, Stage, StageKind } from '../../types/project';
+import { buildSchemeLayout } from './schemeLayout';
 
 /** Метаданные типа узла блок-схемы для панели инструментов и рендера карточки. */
 const KIND_META: Record<Exclude<StageKind, 'stage'>, { label: string; hint: string }> = {
@@ -32,6 +33,11 @@ import styles from './SchemeFlowchart.module.css';
 
 interface SchemeFlowchartProps {
   stages: Stage[];
+  /**
+   * FORK-JOIN-001: рёбра графа схемы. Если заданы и соответствуют узлам — участок
+   * fork→join рисуется параллельными ветками (колонками); иначе раскладка линейна.
+   */
+  edges?: SchemeEdge[];
   roles: Role[];
   /** Ошибки названий этапов по id этапа. */
   stageErrors: Record<string, string>;
@@ -56,6 +62,8 @@ interface SchemeFlowchartProps {
   onSetStageEnabled: (stageId: string, enabled: boolean) => void;
   onSetStageScanPath: (stageId: string, scanPath: string) => void;
   onSetStageStatus: (stageId: string, taskStatus: string) => void;
+  /** FORK-JOIN-001: задать/снять парный join у узла fork (null — авто). */
+  onSetStageJoinKey?: (stageId: string, joinKey: string | null) => void;
   onApplyDefaults: () => void;
 }
 
@@ -66,6 +74,7 @@ interface SchemeFlowchartProps {
  */
 export function SchemeFlowchart({
   stages,
+  edges,
   roles,
   stageErrors,
   scanErrors,
@@ -83,6 +92,7 @@ export function SchemeFlowchart({
   onSetStageEnabled,
   onSetStageScanPath,
   onSetStageStatus,
+  onSetStageJoinKey,
   onApplyDefaults,
 }: SchemeFlowchartProps) {
   const [dragIndex, setDragIndex] = useState<number | null>(null);
@@ -134,6 +144,173 @@ export function SchemeFlowchart({
 
   const openStage = stages.find((s) => s.id === openStageId) ?? null;
   const openIndex = openStage ? stages.findIndex((s) => s.id === openStage.id) : -1;
+
+  // FORK-JOIN-001: узлы join (с ключом) — варианты парного барьера для fork.
+  const joinOptions = stages.flatMap((s, i) =>
+    (s.kind === 'join' && s.stageKey)
+      ? [{ key: s.stageKey, label: s.name.trim() || `Узел ${i + 1} (join)` }]
+      : [],
+  );
+
+  // FORK-JOIN-001: раскладка — участок fork→join сворачивается в параллельные
+  // ветки (рисуются колонками рядом), остальное остаётся линейной цепочкой.
+  const layout = buildSchemeLayout(stages, edges ?? []);
+
+  const connector = (
+    <div className={styles.connector} aria-hidden="true">
+      <ArrowDown size={16} />
+    </div>
+  );
+
+  // Карточка одного узла-этапа. Вынесена из рендера, чтобы переиспользовать её и
+  // в линейной цепочке, и внутри колонок параллельных веток.
+  const renderCard = (stage: Stage, index: number) => {
+    const enabled = stage.enabled !== false;
+    const kind = stage.kind ?? 'stage';
+    const control = kind !== 'stage';
+    const role = roles.find((r) => r.id === stage.roleIds[0]);
+    const scanner = !control && role ? isScannerRole(role) : false;
+    const hasError = Boolean(
+      stageErrors[stage.id] || scanErrors[stage.id] || statusErrors[stage.id],
+    );
+    const stageLabel =
+      stage.name.trim() || (control ? KIND_META[kind].label : `Этап ${index + 1}`);
+    // Перезапущенные задачи (статус RESTART) стоят в очереди именно к Приёмщику
+    // задач — учитываем их в счётчике его этапа, иначе они «пропадают» из схемы.
+    const restartHere = role?.code === 'TASK_INTAKE_OFFICER' ? taskCounts['RESTART'] ?? 0 : 0;
+    const taskCount =
+      (stage.taskStatus ? taskCounts[stage.taskStatus] ?? 0 : 0) + restartHere;
+
+    return (
+      <div
+        className={cn(
+          styles.node,
+          control && styles.nodeControl,
+          kind === 'fork' && styles.nodeFork,
+          kind === 'join' && styles.nodeJoin,
+          kind === 'condition' && styles.nodeCondition,
+          !enabled && styles.nodeDisabled,
+          scanner && styles.nodeScanner,
+          hasError && styles.nodeError,
+          dragIndex === index && styles.nodeDragging,
+          overIndex === index &&
+            dragIndex !== null &&
+            dragIndex !== index &&
+            styles.nodeDropTarget,
+        )}
+        draggable={dragEnabledIndex === index}
+        onDragStart={() => setDragIndex(index)}
+        onDragEnter={() => setOverIndex(index)}
+        onDragOver={(e: DragEvent) => e.preventDefault()}
+        onDrop={(e: DragEvent) => {
+          e.preventDefault();
+          handleDrop(index);
+        }}
+        onDragEnd={() => {
+          setDragEnabledIndex(null);
+          setDragIndex(null);
+          setOverIndex(null);
+        }}
+      >
+        <div className={styles.nodeHead}>
+          <button
+            type="button"
+            className={styles.grip}
+            onMouseDown={() => setDragEnabledIndex(index)}
+            onMouseUp={() => setDragEnabledIndex(null)}
+            onBlur={() => setDragEnabledIndex(null)}
+            aria-label={`Перетащите, чтобы изменить порядок этапа «${stageLabel}»`}
+            title="Перетащить для изменения порядка"
+          >
+            <GripVertical size={16} aria-hidden="true" />
+          </button>
+          <span className={cn(styles.number, control && styles.numberControl)}>
+            {index + 1}
+          </span>
+          {control && (
+            <span className={styles.kindTag}>
+              {kind === 'fork' && <GitFork size={14} aria-hidden="true" />}
+              {kind === 'join' && <GitMerge size={14} aria-hidden="true" />}
+              {kind === 'condition' && <Diamond size={14} aria-hidden="true" />}
+              {KIND_META[kind].label}
+            </span>
+          )}
+          <span className={styles.spacer} />
+          {hasError && (
+            <AlertCircle
+              size={16}
+              className={styles.errorIcon}
+              aria-label="В настройках этапа есть ошибки"
+            />
+          )}
+          <label
+            className={styles.toggle}
+            title={enabled ? 'Этап включён' : 'Этап отключён'}
+          >
+            <input
+              type="checkbox"
+              className={styles.checkbox}
+              checked={enabled}
+              onChange={(e) => onSetStageEnabled(stage.id, e.target.checked)}
+              aria-label={`Включить этап «${stageLabel}»`}
+            />
+          </label>
+          <button
+            type="button"
+            className={styles.gear}
+            onClick={() => setOpenStageId(stage.id)}
+            aria-label={`Настройки этапа «${stageLabel}»`}
+            title="Настройки этапа"
+          >
+            <Settings size={16} aria-hidden="true" />
+          </button>
+        </div>
+
+        {control ? (
+          <div className={styles.nodeMeta}>
+            <span className={styles.controlHint}>
+              {stage.name.trim() ? `${stage.name.trim()} — ` : ''}
+              {KIND_META[kind].hint}
+            </span>
+            {!enabled && <span className={styles.offChip}>Отключён</span>}
+          </div>
+        ) : (
+          <>
+            <div className={styles.nodeMeta}>
+              {role ? (
+                <span className={cn(styles.roleChip, scanner && styles.roleChipScanner)}>
+                  {role.name}
+                </span>
+              ) : (
+                <span className={styles.roleEmpty}>Роль не выбрана</span>
+              )}
+              {enabled && stage.taskStatus && (
+                <span className={styles.statusChip}>{taskStatusLabel(stage.taskStatus)}</span>
+              )}
+              {!enabled && <span className={styles.offChip}>Отключён</span>}
+            </div>
+
+            <div className={styles.nodeActions}>
+              <button
+                type="button"
+                className={styles.tasksBtn}
+                onClick={() => setTasksStageId(stage.id)}
+              >
+                <ListTree size={15} aria-hidden="true" />
+                Задачи
+                <span
+                  className={cn(styles.taskCount, taskCount > 0 && styles.taskCountActive)}
+                  title={`Задач на этом этапе сейчас: ${taskCount}`}
+                >
+                  {taskCount}
+                </span>
+              </button>
+            </div>
+          </>
+        )}
+      </div>
+    );
+  };
 
   const tasksStage = stages.find((s) => s.id === tasksStageId) ?? null;
   const tasksStageIndex = tasksStage ? stages.findIndex((s) => s.id === tasksStage.id) : -1;
@@ -244,157 +421,41 @@ export function SchemeFlowchart({
           <ArrowDown size={16} />
         </li>
 
-        {stages.map((stage, index) => {
-          const enabled = stage.enabled !== false;
-          const kind = stage.kind ?? 'stage';
-          const control = kind !== 'stage';
-          const role = roles.find((r) => r.id === stage.roleIds[0]);
-          const scanner = !control && role ? isScannerRole(role) : false;
-          const hasError = Boolean(
-            stageErrors[stage.id] || scanErrors[stage.id] || statusErrors[stage.id],
-          );
-          const stageLabel =
-            stage.name.trim() || (control ? KIND_META[kind].label : `Этап ${index + 1}`);
-          // Число задач сейчас на этом этапе (по статусу этапа, по всем проектам).
-          const taskCount = stage.taskStatus ? taskCounts[stage.taskStatus] ?? 0 : 0;
-
+        {layout.map((item) => {
+          if (item.type === 'node') {
+            const { stage, index } = item.node;
+            return (
+              <li key={stage.id} className={styles.nodeWrap}>
+                {renderCard(stage, index)}
+                {connector}
+              </li>
+            );
+          }
+          // FORK-JOIN-001: участок fork → [ветки колонками] → join.
+          const { fork, branches, join } = item;
           return (
-            <li key={stage.id} className={styles.nodeWrap}>
+            <li key={fork.stage.id} className={styles.nodeWrap}>
+              {renderCard(fork.stage, fork.index)}
+              {connector}
               <div
-                className={cn(
-                  styles.node,
-                  control && styles.nodeControl,
-                  kind === 'fork' && styles.nodeFork,
-                  kind === 'join' && styles.nodeJoin,
-                  kind === 'condition' && styles.nodeCondition,
-                  !enabled && styles.nodeDisabled,
-                  scanner && styles.nodeScanner,
-                  hasError && styles.nodeError,
-                  dragIndex === index && styles.nodeDragging,
-                  overIndex === index &&
-                    dragIndex !== null &&
-                    dragIndex !== index &&
-                    styles.nodeDropTarget,
-                )}
-                draggable={dragEnabledIndex === index}
-                onDragStart={() => setDragIndex(index)}
-                onDragEnter={() => setOverIndex(index)}
-                onDragOver={(e: DragEvent) => e.preventDefault()}
-                onDrop={(e: DragEvent) => {
-                  e.preventDefault();
-                  handleDrop(index);
-                }}
-                onDragEnd={() => {
-                  setDragEnabledIndex(null);
-                  setDragIndex(null);
-                  setOverIndex(null);
-                }}
+                className={styles.branches}
+                role="group"
+                aria-label="Параллельные ветки"
               >
-                <div className={styles.nodeHead}>
-                  <button
-                    type="button"
-                    className={styles.grip}
-                    onMouseDown={() => setDragEnabledIndex(index)}
-                    onMouseUp={() => setDragEnabledIndex(null)}
-                    onBlur={() => setDragEnabledIndex(null)}
-                    aria-label={`Перетащите, чтобы изменить порядок этапа «${stageLabel}»`}
-                    title="Перетащить для изменения порядка"
-                  >
-                    <GripVertical size={16} aria-hidden="true" />
-                  </button>
-                  <span className={cn(styles.number, control && styles.numberControl)}>
-                    {index + 1}
-                  </span>
-                  {control && (
-                    <span className={styles.kindTag}>
-                      {kind === 'fork' && <GitFork size={14} aria-hidden="true" />}
-                      {kind === 'join' && <GitMerge size={14} aria-hidden="true" />}
-                      {kind === 'condition' && <Diamond size={14} aria-hidden="true" />}
-                      {KIND_META[kind].label}
-                    </span>
-                  )}
-                  <span className={styles.spacer} />
-                  {hasError && (
-                    <AlertCircle
-                      size={16}
-                      className={styles.errorIcon}
-                      aria-label="В настройках этапа есть ошибки"
-                    />
-                  )}
-                  <label
-                    className={styles.toggle}
-                    title={enabled ? 'Этап включён' : 'Этап отключён'}
-                  >
-                    <input
-                      type="checkbox"
-                      className={styles.checkbox}
-                      checked={enabled}
-                      onChange={(e) => onSetStageEnabled(stage.id, e.target.checked)}
-                      aria-label={`Включить этап «${stageLabel}»`}
-                    />
-                  </label>
-                  <button
-                    type="button"
-                    className={styles.gear}
-                    onClick={() => setOpenStageId(stage.id)}
-                    aria-label={`Настройки этапа «${stageLabel}»`}
-                    title="Настройки этапа"
-                  >
-                    <Settings size={16} aria-hidden="true" />
-                  </button>
-                </div>
-
-                {control ? (
-                  <div className={styles.nodeMeta}>
-                    <span className={styles.controlHint}>
-                      {stage.name.trim() ? `${stage.name.trim()} — ` : ''}
-                      {KIND_META[kind].hint}
-                    </span>
-                    {!enabled && <span className={styles.offChip}>Отключён</span>}
+                {branches.map((branch, bi) => (
+                  <div key={branch[0]?.stage.id ?? `branch-${bi}`} className={styles.branch}>
+                    {branch.map((pn, ni) => (
+                      <Fragment key={pn.stage.id}>
+                        {renderCard(pn.stage, pn.index)}
+                        {ni < branch.length - 1 && connector}
+                      </Fragment>
+                    ))}
                   </div>
-                ) : (
-                  <>
-                    <div className={styles.nodeMeta}>
-                      {role ? (
-                        <span
-                          className={cn(styles.roleChip, scanner && styles.roleChipScanner)}
-                        >
-                          {role.name}
-                        </span>
-                      ) : (
-                        <span className={styles.roleEmpty}>Роль не выбрана</span>
-                      )}
-                      {enabled && stage.taskStatus && (
-                        <span className={styles.statusChip}>
-                          {taskStatusLabel(stage.taskStatus)}
-                        </span>
-                      )}
-                      {!enabled && <span className={styles.offChip}>Отключён</span>}
-                    </div>
-
-                    <div className={styles.nodeActions}>
-                      <button
-                        type="button"
-                        className={styles.tasksBtn}
-                        onClick={() => setTasksStageId(stage.id)}
-                      >
-                        <ListTree size={15} aria-hidden="true" />
-                        Задачи
-                        <span
-                          className={cn(styles.taskCount, taskCount > 0 && styles.taskCountActive)}
-                          title={`Задач на этом этапе сейчас: ${taskCount}`}
-                        >
-                          {taskCount}
-                        </span>
-                      </button>
-                    </div>
-                  </>
-                )}
+                ))}
               </div>
-
-              <div className={styles.connector} aria-hidden="true">
-                <ArrowDown size={16} />
-              </div>
+              {connector}
+              {renderCard(join.stage, join.index)}
+              {connector}
             </li>
           );
         })}
@@ -419,12 +480,18 @@ export function SchemeFlowchart({
           scanError={scanErrors[openStage.id] ?? null}
           statusError={statusErrors[openStage.id] ?? null}
           hideScanPath={hideScanPath}
+          joinOptions={joinOptions}
           canRemove={stages.length > 1}
           onRename={(name) => onRenameStage(openStage.id, name)}
           onSetRole={(roleId) => onSetStageRole(openStage.id, roleId)}
           onToggleEnabled={(en) => onSetStageEnabled(openStage.id, en)}
           onSetScanPath={(scanPath) => onSetStageScanPath(openStage.id, scanPath)}
           onSetStatus={(taskStatus) => onSetStageStatus(openStage.id, taskStatus)}
+          onSetJoinKey={
+            onSetStageJoinKey
+              ? (joinKey) => onSetStageJoinKey(openStage.id, joinKey)
+              : undefined
+          }
           onRemove={() => onRemoveStage(openStage.id)}
         />
       )}

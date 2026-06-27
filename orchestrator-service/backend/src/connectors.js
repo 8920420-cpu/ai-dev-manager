@@ -41,11 +41,20 @@ function clientConfig(s) {
 async function withClient(fn) {
   const s = await loadSettings();
   const client = new Client(clientConfig(s));
+  // DB-CONN-RESILIENCE-001: см. db.js — слушатель 'error' делает обрыв соединения
+  // (Patroni/PgBouncer переключение лидера) нефатальным, иначе Node роняет процесс.
+  client.on('error', (err) => {
+    console.error(`[orchestrator-service] DB client error (connectors, не фатально): ${err.message}`);
+  });
   await client.connect();
   try {
     return await fn(client);
   } finally {
-    await client.end();
+    try {
+      await client.end();
+    } catch (endErr) {
+      console.error(`[orchestrator-service] DB client.end() error (connectors, игнор): ${endErr.message}`);
+    }
   }
 }
 

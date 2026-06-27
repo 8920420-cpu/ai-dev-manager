@@ -5,6 +5,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve, join, extname, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadSettings, saveSettings, resolveSettings, redactSettings } from './config.js';
+import { getAppSettings, updateAppSettings } from './appSettings.js';
 import {
   testConnection,
   bootstrap,
@@ -13,6 +14,11 @@ import {
   getAppliedMigrations,
   acceptScannerCompletion,
   acceptScannerIntake,
+  listUnassignedTasks,
+  assignTaskProject,
+  advanceTask,
+  moveTask,
+  restartStuckTasks,
   claimNextClaudeTask,
   releaseClaudeTask,
   claimNextHostTask,
@@ -42,13 +48,6 @@ import {
   deleteProject,
 } from './projects.js';
 import { listDatabases } from './databases.js';
-import {
-  listAdditionalDatabases,
-  getAdditionalDatabase,
-  createAdditionalDatabase,
-  updateAdditionalDatabase,
-  deleteAdditionalDatabase,
-} from './additionalDatabases.js';
 import { listRoleConnectors, saveRoleConnectors } from './roleConnectors.js';
 import {
   listTools,
@@ -84,7 +83,6 @@ import {
   deleteConnection,
   testConnectionById,
 } from './databaseConnections.js';
-import { importLegacy } from './importLegacy.js';
 import { pickFolder } from './fsPicker.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -141,15 +139,22 @@ function sendJson(res, code, obj) {
   res.end(JSON.stringify(obj));
 }
 
-function readBody(req) {
+export function readBody(req) {
   return new Promise((resolve, reject) => {
-    let data = '';
+    // Собираем СЫРЫЕ буферы и декодируем UTF-8 один раз в конце. Нельзя делать
+    // `data += chunk` (chunk.toString() на каждый чанк): многобайтовый символ
+    // (кириллица и пр.) может попасть на границу TCP-чанков и декодироваться
+    // раздельно → символы-замены «�» (битая кодировка заголовка/описания задачи).
+    const chunks = [];
+    let size = 0;
     req.on('data', (c) => {
-      data += c;
-      if (data.length > 1e6) reject(new Error('payload too large'));
+      chunks.push(c);
+      size += c.length;
+      if (size > 1e6) reject(new Error('payload too large'));
     });
     req.on('end', () => {
-      if (!data) return resolve({});
+      if (size === 0) return resolve({});
+      const data = Buffer.concat(chunks).toString('utf8');
       try {
         resolve(JSON.parse(data));
       } catch {
@@ -185,15 +190,6 @@ function matchProjectRoute(pathname) {
   const m = pathname.match(/^\/api\/projects\/([^/]+)(?:\/(task-statistics|status|scanner))?$/);
   if (!m) return null;
   return { id: decodeURIComponent(m[1]), kind: m[2] || 'item' };
-}
-
-// Разбор путей /api/additional-databases[/:id]. DEPRECATED (legacy):
-// единый контракт — /api/database-connections (DATABASE-CONNECTIONS-001).
-function matchAdditionalDbRoute(pathname) {
-  if (pathname === '/api/additional-databases') return { kind: 'collection' };
-  const m = pathname.match(/^\/api\/additional-databases\/([^/]+)$/);
-  if (!m) return null;
-  return { kind: 'item', id: decodeURIComponent(m[1]) };
 }
 
 // Разбор путей /api/database-connections[/:id[/test]] — единая модель подключений.
@@ -303,6 +299,13 @@ export function createApp() {
           return openTaskEventsStream(req, res);
         }
 
+        // Рантайм-настройки приложения (APP-SETTINGS-001): параллельность runner и пр.
+        if (req.method === 'GET' && p === '/api/app-settings')
+          return sendJson(res, 200, await getAppSettings(await loadSettings()));
+
+        if (req.method === 'PUT' && p === '/api/app-settings')
+          return sendJson(res, 200, await updateAppSettings(await loadSettings(), await readBody(req)));
+
         if (req.method === 'GET' && p === '/api/settings')
           return sendJson(res, 200, redactSettings(await loadSettings()));
 
@@ -404,6 +407,45 @@ export function createApp() {
             await getTaskHistory(await loadSettings(), url.searchParams.get('taskId')),
           );
 
+        // Неразобранные задачи (project_id IS NULL) — корзина Приёмщика задач.
+        if (req.method === 'GET' && p === '/api/tasks/unassigned')
+          return sendJson(res, 200, await listUnassignedTasks(await loadSettings()));
+
+        // Назначить неразобранной задаче проект → задача уходит по цепочке ролей.
+        const assignMatch = p.match(/^\/api\/tasks\/([^/]+)\/assign-project$/);
+        if (assignMatch && req.method === 'POST') {
+          const taskId = decodeURIComponent(assignMatch[1]);
+          const body = await readBody(req);
+          const result = await assignTaskProject(await loadSettings(), taskId, body.project ?? body.projectId);
+          publishTaskChange('task_project_assigned', { taskId });
+          return sendJson(res, 200, result);
+        }
+
+        // Продвинуть задачу на следующий этап маршрута проекта (авто, FORWARD).
+        const advanceMatch = p.match(/^\/api\/tasks\/([^/]+)\/advance$/);
+        if (advanceMatch && req.method === 'POST') {
+          const taskId = decodeURIComponent(advanceMatch[1]);
+          const result = await advanceTask(await loadSettings(), taskId);
+          publishTaskChange('task_advanced', { taskId });
+          return sendJson(res, 200, result);
+        }
+
+        // Массовый перезапуск зависших задач: статус RESTART → Приёмщик берёт их сразу.
+        if (req.method === 'POST' && p === '/api/tasks/restart-stuck') {
+          const result = await restartStuckTasks(await loadSettings());
+          publishTaskChange('tasks_restarted', { restarted: result.restarted });
+          return sendJson(res, 200, result);
+        }
+
+        // Ручное перемещение задачи на выбранный этап проекта (manual, с аудитом).
+        const moveMatch = p.match(/^\/api\/tasks\/([^/]+)\/move$/);
+        if (moveMatch && req.method === 'POST') {
+          const taskId = decodeURIComponent(moveMatch[1]);
+          const result = await moveTask(await loadSettings(), taskId, await readBody(req));
+          publishTaskChange('task_moved', { taskId });
+          return sendJson(res, 200, result);
+        }
+
         // --- Единая «Схема разработки» (общий конвейер ролей для всех проектов) ---
         if (p === '/api/development-scheme') {
           if (req.method === 'GET') return sendJson(res, 200, await getScheme(await loadSettings()));
@@ -417,25 +459,6 @@ export function createApp() {
           if (req.method === 'GET') return sendJson(res, 200, await listProjectsRich(await loadSettings()));
           if (req.method === 'POST')
             return sendJson(res, 200, await createOrUpsertProject(await loadSettings(), await readBody(req)));
-          return sendJson(res, 405, { error: 'method_not_allowed' });
-        }
-
-        // --- Доп. БД (additional_databases) — секрет не отдаётся ---
-        const adb = matchAdditionalDbRoute(p);
-        if (adb) {
-          if (adb.kind === 'collection') {
-            if (req.method === 'GET')
-              return sendJson(res, 200, await listAdditionalDatabases(await loadSettings()));
-            if (req.method === 'POST')
-              return sendJson(res, 201, await createAdditionalDatabase(await loadSettings(), await readBody(req)));
-          } else {
-            if (req.method === 'GET')
-              return sendJson(res, 200, await getAdditionalDatabase(await loadSettings(), adb.id));
-            if (req.method === 'PUT')
-              return sendJson(res, 200, await updateAdditionalDatabase(await loadSettings(), adb.id, await readBody(req)));
-            if (req.method === 'DELETE')
-              return sendJson(res, 200, await deleteAdditionalDatabase(await loadSettings(), adb.id));
-          }
           return sendJson(res, 405, { error: 'method_not_allowed' });
         }
 
@@ -568,13 +591,6 @@ export function createApp() {
         // --- Нативный выбор папки на хосте backend (абсолютный путь) ---
         if (p === '/api/fs/pick-folder') {
           if (req.method === 'POST') return sendJson(res, 200, await pickFolder());
-          return sendJson(res, 405, { error: 'method_not_allowed' });
-        }
-
-        // --- Идемпотентный импорт legacy-данных (localStorage → сервер) ---
-        if (p === '/api/import/legacy') {
-          if (req.method === 'POST')
-            return sendJson(res, 200, await importLegacy(await loadSettings(), await readBody(req)));
           return sendJson(res, 405, { error: 'method_not_allowed' });
         }
 

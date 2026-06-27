@@ -48,10 +48,20 @@ export function deriveSchemeEdges(stages: Stage[]): DerivedScheme {
     const node = withKeys[i]!;
     const key = node.stageKey!;
     if (node.kind === 'fork') {
-      // Ближайший join справа — парный барьер; этапы между ними — ветки.
-      let j = i + 1;
-      while (j < n && withKeys[j]!.kind !== 'join') j += 1;
-      const join = j < n ? withKeys[j]! : null;
+      // Парный join: явно выбранный в настройках узла joinKey приоритетнее
+      // позиционного «ближайший join справа» (фолбэк, если выбор не задан или
+      // указанный join не найден). Этапы между fork и join — параллельные ветки.
+      let j = -1;
+      if (node.joinKey) {
+        j = withKeys.findIndex(
+          (s, idx) => idx > i && s.kind === 'join' && s.stageKey === node.joinKey,
+        );
+      }
+      if (j === -1) {
+        j = i + 1;
+        while (j < n && withKeys[j]!.kind !== 'join') j += 1;
+      }
+      const join = j >= 0 && j < n ? withKeys[j]! : null;
       const branches = withKeys.slice(i + 1, j).filter((b) => (b.kind ?? 'stage') !== 'join');
       if (prev) addEdge(prev, key);
       if (join && branches.length) {

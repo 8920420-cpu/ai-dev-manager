@@ -21,6 +21,7 @@ export const TASK_STATUSES = [
   'FAILED',
   'CANCELLED',
   'WAITING_FOR_CHILDREN',
+  'RESTART',
 ] as const;
 
 export type TaskStatus = (typeof TASK_STATUSES)[number];
@@ -42,6 +43,7 @@ export const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
   FAILED: 'Ошибка',
   CANCELLED: 'Отменено',
   WAITING_FOR_CHILDREN: 'Ожидает подзадачи',
+  RESTART: 'Перезапуск',
 };
 
 /** Подпись статуса с запасным вариантом для неизвестных кодов. */

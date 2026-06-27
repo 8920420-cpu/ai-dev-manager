@@ -145,3 +145,11 @@
   flex-direction: column;
   gap: var(--space-4);
 }
+
+.executionForm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  align-items: flex-start;
+  max-width: 420px;
+}

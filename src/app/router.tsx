@@ -10,28 +10,35 @@ import {
 /** Ключи разделов приложения. Совпадают с hash-путями для deep-linking. */
 export type RouteKey =
   | 'projects'
+  | 'tasks'
   | 'development-scheme'
   | 'integrations'
   | 'settings-roles'
-  | 'settings-tools';
+  | 'settings-tools'
+  | 'settings-execution';
 
 const ROUTES: Record<RouteKey, string> = {
   projects: '#/projects',
+  tasks: '#/tasks',
   'development-scheme': '#/scheme',
   integrations: '#/integrations',
   'settings-roles': '#/settings/roles',
   'settings-tools': '#/settings/tools',
+  'settings-execution': '#/settings/execution',
 };
 
 const DEFAULT: RouteKey = 'projects';
 
 function parseHash(): RouteKey {
   const [section, sub] = window.location.hash.replace(/^#\/?/, '').split('/');
+  if (section === 'tasks') return 'tasks';
   if (section === 'scheme') return 'development-scheme';
   if (section === 'integrations') return 'integrations';
   if (section === 'settings') {
     // Раздел «Базы данных» удалён: БД одна (БД оркестратора).
-    return sub === 'tools' ? 'settings-tools' : 'settings-roles';
+    if (sub === 'tools') return 'settings-tools';
+    if (sub === 'execution') return 'settings-execution';
+    return 'settings-roles';
   }
   return 'projects';
 }

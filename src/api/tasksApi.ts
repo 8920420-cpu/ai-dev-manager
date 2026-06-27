@@ -123,10 +123,103 @@ export interface TaskHistory {
   events: TaskHistoryEvent[];
 }
 
+/** Неразобранная задача — без проекта (project_id IS NULL), ждёт назначения. */
+export interface UnassignedTask {
+  id: string;
+  externalId: string | null;
+  title: string;
+  description: string | null;
+  status: string;
+  createdAt: string | null;
+  /** Что постановщик прислал в качестве проекта (не сопоставилось). */
+  requestedProject: string | null;
+}
+
+/** Ответ `GET /api/tasks/unassigned`. */
+export interface UnassignedTasks {
+  tasks: UnassignedTask[];
+}
+
+/** Ответ `POST /api/tasks/:id/assign-project`. */
+export interface AssignProjectResult {
+  assigned: boolean;
+  taskId: string;
+  project: string;
+  nextRole: string;
+}
+
+/** Ответ `POST /api/tasks/:id/advance` — авто-продвижение по маршруту проекта. */
+export interface AdvanceTaskResult {
+  advanced: boolean;
+  taskId: string;
+  fromStatus: string;
+  toStatus: string;
+  nextRole: string | null;
+  done: boolean;
+}
+
+/** Ответ `POST /api/tasks/:id/move` — ручное перемещение на выбранный этап. */
+export interface MoveTaskResult {
+  moved: boolean;
+  taskId: string;
+  fromStatus: string;
+  toStatus: string;
+  targetStage: string | null;
+}
+
+/** Ответ `POST /api/tasks/restart-stuck` — массовый перезапуск зависших задач. */
+export interface RestartStuckResult {
+  restarted: number;
+}
+
 export const tasksApi = {
   /** `GET /api/tasks/tree` — все проекты с задачами и подзадачами. */
   async tree(signal?: AbortSignal): Promise<TaskTree> {
     return http.get<TaskTree>('/api/tasks/tree', { signal });
+  },
+
+  /**
+   * `GET /api/tasks/unassigned` — неразобранные задачи (без проекта). Корзина
+   * роли Task Intake Officer: их можно назначить на проект вручную.
+   */
+  async unassigned(signal?: AbortSignal): Promise<UnassignedTasks> {
+    return http.get<UnassignedTasks>('/api/tasks/unassigned', { signal });
+  },
+
+  /**
+   * `POST /api/tasks/:id/assign-project` — назначить неразобранной задаче проект.
+   * После назначения задача уходит по цепочке ролей (исчезает из неразобранных).
+   */
+  async assignProject(taskId: string, projectId: string): Promise<AssignProjectResult> {
+    return http.post<AssignProjectResult>(
+      `/api/tasks/${encodeURIComponent(taskId)}/assign-project`,
+      { project: projectId },
+    );
+  },
+
+  /**
+   * `POST /api/tasks/:id/advance` — продвинуть задачу на следующий этап маршрута
+   * проекта (авто). Недоступно для терминальных/заблокированных задач — для них move().
+   */
+  async advance(taskId: string): Promise<AdvanceTaskResult> {
+    return http.post<AdvanceTaskResult>(`/api/tasks/${encodeURIComponent(taskId)}/advance`);
+  },
+
+  /**
+   * `POST /api/tasks/:id/move` — ручное перемещение задачи на выбранный этап проекта
+   * (manual). Пишет audit-событие; используется для BLOCKED/непродвигаемых задач.
+   */
+  async move(taskId: string, input: { toStageId: string; reason?: string }): Promise<MoveTaskResult> {
+    return http.post<MoveTaskResult>(`/api/tasks/${encodeURIComponent(taskId)}/move`, input);
+  },
+
+  /**
+   * `POST /api/tasks/restart-stuck` — перезапустить все зависшие задачи (с проектом,
+   * не терминальные, не ждущие подзадачи, не в работе). Они получают статус RESTART
+   * и сразу берутся Приёмщиком задач (TASK_INTAKE_OFFICER). Возвращает число задач.
+   */
+  async restartStuck(): Promise<RestartStuckResult> {
+    return http.post<RestartStuckResult>('/api/tasks/restart-stuck');
   },
 
   /** `GET /api/tasks/stats` — число задач на каждом статусе/этапе (по всем проектам). */

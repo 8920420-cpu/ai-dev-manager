@@ -187,7 +187,9 @@ export async function getTaskStatistics(s, projectId, pagination = {}) {
     const sumByStage = (statuses) =>
       statuses.reduce((acc, st) => acc + (byStatus[st] ?? 0), 0);
     const blocked = byStatus.BLOCKED ?? 0;
-    const completed = byStatus.DONE ?? 0;
+    // Отменённые задачи учитываются как завершённые: для пользователя «Отменено»
+    // — это закрытый, не требующий действий результат, наравне с «Завершено».
+    const completed = (byStatus.DONE ?? 0) + (byStatus.CANCELLED ?? 0);
     const terminalCount = sumByStage([...TERMINAL_STATUSES]);
     const active = total - terminalCount - blocked;
     const byStage = {};

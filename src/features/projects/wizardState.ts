@@ -39,6 +39,7 @@ export type WizardAction =
   | { type: 'setStageEnabled'; stageId: string; enabled: boolean }
   | { type: 'setStageScanPath'; stageId: string; scanPath: string }
   | { type: 'setStageStatus'; stageId: string; taskStatus: string }
+  | { type: 'setStageJoinKey'; stageId: string; joinKey: string | null }
   | { type: 'applyDefaultStages' }
   | { type: 'addRole'; name: string }
   | { type: 'removeRole'; roleId: string }
@@ -204,6 +205,16 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
           s.id === action.stageId
             ? { ...s, taskStatus: action.taskStatus || undefined }
             : s,
+        ),
+      };
+    case 'setStageJoinKey':
+      // FORK-JOIN-001: для узла fork — выбор парного join (по его stageKey).
+      // Пустой выбор → снять привязку (undefined): deriveSchemeEdges откатится
+      // на позиционный «ближайший join справа».
+      return {
+        ...state,
+        stages: state.stages.map((s) =>
+          s.id === action.stageId ? { ...s, joinKey: action.joinKey || undefined } : s,
         ),
       };
     case 'applyDefaultStages':

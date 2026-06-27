@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
-import { Check, Pencil, Plus, Trash2, X } from 'lucide-react';
+import { Check, Inbox, Pencil, Plus, Trash2, X } from 'lucide-react';
 import {
   Button,
   Callout,
@@ -10,14 +10,19 @@ import {
 } from '../../components/ui';
 import { rolesApi } from '../../api/rolesApi';
 import { roleGroupsApi } from '../../api/roleGroupsApi';
+import { tasksApi, subscribeTaskChanges } from '../../api/tasksApi';
 import type { RoleCard, RoleGroup } from '../../types/settings';
 import { RoleCardModal } from './RoleCardModal';
+import { UnassignedTasksModal } from './UnassignedTasksModal';
 import styles from './RoleCardsSection.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
 
 /** Псевдо-id корзины «Прочее» (роли без группы). */
 const UNGROUPED = '__ungrouped__';
+
+/** Роль-приёмщик: у её карточки показываем кнопку «Неразобранные задачи». */
+const INTAKE_ROLE_CODE = 'TASK_INTAKE_OFFICER';
 
 /**
  * Секция «Карточки ролей»: роли пайплайна, разложенные по управляемым смысловым
@@ -32,6 +37,10 @@ export function RoleCardsSection() {
   const [roles, setRoles] = useState<RoleCard[]>([]);
   const [groups, setGroups] = useState<RoleGroup[]>([]);
   const [editing, setEditing] = useState<RoleCard | null>(null);
+
+  // «Неразобранные задачи» Приёмщика: счётчик на карточке роли + модалка назначения.
+  const [unassignedCount, setUnassignedCount] = useState(0);
+  const [intakeOpen, setIntakeOpen] = useState(false);
 
   // --- Состояние управления группами ---
   const [newGroupName, setNewGroupName] = useState('');
@@ -61,6 +70,26 @@ export function RoleCardsSection() {
     return () => {
       active = false;
       ctrl.abort();
+    };
+  }, []);
+
+  // Счётчик неразобранных задач: грузим при монтировании и обновляем по SSE-сигналу
+  // об изменении задач (новая неразобранная пришла / задачу назначили на проект).
+  useEffect(() => {
+    const ctrl = new AbortController();
+    const refresh = () => {
+      tasksApi
+        .unassigned(ctrl.signal)
+        .then((res) => setUnassignedCount(res.tasks.length))
+        .catch(() => {
+          /* недоступность счётчика не должна ломать раздел ролей */
+        });
+    };
+    refresh();
+    const unsubscribe = subscribeTaskChanges(refresh);
+    return () => {
+      ctrl.abort();
+      unsubscribe();
     };
   }, []);
 
@@ -143,6 +172,7 @@ export function RoleCardsSection() {
   }
 
   function renderRoleRow(role: RoleCard) {
+    const isIntake = role.code === INTAKE_ROLE_CODE;
     return (
       <li key={role.code} className={styles.row}>
         <button
@@ -159,6 +189,21 @@ export function RoleCardsSection() {
             {role.skills.length > 0 ? `Skills: ${role.skills.length}` : 'Без skills'}
           </span>
         </button>
+        {isIntake && (
+          <Button
+            variant={unassignedCount > 0 ? 'secondary' : 'ghost'}
+            size="sm"
+            leftIcon={<Inbox size={15} aria-hidden="true" />}
+            onClick={() => setIntakeOpen(true)}
+            aria-label="Открыть неразобранные задачи"
+            title="Задачи без проекта — назначить вручную"
+          >
+            Неразобранные
+            {unassignedCount > 0 && (
+              <span className={styles.unassignedBadge}>{unassignedCount}</span>
+            )}
+          </Button>
+        )}
       </li>
     );
   }
@@ -303,6 +348,12 @@ export function RoleCardsSection() {
         role={editing}
         groups={groups}
         onSaved={handleSaved}
+      />
+
+      <UnassignedTasksModal
+        open={intakeOpen}
+        onClose={() => setIntakeOpen(false)}
+        onChanged={setUnassignedCount}
       />
 
       <ConfirmDialog

@@ -13,6 +13,15 @@ import { invoke as llmInvoke, invokeChat } from './llmConnector.js';
 // Максимум итераций tool-loop (сколько раз роль может вызвать инструменты подряд).
 const TOOL_MAX_ITERS = Number(process.env.ROLE_TOOL_MAX_ITERS || 8);
 
+// RUNNER-LLM-TIMEOUT-001: таймаут ОДНОГО вызова коннектора в рассуждающей роли.
+// По умолчанию llmConnector ждёт ответ AI до 10 минут. При всплеске нагрузки
+// (массовый перезапуск задач) DeepSeek отвечает медленно, и один зависший вызов
+// держит слот воркера почти весь RUNNER_ROLE_TIMEOUT_MS (15 мин) — все слоты роли
+// оказываются заняты повисшими вызовами, и очередь не разгребается. Ограничиваем
+// каждый вызов небольшим таймаутом (по умолчанию 3 мин, env-настройка): зависший
+// вызов падает быстро, роль помечается FAILED и переигрывается, слот освобождается.
+const LLM_CALL_TIMEOUT_MS = Number(process.env.ROLE_LLM_CALL_TIMEOUT_MS || 3 * 60 * 1000);
+
 /**
  * Прогон рассуждающей роли с инструментами (function calling). Ведёт диалог:
  * модель ↔ инструменты (tools-service) до финального текстового ответа. Возвращает
@@ -51,7 +60,7 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
   let text = '';
   for (let i = 0; i < TOOL_MAX_ITERS; i += 1) {
     iterations += 1;
-    const { message } = await invokeChat(conn, { messages, tools: toolSchemas });
+    const { message } = await invokeChat(conn, { messages, tools: toolSchemas }, { timeoutMs: LLM_CALL_TIMEOUT_MS });
     const native = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
     const content = String(message?.content ?? '');
 
@@ -115,7 +124,7 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
         + 'данных верни ТОЛЬКО финальный JSON-вердикт в требуемом формате — без разметки tool_calls, '
         + 'без markdown и без пояснений вокруг JSON.',
     });
-    const { message } = await invokeChat(conn, { messages, tools: [] });
+    const { message } = await invokeChat(conn, { messages, tools: [] }, { timeoutMs: LLM_CALL_TIMEOUT_MS });
     text = String(message?.content ?? '').trim();
   }
   return { text, iterations, toolCalls };
@@ -466,7 +475,7 @@ export async function runReasoningRole(client, { roleCode, context, outputFields
       text = loop.text;
       durationMs = Date.now() - started;
     } else {
-      const r = await llmInvoke(conn, { system, user });
+      const r = await llmInvoke(conn, { system, user }, { timeoutMs: LLM_CALL_TIMEOUT_MS });
       text = r.text;
       httpStatus = r.httpStatus;
       durationMs = r.durationMs;

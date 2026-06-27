@@ -5,10 +5,11 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ROLE_FLOW, fastForwardHiddenRoles } from './rolePipeline.js';
 import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK } from './roleEngine.js';
-import { buildRoute, resolveTransition, forwardFrom, routeIsUsable } from './projectRoute.js';
+import { buildRoute, resolveTransition, forwardFrom, routeIsUsable, TERMINAL_STATUSES } from './projectRoute.js';
 import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey } from './graphRoute.js';
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
 import { buildPipelineClaimContract } from './pipelineDispatch.js';
+import { reconcileClockSkew } from './clockGuard.js';
 
 const { Client } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -34,11 +35,26 @@ function assertIdentifier(name) {
 
 export async function withClient(cfg, fn) {
   const client = new Client(cfg);
+  // DB-CONN-RESILIENCE-001: node-postgres эмитит на Client событие 'error' при
+  // обрыве соединения (Patroni/PgBouncer/HAProxy периодически рвут коннект при
+  // переключении лидера). Без слушателя 'error' Node роняет ВЕСЬ процесс
+  // («Unhandled 'error' event»), и контейнер уходит в рестарт-луп. Слушатель
+  // делает обрыв нефатальным: in-flight запрос всё равно отклонится и будет
+  // обработан вызывающим (tick runner'а ловит ошибку и повторит на след. тике).
+  client.on('error', (err) => {
+    console.error(`[orchestrator-service] DB client error (не фатально): ${err.message}`);
+  });
   await client.connect();
   try {
     return await fn(client);
   } finally {
-    await client.end();
+    // end() сам может бросить, если соединение уже оборвано — это не должно
+    // маскировать исходную ошибку и не должно ронять процесс.
+    try {
+      await client.end();
+    } catch (endErr) {
+      console.error(`[orchestrator-service] DB client.end() error (игнор): ${endErr.message}`);
+    }
   }
 }
 
@@ -259,6 +275,45 @@ export async function acceptScannerCompletionTx(c, payload) {
   }
 }
 
+// Найти проект по id (uuid) | code | name | root_path. В отличие от requireProject
+// НЕ бросает ошибку при отсутствии — возвращает null (для интейка: нет проекта →
+// задача становится «неразобранной»). Сравнение по id через ::text безопасно для
+// произвольной строки (без падения на не-uuid).
+async function findProject(c, ref) {
+  const v = String(ref ?? '').trim();
+  if (!v) return null;
+  const r = await c.query(
+    `SELECT id, code, root_path FROM projects
+      WHERE id::text = $1 OR code = $1 OR name = $1 OR root_path = $1
+      ORDER BY created_at LIMIT 1`,
+    [v],
+  );
+  return r.rowCount ? r.rows[0] : null;
+}
+
+// Вычислить роль входа и стартовый узел графа для задачи проекта. В граф-схеме
+// (есть рёбра) задача стартует на узле с ролью-приёмщиком; в линейной — stageKey
+// NULL. Для неразобранной задачи (projectId = null) рёбер нет → stageKey NULL.
+async function computeEntry(c, projectId) {
+  const role = await entryRole(c);
+  if (!projectId) return { role, entryStageKey: null };
+  const hasEdges = (await c.query(
+    'SELECT 1 FROM project_stage_edges WHERE project_id = $1 LIMIT 1', [projectId],
+  )).rowCount > 0;
+  let entryStageKey = null;
+  if (hasEdges) {
+    const es = await c.query(
+      `SELECT ps.stage_key FROM project_stages ps
+         JOIN project_stage_roles psr ON psr.stage_id = ps.id
+        WHERE ps.project_id = $1 AND psr.role_id = $2 AND ps.enabled = true
+        ORDER BY ps.position LIMIT 1`,
+      [projectId, role.id],
+    );
+    entryStageKey = es.rows[0]?.stage_key ?? null;
+  }
+  return { role, entryStageKey };
+}
+
 // Роль входа задачи в конвейер: Приёмщик задач (TASK_INTAKE_OFFICER), иначе первая
 // роль единой схемы, иначе ARCHITECT. Scanner создаёт задачу под этой ролью.
 async function entryRole(c) {
@@ -286,15 +341,20 @@ async function entryRole(c) {
 export async function acceptScannerIntake(s, input) {
   const payload = normalizeScannerIntake(input);
   return withClient(clientConfig(s), async (c) => {
-    const project = await requireProject(c, payload.project);
-    const serviceId = await getOrCreateService(c, project.id, payload.service);
+    // Постановщик явно указывает папку проекта (projectPath) или иной идентификатор.
+    // Сопоставляем детерминированно. Не нашли → проект НЕ задан, задача станет
+    // неразобранной (project_id IS NULL) и попадёт в корзину Приёмщика.
+    const project = await findProject(c, payload.project);
+    const serviceId = project ? await getOrCreateService(c, project.id, payload.service) : null;
+    // Идемпотентный поиск дубля: для назначенной — в рамках проекта, для
+    // неразобранной — среди задач без проекта (частичный uniq-индекс).
+    const findDup = () => (project
+      ? c.query('SELECT id FROM tasks WHERE project_id = $1 AND external_id = $2', [project.id, payload.externalId])
+      : c.query('SELECT id FROM tasks WHERE project_id IS NULL AND external_id = $1', [payload.externalId]));
 
     await c.query('BEGIN');
     try {
-      const existing = await c.query(
-        'SELECT id FROM tasks WHERE project_id = $1 AND external_id = $2',
-        [project.id, payload.externalId],
-      );
+      const existing = await findDup();
       if (existing.rowCount) {
         await c.query('COMMIT');
         return {
@@ -303,60 +363,52 @@ export async function acceptScannerIntake(s, input) {
         };
       }
 
-      const role = await entryRole(c);
-
-      // FORK-JOIN-001: в граф-схеме (есть рёбра) задача отслеживает узел —
-      // стартует на узле с ролью-приёмщиком. В линейной схеме — NULL (по позиции).
-      const hasEdges = (await c.query(
-        'SELECT 1 FROM project_stage_edges WHERE project_id = $1 LIMIT 1', [project.id],
-      )).rowCount > 0;
-      let entryStageKey = null;
-      if (hasEdges) {
-        const es = await c.query(
-          `SELECT ps.stage_key FROM project_stages ps
-             JOIN project_stage_roles psr ON psr.stage_id = ps.id
-            WHERE ps.project_id = $1 AND psr.role_id = $2 AND ps.enabled = true
-            ORDER BY ps.position LIMIT 1`,
-          [project.id, role.id],
-        );
-        entryStageKey = es.rows[0]?.stage_key ?? null;
-      }
+      const { role, entryStageKey } = await computeEntry(c, project?.id ?? null);
+      // Назначенная задача стартует в BACKLOG (runner ведёт её дальше); неразобранная
+      // паркуется в BLOCKED и ждёт ручного назначения проекта.
+      const status = project ? 'BACKLOG' : 'BLOCKED';
+      // Проект кладём в карточку сразу (детерминированно по папке) — Приёмщику не
+      // нужно угадывать. Для неразобранной фиксируем, что именно прислал постановщик.
+      const dataCard = project
+        ? { project: project.code, projectPath: project.root_path }
+        : { requestedProject: payload.project || null };
 
       const ins = await c.query(
         `INSERT INTO tasks
-           (project_id, service_id, external_id, title, description, status, current_role_id, current_stage_key, created_by)
-         VALUES ($1, $2, $3, $4, $5, 'BACKLOG', $6, $7::uuid, 'scanner-intake')
+           (project_id, service_id, external_id, title, description, status, current_role_id, current_stage_key, created_by, data_card)
+         VALUES ($1, $2, $3, $4, $5, $6::task_status, $7, $8::uuid, 'scanner-intake', $9::jsonb)
          RETURNING id`,
-        [project.id, serviceId, payload.externalId, payload.title, payload.description, role.id, entryStageKey],
+        [project?.id ?? null, serviceId, payload.externalId, payload.title, payload.description,
+         status, role.id, entryStageKey, JSON.stringify(dataCard)],
       );
       const taskId = ins.rows[0].id;
 
       // Исходный запрос в событии — Приёмщик увидит его через buildRoleContext.
       await c.query(
         `INSERT INTO task_events (task_id, event_type, to_status, role_id, payload_json)
-         VALUES ($1, 'TASK_CREATED', 'BACKLOG', $2, $3::jsonb)`,
-        [taskId, role.id, JSON.stringify({
+         VALUES ($1, 'TASK_CREATED', $2::task_status, $3, $4::jsonb)`,
+        [taskId, status, role.id, JSON.stringify({
           source: 'scanner-intake',
           externalId: payload.externalId,
           service: payload.service,
           result: payload.result,
           changedFiles: payload.changedFiles,
+          requestedProject: payload.project || null,
+          unassigned: !project,
+          ...(project ? {} : { reason: 'project_unresolved' }),
         })],
       );
       await c.query('COMMIT');
       return {
-        accepted: true, imported: true, duplicate: false,
-        taskId, externalId: payload.externalId, project: project.code,
+        accepted: true, imported: true, duplicate: false, unassigned: !project,
+        taskId, externalId: payload.externalId, project: project?.code ?? null,
         service: payload.service, nextRole: role.code,
       };
     } catch (error) {
       await c.query('ROLLBACK');
       // Гонка: тот же external_id импортирован параллельно — это не ошибка.
       if (error.code === '23505') {
-        const again = await c.query(
-          'SELECT id FROM tasks WHERE project_id = $1 AND external_id = $2',
-          [project.id, payload.externalId],
-        );
+        const again = await findDup();
         if (again.rowCount) {
           return {
             accepted: true, imported: false, duplicate: true,
@@ -367,6 +419,288 @@ export async function acceptScannerIntake(s, input) {
       throw error;
     }
   });
+}
+
+/**
+ * Список неразобранных задач (project_id IS NULL) — корзина роли Task Intake
+ * Officer. Это задачи, для которых постановщик не указал/не сопоставился проект.
+ */
+export async function listUnassignedTasks(s) {
+  return withClient(clientConfig(s), async (c) => {
+    const r = await c.query(
+      `SELECT t.id, t.external_id, t.title, t.description, t.status::text AS status,
+              t.created_at, t.data_card
+         FROM tasks t
+        WHERE t.project_id IS NULL
+          AND t.status NOT IN ('DONE', 'CANCELLED')
+        ORDER BY t.created_at DESC`,
+    );
+    return {
+      tasks: r.rows.map((row) => ({
+        id: row.id,
+        externalId: row.external_id,
+        title: row.title,
+        description: row.description,
+        status: row.status,
+        createdAt: row.created_at,
+        requestedProject: row.data_card?.requestedProject ?? null,
+      })),
+    };
+  });
+}
+
+/**
+ * Назначить неразобранной задаче проект и пустить её по конвейеру. Только задача
+ * без проекта (project_id IS NULL) может быть назначена. После назначения задача
+ * получает project_id, роль входа (Приёмщик), статус BACKLOG — runner ведёт её
+ * дальше по цепочке. Возвращает { assigned, taskId, project, nextRole }.
+ */
+export async function assignTaskProject(s, taskId, projectRef) {
+  const id = String(taskId ?? '').trim();
+  if (!id) throw scannerError(422, 'task_required');
+  return withClient(clientConfig(s), async (c) => {
+    const project = await findProject(c, projectRef);
+    if (!project) throw scannerError(404, 'project_not_registered');
+    await c.query('BEGIN');
+    try {
+      const cur = await c.query(
+        'SELECT id, external_id, project_id FROM tasks WHERE id = $1 FOR UPDATE', [id],
+      );
+      if (!cur.rowCount) throw scannerError(404, 'task_not_found');
+      if (cur.rows[0].project_id) throw scannerError(409, 'task_already_assigned');
+
+      // В целевом проекте уже может быть задача с таким external_id — назначение
+      // нарушило бы UNIQUE (project_id, external_id). Явно сообщаем о конфликте.
+      const externalId = cur.rows[0].external_id;
+      if (externalId) {
+        const dup = await c.query(
+          'SELECT id FROM tasks WHERE project_id = $1 AND external_id = $2', [project.id, externalId],
+        );
+        if (dup.rowCount) throw scannerError(409, 'external_id_conflict');
+      }
+
+      const { role, entryStageKey } = await computeEntry(c, project.id);
+      const upd = await c.query(
+        `UPDATE tasks
+            SET project_id = $2, status = 'BACKLOG', current_role_id = $3,
+                current_stage_key = $4::uuid, assigned_agent_id = NULL,
+                data_card = COALESCE(data_card, '{}'::jsonb)
+                            || jsonb_build_object('project', $5::text, 'projectPath', $6::text),
+                updated_at = now()
+          WHERE id = $1 AND project_id IS NULL
+          RETURNING id`,
+        [id, project.id, role.id, entryStageKey, project.code, project.root_path],
+      );
+      if (!upd.rowCount) throw scannerError(409, 'task_already_assigned');
+
+      await c.query(
+        `INSERT INTO task_events (task_id, event_type, to_status, role_id, payload_json)
+         VALUES ($1, 'TASK_UPDATED', 'BACKLOG', $2, $3::jsonb)`,
+        [id, role.id, JSON.stringify({ source: 'intake-assign', project: project.code, nextRole: role.code })],
+      );
+      await c.query('COMMIT');
+      return { assigned: true, taskId: id, project: project.code, nextRole: role.code };
+    } catch (error) {
+      await c.query('ROLLBACK');
+      throw error;
+    }
+  });
+}
+
+// TASK-MANUAL-MOVE-001 — UI-мутации продвижения/перемещения задачи из раздела
+// «Задачи». advanceTask: авто-продвижение по маршруту проекта (как runner после
+// успешного шага). moveTask: ручное перемещение на выбранный этап с аудитом.
+// Обе пишут task_events и снимают assigned_agent_id (задача освобождается).
+
+/**
+ * Продвинуть задачу на следующий этап маршрута проекта (FORWARD). Применяет ту же
+ * логику, что runner: граф-режим при current_stage_key, иначе позиционный маршрут.
+ * Терминальные (DONE/CANCELLED/FAILED) и BLOCKED задачи авто-продвижению не
+ * подлежат — для них ручное перемещение moveTask. Публичная обёртка над Tx.
+ */
+export async function advanceTask(s, taskId) {
+  return withClient(clientConfig(s), (c) => advanceTaskTx(c, taskId));
+}
+
+export async function advanceTaskTx(c, taskId) {
+  const id = String(taskId ?? '').trim();
+  if (!id) throw scannerError(422, 'task_required');
+  await c.query('BEGIN');
+  try {
+    const cur = await c.query(
+      `SELECT t.id, t.project_id, t.status::text AS status, t.current_role_id,
+              t.current_stage_key, r.code AS role_code
+         FROM tasks t LEFT JOIN roles r ON r.id = t.current_role_id
+        WHERE t.id = $1 FOR UPDATE OF t`,
+      [id],
+    );
+    if (!cur.rowCount) throw scannerError(404, 'task_not_found');
+    const task = cur.rows[0];
+    if (!task.project_id) throw scannerError(409, 'task_without_project');
+    if (TERMINAL_STATUSES.has(task.status)) throw scannerError(409, 'task_terminal');
+    if (task.status === 'BLOCKED') throw scannerError(409, 'task_blocked_use_manual');
+
+    const route = await loadProjectRoute(c, task.project_id);
+    const decision = { outcome: 'FORWARD' };
+    const resolved = task.current_stage_key
+      ? await resolveGraphTransition(c, task, decision)
+      : resolveTransition(route, task.role_code, decision);
+
+    const nextRoleId = resolved.done || !resolved.nextRole
+      ? null
+      : (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null;
+
+    await c.query(
+      `UPDATE tasks SET status = $2::task_status, current_role_id = $3,
+              assigned_agent_id = NULL, current_stage_key = $4::uuid, updated_at = now()
+        WHERE id = $1`,
+      [id, resolved.toStatus, nextRoleId, resolved.nextStageKey ?? null],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'TASK_UPDATED', $2::task_status, $3::task_status, $4, $5::jsonb)`,
+      [id, task.status, resolved.toStatus, nextRoleId, JSON.stringify({
+        source: 'manual-advance', via: resolved.via ?? null,
+        fromRole: task.role_code ?? null, nextRole: resolved.nextRole ?? null,
+        done: resolved.done === true,
+      })],
+    );
+    await c.query('COMMIT');
+    return {
+      advanced: true, taskId: id, fromStatus: task.status,
+      toStatus: resolved.toStatus, nextRole: resolved.nextRole ?? null, done: resolved.done === true,
+    };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
+}
+
+/**
+ * Ручное перемещение задачи на выбранный этап проекта (manual). Для заблокированных
+ * или иначе непродвигаемых задач: пользователь выбирает целевой этап (его id), мы
+ * пишем audit-событие source='manual' с прежним/новым статусом и комментарием,
+ * снимаем назначение агента. Целевой этап обязан принадлежать проекту задачи и
+ * иметь статус (контрольные узлы fork/join отклоняются). Публичная обёртка над Tx.
+ */
+export async function moveTask(s, taskId, input) {
+  return withClient(clientConfig(s), (c) => moveTaskTx(c, taskId, input));
+}
+
+export async function moveTaskTx(c, taskId, input) {
+  const id = String(taskId ?? '').trim();
+  if (!id) throw scannerError(422, 'task_required');
+  const toStageId = String(input?.toStageId ?? '').trim();
+  if (!toStageId) throw scannerError(422, 'target_stage_required');
+  const reason = String(input?.reason ?? '').trim();
+  await c.query('BEGIN');
+  try {
+    const cur = await c.query(
+      `SELECT id, project_id, status::text AS status FROM tasks WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    if (!cur.rowCount) throw scannerError(404, 'task_not_found');
+    const task = cur.rows[0];
+    if (!task.project_id) throw scannerError(409, 'task_without_project');
+
+    // Целевой этап обязан принадлежать проекту задачи; берём первую роль этапа.
+    const st = await c.query(
+      `SELECT ps.stage_key, ps.kind, ps.task_status::text AS task_status, ps.name,
+              (SELECT psr.role_id FROM project_stage_roles psr
+                WHERE psr.stage_id = ps.id ORDER BY psr.position LIMIT 1) AS role_id
+         FROM project_stages ps
+        WHERE ps.id = $1 AND ps.project_id = $2`,
+      [toStageId, task.project_id],
+    );
+    if (!st.rowCount) throw scannerError(404, 'target_stage_not_found');
+    const stage = st.rows[0];
+    const toStatus = stage.task_status;
+    // Контрольные узлы (fork/join) не несут статуса — на них вручную не переводим.
+    if (!toStatus) throw scannerError(422, 'target_stage_no_status');
+
+    await c.query(
+      `UPDATE tasks SET status = $2::task_status, current_role_id = $3,
+              current_stage_key = $4::uuid, assigned_agent_id = NULL, updated_at = now()
+        WHERE id = $1`,
+      [id, toStatus, stage.role_id ?? null, stage.stage_key ?? null],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'TASK_UPDATED', $2::task_status, $3::task_status, $4, $5::jsonb)`,
+      [id, task.status, toStatus, stage.role_id ?? null, JSON.stringify({
+        source: 'manual', via: 'manual-move', fromStatus: task.status, toStatus,
+        targetStage: stage.name ?? null, reason: reason || null,
+      })],
+    );
+    await c.query('COMMIT');
+    return { moved: true, taskId: id, fromStatus: task.status, toStatus, targetStage: stage.name ?? null };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
+}
+
+/**
+ * TASK-RESTART-001 — массовый перезапуск зависших задач из раздела «Задачи».
+ * Зависшие = с проектом, НЕ терминальные (DONE/CANCELLED/FAILED), НЕ ждущие
+ * подзадачи (WAITING_FOR_CHILDREN), НЕ уже на перезапуске (RESTART) и «не в работе»
+ * (свободный слот assigned_agent_id IS NULL). Подзадачи учитываются наравне с
+ * верхним уровнем. Каждая такая задача возвращается Приёмщику задач в статусе
+ * RESTART (current_role_id = TASK_INTAKE_OFFICER, current_stage_key = вход проекта),
+ * под которым claimLlmRoleTask забирает её безусловно. Публичная обёртка над Tx.
+ *
+ * Перед выборкой освобождаем осиротевшие/просроченные захваты (resetStaleClaims):
+ * зависшая сессия отпускает слот, и её задача попадает в перезапуск как «не в работе»,
+ * а реально активные задачи сохраняют назначение и не трогаются.
+ */
+export async function restartStuckTasks(s) {
+  return withClient(clientConfig(s), (c) => restartStuckTasksTx(c));
+}
+
+export async function restartStuckTasksTx(c) {
+  await resetStaleClaims(c);
+  await c.query('BEGIN');
+  try {
+    // Проекты, у которых есть зависшие задачи (вход проекта вычисляем по проекту).
+    const projects = await c.query(
+      `SELECT DISTINCT project_id FROM tasks
+        WHERE project_id IS NOT NULL
+          AND assigned_agent_id IS NULL
+          AND status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','RESTART')`,
+    );
+    let restarted = 0;
+    for (const row of projects.rows) {
+      const { role, entryStageKey } = await computeEntry(c, row.project_id);
+      if (!role?.id) continue; // нет роли входа (Приёмщика) — пропускаем проект
+      const upd = await c.query(
+        `WITH targets AS (
+           SELECT id, status::text AS from_status FROM tasks
+            WHERE project_id = $1
+              AND assigned_agent_id IS NULL
+              AND status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','RESTART')
+         ), upd AS (
+           UPDATE tasks t
+              SET status = 'RESTART', current_role_id = $2,
+                  current_stage_key = $3::uuid, assigned_agent_id = NULL, updated_at = now()
+             FROM targets WHERE t.id = targets.id
+           RETURNING t.id
+         )
+         INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+         SELECT targets.id, 'TASK_UPDATED', targets.from_status::task_status, 'RESTART'::task_status, $2,
+                jsonb_build_object('source', 'manual-restart', 'reason', 'restart_stuck',
+                                   'nextRole', 'TASK_INTAKE_OFFICER')
+           FROM targets
+         RETURNING task_id`,
+        [row.project_id, role.id, entryStageKey],
+      );
+      restarted += upd.rowCount;
+    }
+    await c.query('COMMIT');
+    return { restarted };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
 }
 
 // Найти сервис по (project, code) или СОЗДАТЬ его (авто-регистрация при импорте).
@@ -388,18 +722,50 @@ async function getOrCreateService(c, projectId, serviceCode, serviceName) {
   return ins.rows[0].id;
 }
 
+/**
+ * Эвристика «битой кодировки» (mojibake). Текст приходит уже повреждённым с
+ * клиента (напр. codex на Windows-консоли схлопывает кириллицу в «?»; разрыв
+ * UTF-8 на границе чанков даёт символ-замену U+FFFD «�»). Такой текст бесполезен:
+ * исходную задачу по нему не восстановить. Чтобы мусор не оседал в БД отдельной
+ * BLOCKED-задачей, отклоняем его прямо на приёмке. Возвращает true, если текст
+ * выглядит повреждённым:
+ *  - содержит U+FFFD (символ-замену), либо
+ *  - содержит подряд 3+ знака «?» (схлопнутое слово кириллицы), либо
+ *  - доля «?» среди непробельных символов ≥ 25% (рассыпанные «?»).
+ * Одиночные/двойные «?» (риторический вопрос) НЕ считаются порчей.
+ */
+export function looksCorruptedText(text) {
+  const s = String(text ?? '');
+  if (!s) return false;
+  if (s.includes('�')) return true;
+  if (/\?{3,}/.test(s)) return true;
+  const q = (s.match(/\?/g) || []).length;
+  const nonSpace = s.replace(/\s/g, '').length;
+  return q >= 3 && nonSpace > 0 && q / nonSpace >= 0.25;
+}
+
 export function normalizeScannerIntake(input) {
   const required = (key) => {
     const value = String(input?.[key] ?? '').trim();
     if (!value) throw scannerError(422, `${key}_required`);
     return value;
   };
+  // Идентификатор проекта: приоритет у явной папки (projectPath), затем project.
+  // НЕ обязателен — нераспознанный/пустой проект делает задачу неразобранной.
+  const project = String(input?.projectPath ?? input?.project ?? '').trim();
+  const title = required('title');
+  const description = String(input?.description ?? '').trim() || null;
+  // Битую кодировку отклоняем на входе: задачу по такому тексту не восстановить,
+  // а клиенту нужно переприслать запрос в корректной UTF-8 (а не плодить мусор).
+  if (looksCorruptedText(title) || looksCorruptedText(description)) {
+    throw scannerError(422, 'corrupted_encoding');
+  }
   return {
     externalId: required('externalId'),
-    project: required('project'),
-    title: required('title'),
+    project,
+    title,
     service: String(input?.service ?? '').trim(),
-    description: String(input?.description ?? '').trim() || null,
+    description,
     result: String(input?.result ?? ''),
     changedFiles: Array.isArray(input?.changedFiles) ? input.changedFiles.map(String) : [],
   };
@@ -602,7 +968,10 @@ export async function claimNextClaudeTask(s) {
               'orchestrator_complete_scanner_task с этими taskId, completionKey, ' +
               'project, service, title, sourceDocument; перечисли changedFiles и ' +
               'result. Не оставляй задачу без рапорта — иначе она зависнет на этапе ' +
-              'Programmer (CODING) и затормозит весь пайплайн.',
+              'Programmer (CODING) и затормозит весь пайплайн. После успешной сдачи ' +
+              'результата очисти рабочий контекст сессии программиста (например, ' +
+              'командой /clear в Claude Code), чтобы следующая задача не получила ' +
+              'остатки контекста выполненной задачи.',
           },
         },
       };
@@ -1090,8 +1459,17 @@ async function loadRoleContract(c, roleCode) {
  * Сетевой вызов держим вне транзакции, чтобы не блокировать строки на минуты.
  * Возвращает массив применённых шагов.
  */
-export async function advanceAutomatedTasks(s, { max = Number(process.env.RUNNER_MAX_PER_TICK || 3) } = {}) {
-  return withClient(clientConfig(s), async (c) => {
+export async function advanceAutomatedTasks(s, opts = {}) {
+  // RUNNER-CONCURRENCY-001: лимит «горутин на роль» берём из app_settings (UI),
+  // переопределение через opts — для тестов. Минимум 1.
+  const cap = Math.max(
+    1,
+    Number(opts.maxConcurrencyPerRole ?? (await getMaxConcurrencyPerRole(s))) || 1,
+  );
+
+  // Предшаги (реконсиляция, пропуск ролей, fork/join) — быстрые, на одном клиенте.
+  // Здесь же планируем, сколько свободных слотов осталось по каждой роли.
+  const slots = await withClient(clientConfig(s), async (c) => {
     await resetStaleClaims(c);
     // Пропускаемые роли (ROLE-GROUPS-001 / per-project) прокручиваются до первой
     // активной роли ДО любого claim — за пропущенные роли не создаётся agent/host run.
@@ -1100,14 +1478,71 @@ export async function advanceAutomatedTasks(s, { max = Number(process.env.RUNNER
     // дети попадали в очередь, а родитель не клеймился на gate-узле.
     await advanceForkNodes(c);
     await advanceJoinNodes(c);
-    const applied = [];
-    for (let i = 0; i < max; i += 1) {
-      const claimed = await claimLlmRoleTask(c);
-      if (!claimed) break;
-      const step = await processClaimedRole(c, claimed);
-      if (step) applied.push(step);
-    }
-    return applied;
+    return computeRoleFreeSlots(c, cap);
+  });
+
+  // По одному воркеру на каждый свободный слот роли. Каждый claim+process идёт в
+  // СВОЁМ соединении и транзакции — задачи разных (и одной) ролей обрабатываются
+  // параллельно. Двойной захват исключён FOR UPDATE SKIP LOCKED в claimLlmRoleTask.
+  const jobs = [];
+  for (const [roleCode, free] of slots) {
+    for (let i = 0; i < free; i += 1) jobs.push(roleCode);
+  }
+  const results = await Promise.all(
+    jobs.map((roleCode) =>
+      withClient(clientConfig(s), async (c) => {
+        const claimed = await claimLlmRoleTask(c, roleCode);
+        if (!claimed) return null;
+        return processClaimedRole(c, claimed);
+      }).catch(() => null),
+    ),
+  );
+  return results.filter(Boolean);
+}
+
+// RUNNER-CONCURRENCY-001: сколько новых воркеров запускать по каждой ИИ-роли в
+// этом тике. free = min(ожидающие задачи, cap − уже в работе). Считаем по всем
+// видимым ролям активных проектов одним запросом; роли без ожидающих опускаем.
+async function computeRoleFreeSlots(c, cap) {
+  const r = await c.query(
+    `SELECT r.code AS role_code,
+            count(*) FILTER (WHERE t.assigned_agent_id IS NOT NULL)::int AS inflight,
+            count(*) FILTER (WHERE t.assigned_agent_id IS NULL)::int AS pending
+       FROM roles r
+       JOIN tasks t ON t.current_role_id = r.id
+       JOIN projects p ON p.id = t.project_id
+      WHERE r.code = ANY($1::text[])
+        AND r.hidden = false
+        AND p.status <> 'paused'
+        AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
+      GROUP BY r.code`,
+    [LLM_ROLE_CODES],
+  );
+  const slots = new Map();
+  for (const row of r.rows) {
+    const free = Math.min(row.pending, Math.max(0, cap - row.inflight));
+    if (free > 0) slots.set(row.role_code, free);
+  }
+  return slots;
+}
+
+// Низкоуровневое чтение app_settings (рантайм-конфиг). Таблицы может ещё не быть
+// (миграция не накатана) — тогда отдаём fallback, не роняя runner.
+async function readAppSetting(c, key, fallback) {
+  try {
+    const r = await c.query('SELECT value FROM app_settings WHERE key = $1', [key]);
+    return r.rowCount ? r.rows[0].value : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+// Лимит параллельных обработок на роль (app_settings.max_concurrency_per_role).
+export async function getMaxConcurrencyPerRole(s) {
+  return withClient(clientConfig(s), async (c) => {
+    const v = await readAppSetting(c, 'max_concurrency_per_role', 3);
+    const n = Math.floor(Number(v));
+    return Number.isFinite(n) && n >= 1 ? n : 3;
   });
 }
 
@@ -1393,6 +1828,9 @@ export async function advanceJoinNodes(c) {
 
 // Снять зависшие захваты: agent_run RUNNING старше таймаута → TIMEOUT, слот свободен.
 async function resetStaleClaims(c) {
+  // CLOCK-GUARD-001: до проверки таймаутов компенсируем возможный скачок настенных
+  // часов БД/Docker-VM, иначе все прогоны «в полёте» разом гасятся ложным TIMEOUT.
+  await reconcileClockSkew(c, { log: (m) => console.log(m) });
   await c.query(
     `WITH stale AS (
        SELECT id, task_id FROM agent_runs
@@ -1445,18 +1883,41 @@ async function releaseStaleClaudeClaims(c, timeoutMs = CLAUDE_ASSIGN_TIMEOUT_MS,
   return r.rowCount;
 }
 
+// RUNNER-STARTUP-REAP-001: при запуске процесса любой agent_run в статусе RUNNING
+// заведомо осиротел — горутина-исполнитель прошлого процесса умерла вместе с ним,
+// довести вызов до конца некому. Без немедленной зачистки такие прогоны держат
+// слоты «N на роль» вплоть до 15-минутного resetStaleClaims, и после каждого
+// перезапуска очередь рассуждающих ролей стоит ~15 минут. Гасим их сразу
+// (TIMEOUT, слот свободен), задача переигрывается штатно.
+async function reapOrphanRunningRuns(c) {
+  const r = await c.query(
+    `WITH stale AS (
+       SELECT id, task_id FROM agent_runs WHERE status = 'RUNNING'
+     ), done AS (
+       UPDATE agent_runs SET status = 'TIMEOUT', finished_at = now()
+        WHERE id IN (SELECT id FROM stale)
+     )
+     UPDATE tasks SET assigned_agent_id = NULL
+       WHERE id IN (SELECT task_id FROM stale) AND status NOT IN ('DONE','CANCELLED')`,
+  );
+  return r.rowCount;
+}
+
 /**
  * Стартовая реконсиляция (вызывается один раз при запуске оркестратора).
- * Полный перезапуск программы означает, что активной сессии Разработчика в
- * полёте нет, поэтому немедленно (timeoutMs=0) освобождаем все осиротевшие
- * Programmer-назначения — фидер переподаст их в свободный слот, не дожидаясь
- * 15-минутного таймаута. Безопасно: фидер пишет только в пустой слот.
- * Возвращает число освобождённых задач.
+ * Полный перезапуск программы означает, что активных сессий (ни Разработчика,
+ * ни рассуждающих ролей) в полёте нет, поэтому немедленно освобождаем:
+ *   1) осиротевшие Programmer-назначения (releaseStaleClaudeClaims, timeoutMs=0);
+ *   2) повисшие RUNNING agent_runs рассуждающих ролей (reapOrphanRunningRuns) —
+ *      иначе они держат слоты «N на роль» до 15-минутного таймаута и очередь
+ *      стоит после каждого рестарта.
+ * Возвращает число освобождённых Programmer-задач.
  */
 export async function reconcileOnStartup(s) {
-  return withClient(clientConfig(s), async (c) =>
-    releaseStaleClaudeClaims(c, 0, 'orchestrator_restart_reconcile'),
-  );
+  return withClient(clientConfig(s), async (c) => {
+    await reapOrphanRunningRuns(c);
+    return releaseStaleClaudeClaims(c, 0, 'orchestrator_restart_reconcile');
+  });
 }
 
 // Захватить одну задачу под ИИ-ролью. Возвращает контекст захвата или null.
@@ -1464,10 +1925,17 @@ export async function reconcileOnStartup(s) {
 // берём из этапов проекта (project_stages.task_status у включённого этапа с этой
 // ролью). Если у проекта нет настроенного маршрута — канонический фолбэк по
 // LLM_FLOW_PAIRS (ROLE_FLOW.from). Проекты на паузе (status='paused') пропускаем.
-async function claimLlmRoleTask(c) {
+async function claimLlmRoleTask(c, roleCode = null) {
   // Пары канонического фолбэка начинаются с $2 ($1 = массив кодов ИИ-ролей).
   const valuesSql = LLM_FLOW_PAIRS.map((_, i) => `($${i * 2 + 2}::text, $${i * 2 + 3}::text)`).join(', ');
   const params = [LLM_ROLE_CODES, ...LLM_FLOW_PAIRS.flatMap((p) => [p.code, p.status])];
+  // RUNNER-CONCURRENCY-001: при параллельной обработке claim сужают до одной роли,
+  // чтобы соблюсти лимит «N горутин на роль» — каждый воркер берёт задачу своей роли.
+  let roleFilter = '';
+  if (roleCode) {
+    params.push(roleCode);
+    roleFilter = `AND r.code = $${params.length}`;
+  }
   await c.query('BEGIN');
   try {
     const picked = await c.query(
@@ -1480,6 +1948,7 @@ async function claimLlmRoleTask(c) {
           AND r.hidden = false
           AND p.status <> 'paused'
           AND r.code = ANY($1::text[])
+          ${roleFilter}
           AND (
             EXISTS (
               SELECT 1 FROM project_stages ps
@@ -1494,6 +1963,10 @@ async function claimLlmRoleTask(c) {
               )
               AND (r.code, t.status::text) IN (VALUES ${valuesSql})
             )
+            -- TASK-RESTART-001: перезапущенные задачи Приёмщик забирает БЕЗУСЛОВНО,
+            -- даже если у проекта нет этапа с маппингом на этот статус (иначе после
+            -- ручного перезапуска они бы снова зависли, как BACKLOG при входе READY).
+            OR (r.code = 'TASK_INTAKE_OFFICER' AND t.status::text = 'RESTART')
           )
         ORDER BY t.priority DESC, t.created_at
         FOR UPDATE OF t SKIP LOCKED

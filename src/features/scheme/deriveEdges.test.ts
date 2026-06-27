@@ -43,6 +43,22 @@ describe('deriveSchemeEdges', () => {
     expect(pairs).not.toContain('B->C');
   });
 
+  it('явный joinKey приоритетнее ближайшего join (выбор парного барьера)', () => {
+    // Между fork и его явным join (J2) есть ещё один join (J1) — позиционный
+    // резолвер взял бы J1, но выбран J2, поэтому ветка замыкается на J2.
+    const fork: Stage = { id: 'F', kind: 'fork', stageKey: 'F', joinKey: 'J2', name: 'F', roleIds: [], enabled: true };
+    const stages = [node('A'), fork, node('B'), node('J1', 'join'), node('J2', 'join'), node('D')];
+    const { stages: out, edges } = deriveSchemeEdges(stages);
+    const pairs = edges.map((e) => `${e.fromKey}->${e.toKey}`);
+
+    expect(out.find((s) => s.id === 'F')!.joinKey).toBe('J2');
+    expect(pairs).toContain('A->F');
+    expect(pairs).toContain('F->B');
+    expect(pairs).toContain('B->J2'); // замыкание на ВЫБРАННЫЙ join, не на ближайший
+    expect(pairs).toContain('J2->D');
+    expect(pairs).not.toContain('B->J1'); // ближайший join проигнорирован
+  });
+
   it('некорректный fork без join → линейная трактовка (схема не ломается)', () => {
     const { edges } = deriveSchemeEdges([node('A'), node('F', 'fork'), node('B')]);
     const pairs = edges.map((e) => `${e.fromKey}->${e.toKey}`);

@@ -1,9 +1,8 @@
 #!/usr/bin/env node
 import process from 'node:process';
 import { createServer } from 'node:http';
-import { join, resolve, dirname } from 'node:path';
+import { join, resolve } from 'node:path';
 import { TaskScanner } from '../src/TaskScanner.js';
-import { TaskFeeder } from '../src/TaskFeeder.js';
 import { TaskIntake } from '../src/TaskIntake.js';
 import { ScannerSupervisor } from '../src/ScannerSupervisor.js';
 import {
@@ -11,7 +10,7 @@ import {
   createSnapshotStageConfigProvider,
 } from '../src/StageConfigProvider.js';
 import { createHttpDispatch } from '../src/httpDispatch.js';
-import { createHttpFeed } from '../src/httpFeed.js';
+import { resolveScannerRuntime, ScannerModeError } from '../src/runtimeConfig.js';
 
 // --- Конфигурация ----------------------------------------------------------
 const once = process.argv.includes('--once');
@@ -20,15 +19,27 @@ const debounceMs = Number(process.env.SCANNER_DEBOUNCE_MS || 150);
 const fallbackMs = Number(process.env.SCANNER_FALLBACK_MS ?? 5000);
 const clearOnDispatch = process.env.SCANNER_CLEAR_ON_DISPATCH !== 'false';
 
-// Базовый URL оркестратора для API-режима. Из него выводятся все endpoints.
-const apiBase = (process.env.SCANNER_API_BASE || process.env.ORCHESTRATOR_API_BASE || '').replace(/\/+$/, '');
-const snapshotPath = process.env.SCANNER_SNAPSHOT ? resolve(process.env.SCANNER_SNAPSHOT) : null;
-
-// Приоритет режимов: API (по этапам проектов) > snapshot > legacy single-watcher.
-// API-конфигурация ВСЕГДА имеет приоритет над SCANNER_DOCUMENT: при одновременной
-// установке legacy env игнорируется (с явным сообщением), чтобы не было двух
-// конфликтующих источников истины для одной папки.
-const mode = apiBase ? 'api' : snapshotPath ? 'snapshot' : 'legacy';
+// Режим строго из нового контракта (api/snapshot). Legacy single-watcher удалён:
+// устаревшие переменные окружения игнорируются с диагностикой.
+let runtime;
+try {
+  runtime = resolveScannerRuntime(process.env);
+} catch (error) {
+  if (error instanceof ScannerModeError) {
+    console.error(error.message);
+    process.exit(1);
+  }
+  throw error;
+}
+const { mode, apiBase, orchestratorBase, legacyEnvIgnored } = runtime;
+if (legacyEnvIgnored.length) {
+  console.warn(
+    `Ignored unsupported legacy scanner env: ${legacyEnvIgnored.join(', ')}. ` +
+      'Use SCANNER_API_BASE (api) or SCANNER_SNAPSHOT + ORCHESTRATOR_API_BASE (snapshot).',
+  );
+}
+const snapshotPath = mode === 'snapshot' ? resolve(process.env.SCANNER_SNAPSHOT) : null;
+const taskCompletedEndpoint = `${orchestratorBase}/api/scanner/task-completed`;
 
 /** Имя state-файла на watcher: изолирует exactly-once state по projectId+stageId. */
 function stateFileFor(config, stateDir) {
@@ -38,7 +49,6 @@ function stateFileFor(config, stateDir) {
 
 // --- API / snapshot мульти-watcher режим -----------------------------------
 function buildSupervisor() {
-  const endpoint = `${apiBase || (process.env.SCANNER_ENDPOINT || '').replace(/\/api\/scanner\/task-completed$/, '')}/api/scanner/task-completed`;
   const stateDir = resolve(process.env.SCANNER_STATE_DIR || 'runtime/scanner-state');
   const intervalMs = Number(process.env.SCANNER_CONFIG_INTERVAL_MS || 5000);
 
@@ -56,52 +66,24 @@ function buildSupervisor() {
       debounceMs,
       fallbackMs,
       clearOnDispatch,
-      dispatch: createHttpDispatch({ endpoint, token }),
+      dispatch: createHttpDispatch({ endpoint: taskCompletedEndpoint, token }),
     });
 
   return new ScannerSupervisor({ provider, buildScanner, intervalMs });
 }
 
-// --- Legacy одиночный watcher + обратный мост (fallback) -------------------
-function buildLegacy() {
-  const documentPath = resolve(process.env.SCANNER_DOCUMENT || 'tasks/claude-tasks.json');
-  const statePath = resolve(process.env.SCANNER_STATE || 'tasks/.scanner-state.json');
-  const endpoint = process.env.SCANNER_ENDPOINT || 'http://localhost:4186/api/scanner/task-completed';
-  const base = endpoint.replace(/\/api\/scanner\/task-completed$/, '');
-  const nextEndpoint = process.env.FEEDER_NEXT_ENDPOINT || `${base}/api/runner/next-claude-task`;
-  const releaseEndpoint = process.env.FEEDER_RELEASE_ENDPOINT || `${base}/api/runner/release-claude-task`;
-  const feederEnabled = process.env.FEEDER_ENABLED !== 'false';
-  const feederIntervalMs = Number(process.env.FEEDER_INTERVAL_MS || 3000);
-
-  const scanner = new TaskScanner({
-    documentPath,
-    statePath,
-    debounceMs,
-    fallbackMs,
-    clearOnDispatch,
-    dispatch: createHttpDispatch({ endpoint, token }),
+// --- Интейк Markdown-очередей (SCANNER-INTAKE-001) --------------------------
+// Не связан с режимом watcher: импортирует задачи из tasks/<service>.md (секции
+// с маркером `[x]`) в БД оркестратора. Включается заданием проекта-владельца.
+function buildIntake() {
+  const project = String(process.env.SCANNER_INTAKE_PROJECT ?? '').trim();
+  if (!project) return null;
+  const tasksDir = resolve(process.env.SCANNER_INTAKE_DIR || 'tasks');
+  return new TaskIntake({
+    tasksDir,
+    project,
+    intake: createHttpDispatch({ endpoint: `${orchestratorBase}/api/scanner/task-intake`, token }),
   });
-  const feeder = feederEnabled
-    ? new TaskFeeder({ documentPath, ...createHttpFeed({ nextEndpoint, releaseEndpoint, token }) })
-    : null;
-
-  // Интейк из Markdown-очередей сервисов: tasks/<service>.md, задачи с маркером
-  // `[x]` → БД, после чего секция вырезается из файла. Включается заданием
-  // проекта-владельца (SCANNER_INTAKE_PROJECT). Папка очередей по умолчанию —
-  // каталог документа (та же tasks/, где лежит claude-tasks.json).
-  const intakeProject = String(process.env.SCANNER_INTAKE_PROJECT ?? '').trim();
-  const intakeIntervalMs = Number(process.env.SCANNER_INTAKE_INTERVAL_MS || 5000);
-  const intake = intakeProject
-    ? new TaskIntake({
-        tasksDir: process.env.SCANNER_INTAKE_DIR
-          ? resolve(process.env.SCANNER_INTAKE_DIR)
-          : dirname(documentPath),
-        project: intakeProject,
-        intake: createHttpDispatch({ endpoint: `${base}/api/scanner/task-intake`, token }),
-      })
-    : null;
-
-  return { documentPath, scanner, feeder, nextEndpoint, feederIntervalMs, intake, intakeIntervalMs };
 }
 
 // --- Health/readiness HTTP -------------------------------------------------
@@ -125,63 +107,43 @@ function startHealthServer(readiness) {
 }
 
 // --- Запуск ----------------------------------------------------------------
-if (apiBase && process.env.SCANNER_DOCUMENT) {
-  console.warn('SCANNER_DOCUMENT ignored: API config (SCANNER_API_BASE) takes precedence');
-}
+const supervisor = buildSupervisor();
+const intake = buildIntake();
 
-if (mode === 'legacy') {
-  const { documentPath, scanner, feeder, nextEndpoint, feederIntervalMs, intake, intakeIntervalMs } = buildLegacy();
-  if (once) {
-    const scan = await scanner.scanOnce();
-    const feed = feeder ? await feeder.feedOnce() : null;
-    const intakeResult = intake ? await intake.scanOnce() : null;
-    console.log(JSON.stringify({ scan, feed, intake: intakeResult }));
-  } else {
-    console.log(`Scanner (legacy single watcher) watches ${documentPath}`);
-    scanner.start();
-    let feederTimer = null;
-    if (feeder) {
-      console.log(`Feeder polls ${nextEndpoint} every ${feederIntervalMs}ms`);
-      const feedTick = () => feeder.feedOnce().catch((e) => console.error(`Feeder failed: ${e.message}`));
-      void feedTick();
-      feederTimer = setInterval(feedTick, feederIntervalMs);
-      feederTimer.unref?.();
-    }
-    let intakeTimer = null;
-    if (intake) {
-      console.log(`Intake scans ${intake.tasksDir} (project ${intake.project}) every ${intakeIntervalMs}ms`);
-      const intakeTick = () => intake.scanOnce().catch((e) => console.error(`Intake failed: ${e.message}`));
-      void intakeTick();
-      intakeTimer = setInterval(intakeTick, intakeIntervalMs);
-      intakeTimer.unref?.();
-    }
-    startHealthServer(() => ({ status: 'ok', mode: 'legacy', watcher: { documentPath }, intake: intake ? { tasksDir: intake.tasksDir, project: intake.project } : null }));
-    const stop = () => {
-      scanner.stop();
-      if (feederTimer) clearInterval(feederTimer);
-      if (intakeTimer) clearInterval(intakeTimer);
-      process.exit(0);
-    };
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', stop);
-    await new Promise(() => {});
-  }
+if (once) {
+  const summary = await supervisor.refresh();
+  const intakeResult = intake ? await intake.scanOnce() : null;
+  console.log(JSON.stringify({ mode, summary, intake: intakeResult, readiness: supervisor.readiness() }));
+  supervisor.stop();
 } else {
-  const supervisor = buildSupervisor();
-  if (once) {
-    const summary = await supervisor.refresh();
-    console.log(JSON.stringify({ mode, summary, readiness: supervisor.readiness() }));
-    supervisor.stop();
-  } else {
-    console.log(`Scanner (${mode} multi-watcher) reconciling from orchestrator config`);
-    await supervisor.start();
-    startHealthServer(() => ({ mode, ...supervisor.readiness() }));
-    const stop = () => {
-      supervisor.stop();
-      process.exit(0);
-    };
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', stop);
-    await new Promise(() => {});
+  console.log(`Scanner (${mode} multi-watcher) reconciling from orchestrator config`);
+  await supervisor.start();
+  let intakeTimer = null;
+  if (intake) {
+    const intakeIntervalMs = Number(process.env.SCANNER_INTAKE_INTERVAL_MS || 5000);
+    console.log(`Intake scans ${intake.tasksDir} (project ${intake.project}) every ${intakeIntervalMs}ms`);
+    const intakeTick = () => intake.scanOnce().catch((e) => console.error(`Intake failed: ${e.message}`));
+    void intakeTick();
+    intakeTimer = setInterval(intakeTick, intakeIntervalMs);
+    intakeTimer.unref?.();
   }
+  startHealthServer(() => ({
+    mode,
+    ...supervisor.readiness(),
+    intake: intake ? { tasksDir: intake.tasksDir, project: intake.project } : null,
+  }));
+  // Health-сервер и intake-таймер заunref'лены, а watcher'ов может не быть
+  // (например, стартовый refresh не достучался до оркестратора — `fetch failed`).
+  // Без единственного ref'd хэндла событийный цикл пустеет и Node завершается
+  // с кодом 13 (unsettled top-level await ниже). Этот таймер держит процесс живым.
+  const keepAlive = setInterval(() => {}, 3600_000);
+  const stop = () => {
+    supervisor.stop();
+    if (intakeTimer) clearInterval(intakeTimer);
+    clearInterval(keepAlive);
+    process.exit(0);
+  };
+  process.on('SIGINT', stop);
+  process.on('SIGTERM', stop);
+  await new Promise(() => {});
 }

@@ -190,6 +190,8 @@ export async function testConnectionById(s, id) {
       ssl: row.ssl_mode && row.ssl_mode !== 'disable' ? { rejectUnauthorized: false } : undefined,
       connectionTimeoutMillis: 5000,
     });
+    // DB-CONN-RESILIENCE-001: обрыв проверочного соединения не должен ронять процесс.
+    client.on('error', () => {});
     try {
       await client.connect();
       await client.query('SELECT 1');

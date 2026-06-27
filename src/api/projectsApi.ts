@@ -213,8 +213,12 @@ export function asStageSaveError(err: unknown): StageSaveError | null {
 }
 
 export const projectsApi = {
-  async list(): Promise<Project[]> {
-    const { projects } = await http.get<{ projects: RichProject[] }>('/api/projects');
+  async list(signal?: AbortSignal): Promise<Project[]> {
+    // Опции передаём только при наличии signal — иначе вызов остаётся
+    // одноаргументным (http.get сам по себе без отмены).
+    const { projects } = signal
+      ? await http.get<{ projects: RichProject[] }>('/api/projects', { signal })
+      : await http.get<{ projects: RichProject[] }>('/api/projects');
     return (projects ?? [])
       .map(fromRich)
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));

@@ -1,18 +1,36 @@
 # scanner-service
 
-Файловый мост между Claude Code в VS Code и AI Orchestrator.
+Файловый мост между Claude Code в VS Code и AI Orchestrator. Работает в режиме
+**multi-watcher**: сам сверяется с конфигурацией и поднимает по одному наблюдателю
+на каждую активную Scanner-папку проекта. Устаревший legacy single-watcher с
+`SCANNER_DOCUMENT`/`SCANNER_STATE`/`SCANNER_ENDPOINT` и обратным мостом-фидером
+(`TaskFeeder`, `FEEDER_*`) удалён; эти переменные больше не поддерживаются и при
+наличии игнорируются с диагностическим предупреждением.
+
+## Режимы
+
+Режим задаётся явно одной из переменных (иначе сервис завершится с ошибкой):
+
+- **api** (`SCANNER_API_BASE`) — папки наблюдения берутся из этапов проектов
+  оркестратора (`GET /api/projects`). `SCANNER_API_BASE` одновременно служит базой
+  для отправки результатов.
+- **snapshot** (`SCANNER_SNAPSHOT`) — папки наблюдения берутся из локального
+  файла-снимка. URL оркестратора для отправки результатов задаётся отдельно через
+  `ORCHESTRATOR_API_BASE` (обязателен в этом режиме).
 
 ## Как работает
 
-1. Оркестратор или пользователь добавляет задачу в `tasks/claude-tasks.json`.
-2. Claude выполняет задачу, заполняет `result`, `changedFiles`, `completedAt` и
+1. Супервайзер периодически (`SCANNER_CONFIG_INTERVAL_MS`) сверяет конфигурацию и
+   синхронизирует набор наблюдателей: на каждую `(projectId, stageId)` — свой
+   watcher и свой exactly-once state-файл в `SCANNER_STATE_DIR`.
+2. Оркестратор или пользователь кладёт задачу в документ наблюдаемой папки
+   (`claude-tasks.json` по умолчанию).
+3. Claude выполняет задачу, заполняет `result`, `changedFiles`, `completedAt` и
    последним действием ставит `status: "выполнено"`.
-3. Scanner замечает изменение и вызывает
-   `POST /api/scanner/task-completed`.
-4. Оркестратор проверяет UUID, проект и сервис, после чего переводит задачу к
-   `TASK_REVIEWER`.
-5. Успешная доставка фиксируется в `tasks/.scanner-state.json`; повторное
-   сохранение документа не создаёт новый запуск.
+4. Scanner замечает изменение и вызывает `POST /api/scanner/task-completed`.
+5. Оркестратор проверяет UUID, проект и сервис, после чего переводит задачу к
+   `TASK_REVIEWER`. Успешная доставка фиксируется в state-файле этого watcher'а;
+   повторное сохранение документа не создаёт новый запуск.
 
 ## Формат документа
 
@@ -36,16 +54,17 @@
 
 ## Запуск
 
-В Docker сервис стартует вместе с `docker compose up -d`. Локально:
+В Docker сервис стартует вместе с `docker compose up -d` (compose настраивает
+api-режим: `SCANNER_API_BASE`, `SCANNER_STATE_DIR`). Локально:
 
 ```text
 cd scanner-service
-npm start
+SCANNER_API_BASE=http://localhost:4186 npm start
 ```
 
-Сервис следит за документом через `fs.watch` (события файловой системы), а не
-опросом по таймеру. Несколько событий от одного сохранения схлопываются дебаунсом
-(`SCANNER_DEBOUNCE_MS`, по умолчанию 150 мс).
+Каждый watcher следит за документом через `fs.watch` (события файловой системы), а
+не опросом по таймеру. Несколько событий от одного сохранения схлопываются
+дебаунсом (`SCANNER_DEBOUNCE_MS`, по умолчанию 150 мс).
 
 Дополнительно работает редкий резервный опрос (`SCANNER_FALLBACK_MS`, по умолчанию
 5000 мс; `0` — выключить) — страховка на случай, когда события `fs.watch` не доходят.
@@ -53,8 +72,10 @@ npm start
 с хоста в контейнер, поэтому без резервного опроса изменения файла можно не увидеть.
 `scanOnce` идемпотентен, поэтому повторные проходы не создают дублей.
 
-Переменные: `SCANNER_DOCUMENT`, `SCANNER_STATE`, `SCANNER_ENDPOINT`,
-`SCANNER_DEBOUNCE_MS`, `SCANNER_FALLBACK_MS`, `ORCHESTRATOR_API_TOKEN`.
+Переменные: `SCANNER_API_BASE` **или** (`SCANNER_SNAPSHOT` + `ORCHESTRATOR_API_BASE`),
+`SCANNER_STATE_DIR`, `SCANNER_CONFIG_INTERVAL_MS`, `SCANNER_DEBOUNCE_MS`,
+`SCANNER_FALLBACK_MS`, `SCANNER_CLEAR_ON_DISPATCH`, `SCANNER_HEALTH_PORT`,
+`ORCHESTRATOR_API_TOKEN`.
 
 ## Интейк задач из Markdown-очередей `tasks/<service>.md` (SCANNER-INTAKE-001)
 
@@ -91,4 +112,6 @@ Pre-coding brief:
 
 Включается заданием **проекта-владельца** `SCANNER_INTAKE_PROJECT` (значение —
 `code`|`name`|`root_path` проекта). Без него интейк выключен. Доп. переменные:
-`SCANNER_INTAKE_DIR` (по умолчанию каталог документа), `SCANNER_INTAKE_INTERVAL_MS`.
+`SCANNER_INTAKE_DIR` (по умолчанию `tasks`), `SCANNER_INTAKE_INTERVAL_MS`. Интейк
+не зависит от режима watcher и использует ту же базу оркестратора
+(`SCANNER_API_BASE`/`ORCHESTRATOR_API_BASE`).
