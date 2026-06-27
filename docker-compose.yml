@@ -36,6 +36,18 @@ services:
       # root_path в БД — путь хоста (Windows), а tools-service монтирует родитель
       # проектов в /projects. Префикс берём из PROJECTS_HOST_ROOT (.env).
       TOOLS_PROJECT_PATH_MAP: "${PROJECTS_HOST_ROOT:-K:\\Роботы\\Golang\\git}=>/projects"
+      # Задачи ставит Codex чётко → роли не тратят много токенов на вывод.
+      # Меньше max_tokens = быстрее генерация и ниже нагрузка на провайдера.
+      CONNECTOR_LLM_MAX_TOKENS: "${CONNECTOR_LLM_MAX_TOKENS:-2048}"
+      # CONNECTOR-LIMITER-001: глобальный адаптивный лимитер вызовов DeepSeek.
+      # Старт с 6 одновременных, нащупывает потолок (AIMD) до MAX, при троттлинге
+      # откатывается до MIN. TPM_BUDGET>0 включает мягкий гейт по токенам/мин.
+      CONNECTOR_LIMIT_START: "${CONNECTOR_LIMIT_START:-6}"
+      CONNECTOR_LIMIT_MIN: "${CONNECTOR_LIMIT_MIN:-2}"
+      CONNECTOR_LIMIT_MAX: "${CONNECTOR_LIMIT_MAX:-32}"
+      CONNECTOR_LIMIT_PROBE_AFTER: "${CONNECTOR_LIMIT_PROBE_AFTER:-15}"
+      CONNECTOR_TPM_BUDGET: "${CONNECTOR_TPM_BUDGET:-0}"
+      CONNECTOR_RETRY_MAX: "${CONNECTOR_RETRY_MAX:-1}"
     networks:
       - default
       - shared-network

@@ -51,6 +51,8 @@ export function parseTextToolCalls(content) {
 }
 
 async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
+  const deadline = Date.now() + LLM_CALL_TIMEOUT_MS;
+  const remainingMs = () => Math.max(1, deadline - Date.now());
   const messages = [
     { role: 'system', content: system },
     { role: 'user', content: user },
@@ -60,7 +62,7 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
   let text = '';
   for (let i = 0; i < TOOL_MAX_ITERS; i += 1) {
     iterations += 1;
-    const { message } = await invokeChat(conn, { messages, tools: toolSchemas }, { timeoutMs: LLM_CALL_TIMEOUT_MS });
+    const { message } = await invokeChat(conn, { messages, tools: toolSchemas }, { timeoutMs: remainingMs() });
     const native = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
     const content = String(message?.content ?? '');
 
@@ -124,7 +126,7 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
         + 'данных верни ТОЛЬКО финальный JSON-вердикт в требуемом формате — без разметки tool_calls, '
         + 'без markdown и без пояснений вокруг JSON.',
     });
-    const { message } = await invokeChat(conn, { messages, tools: [] }, { timeoutMs: LLM_CALL_TIMEOUT_MS });
+    const { message } = await invokeChat(conn, { messages, tools: [] }, { timeoutMs: remainingMs() });
     text = String(message?.content ?? '').trim();
   }
   return { text, iterations, toolCalls };

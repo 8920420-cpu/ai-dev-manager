@@ -6,6 +6,7 @@ import { dirname, resolve, join, extname, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadSettings, saveSettings, resolveSettings, redactSettings } from './config.js';
 import { getAppSettings, updateAppSettings } from './appSettings.js';
+import { stats as connectorCapacity } from './connectorLimiter.js';
 import {
   testConnection,
   bootstrap,
@@ -302,6 +303,12 @@ export function createApp() {
         // Рантайм-настройки приложения (APP-SETTINGS-001): параллельность runner и пр.
         if (req.method === 'GET' && p === '/api/app-settings')
           return sendJson(res, 200, await getAppSettings(await loadSettings()));
+
+        // CONNECTOR-LIMITER-001: ёмкость внешнего LLM-коннектора. Сервисы
+        // спрашивают перед отправкой: { free, canSend, limit, active, tpm, ... }.
+        // canSend=false → есть смысл подождать, а не слать вызов вхолостую.
+        if (req.method === 'GET' && p === '/api/connector/capacity')
+          return sendJson(res, 200, connectorCapacity());
 
         if (req.method === 'PUT' && p === '/api/app-settings')
           return sendJson(res, 200, await updateAppSettings(await loadSettings(), await readBody(req)));

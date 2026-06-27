@@ -3,8 +3,87 @@
 // Чистые функции (buildRequest/parseLLMResponse/normalize*) покрыты тестами и
 // не зависят от сети — это упрощает проверку «точно такой же» логики.
 
+import { acquire, recordResult, classifyOutcome } from './connectorLimiter.js';
+
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000; // 10 минут, как в источнике
 const RESPONSE_LIMIT_BYTES = 4 << 20; // 4 МБ
+
+// CONNECTOR-LIMITER-001: число повторов на ретраябельных сбоях (429/5xx/сеть).
+function envInt(name, def) {
+  const n = Number.parseInt(String(process.env[name] ?? '').trim(), 10);
+  return Number.isFinite(n) ? n : def;
+}
+const RETRY_MAX = Math.max(0, envInt('CONNECTOR_RETRY_MAX', 1));
+const RETRY_BASE_MS = Math.max(50, envInt('CONNECTOR_RETRY_BASE_MS', 500));
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const backoffMs = (attempt) => RETRY_BASE_MS * 2 ** attempt + Math.floor(Math.random() * RETRY_BASE_MS);
+
+// Извлечь число использованных токенов из ответа OpenAI-совместимого API.
+function extractUsageTokens(raw) {
+  try {
+    const j = JSON.parse(raw);
+    const u = j?.usage;
+    if (!u) return 0;
+    if (Number.isFinite(u.total_tokens)) return u.total_tokens;
+    return (Number(u.prompt_tokens) || 0) + (Number(u.completion_tokens) || 0);
+  } catch {
+    return 0;
+  }
+}
+
+// Единый сетевой вызов модели под глобальным лимитером + ретрай. Захватывает
+// слот, делает fetch, фиксирует исход (для AIMD/учёта токенов), освобождает слот.
+// Возвращает { status, raw, durationMs } на 2xx; иначе бросает Error (с httpStatus).
+async function networkCall(conn, { endpoint, body, headers, timeoutMs }) {
+  let lastError = null;
+  for (let attempt = 0; attempt <= RETRY_MAX; attempt += 1) {
+    const release = await acquire();
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const started = Date.now();
+    try {
+      const res = await fetch(endpoint, { method: 'POST', headers, body, signal: controller.signal });
+      const raw = await res.text();
+      const durationMs = Date.now() - started;
+      clearTimeout(timer);
+      release();
+      if (res.status < 200 || res.status >= 300) {
+        const outcome = classifyOutcome({ httpStatus: res.status });
+        recordResult({ outcome, totalTokens: 0 });
+        const err = new Error(`connector "${conn.name}": HTTP ${res.status}: ${truncateErrBody(raw)}`);
+        err.httpStatus = res.status;
+        err.durationMs = durationMs;
+        if (outcome === 'throttle' && attempt < RETRY_MAX) {
+          lastError = err;
+          await sleep(backoffMs(attempt));
+          continue;
+        }
+        throw err;
+      }
+      recordResult({ outcome: 'ok', totalTokens: extractUsageTokens(raw) });
+      return { status: res.status, raw, durationMs };
+    } catch (e) {
+      clearTimeout(timer);
+      release();
+      if (e?.httpStatus) throw e; // уже обработанный HTTP-ответ выше
+      const durationMs = Date.now() - started;
+      const aborted = e?.name === 'AbortError';
+      const msg = aborted ? `AI response timeout (${timeoutMs}ms)` : (e?.message || 'network error');
+      recordResult({ outcome: classifyOutcome({ aborted, errorMessage: msg }), totalTokens: 0 });
+      const err = new Error(`connector "${conn.name}": ${msg}`);
+      err.durationMs = durationMs;
+      // Таймаут/abort не ретраим: бюджет роли уже потрачен. Сетевые — ретраим.
+      if (!aborted && attempt < RETRY_MAX) {
+        lastError = err;
+        await sleep(backoffMs(attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError ?? new Error(`connector "${conn.name}": network call failed`);
+}
 
 // --- настройки через окружение (аналог os.Getenv в источнике) -------------
 
@@ -211,56 +290,30 @@ export function parseLLMResponse(raw) {
  */
 export async function invoke(conn, input, { timeoutMs = DEFAULT_TIMEOUT_MS } = {}) {
   const { endpoint, body } = buildRequest(conn, input);
-  const started = Date.now();
-
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   const headers = { 'Content-Type': 'application/json' };
   const token = String(conn.accessToken ?? '').trim();
   if (token !== '') headers['Authorization'] = 'Bearer ' + token;
 
-  let res;
-  try {
-    res = await fetch(endpoint, { method: 'POST', headers, body, signal: controller.signal });
-  } catch (e) {
-    clearTimeout(timer);
-    if (e?.name === 'AbortError') {
-      throw new Error(`connector "${conn.name}": AI response timeout (${timeoutMs}ms)`);
-    }
-    throw new Error(`connector "${conn.name}": request failed: ${e.message}`);
-  } finally {
-    clearTimeout(timer);
-  }
+  // Сеть под глобальным лимитером (семафор + AIMD + учёт токенов) и ретраем.
+  const { status, raw, durationMs } = await networkCall(conn, { endpoint, body, headers, timeoutMs });
 
-  const raw = await res.text();
-  const durationMs = Date.now() - started;
-
-  if (res.status < 200 || res.status >= 300) {
-    const err = new Error(
-      `connector "${conn.name}": HTTP ${res.status}: ${truncateErrBody(raw)}`,
-    );
-    err.httpStatus = res.status;
-    err.durationMs = durationMs;
-    throw err;
-  }
   if (raw.length > RESPONSE_LIMIT_BYTES) {
     throw new Error(`connector "${conn.name}": response too large`);
   }
-
   let text;
   try {
     text = parseLLMResponse(raw);
   } catch (e) {
     const err = new Error(`connector "${conn.name}": ${e.message}`);
-    err.httpStatus = res.status;
+    err.httpStatus = status;
     err.durationMs = durationMs;
     throw err;
   }
   if (String(text).trim() === '') {
     throw new Error(`connector "${conn.name}": empty response`);
   }
-  return { text, httpStatus: res.status, durationMs };
+  return { text, httpStatus: status, durationMs };
 }
 
 /**
@@ -290,39 +343,23 @@ export async function invokeChat(conn, { messages, tools = [] }, { timeoutMs = D
     req.tool_choice = 'auto';
   }
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
   const headers = { 'Content-Type': 'application/json' };
   const token = String(conn.accessToken ?? '').trim();
   if (token !== '') headers['Authorization'] = 'Bearer ' + token;
 
-  const started = Date.now();
-  let res;
-  try {
-    res = await fetch(endpoint, { method: 'POST', headers, body: JSON.stringify(req), signal: controller.signal });
-  } catch (e) {
-    clearTimeout(timer);
-    if (e?.name === 'AbortError') throw new Error(`connector "${conn.name}": AI response timeout (${timeoutMs}ms)`);
-    throw new Error(`connector "${conn.name}": request failed: ${e.message}`);
-  } finally {
-    clearTimeout(timer);
-  }
-  const raw = await res.text();
-  const durationMs = Date.now() - started;
-  if (res.status < 200 || res.status >= 300) {
-    const err = new Error(`connector "${conn.name}": HTTP ${res.status}: ${truncateErrBody(raw)}`);
-    err.httpStatus = res.status;
-    throw err;
-  }
+  // Сеть под глобальным лимитером (семафор + AIMD + учёт токенов) и ретраем.
+  const { status, raw, durationMs } = await networkCall(conn, {
+    endpoint, body: JSON.stringify(req), headers, timeoutMs,
+  });
   let parsed;
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { message: { role: 'assistant', content: raw, tool_calls: [] }, httpStatus: res.status, durationMs };
+    return { message: { role: 'assistant', content: raw, tool_calls: [] }, httpStatus: status, durationMs };
   }
   const message = parsed?.choices?.[0]?.message ?? { role: 'assistant', content: '' };
   if (!Array.isArray(message.tool_calls)) message.tool_calls = [];
-  return { message, httpStatus: res.status, durationMs };
+  return { message, httpStatus: status, durationMs };
 }
 
 // Экспорт внутренних чистых функций для тестов.

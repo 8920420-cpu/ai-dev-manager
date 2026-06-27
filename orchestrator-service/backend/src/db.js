@@ -1844,14 +1844,28 @@ async function resetStaleClaims(c) {
   await reconcileClockSkew(c, { log: (m) => console.log(m) });
   await c.query(
     `WITH stale AS (
-       SELECT id, task_id FROM agent_runs
-        WHERE status = 'RUNNING' AND started_at < now() - ($1::bigint * interval '1 millisecond')
+       SELECT ar.id, ar.task_id, ar.role_id, t.status::text AS task_status
+         FROM agent_runs ar
+         JOIN tasks t ON t.id = ar.task_id
+        WHERE ar.status = 'RUNNING' AND ar.started_at < now() - ($1::bigint * interval '1 millisecond')
      ), done AS (
-       UPDATE agent_runs SET status = 'TIMEOUT', finished_at = now()
+       UPDATE agent_runs
+          SET status = 'TIMEOUT',
+              finished_at = now(),
+              error_text = 'role execution timed out before producing a structured result',
+              output_json = jsonb_build_object('status', 'TIMEOUT', 'reason', 'role_timeout')
         WHERE id IN (SELECT id FROM stale)
+        RETURNING task_id
+     ), freed AS (
+       UPDATE tasks SET assigned_agent_id = NULL
+        WHERE id IN (SELECT task_id FROM stale) AND status NOT IN ('DONE','CANCELLED')
+        RETURNING id
      )
-     UPDATE tasks SET assigned_agent_id = NULL
-       WHERE id IN (SELECT task_id FROM stale) AND status NOT IN ('DONE','CANCELLED')`,
+     INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     SELECT s.task_id, 'STATUS_CHANGED', s.task_status::task_status, s.task_status::task_status, s.role_id,
+            jsonb_build_object('runner', true, 'reason', 'role_timeout', 'runStatus', 'TIMEOUT')
+       FROM stale s
+       JOIN freed f ON f.id = s.task_id`,
     [ROLE_TIMEOUT_MS],
   );
   await releaseStaleClaudeClaims(c);
@@ -1903,13 +1917,28 @@ async function releaseStaleClaudeClaims(c, timeoutMs = CLAUDE_ASSIGN_TIMEOUT_MS,
 async function reapOrphanRunningRuns(c) {
   const r = await c.query(
     `WITH stale AS (
-       SELECT id, task_id FROM agent_runs WHERE status = 'RUNNING'
+       SELECT ar.id, ar.task_id, ar.role_id, t.status::text AS task_status
+         FROM agent_runs ar
+         JOIN tasks t ON t.id = ar.task_id
+        WHERE ar.status = 'RUNNING'
      ), done AS (
-       UPDATE agent_runs SET status = 'TIMEOUT', finished_at = now()
+       UPDATE agent_runs
+          SET status = 'TIMEOUT',
+              finished_at = now(),
+              error_text = 'orchestrator restarted while run was RUNNING; run was reaped as TIMEOUT',
+              output_json = jsonb_build_object('status', 'TIMEOUT', 'reason', 'orchestrator_restart_reconcile')
         WHERE id IN (SELECT id FROM stale)
+        RETURNING task_id
+     ), freed AS (
+       UPDATE tasks SET assigned_agent_id = NULL
+        WHERE id IN (SELECT task_id FROM stale) AND status NOT IN ('DONE','CANCELLED')
+        RETURNING id
      )
-     UPDATE tasks SET assigned_agent_id = NULL
-       WHERE id IN (SELECT task_id FROM stale) AND status NOT IN ('DONE','CANCELLED')`,
+     INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     SELECT s.task_id, 'STATUS_CHANGED', s.task_status::task_status, s.task_status::task_status, s.role_id,
+            jsonb_build_object('runner', true, 'reason', 'orchestrator_restart_reconcile', 'runStatus', 'TIMEOUT')
+       FROM stale s
+       JOIN freed f ON f.id = s.task_id`,
   );
   return r.rowCount;
 }
