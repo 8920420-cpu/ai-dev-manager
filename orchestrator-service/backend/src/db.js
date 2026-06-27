@@ -928,11 +928,22 @@ export async function claimNextClaudeTask(s) {
       // Те же поля строго проверяет acceptScannerCompletion (нельзя вернуть без них).
       const progContract = await loadRoleContract(c, 'PROGRAMMER');
       const requiredFields = progContract.outputs.filter((f) => f.required).map((f) => f.key);
-      await c.query(
+      const assigned = await c.query(
         `INSERT INTO task_events (task_id, event_type, to_status, role_id, payload_json)
-         VALUES ($1, 'AGENT_ASSIGNED', 'CODING', $2, $3::jsonb)`,
+         VALUES ($1, 'AGENT_ASSIGNED', 'CODING', $2, $3::jsonb)
+         RETURNING id`,
         [row.id, row.current_role_id, JSON.stringify({ target: 'claude-tasks.json', agent: 'claude_programmer' })],
       );
+      // Ключ сдачи ДОЛЖЕН быть уникален для каждого захвата задачи, а не только для
+      // её id. Иначе после повторного входа задачи в CODING (RESTART/refeed/доработка
+      // от ревьюера) её сдача попадёт в scanner_dispatches как дубль по уже
+      // существующему (task_id, completion_key) → acceptScannerCompletion вернёт
+      // duplicate БЕЗ продвижения, задача навсегда залипнет в CODING и claim_next_
+      // claude_task начнёт по кругу выдавать одну и ту же «уже завершённую» задачу.
+      // Привязка к id события AGENT_ASSIGNED (создаётся при каждом захвате) даёт
+      // свежий ключ на каждый заход и сохраняет идемпотентность в рамках одного
+      // захвата (исполнитель сдаёт ровно тем ключом, что получил здесь).
+      const completionKey = `programmer-${row.id}-${assigned.rows[0].id}`;
       await c.query('COMMIT');
       return {
         task: {
@@ -958,7 +969,7 @@ export async function claimNextClaudeTask(s) {
           completion: {
             required: true,
             tool: 'orchestrator_complete_scanner_task',
-            completionKey: `programmer-${row.id}`,
+            completionKey,
             project: project_code,
             service: service_code ?? '',
             title: row.title,
