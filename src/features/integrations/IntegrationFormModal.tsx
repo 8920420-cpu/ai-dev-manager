@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import {
   Button,
+  Callout,
   ConfirmDialog,
   Input,
   Select,
@@ -26,10 +27,17 @@ interface IntegrationFormModalProps {
  * Пресеты провайдеров. Endpoint вручную не задаётся — его определяет сам
  * коннектор по провайдеру (на backend, см. PROVIDER_ENDPOINTS). Здесь — только
  * подпись и дефолтная модель для подсказки.
+ *
+ * INTEGRATION-ENGINE-UNIFY-001: провайдеры с driver=true — хостовые исполнители
+ * рассуждающих ролей (Codex / Claude Code). У них нет сетевого endpoint и токена:
+ * оркестратор лишь отдаёт драйверу роль и промпт, а LLM-вызов делает сам драйвер
+ * на машине (codex login / вход в claude). Модель и access token для них не нужны.
  */
-const PROVIDERS: Record<string, { label: string; model: string }> = {
-  deepseek: { label: 'DeepSeek', model: 'deepseek-chat' },
-  openai: { label: 'OpenAI', model: 'gpt-4o-mini' },
+const PROVIDERS: Record<string, { label: string; model: string; driver?: boolean }> = {
+  deepseek: { label: 'DeepSeek API', model: 'deepseek-chat' },
+  openai: { label: 'OpenAI API', model: 'gpt-4o-mini' },
+  codex: { label: 'Codex (драйвер)', model: '', driver: true },
+  claude_code: { label: 'Claude Code (драйвер)', model: '', driver: true },
 };
 
 export function IntegrationFormModal({
@@ -49,6 +57,8 @@ export function IntegrationFormModal({
   const [confirmClose, setConfirmClose] = useState(false);
 
   const isEdit = Boolean(initial);
+  // Драйвер (Codex/Claude Code) — хостовый исполнитель: без модели и токена.
+  const isDriver = Boolean(PROVIDERS[provider]?.driver);
 
   useEffect(() => {
     if (!open) return;
@@ -75,8 +85,9 @@ export function IntegrationFormModal({
 
   function validateAll(): boolean {
     const nErr = required(name, 'Название');
-    // Токен обязателен при создании; при редактировании пустой = «не менять».
-    const tErr = !isEdit && token.trim() === '' ? 'Укажите access token' : null;
+    // Токен обязателен только для API-провайдеров при создании; драйверу токен не
+    // нужен, при редактировании пустой = «не менять».
+    const tErr = !isEdit && !isDriver && token.trim() === '' ? 'Укажите access token' : null;
     setNameError(nErr);
     setTokenError(tErr);
     return !nErr && !tErr;
@@ -89,9 +100,10 @@ export function IntegrationFormModal({
       const payload: IntegrationInput = {
         name: name.trim(),
         provider,
-        model: model.trim(),
+        // Драйверу модель/токен не нужны — не отправляем (сбрасываем на сервере).
+        model: isDriver ? '' : model.trim(),
       };
-      if (token.trim() !== '') payload.accessToken = token.trim();
+      if (!isDriver && token.trim() !== '') payload.accessToken = token.trim();
 
       let result: Integration;
       if (initial) {
@@ -120,7 +132,7 @@ export function IntegrationFormModal({
         open={open}
         onClose={requestClose}
         title={isEdit ? 'Изменить интеграцию' : 'Добавить интеграцию'}
-        subtitle="Коннектор AI-провайдера (DeepSeek / OpenAI-совместимый)"
+        subtitle="AI-API (DeepSeek / OpenAI) или хостовый драйвер (Codex / Claude Code)"
         size="md"
         footer={
           <>
@@ -161,36 +173,47 @@ export function IntegrationFormModal({
             ))}
           </Select>
 
-          <Input
-            label="Модель"
-            optional
-            mono
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-            helper={`Если пусто — модель по умолчанию (${modelPlaceholder})`}
-            placeholder={modelPlaceholder}
-            autoComplete="off"
-          />
+          {isDriver ? (
+            <Callout tone="info" title="Хостовый драйвер">
+              Драйвер исполняет рассуждающие роли на этой машине (нужен запущенный
+              хостовый раннер и вход: <code>codex login</code> / вход в Claude Code).
+              Модель и access token не требуются — оркестратор отдаёт драйверу роль и
+              готовый промпт, а вызов модели делает сам драйвер.
+            </Callout>
+          ) : (
+            <>
+              <Input
+                label="Модель"
+                optional
+                mono
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                helper={`Если пусто — модель по умолчанию (${modelPlaceholder})`}
+                placeholder={modelPlaceholder}
+                autoComplete="off"
+              />
 
-          <PasswordInput
-            label="Access token"
-            required={!isEdit}
-            value={token}
-            onChange={(e) => {
-              setToken(e.target.value);
-              if (tokenError) setTokenError(null);
-            }}
-            error={tokenError}
-            autoComplete="off"
-            helper={
-              isEdit
-                ? initial?.hasToken
-                  ? 'Токен сохранён. Оставьте пустым, чтобы не менять.'
-                  : 'Токен ещё не задан.'
-                : 'Bearer-токен провайдера. Хранится только на сервере.'
-            }
-            placeholder={isEdit && initial?.hasToken ? '••••••••' : 'sk-…'}
-          />
+              <PasswordInput
+                label="Access token"
+                required={!isEdit}
+                value={token}
+                onChange={(e) => {
+                  setToken(e.target.value);
+                  if (tokenError) setTokenError(null);
+                }}
+                error={tokenError}
+                autoComplete="off"
+                helper={
+                  isEdit
+                    ? initial?.hasToken
+                      ? 'Токен сохранён. Оставьте пустым, чтобы не менять.'
+                      : 'Токен ещё не задан.'
+                    : 'Bearer-токен провайдера. Хранится только на сервере.'
+                }
+                placeholder={isEdit && initial?.hasToken ? '••••••••' : 'sk-…'}
+              />
+            </>
+          )}
         </div>
       </Modal>
 

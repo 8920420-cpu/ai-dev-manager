@@ -487,6 +487,24 @@ export function decideTransition(roleCode, verdict, { reworkCount = 0, maxRework
 
 // --- Сетевой слой (вне транзакции) -----------------------------------------
 
+// ROLE-ENGINE-ROUTING-001: коннектор, ЯВНО назначенный роли в карточке роли
+// (role_connectors → «Движок»). Если назначен включённый API-коннектор с токеном
+// — внутренний цикл использует именно его (а не подбор по consumer_service).
+// Коннекторы-драйверы (codex/claude_code) сюда не попадают: у них пустой токен,
+// и такие роли исполняет хостовый драйвер, а не runReasoningRole.
+export async function pickAssignedConnectorRow(client, roleCode) {
+  const r = await client.query(
+    `SELECT cn.id, cn.name, cn.provider, cn.endpoint, cn.access_token, cn.model,
+            cn.consumer_service, cn.priority
+       FROM role_connectors rc
+       JOIN connectors cn ON cn.id = rc.connector_id
+      WHERE rc.role_code = $1 AND cn.is_enabled = true AND cn.access_token <> ''
+      LIMIT 1`,
+    [roleCode],
+  );
+  return r.rows[0] ?? null;
+}
+
 // Выбрать включённый коннектор с токеном. Предпочтение: точное совпадение
 // consumer_service, затем пустой consumer_service, затем по priority.
 export async function pickConnectorRow(client, consumerService = '') {
@@ -527,7 +545,10 @@ export async function runReasoningRole(client, { roleCode, context, outputFields
   const { composeRoleSystemPrompt } = await import('./roles.js');
   const system = await composeRoleSystemPrompt(client, roleCode);
   const user = buildUserPayload(roleCode, context, outputFields);
-  const row = await pickConnectorRow(client, `runner:${roleCode}`);
+  // Сначала — коннектор, явно назначенный роли (карточка роли → «Движок»);
+  // иначе подбор по consumer_service/priority (прежнее поведение, фолбэк).
+  const row = (await pickAssignedConnectorRow(client, roleCode))
+    ?? (await pickConnectorRow(client, `runner:${roleCode}`));
   if (!row) {
     const e = new Error('no_enabled_connector');
     e.code = 'NO_CONNECTOR';

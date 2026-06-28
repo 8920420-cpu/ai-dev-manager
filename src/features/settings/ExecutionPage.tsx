@@ -1,44 +1,61 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Button, Callout, Input, LoadingBlock, PageHeader, Section, Select, useToast } from '../../components/ui';
-import { appSettingsApi, type AppSettings, type RoleEngine } from '../../api/appSettingsApi';
+import { appSettingsApi, type AppSettings } from '../../api/appSettingsApi';
+import { integrationsApi } from '../../api/integrationsApi';
+import { roleConnectionsApi } from '../../api/roleConnectionsApi';
+import type { Integration } from '../../types/integration';
 import { ClaudeConnectionSection } from './ClaudeConnectionSection';
 import { AuditSection } from './AuditSection';
-import { ENGINE_OPTIONS, REASONING_ROLES } from './roleEngines';
+import { REASONING_ROLES } from './roleEngines';
 import styles from './settings.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
 
-// Карта движков по ролям сравнима поверхностно: ключ есть только у не-deepseek.
-function sameEngines(a: Record<string, RoleEngine>, b: Record<string, RoleEngine>): boolean {
-  const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
-  for (const k of keys) if ((a[k] ?? 'deepseek') !== (b[k] ?? 'deepseek')) return false;
+// Карта «роль → id назначенной интеграции» ('' = не назначено). Сравнение по
+// рассуждающим ролям — поверхностное (пустое значение эквивалентно отсутствию).
+type AssignMap = Record<string, string>;
+
+function sameAssignments(a: AssignMap, b: AssignMap): boolean {
+  for (const r of REASONING_ROLES) {
+    if ((a[r.code] ?? '') !== (b[r.code] ?? '')) return false;
+  }
   return true;
 }
 
 /**
  * Раздел «Настройки → Выполнение»: глобальные параметры работы фонового runner.
- * Сейчас — «Параллельных горутин на роль»: сколько задач одной роли (Приёмщик
- * задач, Архитектор, Декомпозер и т.д.) обрабатываются одновременно. Значение
- * применяется на следующем тике runner без перезапуска сервиса.
+ * Включает «Движок по ролям» — какая ИНТЕГРАЦИЯ исполняет каждую рассуждающую
+ * роль (INTEGRATION-ENGINE-UNIFY-001: движок = выбранная интеграция). Источник
+ * истины тот же, что и в карточке роли — /api/role-connectors.
  */
 export function ExecutionPage() {
   const toast = useToast();
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [concurrency, setConcurrency] = useState('3');
   const [programmerConcurrency, setProgrammerConcurrency] = useState('3');
-  const [roleEngines, setRoleEngines] = useState<Record<string, RoleEngine>>({});
+  const [integrations, setIntegrations] = useState<Integration[]>([]);
+  const [assignments, setAssignments] = useState<AssignMap>({});
+  const [savedAssignments, setSavedAssignments] = useState<AssignMap>({});
   const [saved, setSaved] = useState<AppSettings | null>(null);
   const [saving, setSaving] = useState(false);
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoadState('loading');
     try {
-      const s = await appSettingsApi.get(signal);
+      const [s, intgs, conns] = await Promise.all([
+        appSettingsApi.get(signal),
+        integrationsApi.list(),
+        roleConnectionsApi.list(),
+      ]);
       if (signal?.aborted) return;
       setSaved(s);
       setConcurrency(String(s.maxConcurrencyPerRole));
       setProgrammerConcurrency(String(s.programmerConcurrency));
-      setRoleEngines(s.roleEngines ?? {});
+      setIntegrations(intgs);
+      const map: AssignMap = {};
+      for (const c of conns) if (c.integrationId) map[c.role] = c.integrationId;
+      setAssignments(map);
+      setSavedAssignments(map);
       setLoadState('ready');
     } catch (e) {
       if (signal?.aborted || (e instanceof DOMException && e.name === 'AbortError')) return;
@@ -46,11 +63,11 @@ export function ExecutionPage() {
     }
   }, []);
 
-  const setRoleEngine = (role: string, engine: RoleEngine) => {
-    setRoleEngines((prev) => {
+  const setRoleIntegration = (role: string, integrationId: string) => {
+    setAssignments((prev) => {
       const next = { ...prev };
-      if (engine === 'deepseek') delete next[role];
-      else next[role] = engine;
+      if (integrationId) next[role] = integrationId;
+      else delete next[role];
       return next;
     });
   };
@@ -61,6 +78,19 @@ export function ExecutionPage() {
     return () => ctrl.abort();
   }, [load]);
 
+  // Список движков для каждой роли = включённые интеграции; плюс ныне выключенная,
+  // если именно она назначена роли (чтобы не потерять текущее назначение).
+  const enabledIntegrations = useMemo(
+    () => integrations.filter((i) => i.isEnabled),
+    [integrations],
+  );
+  const optionsFor = (role: string): Integration[] => {
+    const assignedId = assignments[role];
+    const assigned = assignedId ? integrations.find((i) => i.id === assignedId) : undefined;
+    if (assigned && !assigned.isEnabled) return [...enabledIntegrations, assigned];
+    return enabledIntegrations;
+  };
+
   const parsed = Number(concurrency);
   const valid = Number.isInteger(parsed) && parsed >= 1 && parsed <= 50;
   const progParsed = Number(programmerConcurrency);
@@ -68,7 +98,7 @@ export function ExecutionPage() {
   const dirty = saved !== null
     && (parsed !== saved.maxConcurrencyPerRole
       || progParsed !== saved.programmerConcurrency
-      || !sameEngines(roleEngines, saved.roleEngines ?? {}));
+      || !sameAssignments(assignments, savedAssignments));
 
   const handleSave = async () => {
     if (!valid) {
@@ -84,12 +114,17 @@ export function ExecutionPage() {
       const next = await appSettingsApi.save({
         maxConcurrencyPerRole: parsed,
         programmerConcurrency: progParsed,
-        roleEngines,
       });
+      // Назначения движков (интеграций) по ролям — отдельный источник истины
+      // (/api/role-connectors). Шлём все рассуждающие роли (upsert по коду роли).
+      const items = REASONING_ROLES.map((r) =>
+        roleConnectionsApi.make(r.code, assignments[r.code] ?? ''),
+      );
+      await roleConnectionsApi.saveAll(items);
       setSaved(next);
       setConcurrency(String(next.maxConcurrencyPerRole));
       setProgrammerConcurrency(String(next.programmerConcurrency));
-      setRoleEngines(next.roleEngines ?? {});
+      setSavedAssignments({ ...assignments });
       toast.success('Настройки выполнения сохранены');
     } catch (e) {
       toast.error(e instanceof Error ? e.message : 'Не удалось сохранить настройки');
@@ -143,25 +178,34 @@ export function ExecutionPage() {
 
           <Section
             title="Движок по ролям"
-            description="Кто исполняет каждую рассуждающую роль: DeepSeek (внутренний tool-loop оркестратора), Codex или Claude Code (хостовые драйверы на подписке). Драйверу оркестратор отдаёт задачу, роль и готовый промпт — он лишь гоняет модель. Программист (CODING) — отдельный конвейер Claude Code. Для Codex/Claude нужен запущенный хостовый раннер (codex login / claude вход на машине)."
+            description="Какая ИНТЕГРАЦИЯ исполняет каждую рассуждающую роль: API-коннектор (DeepSeek — внутренний tool-loop оркестратора) либо хостовый драйвер (Codex / Claude Code на подписке). Драйверу оркестратор отдаёт задачу, роль и готовый промпт — он лишь гоняет модель. Тот же выбор, что в карточке роли. Список — только включённые интеграции из раздела «Интеграции». Для драйверов нужен запущенный хостовый раннер."
           >
-            <div className={styles.executionForm}>
-              {REASONING_ROLES.map((r) => (
-                <Select
-                  key={r.code}
-                  label={r.label}
-                  value={roleEngines[r.code] ?? 'deepseek'}
-                  onChange={(e) => setRoleEngine(r.code, e.target.value as RoleEngine)}
-                  disabled={saving}
-                >
-                  {ENGINE_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </Select>
-              ))}
-            </div>
+            {enabledIntegrations.length === 0 ? (
+              <Callout tone="info" title="Нет доступных интеграций">
+                Добавьте интеграцию в разделе «Интеграции» (DeepSeek API, Codex или
+                Claude Code драйвер), чтобы назначить роли движок.
+              </Callout>
+            ) : (
+              <div className={styles.executionForm}>
+                {REASONING_ROLES.map((r) => (
+                  <Select
+                    key={r.code}
+                    label={r.label}
+                    value={assignments[r.code] ?? ''}
+                    onChange={(e) => setRoleIntegration(r.code, e.target.value)}
+                    disabled={saving}
+                  >
+                    <option value="">DeepSeek (внутренний, по умолчанию)</option>
+                    {optionsFor(r.code).map((intg) => (
+                      <option key={intg.id} value={intg.id}>
+                        {intg.name}
+                        {intg.isEnabled ? '' : ' (выключено)'}
+                      </option>
+                    ))}
+                  </Select>
+                ))}
+              </div>
+            )}
           </Section>
 
           <Section

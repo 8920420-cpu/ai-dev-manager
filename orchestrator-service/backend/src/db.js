@@ -1869,20 +1869,57 @@ export async function getMaxConcurrencyPerRole(s) {
   });
 }
 
-// ROLE-ENGINE-ROUTING-001: карта «рассуждающая роль → движок» из настроек
-// (app_settings.role_engines — JSON-объект). Движки: 'deepseek' (внутренний,
-// дефолт при отсутствии записи), 'codex', 'claude_code' (хостовые драйверы).
-// Возвращаем только валидные записи для известных рассуждающих ролей.
+// ROLE-ENGINE-ROUTING-001: карта «рассуждающая роль → движок».
+//
+// ИСТОЧНИК ИСТИНЫ — назначения «роль → интеграция (коннектор)» (role_connectors):
+// движок роли = тип провайдера назначенного ВКЛЮЧЁННОГО коннектора. Это и есть
+// объединение бывших полей «Интеграция (коннектор)» и «Движок» в одно — выбор
+// интеграции в карточке роли определяет исполнителя:
+//   provider codex/claude_code → хостовый драйвер (внешний движок);
+//   deepseek/openai/прочее     → внутренний DeepSeek-цикл оркестратора.
+// Legacy app_settings.role_engines используется как ФОЛБЭК для ролей, которым ещё
+// не назначена интеграция (плавный переход со старой матрицы «Движок по ролям»).
 const EXTERNAL_ENGINES = new Set(['codex', 'claude_code']);
+
+// Тип провайдера коннектора → движок исполнения роли. Должен совпадать с
+// frontend roleEngines.ts (providerToEngine).
+function providerToEngine(provider) {
+  const p = String(provider ?? '').trim().toLowerCase();
+  if (p === 'codex' || p === 'claude_code') return p;
+  return 'deepseek';
+}
+
 async function getRoleEngines(c) {
-  const raw = await readAppSetting(c, 'role_engines', {});
-  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
   const allowed = new Set(LLM_ROLE_CODES);
+
+  // 1) Назначения из role_connectors (новый источник истины). Берём только
+  // ВКЛЮЧЁННЫЕ коннекторы: выключенная интеграция = «не делегируем» (и в UI она
+  // не показывается в списке движков).
+  const assigned = new Map();
+  const rc = await c.query(
+    `SELECT rc.role_code, cn.provider
+       FROM role_connectors rc
+       JOIN connectors cn ON cn.id = rc.connector_id
+      WHERE cn.is_enabled = true`,
+  );
+  for (const row of rc.rows) {
+    const role = String(row.role_code).trim().toUpperCase();
+    if (allowed.has(role)) assigned.set(role, providerToEngine(row.provider));
+  }
+
+  // 2) Legacy-карта из app_settings — фолбэк для ролей без явного назначения.
+  const raw = await readAppSetting(c, 'role_engines', {});
+  const legacy = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+
+  // Отдаём только внешние делегирования (codex/claude_code) — внутренний движок
+  // (deepseek) есть дефолт и в карте не хранится, его консьюмеры трактуют как
+  // «не внешний». Явное назначение API-коннектора (deepseek) перекрывает legacy.
   const out = {};
-  for (const [role, engine] of Object.entries(src)) {
-    const r = String(role).trim().toUpperCase();
-    const e = String(engine).trim().toLowerCase();
-    if (allowed.has(r) && (e === 'codex' || e === 'claude_code' || e === 'deepseek')) out[r] = e;
+  for (const role of allowed) {
+    const engine = assigned.has(role)
+      ? assigned.get(role)
+      : String(legacy[role] ?? '').trim().toLowerCase();
+    if (engine === 'codex' || engine === 'claude_code') out[role] = engine;
   }
   return out;
 }

@@ -10,6 +10,7 @@ import {
   type MenuItem,
 } from '../../components/ui';
 import { integrationsApi } from '../../api/integrationsApi';
+import { isDriverProvider } from '../settings/roleEngines';
 import { formatDateTime } from '../../lib/format';
 import type { ConnectionState } from '../../types/common';
 import type { Integration } from '../../types/integration';
@@ -38,6 +39,11 @@ export function IntegrationCard({
   const [checking, setChecking] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [removing, setRemoving] = useState(false);
+
+  // Драйвер (Codex/Claude Code) не вызывается по AI-API: «Проверить соединение»
+  // (ping через коннектор) для него неприменим — скрываем, чтобы не было заведомо
+  // падающего действия. Состояние такой интеграции — нейтральное.
+  const isDriver = isDriverProvider(integration.provider);
 
   const displayState: ConnectionState = checking
     ? 'checking'
@@ -78,12 +84,16 @@ export function IntegrationCard({
       icon: <ScrollText size={16} aria-hidden="true" />,
       onSelect: () => onOpen(integration),
     },
-    {
-      label: 'Проверить соединение',
-      icon: <Activity size={16} aria-hidden="true" />,
-      onSelect: handleCheck,
-      disabled: checking,
-    },
+    ...(isDriver
+      ? []
+      : [
+          {
+            label: 'Проверить соединение',
+            icon: <Activity size={16} aria-hidden="true" />,
+            onSelect: handleCheck,
+            disabled: checking,
+          },
+        ]),
     {
       label: 'Изменить',
       icon: <Pencil size={16} aria-hidden="true" />,
@@ -131,15 +141,17 @@ export function IntegrationCard({
         >
           Открыть
         </Button>
-        <Button
-          variant="secondary"
-          size="sm"
-          leftIcon={<Activity size={15} aria-hidden="true" />}
-          loading={checking}
-          onClick={handleCheck}
-        >
-          Проверить
-        </Button>
+        {!isDriver && (
+          <Button
+            variant="secondary"
+            size="sm"
+            leftIcon={<Activity size={15} aria-hidden="true" />}
+            loading={checking}
+            onClick={handleCheck}
+          >
+            Проверить
+          </Button>
+        )}
       </div>
 
       <ConfirmDialog

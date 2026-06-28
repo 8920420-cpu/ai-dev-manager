@@ -22,7 +22,21 @@ export const PROVIDER_ENDPOINTS = {
   openai: 'https://api.openai.com/v1',
 };
 
+// ROLE-ENGINE-ROUTING-001: провайдеры-«драйверы» — это хостовые исполнители
+// рассуждающих ролей (Codex / Claude Code), а не сетевые AI-API. У них нет
+// HTTP-endpoint и access token: оркестратор лишь отдаёт им роль+промпт через
+// generic-контракт next-reasoning-task, а LLM-вызов делает сам драйвер. В
+// разделе «Интеграции» они показываются наравне с API-коннекторами, а в карточке
+// роли выбор такого коннектора = делегирование роли соответствующему движку.
+export const DRIVER_PROVIDERS = new Set(['codex', 'claude_code']);
+
+export function isDriverProvider(provider) {
+  return DRIVER_PROVIDERS.has(String(provider ?? '').trim().toLowerCase());
+}
+
 function endpointForProvider(provider) {
+  // Драйвер не обращается к сети — endpoint не нужен (хранится пустым).
+  if (isDriverProvider(provider)) return '';
   const ep = PROVIDER_ENDPOINTS[provider];
   if (!ep) throw httpError(422, 'unknown_provider');
   return ep;
