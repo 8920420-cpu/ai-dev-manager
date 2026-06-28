@@ -23,11 +23,18 @@ services:
       # Фоновый runner продвигает автоматические роли по БД (false — выключить).
       RUNNER_ENABLED: "true"
       RUNNER_INTERVAL_MS: "3000"
-      # Таймаут захвата роли: прогон без завершения дольше порога → TIMEOUT, слот
-      # свободен. Поднят до 30 мин (с 15) — снижает ложные TIMEOUT при скачках
-      # часов Docker-VM (см. patroni-single-node-flapping). RUNNER_CLAUDE_TIMEOUT_MS
-      # наследует это значение, если не задан отдельно.
-      RUNNER_ROLE_TIMEOUT_MS: "${RUNNER_ROLE_TIMEOUT_MS:-1800000}"
+      # Таймаут захвата РАССУЖДАЮЩЕЙ роли: прогон без завершения дольше порога →
+      # TIMEOUT, слот свободен. 3 мин (INCIDENT-FIX 2026-06-28): полезная работа
+      # рассуждающей роли = СЕКУНДЫ (Architect 34с, Reviewer 16с), поэтому при сбое
+      # движка/раннера застрявший захват освобождается за 3 мин, а не за 30 — иначе
+      # один аутаж копит часы простоя. Ложные TIMEOUT от скачков часов Docker-VM
+      # гасит clockGuard (см. patroni-single-node-flapping, clock-guard-timeout-skew).
+      # ВНИМАНИЕ: программист НЕ наследует это значение — см. RUNNER_CLAUDE_TIMEOUT_MS.
+      RUNNER_ROLE_TIMEOUT_MS: "${RUNNER_ROLE_TIMEOUT_MS:-180000}"
+      # Таймаут захвата ПРОГРАММИСТА (claude_programmer/CODING) — отдельно от
+      # рассуждающих ролей: CODING идёт 10–20 мин, поэтому НЕ наследует короткий
+      # RUNNER_ROLE_TIMEOUT_MS (иначе claude-захват реапится посреди написания кода).
+      RUNNER_CLAUDE_TIMEOUT_MS: "${RUNNER_CLAUDE_TIMEOUT_MS:-1500000}"
       # Задайте токен, чтобы закрыть /api/* при сетевом доступе (пусто = выключено).
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
       # Микросервис инструментов (builtin-чтение проекта + MCP для Claude Code).

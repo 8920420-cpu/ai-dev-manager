@@ -76,7 +76,10 @@ async function worker(id) {
       continue;
     }
     if (out && (out.taskId || out.blocked)) console.log(`codex-runner[${id}] tick:`, JSON.stringify(out));
-    if (!out || out.idle || out.busy || out.error) await sleep(INTERVAL_MS);
+    // released — задача вернулась в пул (codex упал/таймаут/сбой бэкенда). БЕЗ паузы
+    // воркер тут же заклеймит ту же задачу снова → горячий спин claim→fail→release
+    // (сотни CANCELLED/час при недоступном Codex). Бэкофф на INTERVAL_MS.
+    if (!out || out.idle || out.busy || out.error || out.released) await sleep(INTERVAL_MS);
   }
 }
 

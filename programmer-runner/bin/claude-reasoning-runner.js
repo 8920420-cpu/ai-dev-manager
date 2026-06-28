@@ -81,7 +81,9 @@ async function worker(id) {
       continue;
     }
     if (out && (out.taskId || out.blocked)) console.log(`claude-reasoning-runner[${id}] tick:`, JSON.stringify(out));
-    if (!out || out.idle || out.busy || out.error) await sleep(INTERVAL_MS);
+    // released — задача вернулась в пул (агент упал/таймаут). БЕЗ паузы воркер тут же
+    // заклеймит её снова → горячий спин claim→fail→release. Бэкофф на INTERVAL_MS.
+    if (!out || out.idle || out.busy || out.error || out.released) await sleep(INTERVAL_MS);
   }
 }
 

@@ -25,6 +25,21 @@ const CODEX_SANDBOX = process.env.CODEX_SANDBOX || 'read-only';
 // Модель: по умолчанию пусто → Codex берёт модель из своего config.toml.
 const CODEX_MODEL = process.env.CODEX_MODEL || '';
 
+// Достаём человекочитаемую причину сбоя из JSONL-хвоста stdout codex. Когда
+// бэкенд ChatGPT/Codex отвечает ошибкой (400 invalid_schema, 429, 502/503), codex
+// часто пишет её НЕ в stderr, а событием turn.failed/error в stdout — без этого в
+// логах оставалось слепое exit_N. Сканируем хвост с конца, берём первое сообщение.
+function extractCodexError(stdoutTail) {
+  const lines = String(stdoutTail || '').split(/\r?\n/).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    let ev;
+    try { ev = JSON.parse(lines[i]); } catch { continue; }
+    const msg = ev?.error?.message ?? ev?.error ?? (ev?.type === 'turn.failed' ? ev?.message : null);
+    if (msg) return (typeof msg === 'string' ? msg : JSON.stringify(msg)).replace(/\s+/g, ' ').slice(0, 400);
+  }
+  return '';
+}
+
 // Связать внешний AbortSignal с убийством процесса.
 function linkAbort(child, signal) {
   if (!signal) return () => {};
@@ -81,15 +96,17 @@ export function makeCodexRunAgent(cfg = {}) {
           return resolve({ code: -1, err: `spawn_failed: ${e.message}` });
         }
         let stderr = '';
+        let stdoutTail = '';
         const unlink = linkAbort(proc, signal);
         proc.stdout?.setEncoding('utf8');
         proc.stderr?.setEncoding('utf8');
-        // JSONL-события codex в stdout нам не нужны (финал берём из lastMsgFile);
-        // прокачиваем поток, чтобы не забить буфер на длинных прогонах.
-        proc.stdout?.on('data', () => {});
+        // Финал берём из lastMsgFile, но при сбое реальная причина приходит
+        // JSONL-событием в stdout — храним только хвост (8 КБ), чтобы извлечь её и
+        // не забить буфер на длинных прогонах.
+        proc.stdout?.on('data', (c) => { stdoutTail = (stdoutTail + c).slice(-8000); });
         proc.stderr?.on('data', (c) => { stderr += c; });
-        proc.on('error', (e) => { unlink(); resolve({ code: -1, err: e.message }); });
-        proc.on('close', (code) => { unlink(); resolve({ code, err: stderr }); });
+        proc.on('error', (e) => { unlink(); resolve({ code: -1, err: e.message, stdoutTail }); });
+        proc.on('close', (code) => { unlink(); resolve({ code, err: stderr, stdoutTail }); });
         proc.stdin?.write(prompt);
         proc.stdin?.end();
       });
@@ -102,7 +119,8 @@ export function makeCodexRunAgent(cfg = {}) {
       raw = String(raw || '').trim();
 
       if (out.code !== 0 && !raw) {
-        const reason = (out.err || `exit_${out.code}`).toString().trim().slice(0, 300);
+        const detail = (out.err && out.err.trim()) || extractCodexError(out.stdoutTail) || `exit_${out.code}`;
+        const reason = detail.toString().trim().slice(0, 400);
         log.warn?.('codexAgent: codex exec завершился неуспехом', { taskId: task.id, code: out.code, reason });
         return { ok: false, error: `codex_failed: ${reason}` };
       }

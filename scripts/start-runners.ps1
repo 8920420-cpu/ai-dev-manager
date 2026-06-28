@@ -46,6 +46,13 @@ if (Test-Path $EnvFile) {
 # База оркестратора — опубликованный из Docker порт 4186 (если не задано иначе).
 if (-not $env:ORCHESTRATOR_URL) { $env:ORCHESTRATOR_URL = 'http://localhost:4186' }
 
+# INCIDENT-FIX 2026-06-28: жёсткий таймаут задачи у рассуждающих раннеров ДОЛЖЕН
+# быть меньше орфан-таймаута оркестратора (RUNNER_ROLE_TIMEOUT_MS, теперь 3 мин),
+# иначе реапер освободит захват раньше нас и мы сдадим его «вхолостую». Ставим 150с
+# (SUCCESS-прогон укладывается в секунды). Можно переопределить заранее в окружении.
+if (-not $env:CODEX_TASK_TIMEOUT_MS)            { $env:CODEX_TASK_TIMEOUT_MS = '150000' }
+if (-not $env:CLAUDE_REASONING_TASK_TIMEOUT_MS) { $env:CLAUDE_REASONING_TASK_TIMEOUT_MS = '150000' }
+
 # Уже запущенные node-процессы демонов (по подстроке скрипта в командной строке).
 function Get-RunnerProcs([string]$ScriptLeaf) {
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" |
