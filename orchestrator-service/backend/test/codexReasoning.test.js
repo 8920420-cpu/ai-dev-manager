@@ -47,7 +47,8 @@ test('buildVerdictJsonSchema: с полями — добавляет строг�
 // --- completeReasoningTaskTx: гварды и идемпотентность -----------------------
 
 const FOUND = /FROM tasks t\s+LEFT JOIN roles r/;
-const APP_SETTINGS = /FROM app_settings WHERE key/;
+// Источник истины движков роли — role_connectors (см. getRoleEngines в db.js).
+const ROLE_CONNECTORS = /FROM role_connectors/;
 
 test('completeReasoningTask: нет задачи → 404', async () => {
   const c = fakeClient([{ re: FOUND, reply: { rowCount: 0, rows: [] } }]);
@@ -76,8 +77,8 @@ test('completeReasoningTask: нет RUNNING-прогона → duplicate', async
 test('completeReasoningTask: роль не делегирована внешнему движку → 409', async () => {
   const c = fakeClient([
     { re: FOUND, reply: { rowCount: 1, rows: [{ id: 't1', status: 'ARCHITECTURE', role_code: 'ARCHITECT', agent_run_id: 'r1' }] } },
-    // app_settings.role_engines пуст → ARCHITECT = deepseek (внутренний), не внешний.
-    { re: APP_SETTINGS, reply: { rowCount: 0, rows: [] } },
+    // нет назначения коннектора → ARCHITECT = deepseek (внутренний), не внешний.
+    { re: ROLE_CONNECTORS, reply: { rowCount: 0, rows: [] } },
   ]);
   await assert.rejects(() => completeReasoningTaskTx(c, { taskId: 't1', verdict: { status: 'READY' } }),
     /role_not_delegated_to_engine/);
@@ -86,7 +87,7 @@ test('completeReasoningTask: роль не делегирована внешне
 test('completeReasoningTask: роль на claude_code → проходит гейт движка (идёт к переходу)', async () => {
   const c = fakeClient([
     { re: FOUND, reply: { rowCount: 1, rows: [{ id: 't1', status: 'ARCHITECTURE', role_code: 'ARCHITECT', agent_run_id: 'r1', project_id: 'p1' }] } },
-    { re: APP_SETTINGS, reply: { rowCount: 1, rows: [{ value: { ARCHITECT: 'claude_code' } }] } },
+    { re: ROLE_CONNECTORS, reply: { rowCount: 1, rows: [{ role_code: 'ARCHITECT', provider: 'claude_code' }] } },
     { re: /from_status = 'FAILURE_ANALYSIS'/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
   ]);
   // Вердикт распознан и роль на внешнем движке → доходит до перехода (BEGIN finalize).

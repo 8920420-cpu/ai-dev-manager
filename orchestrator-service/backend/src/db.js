@@ -1899,8 +1899,6 @@ export async function getMaxConcurrencyPerRole(s) {
 // интеграции в карточке роли определяет исполнителя:
 //   provider codex/claude_code → хостовый драйвер (внешний движок);
 //   deepseek/openai/прочее     → внутренний DeepSeek-цикл оркестратора.
-// Legacy app_settings.role_engines используется как ФОЛБЭК для ролей, которым ещё
-// не назначена интеграция (плавный переход со старой матрицы «Движок по ролям»).
 const EXTERNAL_ENGINES = new Set(['codex', 'claude_code']);
 
 // Тип провайдера коннектора → движок исполнения роли. Должен совпадать с
@@ -1914,9 +1912,9 @@ function providerToEngine(provider) {
 async function getRoleEngines(c) {
   const allowed = new Set(LLM_ROLE_CODES);
 
-  // 1) Назначения из role_connectors (новый источник истины). Берём только
-  // ВКЛЮЧЁННЫЕ коннекторы: выключенная интеграция = «не делегируем» (и в UI она
-  // не показывается в списке движков).
+  // Источник истины — role_connectors: движок роли = тип провайдера её назначенного
+  // ВКЛЮЧЁННОГО коннектора. Выключенная интеграция = «не делегируем» (и в UI она не
+  // показывается в списке движков).
   const assigned = new Map();
   const rc = await c.query(
     `SELECT rc.role_code, cn.provider
@@ -1929,18 +1927,12 @@ async function getRoleEngines(c) {
     if (allowed.has(role)) assigned.set(role, providerToEngine(row.provider));
   }
 
-  // 2) Legacy-карта из app_settings — фолбэк для ролей без явного назначения.
-  const raw = await readAppSetting(c, 'role_engines', {});
-  const legacy = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-
   // Отдаём только внешние делегирования (codex/claude_code) — внутренний движок
-  // (deepseek) есть дефолт и в карте не хранится, его консьюмеры трактуют как
-  // «не внешний». Явное назначение API-коннектора (deepseek) перекрывает legacy.
+  // (deepseek) есть дефолт и в карте не хранится, его консьюмеры трактуют как «не
+  // внешний».
   const out = {};
   for (const role of allowed) {
-    const engine = assigned.has(role)
-      ? assigned.get(role)
-      : String(legacy[role] ?? '').trim().toLowerCase();
+    const engine = assigned.get(role);
     if (engine === 'codex' || engine === 'claude_code') out[role] = engine;
   }
   return out;

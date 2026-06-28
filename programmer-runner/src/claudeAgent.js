@@ -4,11 +4,9 @@
 // host-runner/actions.js — юнит-тестами покрыт инъектируемый ProgrammerRunner, а
 // не этот модуль.
 //
-// Изоляция параллельных задач: при useWorktree=true агент работает в собственном
-// git worktree (см. worktreeManager.js), а его diff серилизованно применяется в
-// main. Это безопасно при concurrency>1. useWorktree=false — legacy-режим: правки
-// идут прямо в основное дерево (снимок git до/после), как concurrency=1.
-import { execFileSync } from 'node:child_process';
+// Изоляция параллельных задач: агент всегда работает в собственном git worktree
+// СВОЕГО микросервиса (см. worktreeManager.js), а его diff серилизованно
+// применяется в main под глобальным локом. Это безопасно при concurrency>1.
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
 import { resolveRepo, loadRepoMap } from './repoResolver.js';
@@ -18,33 +16,6 @@ import { WorktreeManager } from './worktreeManager.js';
 // Набор инструментов, авто-разрешённых агенту. permissionMode='bypassPermissions'
 // и так утверждает всё; allowedTools оставляем как явную белую границу.
 const DEFAULT_ALLOWED_TOOLS = ['Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep', 'TodoWrite'];
-
-// Снимок изменённых путей рабочего дерева (git status --porcelain). Возвращает
-// Set строк "XY path". Если git недоступен — пустой Set (не валим задачу).
-function gitPorcelain(cwd) {
-  try {
-    const out = execFileSync('git', ['-C', cwd, 'status', '--porcelain', '--untracked-files=all'], {
-      encoding: 'utf8',
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    return new Set(out.split('\n').map((l) => l.trim()).filter(Boolean));
-  } catch {
-    return new Set();
-  }
-}
-
-// Имена файлов из строк porcelain (убираем статус XY и возможный "orig -> new").
-function pathsFrom(porcelainSet) {
-  const paths = new Set();
-  for (const line of porcelainSet) {
-    let p = line.slice(2).trim();
-    const arrow = p.indexOf('->');
-    if (arrow >= 0) p = p.slice(arrow + 2).trim();
-    p = p.replace(/^"(.*)"$/, '$1');
-    if (p) paths.add(p);
-  }
-  return paths;
-}
 
 // Связать внешний AbortSignal с AbortController для SDK.
 function linkSignal(signal) {
@@ -138,8 +109,6 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
  * @param {string} [cfg.model]
  * @param {number} [cfg.maxTurns]
  * @param {string[]} [cfg.allowedTools]
- * @param {boolean} [cfg.useWorktree]  изоляция через git worktree (для concurrency>1).
- *   По умолчанию из env PROGRAMMER_WORKTREE (включено, '0' — выключить).
  * @param {Console} [cfg.log]
  */
 export function makeClaudeRunAgent(cfg = {}) {
@@ -147,7 +116,6 @@ export function makeClaudeRunAgent(cfg = {}) {
   const model = cfg.model || process.env.PROGRAMMER_MODEL || 'claude-opus-4-8';
   const maxTurns = Number(cfg.maxTurns || process.env.PROGRAMMER_MAX_TURNS || 100);
   const allowedTools = cfg.allowedTools || DEFAULT_ALLOWED_TOOLS;
-  const useWorktree = cfg.useWorktree ?? (String(process.env.PROGRAMMER_WORKTREE ?? '1') !== '0');
   const log = cfg.log || console;
   // Один менеджер worktree на процесс: держит по одному worktree на микросервис
   // и сериализует задачи внутри сервиса.
@@ -157,32 +125,14 @@ export function makeClaudeRunAgent(cfg = {}) {
   // проекта (консервативно сериализуем такие задачи вместе).
   const serviceKeyOf = (task) => `${String(task?.project || '_').trim()}:${String(task?.service || '_default').trim()}`;
 
-  // Legacy-режим: агент правит прямо в основном дереве, changedFiles — разница
-  // снимков git до/после. Безопасен только при concurrency=1.
-  async function runDirect(repoCwd, env, task, signal) {
-    const before = gitPorcelain(repoCwd);
-    const out = await runSdkOnce({ cwd: repoCwd, env, task, signal, model, maxTurns, allowedTools, log });
-    const after = gitPorcelain(repoCwd);
-    const beforePaths = pathsFrom(before);
-    const changedFiles = [...pathsFrom(after)].filter((p) => !beforePaths.has(p));
-    if (!out.ok) return { ok: false, error: out.error, changedFiles, limitHit: out.limitHit, meta: out.meta };
-    return { ok: true, changedFiles, result: out.result };
-  }
-
-  // Изолированный режим: задача исполняется в worktree СВОЕГО микросервиса
-  // (сериализованно с другими задачами того же сервиса), её дельта применяется в
-  // main под глобальным локом; конфликт → задача возвращается в очередь.
-  async function runIsolated(repoCwd, env, task, signal) {
+  // Задача исполняется в worktree СВОЕГО микросервиса (сериализованно с другими
+  // задачами того же сервиса), её дельта применяется в main под глобальным локом;
+  // конфликт → задача возвращается в очередь.
+  const runAgent = async function runAgent(task, { signal } = {}) {
+    const { cwd: repoCwd, env } = resolveRepo(task, repoMap);
     const serviceKey = serviceKeyOf(task);
     return worktrees.runForService(repoCwd, serviceKey, (worktreeCwd) =>
       runSdkOnce({ cwd: worktreeCwd, env, task, signal, model, maxTurns, allowedTools, log }));
-  }
-
-  const runAgent = async function runAgent(task, { signal } = {}) {
-    const { cwd: repoCwd, env } = resolveRepo(task, repoMap);
-    return useWorktree
-      ? runIsolated(repoCwd, env, task, signal)
-      : runDirect(repoCwd, env, task, signal);
   };
   // Доступ к менеджеру (для остановки/чистки из bin).
   runAgent.worktrees = worktrees;

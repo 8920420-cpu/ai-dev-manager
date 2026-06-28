@@ -80,16 +80,14 @@ const http = {
   },
 };
 
-// Изоляция через worktree обязательна при параллелизме и включена по умолчанию
-// даже при concurrency=1 (безопаснее и точнее атрибутирует changedFiles).
-// PROGRAMMER_WORKTREE=0 — выключить (legacy: правки прямо в основном дереве).
-const useWorktree = String(process.env.PROGRAMMER_WORKTREE ?? '1') !== '0';
-const runAgent = makeClaudeRunAgent({ useWorktree });
+// Изоляция через worktree СВОЕГО микросервиса — единственный режим: безопасна при
+// параллелизме и точно атрибутирует changedFiles (дельта worktree, а не снимок дерева).
+const runAgent = makeClaudeRunAgent();
 // Стартуем со стартовым значением; фактическое тянем из настроек ниже.
 const runner = new ProgrammerRunner({ http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: START_CONCURRENCY });
 
 console.log(`programmer-runner: orchestrator=${ORCH} interval=${INTERVAL_MS}ms taskTimeout=${TASK_TIMEOUT_MS}ms`);
-console.log(`programmer-runner: роль PROGRAMMER (стадия CODING), maxConcurrency=${MAX_CONCURRENCY}, start=${START_CONCURRENCY}, worktree=${useWorktree}`);
+console.log(`programmer-runner: роль PROGRAMMER (стадия CODING), maxConcurrency=${MAX_CONCURRENCY}, start=${START_CONCURRENCY}`);
 
 let stopping = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
