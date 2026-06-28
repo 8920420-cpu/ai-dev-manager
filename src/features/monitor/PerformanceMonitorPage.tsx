@@ -187,6 +187,35 @@ export function PerformanceMonitorPage() {
             </div>
           </Section>
 
+          <Section
+            title="Программист: проходы и лимит ходов"
+            description="За сколько проходов (ходов агента) программист закрывает задачу и как часто упирается в лимит ходов. Частые упоры — сигнал плохой нарезки задач Декомпозитором/Архитектором. Окно — 24 часа."
+          >
+            <div className={styles.metricGrid}>
+              <Metric
+                value={data.programmer.avgPasses ?? '—'}
+                label="Среднее число проходов"
+                hint="ходов агента до сдачи задачи"
+              />
+              <Metric
+                value={data.programmer.maxPasses ?? '—'}
+                label="Максимум проходов"
+                hint="самая «тяжёлая» задача за сутки"
+              />
+              <Metric
+                value={data.programmer.completions}
+                label="Сдач за сутки"
+                hint="завершений с учётом проходов"
+              />
+              <Metric
+                value={data.programmer.limitHits}
+                label="Упоров в лимит ходов"
+                hint="задача не влезла в бюджет ходов"
+                tone={data.programmer.limitHits > 0 ? 'danger' : undefined}
+              />
+            </div>
+          </Section>
+
           <Section title="Задачи по этапам" description="Текущее распределение всех задач по статусам.">
             <div className={styles.statusRow}>
               {Object.entries(data.tasks.byStatus)

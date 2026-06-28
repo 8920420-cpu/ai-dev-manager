@@ -169,6 +169,35 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
       avgDurationMs: row.avg_ms == null ? null : Math.round(Number(row.avg_ms)),
     }));
 
+    // 7) Программист: проходы и упоры в лимит ходов (PROGRAMMER-LIMIT-KPI-001).
+    //    avgPasses/maxPasses — «за сколько проходов программист справляется» (numTurns
+    //    из событий сдачи, поле passes). limitHits — отдельный KPI: задача не влезла
+    //    в бюджет ходов = сигнал плохой нарезки (Декомпозитор/Архитектор). Оба
+    //    считаются за 24 часа по append-only task_events.
+    const progWhere = projectDbId
+      ? 'JOIN tasks t ON t.id = te.task_id AND t.project_id = $1'
+      : '';
+    const prog = await c.query(
+      `SELECT
+         avg((te.payload_json->>'passes')::numeric)
+           FILTER (WHERE (te.payload_json->>'passes') IS NOT NULL) AS avg_passes,
+         max((te.payload_json->>'passes')::int)
+           FILTER (WHERE (te.payload_json->>'passes') IS NOT NULL) AS max_passes,
+         count(*) FILTER (WHERE (te.payload_json->>'passes') IS NOT NULL)::int AS completions,
+         count(*) FILTER (WHERE te.payload_json->>'kind' = 'programmer_limit_exceeded')::int AS limit_hits
+       FROM task_events te ${progWhere}
+       WHERE te.created_at >= now() - interval '24 hours'
+         AND te.payload_json->>'source' IN ('scanner','programmer-runner')`,
+      taskParams,
+    );
+    const programmer = {
+      avgPasses: prog.rows[0].avg_passes == null
+        ? null : Math.round(Number(prog.rows[0].avg_passes) * 10) / 10,
+      maxPasses: prog.rows[0].max_passes == null ? null : Number(prog.rows[0].max_passes),
+      completions: prog.rows[0].completions,
+      limitHits: prog.rows[0].limit_hits,
+    };
+
     const kpi = deriveKpi({ byStatus, transitions, reworkExtra });
 
     return {
@@ -203,6 +232,7 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
       timings: {
         averageCompletedDurationMs,
       },
+      programmer,
       roleLoad,
       connector: connectorBuckets(),
     };

@@ -5,7 +5,7 @@ import { ProgrammerRunner, buildCompletionBody } from '../src/ProgrammerRunner.j
 const silent = { info() {}, warn() {}, error() {} };
 
 function fakeHttp(overrides = {}) {
-  const calls = { claim: 0, complete: [], release: [] };
+  const calls = { claim: 0, complete: [], release: [], releaseArgs: [] };
   return {
     calls,
     async claim() {
@@ -17,8 +17,9 @@ function fakeHttp(overrides = {}) {
       if (overrides.completeThrows) throw new Error('complete boom');
       return { accepted: true, duplicate: false, nextRole: 'TASK_REVIEWER' };
     },
-    async release(taskId) {
+    async release(taskId, opts) {
       calls.release.push(taskId);
+      calls.releaseArgs.push({ taskId, opts });
       return { released: true };
     },
   };
@@ -78,6 +79,25 @@ test('провал-вердикт: runAgent ok=false → release, без complet
   assert.equal(out.reason, 'не смог');
   assert.equal(http.calls.complete.length, 0);
   assert.deepEqual(http.calls.release, ['T1']);
+});
+
+test('лимит ходов: limitHit → release с reason+meta для KPI', async () => {
+  const http = fakeHttp({ claimReturn: () => ({ task: sampleTask() }) });
+  const runAgent = async () => ({
+    ok: false, error: 'max_turns_exceeded', limitHit: true, meta: { numTurns: 100, maxTurns: 100 },
+  });
+  const runner = new ProgrammerRunner({ http, runAgent, log: silent });
+
+  const out = await runner.tick();
+  assert.equal(out.released, true);
+  assert.equal(out.limitHit, true);
+  assert.equal(out.reason, 'max_turns_exceeded');
+  assert.equal(http.calls.complete.length, 0);
+  assert.deepEqual(http.calls.release, ['T1']);
+  // Раннер обязан сообщить оркестратору reason+meta — иначе KPI не запишется.
+  assert.deepEqual(http.calls.releaseArgs[0].opts, {
+    reason: 'max_turns_exceeded', meta: { numTurns: 100, maxTurns: 100 },
+  });
 });
 
 test('исключение исполнителя → release', async () => {
@@ -175,4 +195,11 @@ test('buildCompletionBody: фолбэк на поля задачи, changedFiles
   assert.equal(body.title, 'T');
   assert.deepEqual(body.changedFiles, []);
   assert.deepEqual(body.result, { ok: 1 });
+  assert.equal(body.numTurns, undefined); // нет agent.numTurns → поле не отправляем
+});
+
+test('buildCompletionBody: число проходов берётся из result.agent.numTurns', () => {
+  const task = { id: 'X', completion: { completionKey: 'k' } };
+  const body = buildCompletionBody(task, { result: { summary: 'ok', agent: { numTurns: 42 } } });
+  assert.equal(body.numTurns, 42);
 });

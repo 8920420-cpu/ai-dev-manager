@@ -57,6 +57,12 @@ export interface PerformanceMetrics {
   timings: {
     averageCompletedDurationMs: number | null;
   };
+  programmer: {
+    avgPasses: number | null;
+    maxPasses: number | null;
+    completions: number;
+    limitHits: number;
+  };
   roleLoad: RoleLoad[];
   connector: Record<string, ConnectorBucket>;
 }

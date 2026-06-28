@@ -80,6 +80,16 @@ export class ProgrammerRunner {
 
     if (!agentResult || agentResult.ok !== true) {
       const reason = agentResult?.error || 'agent_reported_failure';
+      // Упор в лимит ходов — ОТДЕЛЬНЫЙ помеченный исход: логируем заметно и сообщаем
+      // оркестратору reason+meta, чтобы он записал событие KPI (отслеживаем работу
+      // Декомпозитора/Архитектора — задача не уложилась в бюджет ходов).
+      if (agentResult?.limitHit) {
+        this.log.error?.('programmer LIMIT EXCEEDED (max turns)', {
+          taskId: task.id, numTurns: agentResult.meta?.numTurns, maxTurns: agentResult.meta?.maxTurns,
+        });
+        await this.safeRelease(task.id, { reason: 'max_turns_exceeded', meta: agentResult.meta });
+        return { taskId: task.id, released: true, reason, limitHit: true, meta: agentResult.meta };
+      }
       this.log.warn?.('programmer agent did not succeed', { taskId: task.id, reason });
       await this.safeRelease(task.id);
       return { taskId: task.id, released: true, reason };
@@ -102,9 +112,9 @@ export class ProgrammerRunner {
     }
   }
 
-  async safeRelease(taskId) {
+  async safeRelease(taskId, opts) {
     try {
-      await this.http.release(taskId);
+      await this.http.release(taskId, opts);
     } catch (error) {
       this.log.error?.('programmer release failed', { taskId, error: error.message });
     }
@@ -117,6 +127,11 @@ export class ProgrammerRunner {
 // идемпотентность повторной сдачи).
 export function buildCompletionBody(task, agentResult) {
   const c = task.completion || {};
+  // Число «проходов» (ходов агента) до завершения — скалярная метрика для Монитора
+  // («за сколько проходов программист справляется»). result сериализуется в строку
+  // на стороне оркестратора, поэтому numTurns отправляем отдельным числом, а не
+  // прячем внутрь result.
+  const numTurns = agentResult.result?.agent?.numTurns;
   return {
     taskId: task.id,
     completionKey: c.completionKey,
@@ -126,5 +141,6 @@ export function buildCompletionBody(task, agentResult) {
     sourceDocument: c.sourceDocument,
     changedFiles: Array.isArray(agentResult.changedFiles) ? agentResult.changedFiles : [],
     result: agentResult.result ?? {},
+    numTurns: Number.isFinite(numTurns) ? numTurns : undefined,
   };
 }

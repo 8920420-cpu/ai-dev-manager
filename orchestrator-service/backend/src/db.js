@@ -263,7 +263,7 @@ export async function acceptScannerCompletionTx(c, payload) {
           [payload.taskId, task.status, task.current_role_id, JSON.stringify({
             source: 'scanner', completionKey: payload.completionKey, service: payload.service,
             result: payload.result, changedFiles: payload.changedFiles, fields: progCardValues,
-            parentTaskId: task.parent_task_id, kind: 'subtask',
+            parentTaskId: task.parent_task_id, kind: 'subtask', passes: payload.numTurns,
           })],
         );
         // Промоут родителя, если открытых подзадач не осталось.
@@ -322,6 +322,7 @@ export async function acceptScannerCompletionTx(c, payload) {
           changedFiles: payload.changedFiles,
           nextRole: nextRoleCode,
           fields: progCardValues,
+          passes: payload.numTurns,
         }), toStatus],
       );
       await c.query('COMMIT');
@@ -1073,17 +1074,38 @@ export async function claimNextClaudeTask(s) {
  * Откат захвата: вернуть задачу в пул, если фидер не смог записать файл.
  * Снимаем назначение агента только с задачи, всё ещё ожидающей кодинга.
  */
-export async function releaseClaudeTask(s, taskId) {
+export async function releaseClaudeTask(s, taskId, opts = {}) {
   const id = String(taskId ?? '').trim();
   if (!id) throw scannerError(422, 'taskId_required');
   return withClient(clientConfig(s), async (c) => {
     const r = await c.query(
       `UPDATE tasks SET assigned_agent_id = NULL
         WHERE id = $1 AND status = 'CODING'
-        RETURNING id`,
+        RETURNING id, current_role_id`,
       [id],
     );
-    return { released: r.rowCount > 0, taskId: id };
+    const released = r.rowCount > 0;
+    // PROGRAMMER-LIMIT-KPI-001: упор программиста в лимит ходов — отдельный KPI.
+    // Пишем append-only событие (event_type=TASK_UPDATED + kind-дискриминатор),
+    // чтобы Монитор считал его как сигнал плохой нарезки задачи (Декомпозитор/
+    // Архитектор), не заводя новое значение в enum event_type. Записываем только
+    // когда задача реально была освобождена из CODING (есть строка с контекстом).
+    if (released && opts.reason === 'max_turns_exceeded') {
+      const numTurns = Number(opts.meta?.numTurns);
+      const maxTurns = Number(opts.meta?.maxTurns);
+      await c.query(
+        `INSERT INTO task_events (task_id, event_type, role_id, payload_json)
+         VALUES ($1, 'TASK_UPDATED', $2, $3::jsonb)`,
+        [id, r.rows[0].current_role_id, JSON.stringify({
+          source: 'programmer-runner',
+          kind: 'programmer_limit_exceeded',
+          reason: 'max_turns_exceeded',
+          numTurns: Number.isFinite(numTurns) ? numTurns : null,
+          maxTurns: Number.isFinite(maxTurns) ? maxTurns : null,
+        })],
+      );
+    }
+    return { released, taskId: id };
   });
 }
 
@@ -3029,6 +3051,9 @@ export function normalizeScannerCompletion(input) {
     status: 'completed',
     result: String(input?.result ?? ''),
     changedFiles: Array.isArray(input?.changedFiles) ? input.changedFiles.map(String) : [],
+    // Число проходов (ходов агента) до завершения — скалярная метрика для Монитора.
+    // result сериализуется в строку выше, поэтому проходы храним отдельным числом.
+    numTurns: Number.isFinite(Number(input?.numTurns)) ? Math.trunc(Number(input.numTurns)) : null,
     completedAt: input?.completedAt ?? null,
     sourceDocument: required('sourceDocument'),
     nextRole: 'TASK_REVIEWER',

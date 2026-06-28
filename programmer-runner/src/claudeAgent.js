@@ -87,6 +87,20 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
     return { ok: false, error: `agent_threw: ${error.message}` };
   }
 
+  // Упор в лимит ходов (maxTurns) — ОТДЕЛЬНЫЙ помеченный исход, а не «просто
+  // провал». Сигнал, что задача не уложилась в бюджет ходов: почти всегда её плохо
+  // нарезали (Декомпозитор/Архитектор). Прокидываем limitHit + метрики, чтобы
+  // оркестратор записал это в KPI, а не потерял в общем reason.
+  if (final && final.subtype === 'error_max_turns') {
+    log.warn?.('claudeAgent: упор в лимит ходов', { taskId: task.id, numTurns: final.num_turns, maxTurns });
+    return {
+      ok: false,
+      error: 'max_turns_exceeded',
+      limitHit: true,
+      meta: { numTurns: final.num_turns ?? maxTurns, maxTurns },
+    };
+  }
+
   const ok = !!final && final.subtype === 'success' && final.is_error !== true;
   const parsed = ok ? parseAgentJson(final.result) : null;
   // Агент явно сообщил о провале — уважаем.
@@ -131,7 +145,7 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
 export function makeClaudeRunAgent(cfg = {}) {
   const repoMap = cfg.repoMap || loadRepoMap();
   const model = cfg.model || process.env.PROGRAMMER_MODEL || 'claude-opus-4-8';
-  const maxTurns = Number(cfg.maxTurns || process.env.PROGRAMMER_MAX_TURNS || 60);
+  const maxTurns = Number(cfg.maxTurns || process.env.PROGRAMMER_MAX_TURNS || 100);
   const allowedTools = cfg.allowedTools || DEFAULT_ALLOWED_TOOLS;
   const useWorktree = cfg.useWorktree ?? (String(process.env.PROGRAMMER_WORKTREE ?? '1') !== '0');
   const log = cfg.log || console;
@@ -151,7 +165,7 @@ export function makeClaudeRunAgent(cfg = {}) {
     const after = gitPorcelain(repoCwd);
     const beforePaths = pathsFrom(before);
     const changedFiles = [...pathsFrom(after)].filter((p) => !beforePaths.has(p));
-    if (!out.ok) return { ok: false, error: out.error, changedFiles };
+    if (!out.ok) return { ok: false, error: out.error, changedFiles, limitHit: out.limitHit, meta: out.meta };
     return { ok: true, changedFiles, result: out.result };
   }
 

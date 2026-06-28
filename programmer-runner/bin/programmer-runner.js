@@ -62,9 +62,12 @@ const http = {
     const json = await asJson(res, 'complete');
     return json.data ?? json;
   },
-  async release(taskId) {
+  // opts: { reason, meta } — при упоре в лимит ходов оркестратор по reason
+  // записывает событие KPI (см. releaseClaudeTask).
+  async release(taskId, opts = {}) {
     const res = await fetch(`${ORCH}/api/runner/release-claude-task`, {
-      method: 'POST', headers: headers(), body: JSON.stringify({ taskId }),
+      method: 'POST', headers: headers(),
+      body: JSON.stringify({ taskId, reason: opts.reason, meta: opts.meta }),
     });
     return asJson(res, 'release');
   },

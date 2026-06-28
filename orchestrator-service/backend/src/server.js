@@ -402,8 +402,13 @@ export function createApp() {
 
         // Откат захвата, если фидер не смог записать файл.
         if (req.method === 'POST' && p === '/api/runner/release-claude-task') {
-          const taskId = (await readBody(req)).taskId;
-          const result = await releaseClaudeTask(await loadSettings(), taskId);
+          const body = await readBody(req);
+          const taskId = body.taskId;
+          // reason/meta опциональны: при reason='max_turns_exceeded' раннер
+          // фиксирует упор программиста в лимит ходов — записываем событие KPI.
+          const result = await releaseClaudeTask(await loadSettings(), taskId, {
+            reason: body.reason, meta: body.meta,
+          });
           publishTaskChange('claude_task_released', { taskId });
           return sendJson(res, 200, result);
         }

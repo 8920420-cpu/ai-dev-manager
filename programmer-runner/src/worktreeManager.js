@@ -97,7 +97,15 @@ export class WorktreeManager {
       }
       const agentOut = await agentFn(handle.worktreeCwd);
       if (!agentOut || agentOut.ok !== true) {
-        return { ok: false, error: agentOut?.error || 'agent_failed', changedFiles: [] };
+        // Прокидываем маркеры исхода исполнителя (например, limitHit при упоре в
+        // лимит ходов) — иначе оркестратор не отличит это от обычного провала.
+        return {
+          ok: false,
+          error: agentOut?.error || 'agent_failed',
+          changedFiles: [],
+          limitHit: agentOut?.limitHit,
+          meta: agentOut?.meta,
+        };
       }
       return this._commitAndIntegrate(repoCwd, handle, agentOut);
     });
