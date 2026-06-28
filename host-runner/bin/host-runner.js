@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { HostRunner } from '../src/HostRunner.js';
 import { runPipelineAction, runGitAction } from '../src/actions.js';
 import { pickFolder } from '../src/folderPicker.js';
+import { setupClaudeToken } from '../src/claudeToken.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -23,6 +24,29 @@ function headers(extra = {}) {
   const h = { 'Content-Type': 'application/json', ...extra };
   if (TOKEN) h.Authorization = `Bearer ${TOKEN}`;
   return h;
+}
+
+// Прочитать JSON-тело запроса моста (для /setup-claude-token). Пустое тело → {}.
+function readJsonBody(req, limitBytes = 1 << 20) {
+  return new Promise((resolve, reject) => {
+    let raw = '';
+    req.on('data', (c) => {
+      raw += c;
+      if (raw.length > limitBytes) {
+        reject(new Error('body too large'));
+        req.destroy();
+      }
+    });
+    req.on('end', () => {
+      if (!raw.trim()) return resolve({});
+      try {
+        resolve(JSON.parse(raw));
+      } catch {
+        reject(new Error('invalid json'));
+      }
+    });
+    req.on('error', reject);
+  });
 }
 
 const http = {
@@ -85,9 +109,27 @@ function startPickerServer() {
         return res.end(JSON.stringify({ ok: false, error: e.message, code: e.code }));
       }
     }
+    // Выпустить/сохранить токен подписки Claude Code для programmer-runner.
+    // Тело пустое → запустить `claude setup-token` (откроет браузер); {token} →
+    // принять вручную вставленный токен. setup-token может занять минуты (OAuth).
+    if (req.method === 'POST' && url.pathname === '/setup-claude-token') {
+      try {
+        const body = await readJsonBody(req);
+        const result = await setupClaudeToken({ token: body?.token });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify(result));
+      } catch (e) {
+        const code = e.code === 'invalid_token' ? 400 : 500;
+        res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ ok: false, error: e.message, code: e.code }));
+      }
+    }
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'not_found' }));
   });
+  // OAuth в `claude setup-token` может занять минуты — снимаем request-timeout,
+  // иначе сервер оборвёт долгий /setup-claude-token.
+  srv.requestTimeout = 0;
   srv.on('error', (e) => console.error(`host-runner picker server error: ${e.message}`));
   srv.listen(PICKER_PORT, '127.0.0.1', () =>
     console.log(`host-runner: picker bridge on http://127.0.0.1:${PICKER_PORT}/pick-folder`),

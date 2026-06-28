@@ -6,6 +6,7 @@ import { ConnectedProjectsPage } from './features/projects/ConnectedProjectsPage
 import { TasksPage } from './features/tasks/TasksPage';
 import { DevelopmentSchemePage } from './features/scheme/DevelopmentSchemePage';
 import { IntegrationsPage } from './features/integrations/IntegrationsPage';
+import { PerformanceMonitorPage } from './features/monitor/PerformanceMonitorPage';
 import { RolesPage } from './features/settings/RolesPage';
 import { ToolsPage } from './features/settings/ToolsPage';
 import { ExecutionPage } from './features/settings/ExecutionPage';
@@ -19,6 +20,8 @@ function CurrentPage() {
       return <DevelopmentSchemePage />;
     case 'integrations':
       return <IntegrationsPage />;
+    case 'monitor-performance':
+      return <PerformanceMonitorPage />;
     case 'settings-roles':
       return <RolesPage />;
     case 'settings-tools':

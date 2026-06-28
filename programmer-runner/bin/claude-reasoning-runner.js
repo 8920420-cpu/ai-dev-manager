@@ -1,0 +1,92 @@
+#!/usr/bin/env node
+// ROLE-ENGINE-ROUTING-001 — драйвер РАССУЖДАЮЩИХ ролей через Claude Code (Agent
+// SDK), назначенных движку 'claude_code'. Опрашивает generic-мост оркестратора,
+// получает роль+готовый промпт+контекст, гоняет headless Claude в корне проекта и
+// сдаёт вердикт. Драйвер «тупой»: какие роли идёт через Claude — решает оркестратор
+// (настройка roleEngines), сам раннер не знает, что будет делать.
+//
+// Авторизация Agent SDK — та же, что у programmer-runner: ANTHROPIC_API_KEY /
+// CLAUDE_CODE_OAUTH_TOKEN / файл токена (ensureClaudeToken) / залогиненная подписка.
+import { ReasoningRunner } from '../src/ReasoningRunner.js';
+import { makeClaudeReasoningRunAgent } from '../src/claudeReasoningAgent.js';
+import { ensureClaudeToken } from '../src/loadToken.js';
+
+const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');
+const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
+const INTERVAL_MS = Number(process.env.CLAUDE_REASONING_INTERVAL_MS || 5000);
+// Жёсткий таймаут на задачу < орфан-таймаута оркестратора (RUNNER_ROLE_TIMEOUT_MS≈15 мин).
+const TASK_TIMEOUT_MS = Number(process.env.CLAUDE_REASONING_TASK_TIMEOUT_MS || 10 * 60 * 1000);
+const CONCURRENCY = Math.max(1, Number(process.env.CLAUDE_REASONING_CONCURRENCY || 2));
+// Если задан CLAUDE_REASONING_ROLE — опрашиваем только её, иначе любую роль,
+// назначенную движку claude_code.
+const ROLE = String(process.env.CLAUDE_REASONING_ROLE || '').trim();
+
+const tokenLoad = ensureClaudeToken();
+if (tokenLoad.loaded) {
+  console.log('claude-reasoning-runner: токен подписки подхвачен из файла (CLAUDE_CODE_OAUTH_TOKEN)');
+} else if (!process.env.ANTHROPIC_API_KEY && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+  console.log('claude-reasoning-runner: ключ/токен не заданы — рассчитываю на залогиненную подписку Claude Code');
+}
+
+function headers(extra = {}) {
+  const h = { 'Content-Type': 'application/json', ...extra };
+  if (TOKEN) h.Authorization = `Bearer ${TOKEN}`;
+  return h;
+}
+
+async function asJson(res, label) {
+  if (!res.ok) throw new Error(`${label}: HTTP ${res.status} ${await res.text().catch(() => '')}`);
+  return res.json();
+}
+
+const http = {
+  // GET /api/runner/next-reasoning-task?engine=claude_code[&role=].
+  async claim() {
+    const params = new URLSearchParams({ engine: 'claude_code' });
+    if (ROLE) params.set('role', ROLE);
+    const res = await fetch(`${ORCH}/api/runner/next-reasoning-task?${params}`, { headers: headers() });
+    return asJson(res, 'claim');
+  },
+  async complete(body) {
+    const res = await fetch(`${ORCH}/api/runner/reasoning-completed`, {
+      method: 'POST', headers: headers(), body: JSON.stringify(body),
+    });
+    return asJson(res, 'complete');
+  },
+  async release(taskId) {
+    const res = await fetch(`${ORCH}/api/runner/release-reasoning-task`, {
+      method: 'POST', headers: headers(), body: JSON.stringify({ taskId }),
+    });
+    return asJson(res, 'release');
+  },
+};
+
+const runAgent = makeClaudeReasoningRunAgent();
+const runner = new ReasoningRunner({ http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY });
+
+console.log(`claude-reasoning-runner: orchestrator=${ORCH} interval=${INTERVAL_MS}ms taskTimeout=${TASK_TIMEOUT_MS}ms`);
+console.log(`claude-reasoning-runner: рассуждающие роли через Claude Code, concurrency=${CONCURRENCY}, role=${ROLE || 'любая делегированная'}`);
+
+let stopping = false;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function worker(id) {
+  while (!stopping) {
+    let out;
+    try {
+      out = await runner.tick();
+    } catch (e) {
+      console.error(`claude-reasoning-runner[${id}] tick error:`, e.message);
+      await sleep(INTERVAL_MS);
+      continue;
+    }
+    if (out && (out.taskId || out.blocked)) console.log(`claude-reasoning-runner[${id}] tick:`, JSON.stringify(out));
+    if (!out || out.idle || out.busy || out.error) await sleep(INTERVAL_MS);
+  }
+}
+
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, () => { stopping = true; setTimeout(() => process.exit(0), 200); });
+}
+
+Promise.all(Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1)));

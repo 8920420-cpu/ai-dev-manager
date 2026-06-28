@@ -16,6 +16,13 @@ test('classifyOutcome: 429/5xx/abort/сетевые → throttle, 4xx → error,
   assert.equal(classifyOutcome({ httpStatus: 200 }), 'ok');
 });
 
+test('keyed limiter: DeepSeek throttle does not reduce OpenAI bucket', () => {
+  _resetForTest({ limit: 8 });
+  recordResult({ key: 'deepseek', outcome: 'throttle', nowMs: 1000 });
+  assert.equal(stats(1000, 'deepseek').limit, nextLimitOnThrottle(LIMITS.START, LIMITS.MIN));
+  assert.equal(stats(1000, 'openai').limit, LIMITS.START);
+});
+
 test('AIMD: throttle делит лимит, success наращивает в пределах MIN/MAX', () => {
   assert.equal(nextLimitOnThrottle(8, 2), 4);
   assert.equal(nextLimitOnThrottle(3, 2), 2); // floor MIN

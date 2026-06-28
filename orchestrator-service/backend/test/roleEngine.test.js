@@ -8,6 +8,8 @@ import {
   buildUserPayload,
   summarizePriorRuns,
   LLM_ROLE_CODES,
+  capToolArgs,
+  compactToolResult,
 } from '../src/roleEngine.js';
 
 test('parseVerdict: чистый JSON', () => {
@@ -152,7 +154,8 @@ test('buildVerdictInstruction/buildUserPayload содержат JSON-контр�
   assert.match(buildVerdictInstruction(), /JSON/);
   const payload = buildUserPayload('TASK_REVIEWER', { taskId: 'x', title: 'T' });
   assert.match(payload, /TASK_REVIEWER/);
-  assert.match(payload, /"title": "T"/);
+  // Контекст сериализуется компактно (без отступов) — экономия токенов.
+  assert.match(payload, /"title":"T"/);
 });
 
 test('summarizePriorRuns: компактный список из agent_runs', () => {
@@ -193,6 +196,20 @@ test('parseTextToolCalls: разбирает текстовый вызов ин�
 test('parseTextToolCalls: нет вызовов → пустой массив', async () => {
   const { parseTextToolCalls } = await import('../src/roleEngine.js');
   assert.deepEqual(parseTextToolCalls('{"status":"READY"}'), []);
+});
+
+test('capToolArgs: ограничивает большие tool-запросы до оркестраторских дефолтов', () => {
+  assert.deepEqual(capToolArgs('read_file', { path: 'a.js' }), { path: 'a.js', maxBytes: 16000 });
+  assert.deepEqual(capToolArgs('read_file', { path: 'a.js', maxBytes: 999999 }), { path: 'a.js', maxBytes: 16000 });
+  assert.deepEqual(capToolArgs('search_text', { query: 'x', maxResults: 999 }), { query: 'x', maxResults: 25 });
+});
+
+test('compactToolResult: режет длинный результат перед возвратом в LLM-контекст', () => {
+  const out = compactToolResult({ content: 'x'.repeat(50) }, { maxChars: 20 });
+  const parsed = JSON.parse(out);
+  assert.equal(parsed.truncated, true);
+  assert.ok(parsed.originalChars > 20);
+  assert.equal(parsed.content.length, 20);
 });
 
 test('LLM_ROLE_CODES покрывает 7 рассуждающих ролей (вкл. Приёмщика задач)', () => {

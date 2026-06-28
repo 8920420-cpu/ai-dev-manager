@@ -19,6 +19,36 @@ const RETRY_BASE_MS = Math.max(50, envInt('CONNECTOR_RETRY_BASE_MS', 500));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const backoffMs = (attempt) => RETRY_BASE_MS * 2 ** attempt + Math.floor(Math.random() * RETRY_BASE_MS);
 
+function retryAfterMs(value) {
+  const raw = String(value ?? '').trim();
+  if (!raw) return null;
+  const seconds = Number(raw);
+  if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+  const at = Date.parse(raw);
+  if (Number.isFinite(at)) return Math.max(0, at - Date.now());
+  return null;
+}
+
+function retryDelayMs(headers, attempt) {
+  const hinted = retryAfterMs(headers?.get?.('retry-after'));
+  if (hinted !== null) return Math.max(0, hinted) + Math.floor(Math.random() * RETRY_BASE_MS);
+  return backoffMs(attempt);
+}
+
+export function limiterKeyForConnector(conn = {}, endpoint = '') {
+  const provider = String(conn.provider ?? '').trim().toLowerCase();
+  if (provider) return provider;
+  const raw = String(endpoint || conn.endpoint || '').trim();
+  try {
+    const host = new URL(raw).hostname.toLowerCase();
+    if (host.includes('deepseek.com')) return 'deepseek';
+    if (host.includes('openai.com')) return 'openai';
+    return `host:${host}`;
+  } catch {
+    return 'generic';
+  }
+}
+
 // Извлечь число использованных токенов из ответа OpenAI-совместимого API.
 function extractUsageTokens(raw) {
   try {
@@ -37,8 +67,9 @@ function extractUsageTokens(raw) {
 // Возвращает { status, raw, durationMs } на 2xx; иначе бросает Error (с httpStatus).
 async function networkCall(conn, { endpoint, body, headers, timeoutMs }) {
   let lastError = null;
+  const limiterKey = limiterKeyForConnector(conn, endpoint);
   for (let attempt = 0; attempt <= RETRY_MAX; attempt += 1) {
-    const release = await acquire();
+    const release = await acquire(limiterKey);
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     const started = Date.now();
@@ -50,18 +81,18 @@ async function networkCall(conn, { endpoint, body, headers, timeoutMs }) {
       release();
       if (res.status < 200 || res.status >= 300) {
         const outcome = classifyOutcome({ httpStatus: res.status });
-        recordResult({ outcome, totalTokens: 0 });
+        recordResult({ key: limiterKey, outcome, totalTokens: 0 });
         const err = new Error(`connector "${conn.name}": HTTP ${res.status}: ${truncateErrBody(raw)}`);
         err.httpStatus = res.status;
         err.durationMs = durationMs;
         if (outcome === 'throttle' && attempt < RETRY_MAX) {
           lastError = err;
-          await sleep(backoffMs(attempt));
+          await sleep(retryDelayMs(res.headers, attempt));
           continue;
         }
         throw err;
       }
-      recordResult({ outcome: 'ok', totalTokens: extractUsageTokens(raw) });
+      recordResult({ key: limiterKey, outcome: 'ok', totalTokens: extractUsageTokens(raw) });
       return { status: res.status, raw, durationMs };
     } catch (e) {
       clearTimeout(timer);
@@ -70,7 +101,7 @@ async function networkCall(conn, { endpoint, body, headers, timeoutMs }) {
       const durationMs = Date.now() - started;
       const aborted = e?.name === 'AbortError';
       const msg = aborted ? `AI response timeout (${timeoutMs}ms)` : (e?.message || 'network error');
-      recordResult({ outcome: classifyOutcome({ aborted, errorMessage: msg }), totalTokens: 0 });
+      recordResult({ key: limiterKey, outcome: classifyOutcome({ aborted, errorMessage: msg }), totalTokens: 0 });
       const err = new Error(`connector "${conn.name}": ${msg}`);
       err.durationMs = durationMs;
       // Таймаут/abort не ретраим: бюджет роли уже потрачен. Сетевые — ретраим.
@@ -368,4 +399,6 @@ export const _internal = {
   normalizeChatCompletionsEndpoint,
   defaultModelForEndpoint,
   ensureUserPromptMentionsJSON,
+  retryAfterMs,
+  limiterKeyForConnector,
 };

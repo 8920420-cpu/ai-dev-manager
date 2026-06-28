@@ -1,0 +1,113 @@
+/* PERFORMANCE-MONITOR-001 — стили раздела «Монитор производительности». */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.generatedAt {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* Сетка карточек-метрик. */
+.metricGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-3);
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-4);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.metricValue {
+  font-size: var(--text-2xl, 1.6rem);
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+.metricLabel {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.metricHint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.metricValue.warn {
+  color: var(--warning, #d08700);
+}
+
+.metricValue.danger {
+  color: var(--danger, #d92d20);
+}
+
+/* Таблица нагрузки по ролям / коннекторам. */
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.table th {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.table td.num,
+.table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.statusRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.statusChip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full, 999px);
+  font-size: var(--text-sm);
+}
+
+.statusChip b {
+  font-variant-numeric: tabular-nums;
+}
+
+.muted {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}

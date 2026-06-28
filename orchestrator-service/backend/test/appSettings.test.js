@@ -35,6 +35,23 @@ test('getAppSettings: пустая таблица → дефолт 3', async () 
   ]);
   const s = await getAppSettingsTx(c);
   assert.equal(s.maxConcurrencyPerRole, 3);
+  assert.equal(s.programmerConcurrency, 3);
+});
+
+test('programmerConcurrency: значение из БД, жёсткий потолок 3', async () => {
+  const c = fakeClient([
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 1, rows: [{ key: 'programmer_concurrency', value: 2 }] } },
+  ]);
+  assert.equal((await getAppSettingsTx(c)).programmerConcurrency, 2);
+
+  const high = fakeClient([
+    { re: /INSERT INTO app_settings/, reply: { rowCount: 1, rows: [] } },
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 0, rows: [] } },
+  ]);
+  await updateAppSettingsTx(high, { programmerConcurrency: 9 });
+  const upsert = high.calls.find((q) => /INSERT/.test(q.sql));
+  assert.equal(upsert.params[0], 'programmer_concurrency');
+  assert.equal(upsert.params[1], '3', '9 клампится до потолка 3');
 });
 
 test('updateAppSettings: валидное значение → upsert и возврат', async () => {

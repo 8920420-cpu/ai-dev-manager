@@ -12,6 +12,9 @@ import { invoke as llmInvoke, invokeChat } from './llmConnector.js';
 
 // Максимум итераций tool-loop (сколько раз роль может вызвать инструменты подряд).
 const TOOL_MAX_ITERS = Number(process.env.ROLE_TOOL_MAX_ITERS || 8);
+const TOOL_RESULT_MAX_CHARS = Math.max(1000, Number(process.env.ROLE_TOOL_RESULT_MAX_CHARS || 12000));
+const TOOL_READ_FILE_MAX_BYTES = Math.max(1000, Number(process.env.ROLE_TOOL_READ_FILE_MAX_BYTES || 16000));
+const TOOL_SEARCH_MAX_RESULTS = Math.max(1, Number(process.env.ROLE_TOOL_SEARCH_MAX_RESULTS || 25));
 
 // RUNNER-LLM-TIMEOUT-001: таймаут ОДНОГО вызова коннектора в рассуждающей роли.
 // По умолчанию llmConnector ждёт ответ AI до 10 минут. При всплеске нагрузки
@@ -50,6 +53,39 @@ export function parseTextToolCalls(content) {
   return out;
 }
 
+export function capToolArgs(name, args = {}) {
+  const out = { ...(args && typeof args === 'object' ? args : {}) };
+  if (name === 'read_file') {
+    const requested = Number(out.maxBytes);
+    out.maxBytes = Number.isFinite(requested)
+      ? Math.min(Math.max(1, requested), TOOL_READ_FILE_MAX_BYTES)
+      : TOOL_READ_FILE_MAX_BYTES;
+  }
+  if (name === 'search_text') {
+    const requested = Number(out.maxResults);
+    out.maxResults = Number.isFinite(requested)
+      ? Math.min(Math.max(1, requested), TOOL_SEARCH_MAX_RESULTS)
+      : TOOL_SEARCH_MAX_RESULTS;
+  }
+  return out;
+}
+
+export function compactToolResult(value, { maxChars = TOOL_RESULT_MAX_CHARS } = {}) {
+  let text;
+  try {
+    text = typeof value === 'string' ? value : JSON.stringify(value);
+  } catch {
+    text = String(value);
+  }
+  if (text.length <= maxChars) return text;
+  return JSON.stringify({
+    truncated: true,
+    originalChars: text.length,
+    content: text.slice(0, maxChars),
+    note: 'Tool result was truncated before adding it back to the LLM context.',
+  });
+}
+
 async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
   const deadline = Date.now() + LLM_CALL_TIMEOUT_MS;
   const remainingMs = () => Math.max(1, deadline - Date.now());
@@ -79,7 +115,9 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
         }
         let resultText;
         try {
-          resultText = JSON.stringify(await executeTool(call?.function?.name, args));
+          resultText = compactToolResult(
+            await executeTool(call?.function?.name, capToolArgs(call?.function?.name, args)),
+          );
         } catch (e) {
           resultText = JSON.stringify({ error: e.message, code: e.code || 'tool_error' });
         }
@@ -97,7 +135,7 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
         toolCalls += 1;
         let resultText;
         try {
-          resultText = JSON.stringify(await executeTool(call.name, call.args));
+          resultText = compactToolResult(await executeTool(call.name, capToolArgs(call.name, call.args)));
         } catch (e) {
           resultText = JSON.stringify({ error: e.message, code: e.code || 'tool_error' });
         }
@@ -213,12 +251,52 @@ export function buildVerdictInstruction(outputFields = []) {
   return lines.join('\n');
 }
 
+// CODEX-REASONING-001: JSON-схема вердикта для `codex exec --output-schema`.
+// Codex (как и OpenAI structured outputs) принимает строгую схему: на каждом
+// уровне с additionalProperties:false ВСЕ перечисленные свойства обязаны быть в
+// required. Поэтому форсируем status/summary/findings (+ fields, если у роли есть
+// исходящие поля) — модель ОБЯЗАНА вернуть валидный вердикт, и verdict_unparsed
+// становится невозможным на уровне CLI (в отличие от DeepSeek-пути, где ответ
+// парсится толерантно parseVerdict). Значения полей трактуем как строки —
+// исходящие поля рассуждающих ролей текстовые; extractOutputs принимает их как
+// есть. Зеркалит buildVerdictInstruction по составу полей.
+export function buildVerdictJsonSchema(outputFields = []) {
+  const fields = (Array.isArray(outputFields) ? outputFields : []).filter((f) => f && f.key);
+  const schema = {
+    type: 'object',
+    additionalProperties: false,
+    required: ['status', 'summary', 'findings'],
+    properties: {
+      status: { type: 'string', description: 'Статус-вердикт из раздела «Формат результата» роли' },
+      summary: { type: 'string', description: 'Краткий вывод на русском' },
+      findings: { type: 'array', items: { type: 'string' }, description: 'Ключевые замечания, если есть' },
+    },
+  };
+  if (fields.length) {
+    const props = {};
+    for (const f of fields) props[f.key] = { type: 'string', description: f.name || f.key };
+    schema.properties.fields = {
+      type: 'object',
+      additionalProperties: false,
+      required: fields.map((f) => f.key),
+      properties: props,
+      description: 'Контракт исходящих полей этапа: заполни каждое непустым значением',
+    };
+    schema.required.push('fields');
+  }
+  return schema;
+}
+
 // Пользовательский payload: компактный контекст задачи + требование вердикта.
 // outputFields — объявленные исходящие поля роли (контракт), если есть.
+// TOKEN-EFFICIENCY: контекст сериализуем КОМПАКТНО (без отступов). Pretty-print
+// (null, 2) добавлял переносы строк и пробелы-отступы в каждый вызов модели — это
+// 10–20% лишних токенов на вложенном контексте (priorRoleOutputs/changedFiles/
+// recentEvents) без какой-либо пользы: модель одинаково читает компактный JSON.
 export function buildUserPayload(roleCode, context, outputFields = []) {
   return [
     `Задача роли ${roleCode}. Контекст задачи (JSON):`,
-    JSON.stringify(context, null, 2),
+    JSON.stringify(context),
     '',
     buildVerdictInstruction(outputFields),
   ].join('\n');

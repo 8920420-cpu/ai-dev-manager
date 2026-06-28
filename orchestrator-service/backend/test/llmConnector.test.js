@@ -11,6 +11,13 @@ test('DeepSeek endpoint распознаётся как OpenAI-совмести�
   assert.equal(_internal.usesOpenAIChatAPI('http://localhost:9000/ingest'), false);
 });
 
+test('limiterKeyForConnector maps DeepSeek/OpenAI to separate buckets', () => {
+  assert.equal(_internal.limiterKeyForConnector({ provider: 'deepseek' }, 'https://api.openai.com/v1'), 'deepseek');
+  assert.equal(_internal.limiterKeyForConnector({}, 'https://api.deepseek.com/v1'), 'deepseek');
+  assert.equal(_internal.limiterKeyForConnector({}, 'https://api.openai.com/v1'), 'openai');
+  assert.equal(_internal.limiterKeyForConnector({}, 'http://localhost:9000/ingest'), 'host:localhost');
+});
+
 test('normalizeChatCompletionsEndpoint дополняет путь до /chat/completions', () => {
   assert.equal(
     _internal.normalizeChatCompletionsEndpoint('https://api.deepseek.com'),

@@ -1,0 +1,17 @@
+{
+  "name": "codex-runner",
+  "version": "0.1.0",
+  "description": "Автоматический исполнитель рассуждающих ролей (Приёмщик/Архитектор/Декомпозитор и пр.), делегированных Codex: опрашивает оркестратор, запускает headless `codex exec` на готовом промпте роли в корне проекта и сдаёт вердикт. Аналог programmer-runner, но для reasoning-ролей и на подписке ChatGPT через локальный Codex CLI.",
+  "type": "module",
+  "bin": {
+    "codex-runner": "bin/codex-runner.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/codex-runner.js",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

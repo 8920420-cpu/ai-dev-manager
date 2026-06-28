@@ -6,7 +6,7 @@ import { dirname, resolve, join, extname, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadSettings, saveSettings, resolveSettings, redactSettings } from './config.js';
 import { getAppSettings, updateAppSettings } from './appSettings.js';
-import { stats as connectorCapacity } from './connectorLimiter.js';
+import { stats as connectorCapacity, allStats as connectorCapacityBuckets } from './connectorLimiter.js';
 import {
   testConnection,
   bootstrap,
@@ -25,6 +25,9 @@ import {
   claimNextHostTask,
   completeHostTask,
   releaseHostTask,
+  claimNextReasoningTask,
+  completeReasoningTask,
+  releaseReasoningTask,
 } from './db.js';
 import {
   listConnectors,
@@ -37,6 +40,8 @@ import {
 } from './connectors.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
+import { getPerformanceMetrics } from './performance.js';
+import { createAuditRun, listAuditRuns, completeAuditRun } from './auditRuns.js';
 import { getTaskTree, getTaskStatusCounts, getTasksByStage, getTaskHistory } from './taskTree.js';
 import { openTaskEventsStream, publishTaskChange } from './taskEvents.js';
 import {
@@ -308,10 +313,45 @@ export function createApp() {
         // спрашивают перед отправкой: { free, canSend, limit, active, tpm, ... }.
         // canSend=false → есть смысл подождать, а не слать вызов вхолостую.
         if (req.method === 'GET' && p === '/api/connector/capacity')
-          return sendJson(res, 200, connectorCapacity());
+          return sendJson(res, 200, { ...connectorCapacity(), buckets: connectorCapacityBuckets() });
 
         if (req.method === 'PUT' && p === '/api/app-settings')
           return sendJson(res, 200, await updateAppSettings(await loadSettings(), await readBody(req)));
+
+        // PERFORMANCE-MONITOR-001: НЕ-AI метрики оркестратора (read-only).
+        // Опционально ?projectId=<uuid|code|root_path|name> сужает задачи проекта.
+        if (req.method === 'GET' && p === '/api/performance')
+          return sendJson(
+            res,
+            200,
+            await getPerformanceMetrics(await loadSettings(), {
+              projectId: url.searchParams.get('projectId'),
+            }),
+          );
+
+        // ORCHESTRATOR-AUDITOR-001: ручной запуск аудита оркестратора (off-route).
+        if (req.method === 'POST' && p === '/api/audit/run')
+          return sendJson(res, 200, await createAuditRun(await loadSettings(), await readBody(req)));
+
+        if (req.method === 'GET' && p === '/api/audit/runs')
+          return sendJson(
+            res,
+            200,
+            await listAuditRuns(await loadSettings(), { limit: url.searchParams.get('limit') }),
+          );
+
+        // Сдача результата аудита исполнителем (внешняя сессия / будущий runner).
+        const auditCompleteMatch = p.match(/^\/api\/audit\/runs\/([^/]+)\/complete$/);
+        if (auditCompleteMatch && req.method === 'POST')
+          return sendJson(
+            res,
+            200,
+            await completeAuditRun(
+              await loadSettings(),
+              decodeURIComponent(auditCompleteMatch[1]),
+              await readBody(req),
+            ),
+          );
 
         if (req.method === 'GET' && p === '/api/settings')
           return sendJson(res, 200, redactSettings(await loadSettings()));
@@ -387,6 +427,32 @@ export function createApp() {
           const taskId = (await readBody(req)).taskId;
           const result = await releaseHostTask(await loadSettings(), taskId);
           publishTaskChange('host_task_released', { taskId });
+          return sendJson(res, 200, result);
+        }
+
+        // ROLE-ENGINE-ROUTING-001: generic-мост рассуждающих ролей на хостовые
+        // драйверы. Роли, назначенные движку (codex/claude_code), исполняет
+        // соответствующий драйвер; оркестратор отдаёт готовый промпт+схему и
+        // принимает вердикт, прогоняя его тем же путём, что и DeepSeek.
+        if (req.method === 'GET' && p === '/api/runner/next-reasoning-task') {
+          const result = await claimNextReasoningTask(
+            await loadSettings(), url.searchParams.get('engine'), url.searchParams.get('role'),
+          );
+          if (result?.task) publishTaskChange('reasoning_task_claimed', { taskId: result.task.id ?? null });
+          return sendJson(res, 200, result);
+        }
+
+        if (req.method === 'POST' && p === '/api/runner/reasoning-completed') {
+          const body = await readBody(req);
+          const result = await completeReasoningTask(await loadSettings(), body);
+          publishTaskChange('reasoning_task_completed', { taskId: body.taskId ?? null });
+          return sendJson(res, 200, result);
+        }
+
+        if (req.method === 'POST' && p === '/api/runner/release-reasoning-task') {
+          const taskId = (await readBody(req)).taskId;
+          const result = await releaseReasoningTask(await loadSettings(), taskId);
+          publishTaskChange('reasoning_task_released', { taskId });
           return sendJson(res, 200, result);
         }
 

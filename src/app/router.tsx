@@ -13,6 +13,7 @@ export type RouteKey =
   | 'tasks'
   | 'development-scheme'
   | 'integrations'
+  | 'monitor-performance'
   | 'settings-roles'
   | 'settings-tools'
   | 'settings-execution';
@@ -22,6 +23,7 @@ const ROUTES: Record<RouteKey, string> = {
   tasks: '#/tasks',
   'development-scheme': '#/scheme',
   integrations: '#/integrations',
+  'monitor-performance': '#/monitor/performance',
   'settings-roles': '#/settings/roles',
   'settings-tools': '#/settings/tools',
   'settings-execution': '#/settings/execution',
@@ -34,6 +36,7 @@ function parseHash(): RouteKey {
   if (section === 'tasks') return 'tasks';
   if (section === 'scheme') return 'development-scheme';
   if (section === 'integrations') return 'integrations';
+  if (section === 'monitor') return 'monitor-performance';
   if (section === 'settings') {
     // Раздел «Базы данных» удалён: БД одна (БД оркестратора).
     if (sub === 'tools') return 'settings-tools';

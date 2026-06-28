@@ -1,17 +1,9 @@
-// CONNECTOR-LIMITER-001 — глобальный адаптивный лимитер вызовов внешнего LLM
-// (DeepSeek/OpenAI-совместимые). Единый регулятор на ВЕСЬ процесс оркестратора:
+// CONNECTOR-LIMITER-001: adaptive limiter for external LLM calls.
 //
-//  1) Ограничивает число одновременных HTTP-запросов к модели (семафор) — чтобы
-//     не «долбить» провайдера десятками параллельных вызовов на роль.
-//  2) Сам нащупывает потолок (AIMD): при устойчивом успехе ПОД НАГРУЗКОЙ
-//     поднимает лимит на +1, при троттлинге/ошибке откатывается (÷2) и пишет в
-//     лог, на каком пределе сломалось.
-//  3) Ведёт учёт токенов (скользящее окно TPM) — троттлинг DeepSeek часто идёт
-//     по токенам в минуту, а не по числу запросов, и отслеживать удобнее по ним.
-//  4) Отдаёт «есть ли свободный слот» (stats/canSend) — чтобы сервисы спрашивали
-//     ёмкость и ждали, а не слали запросы вхолостую.
-//
-// Чистые функции решения (classifyOutcome/nextLimit*) экспортируются для тестов.
+// The limiter is keyed by provider/endpoint. A DeepSeek 429 must reduce only the
+// DeepSeek bucket, not the whole orchestrator and not OpenAI/local connectors.
+// Public functions keep a default key for backward compatibility with tests and
+// older callers.
 
 function envInt(name, def) {
   const n = Number.parseInt(String(process.env[name] ?? '').trim(), 10);
@@ -21,19 +13,13 @@ function envInt(name, def) {
 const START = Math.max(1, envInt('CONNECTOR_LIMIT_START', 6));
 const MIN = Math.max(1, envInt('CONNECTOR_LIMIT_MIN', 2));
 const MAX = Math.max(MIN, envInt('CONNECTOR_LIMIT_MAX', 32));
-// Сколько успехов подряд под насыщением до пробного +1.
 const PROBE_AFTER = Math.max(1, envInt('CONNECTOR_LIMIT_PROBE_AFTER', 15));
-// Окно учёта токенов (мс) и опциональный бюджет TPM (0 = выключено).
 const TOKEN_WINDOW_MS = Math.max(1000, envInt('CONNECTOR_TOKEN_WINDOW_MS', 60_000));
 const TPM_BUDGET = Math.max(0, envInt('CONNECTOR_TPM_BUDGET', 0));
+const DEFAULT_KEY = 'default';
 
 const log = (msg) => console.log(`[connector-limiter] ${msg}`);
 
-// --- чистые функции решения (юнит-тестируемы) ------------------------------
-
-// Классификация исхода вызова: 'ok' | 'throttle' | 'error'.
-// throttle = сигнал «провайдер перегружен / лимит»: 429, 5xx, таймаут/abort,
-// сетевой сбой, либо тело/сообщение с признаками rate-limit/перегруза/токенов.
 export function classifyOutcome({ httpStatus = 0, errorMessage = '', aborted = false } = {}) {
   if (aborted) return 'throttle';
   if (httpStatus === 429) return 'throttle';
@@ -42,7 +28,7 @@ export function classifyOutcome({ httpStatus = 0, errorMessage = '', aborted = f
   if (m && /(rate.?limit|too many|quota|overload|capacity|server busy|tpm|token.?limit|503|429|econn|etimedout|socket hang|network|fetch failed|aborted)/.test(m)) {
     return 'throttle';
   }
-  if (httpStatus >= 400 && httpStatus <= 499) return 'error'; // клиентская ошибка — не троттлинг
+  if (httpStatus >= 400 && httpStatus <= 499) return 'error';
   if (httpStatus >= 200 && httpStatus <= 299) return 'ok';
   if (m) return 'error';
   return 'ok';
@@ -51,42 +37,67 @@ export function classifyOutcome({ httpStatus = 0, errorMessage = '', aborted = f
 export function nextLimitOnThrottle(limit, min = MIN) {
   return Math.max(min, Math.floor(limit / 2));
 }
+
 export function nextLimitOnSuccess(limit, max = MAX) {
   return Math.min(max, limit + 1);
 }
 
-// --- состояние синглтона ----------------------------------------------------
+function normalizeKey(key = DEFAULT_KEY) {
+  const s = String(key ?? '').trim().toLowerCase();
+  return s || DEFAULT_KEY;
+}
 
-const state = {
-  limit: Math.min(MAX, Math.max(MIN, START)),
-  active: 0,
-  queue: [],
-  successStreak: 0,
-  sawSaturation: false, // был ли отказ в слоте с прошлого изменения лимита
-  tokenWindow: [], // [ [tsMs, totalTokens], ... ]
-  lastThrottleAt: null,
-  lastChangeAt: null,
-  lastChangeReason: null,
-};
+function createState() {
+  return {
+    limit: Math.min(MAX, Math.max(MIN, START)),
+    active: 0,
+    queue: [],
+    successStreak: 0,
+    sawSaturation: false,
+    tokenWindow: [],
+    lastThrottleAt: null,
+    lastChangeAt: null,
+    lastChangeReason: null,
+  };
+}
 
-function pump() {
-  while (state.queue.length && state.active < state.limit) {
-    const grant = state.queue.shift();
+const states = new Map();
+
+function getState(key = DEFAULT_KEY) {
+  const id = normalizeKey(key);
+  if (!states.has(id)) states.set(id, createState());
+  return states.get(id);
+}
+
+function resetState(st, overrides = {}) {
+  st.limit = overrides.limit ?? Math.min(MAX, Math.max(MIN, START));
+  st.active = 0;
+  st.queue = [];
+  st.successStreak = 0;
+  st.sawSaturation = false;
+  st.tokenWindow = [];
+  st.lastThrottleAt = null;
+  st.lastChangeAt = null;
+  st.lastChangeReason = null;
+}
+
+function pump(st) {
+  while (st.queue.length && st.active < st.limit) {
+    const grant = st.queue.shift();
     grant();
   }
 }
 
-// Захватить слот. Возвращает одноразовую release-функцию. Если свободных слотов
-// нет — ждём в FIFO-очереди (и фиксируем насыщение для AIMD-пробы вверх).
-export async function acquire() {
+export async function acquire(key = DEFAULT_KEY) {
+  const st = getState(key);
   await new Promise((resolve) => {
-    if (state.active < state.limit) {
-      state.active += 1;
+    if (st.active < st.limit) {
+      st.active += 1;
       resolve();
     } else {
-      state.sawSaturation = true;
-      state.queue.push(() => {
-        state.active += 1;
+      st.sawSaturation = true;
+      st.queue.push(() => {
+        st.active += 1;
         resolve();
       });
     }
@@ -95,96 +106,95 @@ export async function acquire() {
   return () => {
     if (released) return;
     released = true;
-    state.active = Math.max(0, state.active - 1);
-    pump();
+    st.active = Math.max(0, st.active - 1);
+    pump(st);
   };
 }
 
-function trimWindow(nowMs) {
+function trimWindow(st, nowMs) {
   const cutoff = nowMs - TOKEN_WINDOW_MS;
-  while (state.tokenWindow.length && state.tokenWindow[0][0] < cutoff) {
-    state.tokenWindow.shift();
+  while (st.tokenWindow.length && st.tokenWindow[0][0] < cutoff) {
+    st.tokenWindow.shift();
   }
 }
 
-// Токены за окно, нормированные в «токены в минуту».
-export function tokensPerMinute(nowMs = Date.now()) {
-  trimWindow(nowMs);
-  const sum = state.tokenWindow.reduce((a, [, t]) => a + t, 0);
+export function tokensPerMinute(nowMs = Date.now(), key = DEFAULT_KEY) {
+  const st = getState(key);
+  trimWindow(st, nowMs);
+  const sum = st.tokenWindow.reduce((a, [, t]) => a + t, 0);
   return Math.round((sum * 60_000) / TOKEN_WINDOW_MS);
 }
 
-// Зафиксировать исход вызова: подвинуть лимит (AIMD) и учесть токены.
-export function recordResult({ outcome, totalTokens = 0, nowMs = Date.now() } = {}) {
-  if (totalTokens > 0) state.tokenWindow.push([nowMs, totalTokens]);
-  trimWindow(nowMs);
+export function recordResult({ outcome, totalTokens = 0, nowMs = Date.now(), key = DEFAULT_KEY } = {}) {
+  const id = normalizeKey(key);
+  const st = getState(id);
+  if (totalTokens > 0) st.tokenWindow.push([nowMs, totalTokens]);
+  trimWindow(st, nowMs);
 
   if (outcome === 'throttle') {
-    const old = state.limit;
-    state.limit = nextLimitOnThrottle(state.limit, MIN);
-    state.successStreak = 0;
-    state.lastThrottleAt = nowMs;
-    state.sawSaturation = false;
-    if (state.limit !== old) {
-      state.lastChangeAt = nowMs;
-      state.lastChangeReason = 'throttle';
-      log(`throttle at limit=${old} (tpm=${tokensPerMinute(nowMs)}, active=${state.active}) → lower to ${state.limit}`);
+    const old = st.limit;
+    st.limit = nextLimitOnThrottle(st.limit, MIN);
+    st.successStreak = 0;
+    st.lastThrottleAt = nowMs;
+    st.sawSaturation = false;
+    if (st.limit !== old) {
+      st.lastChangeAt = nowMs;
+      st.lastChangeReason = 'throttle';
+      log(`${id}: throttle at limit=${old} (tpm=${tokensPerMinute(nowMs, id)}, active=${st.active}) -> lower to ${st.limit}`);
     } else {
-      log(`throttle at floor limit=${old} (tpm=${tokensPerMinute(nowMs)}) — уже минимум`);
+      log(`${id}: throttle at floor limit=${old} (tpm=${tokensPerMinute(nowMs, id)})`);
     }
     return;
   }
 
   if (outcome === 'ok') {
-    state.successStreak += 1;
-    if (state.successStreak >= PROBE_AFTER && state.sawSaturation && state.limit < MAX) {
-      const old = state.limit;
-      state.limit = nextLimitOnSuccess(state.limit, MAX);
-      state.successStreak = 0;
-      state.sawSaturation = false;
-      state.lastChangeAt = nowMs;
-      state.lastChangeReason = 'probe-up';
-      log(`sustained success at limit=${old} (tpm=${tokensPerMinute(nowMs)}) → raise to ${state.limit}`);
+    st.successStreak += 1;
+    if (st.successStreak >= PROBE_AFTER && st.sawSaturation && st.limit < MAX) {
+      const old = st.limit;
+      st.limit = nextLimitOnSuccess(st.limit, MAX);
+      st.successStreak = 0;
+      st.sawSaturation = false;
+      st.lastChangeAt = nowMs;
+      st.lastChangeReason = 'probe-up';
+      log(`${id}: sustained success at limit=${old} (tpm=${tokensPerMinute(nowMs, id)}) -> raise to ${st.limit}`);
     }
     return;
   }
-  // 'error' (неретраябельная клиентская ошибка) — нейтрально, сбрасываем серию.
-  state.successStreak = 0;
+
+  st.successStreak = 0;
 }
 
-// Снимок ёмкости для эндпоинта и принятия решений сервисами.
-export function stats(nowMs = Date.now()) {
-  const tpm = tokensPerMinute(nowMs);
-  const free = Math.max(0, state.limit - state.active);
+export function stats(nowMs = Date.now(), key = DEFAULT_KEY) {
+  const id = normalizeKey(key);
+  const st = getState(id);
+  const tpm = tokensPerMinute(nowMs, id);
+  const free = Math.max(0, st.limit - st.active);
   const tokenBudgetOk = TPM_BUDGET <= 0 || tpm < TPM_BUDGET;
   return {
-    limit: state.limit,
-    active: state.active,
+    key: id,
+    limit: st.limit,
+    active: st.active,
     free,
-    queued: state.queue.length,
+    queued: st.queue.length,
     minLimit: MIN,
     maxLimit: MAX,
     tpm,
     tpmBudget: TPM_BUDGET,
     tokenWindowMs: TOKEN_WINDOW_MS,
     canSend: free > 0 && tokenBudgetOk,
-    lastThrottleAt: state.lastThrottleAt,
-    lastChangeAt: state.lastChangeAt,
-    lastChangeReason: state.lastChangeReason,
+    lastThrottleAt: st.lastThrottleAt,
+    lastChangeAt: st.lastChangeAt,
+    lastChangeReason: st.lastChangeReason,
   };
 }
 
-// Тестовый сброс состояния.
+export function allStats(nowMs = Date.now()) {
+  return Object.fromEntries([...states.keys()].sort().map((key) => [key, stats(nowMs, key)]));
+}
+
 export function _resetForTest(overrides = {}) {
-  state.limit = overrides.limit ?? Math.min(MAX, Math.max(MIN, START));
-  state.active = 0;
-  state.queue = [];
-  state.successStreak = 0;
-  state.sawSaturation = false;
-  state.tokenWindow = [];
-  state.lastThrottleAt = null;
-  state.lastChangeAt = null;
-  state.lastChangeReason = null;
+  states.clear();
+  resetState(getState(DEFAULT_KEY), overrides);
 }
 
 export const LIMITS = { START, MIN, MAX, PROBE_AFTER, TOKEN_WINDOW_MS, TPM_BUDGET };

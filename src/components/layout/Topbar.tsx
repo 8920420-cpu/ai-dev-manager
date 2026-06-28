@@ -7,6 +7,7 @@ const TITLES: Record<RouteKey, string> = {
   projects: 'Проекты',
   tasks: 'Задачи',
   'development-scheme': 'Схема разработки',
+  'monitor-performance': 'Монитор производительности',
   integrations: 'Интеграции',
   'settings-roles': 'Настройки · Роли',
   'settings-tools': 'Настройки · Инструменты',

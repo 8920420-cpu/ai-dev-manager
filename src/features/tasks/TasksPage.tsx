@@ -173,7 +173,7 @@ export function TasksPage() {
       const res = await tasksApi.restartStuck();
       toast.success(
         res.restarted > 0
-          ? `Перезапущено задач: ${res.restarted} — переданы Приёмщику задач`
+          ? `Перезапущено задач: ${res.restarted} — на текущем этапе`
           : 'Зависших задач не найдено',
       );
       await load();

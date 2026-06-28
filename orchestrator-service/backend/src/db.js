@@ -4,7 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ROLE_FLOW, fastForwardHiddenRoles } from './rolePipeline.js';
-import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK } from './roleEngine.js';
+import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict } from './roleEngine.js';
 import { buildRoute, resolveTransition, forwardFrom, routeIsUsable, TERMINAL_STATUSES } from './projectRoute.js';
 import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey } from './graphRoute.js';
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
@@ -643,15 +643,20 @@ export async function moveTaskTx(c, taskId, input) {
 /**
  * TASK-RESTART-001 — массовый перезапуск зависших задач из раздела «Задачи».
  * Зависшие = с проектом, НЕ терминальные (DONE/CANCELLED/FAILED), НЕ ждущие
- * подзадачи (WAITING_FOR_CHILDREN), НЕ уже на перезапуске (RESTART) и «не в работе»
- * (свободный слот assigned_agent_id IS NULL). Подзадачи учитываются наравне с
- * верхним уровнем. Каждая такая задача возвращается Приёмщику задач в статусе
- * RESTART (current_role_id = TASK_INTAKE_OFFICER, current_stage_key = вход проекта),
- * под которым claimLlmRoleTask забирает её безусловно. Публичная обёртка над Tx.
+ * подзадачи (WAITING_FOR_CHILDREN) и «не в работе» (свободный слот
+ * assigned_agent_id IS NULL). Подзадачи учитываются наравне с верхним уровнем.
+ *
+ * RESTART-IN-PLACE: задача перезапускается НА ТЕКУЩЕМ ЭТАПЕ — current_role_id и
+ * current_stage_key НЕ меняются, задача НЕ перебрасывается на Приёмщика. Раньше
+ * restart-stuck возвращал всё в статус RESTART под TASK_INTAKE_OFFICER, и задачи
+ * «улетали» со своих этапов на вход проекта, теряя прогресс. Со свободным слотом
+ * задача и так переигрывается своей же ролью (claimLlmRoleTask выбирает по
+ * current_role_id + status, не по прошлым прогонам; CODING ждёт programmer-runner),
+ * поэтому достаточно отпустить зависшие захваты — переноса на другой этап не нужно.
  *
  * Перед выборкой освобождаем осиротевшие/просроченные захваты (resetStaleClaims):
- * зависшая сессия отпускает слот, и её задача попадает в перезапуск как «не в работе»,
- * а реально активные задачи сохраняют назначение и не трогаются.
+ * зависшая сессия отпускает слот → её задача переигрывается на текущем этапе, а
+ * реально активные задачи сохраняют назначение и не трогаются.
  */
 export async function restartStuckTasks(s) {
   return withClient(clientConfig(s), (c) => restartStuckTasksTx(c));
@@ -661,42 +666,29 @@ export async function restartStuckTasksTx(c) {
   await resetStaleClaims(c);
   await c.query('BEGIN');
   try {
-    // Проекты, у которых есть зависшие задачи (вход проекта вычисляем по проекту).
-    const projects = await c.query(
-      `SELECT DISTINCT project_id FROM tasks
-        WHERE project_id IS NOT NULL
-          AND assigned_agent_id IS NULL
-          AND status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','RESTART')`,
+    // Перезапуск на текущем этапе: статус/роль/стадия не меняются. Пишем
+    // диагностическое событие (to_status = from_status) и трогаем updated_at,
+    // чтобы зафиксировать намерение «переиграть здесь же».
+    const upd = await c.query(
+      `WITH targets AS (
+         SELECT id, status::text AS from_status, current_role_id FROM tasks
+          WHERE project_id IS NOT NULL
+            AND assigned_agent_id IS NULL
+            AND status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
+       ), upd AS (
+         UPDATE tasks t SET updated_at = now()
+           FROM targets WHERE t.id = targets.id
+         RETURNING t.id
+       )
+       INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       SELECT targets.id, 'TASK_UPDATED', targets.from_status::task_status, targets.from_status::task_status,
+              targets.current_role_id,
+              jsonb_build_object('source', 'manual-restart', 'reason', 'restart_in_place')
+         FROM targets
+       RETURNING task_id`,
     );
-    let restarted = 0;
-    for (const row of projects.rows) {
-      const { role, entryStageKey } = await computeEntry(c, row.project_id);
-      if (!role?.id) continue; // нет роли входа (Приёмщика) — пропускаем проект
-      const upd = await c.query(
-        `WITH targets AS (
-           SELECT id, status::text AS from_status FROM tasks
-            WHERE project_id = $1
-              AND assigned_agent_id IS NULL
-              AND status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','RESTART')
-         ), upd AS (
-           UPDATE tasks t
-              SET status = 'RESTART', current_role_id = $2,
-                  current_stage_key = $3::uuid, assigned_agent_id = NULL, updated_at = now()
-             FROM targets WHERE t.id = targets.id
-           RETURNING t.id
-         )
-         INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
-         SELECT targets.id, 'TASK_UPDATED', targets.from_status::task_status, 'RESTART'::task_status, $2,
-                jsonb_build_object('source', 'manual-restart', 'reason', 'restart_stuck',
-                                   'nextRole', 'TASK_INTAKE_OFFICER')
-           FROM targets
-         RETURNING task_id`,
-        [row.project_id, role.id, entryStageKey],
-      );
-      restarted += upd.rowCount;
-    }
     await c.query('COMMIT');
-    return { restarted };
+    return { restarted: upd.rowCount };
   } catch (error) {
     await c.query('ROLLBACK');
     throw error;
@@ -875,10 +867,17 @@ async function requireService(c, projectId, serviceCode) {
  * FOR UPDATE SKIP LOCKED исключает выдачу одной задачи двум фидерам.
  * Возвращает { task: {...} } для записи в claude-tasks.json или { task: null }.
  */
+// Ключ транзакционного advisory-lock для claim'а PROGRAMMER. Сериализует заявки
+// между параллельными воркерами, чтобы условие «один активный CODING на сервис»
+// (NOT EXISTS ниже) проверялось по уже зафиксированным назначениям, а не в гонке
+// (иначе N воркеров одновременно проходят проверку и хватают ОДИН сервис).
+const CLAUDE_CLAIM_LOCK_KEY = 911_017;
+
 export async function claimNextClaudeTask(s) {
   return withClient(clientConfig(s), async (c) => {
     await c.query('BEGIN');
     try {
+      await c.query('SELECT pg_advisory_xact_lock($1)', [CLAUDE_CLAIM_LOCK_KEY]);
       const picked = await c.query(
         `WITH picked AS (
            SELECT t.id
@@ -891,6 +890,18 @@ export async function claimNextClaudeTask(s) {
              AND t.assigned_agent_id IS NULL
              AND t.service_id IS NOT NULL
              AND p.status <> 'paused'
+             -- PROGRAMMER-WORKTREE-PER-SERVICE: не более одной активной CODING-
+             -- задачи на микросервис (один worktree на сервис). Если у сервиса уже
+             -- есть назначенная задача — пропускаем его, чтобы воркеры разбирали
+             -- РАЗНЫЕ сервисы параллельно, а не толпились на одном (иначе они
+             -- сериализуются на сервис-локе runner'а и параллелизм теряется).
+             AND NOT EXISTS (
+               SELECT 1 FROM tasks t2
+                WHERE t2.project_id = t.project_id
+                  AND t2.service_id = t.service_id
+                  AND t2.status = 'CODING'
+                  AND t2.assigned_agent_id IS NOT NULL
+             )
            ORDER BY t.priority DESC, t.created_at
            FOR UPDATE OF t SKIP LOCKED
            LIMIT 1
@@ -1290,6 +1301,207 @@ export async function releaseHostTask(s, taskId) {
   });
 }
 
+// --- ROLE-ENGINE-ROUTING-001: generic-мост рассуждающих ролей на хостовые драйверы
+//
+// Рассуждающие роли (Приёмщик/Архитектор/Декомпозитор и пр.), назначенные в
+// настройках внешнему движку ('codex' или 'claude_code'), исполняет соответствующий
+// хостовый драйвер: оркестратор в Linux-контейнере не может запустить локальный
+// `codex`/`claude` и не видит их подписки. Контракт ЕДИН для обоих движков (claim
+// возвращает роль+готовый промпт+схему; драйвер «тупой»): меняется лишь локальный
+// агент, который гоняет драйвер. LLM-вызов делается внешне, а ВЕСЬ разбор вердикта
+// и переход остаются в оркестраторе (applyReasoningVerdict) — поведение ролей не
+// меняется, заменяется только источник вердикта (DeepSeek-коннектор → Codex/Claude).
+
+// GET /api/runner/next-reasoning-task?engine=codex|claude_code[&role=CODE] —
+// захватить одну задачу роли, назначенной ЭТОМУ движку, и вернуть ГОТОВЫЙ промпт +
+// JSON-схему вердикта. Раннер «тупой»: сборка промпта и схема остаются здесь.
+// Возвращает { task: null }, если брать нечего или движок/роль не сходятся.
+export async function claimNextReasoningTask(s, engineParam = null, roleParam = null) {
+  const engine = String(engineParam ?? '').trim().toLowerCase();
+  const role = String(roleParam ?? '').trim() || null;
+  return withClient(clientConfig(s), async (c) => {
+    if (!EXTERNAL_ENGINES.has(engine)) return { task: null };
+    const engines = await getRoleEngines(c);
+    const mine = rolesForEngine(engines, engine);
+    if (mine.length === 0) return { task: null };
+    if (role && !mine.includes(role)) return { task: null };
+
+    // claimLlmRoleTask делает свой BEGIN/COMMIT и создаёт agent_run RUNNING +
+    // assigned_agent_id — захват защищён от внутреннего цикла и ловится реапером
+    // (resetStaleClaims) по таймауту, если драйвер умрёт, не сдав результат.
+    let claimed = null;
+    const order = role ? [role] : mine;
+    for (const rc of order) {
+      claimed = await claimLlmRoleTask(c, rc);
+      if (claimed) break;
+    }
+    if (!claimed) return { task: null };
+
+    // Входной гейт полей (ROLE-FIELD-CONTRACT-001) — как в processClaimedRole:
+    // нет обязательного входящего поля → BLOCKED, задачу Codex не отдаём.
+    const contract = await loadRoleContract(c, claimed.role_code);
+    const card = claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {};
+    const missingIn = missingRequiredInputs(card, contract.inputs);
+    if (missingIn.length) {
+      await blockClaimedForFields(c, claimed, missingIn);
+      return { task: null, blocked: { taskId: claimed.id, reason: 'missing_required_inputs', fields: missingIn } };
+    }
+
+    const context = await buildRoleContext(c, claimed);
+    const { composeRoleSystemPrompt } = await import('./roles.js');
+    const systemPrompt = await composeRoleSystemPrompt(c, claimed.role_code);
+    const userPrompt = buildUserPayload(claimed.role_code, context, contract.outputs);
+    const outputSchema = buildVerdictJsonSchema(contract.outputs);
+
+    return {
+      task: {
+        id: claimed.id,
+        engine,
+        role: claimed.role_code,
+        title: claimed.title,
+        projectId: claimed.project_id,
+        project: context.project,
+        // Реальный корень проекта: драйвер запускает агента с этим cwd, и тот сам
+        // читает файлы (свой агентный tool-loop вместо tools-service).
+        projectPath: context.projectPath,
+        docsPath: context.docsPath,
+        agentRunId: claimed.agentRunId,
+        systemPrompt,
+        userPrompt,
+        outputSchema,
+      },
+    };
+  });
+}
+
+// POST /api/runner/reasoning-completed — принять вердикт от codex-runner и сделать
+// переход тем же путём, что и внутренний DeepSeek (applyReasoningVerdict). Маршрутные
+// данные перечитываем на сервере по taskId (раннеру не доверяем). Идемпотентно:
+// если задача терминальна или RUNNING-прогона нет (реапер/повтор) — duplicate.
+export async function completeReasoningTask(s, input) {
+  return withClient(clientConfig(s), (c) => completeReasoningTaskTx(c, input));
+}
+
+export async function completeReasoningTaskTx(c, input) {
+  const taskId = String(input?.taskId ?? '').trim();
+  if (!taskId) throw scannerError(422, 'taskId_required');
+
+  const found = await c.query(
+    `SELECT t.id, t.title, t.description, t.status::text AS status, t.project_id,
+            t.data_card, t.current_stage_key,
+            r.code AS role_code, r.id AS role_id,
+            ar.id AS agent_run_id, ar.agent_id
+       FROM tasks t
+       LEFT JOIN roles r ON r.id = t.current_role_id
+       LEFT JOIN agent_runs ar ON ar.task_id = t.id AND ar.status = 'RUNNING'
+      WHERE t.id = $1`,
+    [taskId],
+  );
+  if (!found.rowCount) throw scannerError(404, 'task_not_found');
+  const row = found.rows[0];
+  if (TERMINAL_TASK_STATUSES.has(row.status)) {
+    return { accepted: true, duplicate: true, taskId, toStatus: row.status, nextRole: null };
+  }
+  // Нет RUNNING-прогона — захват уже снят/финализирован (реапер, двойная сдача).
+  if (!row.agent_run_id) {
+    return { accepted: true, duplicate: true, taskId, toStatus: row.status, nextRole: null };
+  }
+  const engines = await getRoleEngines(c);
+  if (!EXTERNAL_ENGINES.has(engines[row.role_code])) throw scannerError(409, 'role_not_delegated_to_engine');
+
+  // reworkCount — как в claimLlmRoleTask (сколько раз задача возвращалась с анализа).
+  const rc = await c.query(
+    `SELECT count(*)::int AS n FROM task_events WHERE task_id = $1 AND from_status = 'FAILURE_ANALYSIS'`,
+    [taskId],
+  );
+  const claimed = {
+    id: row.id,
+    title: row.title,
+    description: row.description ?? '',
+    status: row.status,
+    project_id: row.project_id,
+    data_card: row.data_card,
+    current_stage_key: row.current_stage_key,
+    role_code: row.role_code,
+    role_id: row.role_id,
+    agentId: row.agent_id,
+    agentRunId: row.agent_run_id,
+    reworkCount: rc.rows[0].n,
+  };
+
+  // Вердикт: codex с --output-schema отдаёт валидный JSON-объект; принимаем либо
+  // распарсенный объект (verdict), либо сырой текст (response, парсим толерантно).
+  const text = typeof input?.response === 'string' && input.response.trim()
+    ? input.response
+    : (input?.verdict != null ? JSON.stringify(input.verdict) : '');
+  const parsed = input?.verdict && typeof input.verdict === 'object' && !Array.isArray(input.verdict)
+    ? input.verdict
+    : parseVerdict(text);
+
+  // Журнал обмена для UI «Промпты» (внешний движок без коннектора → connector_id
+  // NULL). Необязателен — не валим сдачу, если запись не удалась.
+  let exchangeId = null;
+  try {
+    const ins = await c.query(
+      `INSERT INTO prompt_exchanges (connector_id, consumer_service, prompt, response, status, http_status, duration_ms, is_manual)
+       VALUES (NULL, $1, $2, $3, 'завершен', NULL, $4, false) RETURNING id`,
+      [
+        `${engines[row.role_code]}:${row.role_code}`,
+        String(input?.promptText ?? '').slice(0, 100000),
+        text,
+        Number.isFinite(Number(input?.durationMs)) ? Number(input.durationMs) : null,
+      ],
+    );
+    exchangeId = ins.rows[0].id;
+  } catch { /* журнал необязателен */ }
+
+  // SILENT-FAIL-GUARD-001: вердикт не распознан → FAILED (как DeepSeek-путь).
+  if (parsed === null) {
+    await failRoleUnparsed(c, claimed, { response: text, exchangeId });
+    return { accepted: true, taskId, toStatus: 'FAILED', reason: 'verdict_unparsed' };
+  }
+
+  const verdict = normalizeVerdict(row.role_code, parsed);
+  const route = await loadProjectRoute(c, row.project_id);
+  const contract = await loadRoleContract(c, row.role_code);
+  const res = await applyReasoningVerdict(c, claimed, {
+    route,
+    contract,
+    verdict,
+    response: text,
+    exchangeId,
+    durationMs: Number.isFinite(Number(input?.durationMs)) ? Number(input.durationMs) : null,
+  });
+  return {
+    accepted: true,
+    duplicate: false,
+    taskId,
+    toStatus: res?.toStatus ?? null,
+    nextRole: res?.nextRole ?? null,
+    verdict: verdict.status,
+  };
+}
+
+// POST /api/runner/release-reasoning-task — откат захвата (codex-runner не смог
+// выполнить задачу): снять назначение, agent_run RUNNING → CANCELLED. Задача
+// переигрывается штатно (тот же codex-мост заберёт её снова).
+export async function releaseReasoningTask(s, taskId) {
+  const id = String(taskId ?? '').trim();
+  if (!id) throw scannerError(422, 'taskId_required');
+  return withClient(clientConfig(s), async (c) => {
+    await c.query(
+      `UPDATE agent_runs SET status = 'CANCELLED', finished_at = now() WHERE task_id = $1 AND status = 'RUNNING'`,
+      [id],
+    );
+    const r = await c.query(
+      `UPDATE tasks SET assigned_agent_id = NULL
+        WHERE id = $1 AND assigned_agent_id IS NOT NULL AND status NOT IN ('DONE','CANCELLED') RETURNING id`,
+      [id],
+    );
+    return { released: r.rowCount > 0, taskId: id };
+  });
+}
+
 // Пары (роль, статус) только для ИИ-ролей: их продвигает runner через вызов
 // модели. PIPELINE_SERVICE/GIT_INTEGRATOR исключены — их ведёт host-мост.
 const LLM_FLOW_PAIRS = LLM_ROLE_CODES.flatMap((code) =>
@@ -1482,6 +1694,13 @@ export async function advanceAutomatedTasks(s, opts = {}) {
   // Здесь же планируем, сколько свободных слотов осталось по каждой роли.
   const slots = await withClient(clientConfig(s), async (c) => {
     await resetStaleClaims(c);
+    // RUNNER-RUNTIME-REAP-001: помимо просроченных захватов, на каждом тике гасим
+    // осиротевшие RUNNING-прогоны рассуждающих ролей старше таймаута. Свежие сироты
+    // возникают в рантайме при обрыве соединения с БД (pgbouncer/Patroni) — их
+    // финализация рвётся, и они держат слот роли до 30-минутного таймаута, заклинивая
+    // очередь. ageCheck=true: возраст проверяется по RUNNER_ROLE_TIMEOUT_MS с
+    // clockGuard, поэтому реально идущие прогоны не гасятся раньше срока.
+    await reapOrphanRunningRuns(c, { ageCheck: true });
     // Пропускаемые роли (ROLE-GROUPS-001 / per-project) прокручиваются до первой
     // активной роли ДО любого claim — за пропущенные роли не создаётся agent/host run.
     await advanceSkippedStageRoles(c);
@@ -1489,7 +1708,13 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // дети попадали в очередь, а родитель не клеймился на gate-узле.
     await advanceForkNodes(c);
     await advanceJoinNodes(c);
-    return computeRoleFreeSlots(c, cap);
+    // ROLE-ENGINE-ROUTING-001: роли, делегированные внешнему движку (codex/
+    // claude_code), внутренний DeepSeek-цикл НЕ исполняет — их захватывает
+    // соответствующий хостовый драйвер через /api/runner/next-reasoning-task.
+    // Иначе движки конкурировали бы за одни и те же задачи.
+    const external = new Set(externalRoles(await getRoleEngines(c)));
+    const internalRoles = LLM_ROLE_CODES.filter((r) => !external.has(r));
+    return computeRoleFreeSlots(c, cap, internalRoles);
   });
 
   // По одному воркеру на каждый свободный слот роли. Каждый claim+process идёт в
@@ -1514,7 +1739,8 @@ export async function advanceAutomatedTasks(s, opts = {}) {
 // RUNNER-CONCURRENCY-001: сколько новых воркеров запускать по каждой ИИ-роли в
 // этом тике. free = min(ожидающие задачи, cap − уже в работе). Считаем по всем
 // видимым ролям активных проектов одним запросом; роли без ожидающих опускаем.
-async function computeRoleFreeSlots(c, cap) {
+async function computeRoleFreeSlots(c, cap, roleCodes = LLM_ROLE_CODES) {
+  if (!roleCodes || roleCodes.length === 0) return new Map();
   const r = await c.query(
     `SELECT r.code AS role_code,
             count(*) FILTER (WHERE t.assigned_agent_id IS NOT NULL)::int AS inflight,
@@ -1527,7 +1753,7 @@ async function computeRoleFreeSlots(c, cap) {
         AND p.status <> 'paused'
         AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
       GROUP BY r.code`,
-    [LLM_ROLE_CODES],
+    [roleCodes],
   );
   const slots = new Map();
   for (const row of r.rows) {
@@ -1555,6 +1781,35 @@ export async function getMaxConcurrencyPerRole(s) {
     const n = Math.floor(Number(v));
     return Number.isFinite(n) && n >= 1 ? n : 3;
   });
+}
+
+// ROLE-ENGINE-ROUTING-001: карта «рассуждающая роль → движок» из настроек
+// (app_settings.role_engines — JSON-объект). Движки: 'deepseek' (внутренний,
+// дефолт при отсутствии записи), 'codex', 'claude_code' (хостовые драйверы).
+// Возвращаем только валидные записи для известных рассуждающих ролей.
+const EXTERNAL_ENGINES = new Set(['codex', 'claude_code']);
+async function getRoleEngines(c) {
+  const raw = await readAppSetting(c, 'role_engines', {});
+  const src = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const allowed = new Set(LLM_ROLE_CODES);
+  const out = {};
+  for (const [role, engine] of Object.entries(src)) {
+    const r = String(role).trim().toUpperCase();
+    const e = String(engine).trim().toLowerCase();
+    if (allowed.has(r) && (e === 'codex' || e === 'claude_code' || e === 'deepseek')) out[r] = e;
+  }
+  return out;
+}
+
+// Роли, делегированные ВНЕШНЕМУ движку (codex/claude_code): их не исполняет
+// внутренний DeepSeek-цикл, а захватывает соответствующий хостовый драйвер.
+function externalRoles(engines) {
+  return Object.entries(engines).filter(([, e]) => EXTERNAL_ENGINES.has(e)).map(([r]) => r);
+}
+
+// Роли, назначенные конкретному внешнему движку (для claim хостовым драйвером).
+function rolesForEngine(engines, engine) {
+  return Object.entries(engines).filter(([, e]) => e === engine).map(([r]) => r);
 }
 
 /**
@@ -1908,25 +2163,51 @@ async function releaseStaleClaudeClaims(c, timeoutMs = CLAUDE_ASSIGN_TIMEOUT_MS,
   return r.rowCount;
 }
 
-// RUNNER-STARTUP-REAP-001: при запуске процесса любой agent_run в статусе RUNNING
-// заведомо осиротел — горутина-исполнитель прошлого процесса умерла вместе с ним,
-// довести вызов до конца некому. Без немедленной зачистки такие прогоны держат
-// слоты «N на роль» вплоть до 15-минутного resetStaleClaims, и после каждого
-// перезапуска очередь рассуждающих ролей стоит ~15 минут. Гасим их сразу
-// (TIMEOUT, слот свободен), задача переигрывается штатно.
-async function reapOrphanRunningRuns(c) {
+// RUNNER-STARTUP-REAP-001 / RUNNER-RUNTIME-REAP-001: agent_run в статусе RUNNING,
+// исполнитель которого умер, держит слот «N на роль» до таймаута resetStaleClaims.
+// Два сценария осиротения:
+//   1) Перезапуск процесса (ageCheck=false): горутина-исполнитель прошлого процесса
+//      умерла вместе с ним — ЛЮБОЙ RUNNING заведомо осиротел, гасим безусловно.
+//      Полный рестарт означает, что активных вызовов «в полёте» нет.
+//   2) Рантайм (ageCheck=true): после рестарта БД/обрыва соединения (pgbouncer/
+//      Patroni) LLM-вызов/финализацию прогона рвёт, и он повисает в RUNNING уже во
+//      время работы процесса. Стартовая зачистка такие свежие сироты не ловит; до
+//      этого фикса их освобождал только resetStaleClaims на таймауте (~30 минут в
+//      проде), из-за чего очередь роли (max_concurrency_per_role) клинило. Здесь
+//      гасим их на КАЖДОМ тике runner'а, но НЕ безусловно: только прогоны старше
+//      RUNNER_ROLE_TIMEOUT_MS, иначе убьём реально идущий вызов. Перед проверкой
+//      возраста компенсируем скачок настенных часов БД (reconcileClockSkew, как в
+//      resetStaleClaims), чтобы прогоны «в полёте» не получили ложный TIMEOUT.
+// В обоих случаях: agent_run → TIMEOUT, у нетерминальной задачи снимается
+// assigned_agent_id (слот свободен), задача переигрывается штатно.
+export async function reapOrphanRunningRuns(c, { ageCheck = false } = {}) {
+  const reason = ageCheck ? 'orphan_run_timeout' : 'orchestrator_restart_reconcile';
+  const errText = ageCheck
+    ? 'RUNNING run exceeded role timeout without finishing (orphaned mid-run, e.g. DB connection drop); reaped as TIMEOUT'
+    : 'orchestrator restarted while run was RUNNING; run was reaped as TIMEOUT';
+  // В рантайме перед сравнением возраста компенсируем возможный скачок часов БД,
+  // иначе все RUNNING разом окажутся «старше таймаута» и будут погашены ложно.
+  if (ageCheck) {
+    await reconcileClockSkew(c, { log: (m) => console.log(m) });
+  }
+  const params = [errText, reason];
+  let agePredicate = '';
+  if (ageCheck) {
+    params.push(ROLE_TIMEOUT_MS);
+    agePredicate = `AND ar.started_at < now() - ($${params.length}::bigint * interval '1 millisecond')`;
+  }
   const r = await c.query(
     `WITH stale AS (
        SELECT ar.id, ar.task_id, ar.role_id, t.status::text AS task_status
          FROM agent_runs ar
          JOIN tasks t ON t.id = ar.task_id
-        WHERE ar.status = 'RUNNING'
+        WHERE ar.status = 'RUNNING' ${agePredicate}
      ), done AS (
        UPDATE agent_runs
           SET status = 'TIMEOUT',
               finished_at = now(),
-              error_text = 'orchestrator restarted while run was RUNNING; run was reaped as TIMEOUT',
-              output_json = jsonb_build_object('status', 'TIMEOUT', 'reason', 'orchestrator_restart_reconcile')
+              error_text = $1::text,
+              output_json = jsonb_build_object('status', 'TIMEOUT', 'reason', $2::text)
         WHERE id IN (SELECT id FROM stale)
         RETURNING task_id
      ), freed AS (
@@ -1936,9 +2217,10 @@ async function reapOrphanRunningRuns(c) {
      )
      INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
      SELECT s.task_id, 'STATUS_CHANGED', s.task_status::task_status, s.task_status::task_status, s.role_id,
-            jsonb_build_object('runner', true, 'reason', 'orchestrator_restart_reconcile', 'runStatus', 'TIMEOUT')
+            jsonb_build_object('runner', true, 'reason', $2::text, 'runStatus', 'TIMEOUT')
        FROM stale s
        JOIN freed f ON f.id = s.task_id`,
+    params,
   );
   return r.rowCount;
 }
@@ -2157,8 +2439,24 @@ async function processClaimedRole(c, claimed) {
     return failRoleUnparsed(c, claimed, result);
   }
 
-  const { values: cardValues, missingRequired: missingOut } = extractOutputs(result.verdict.fields, contract.outputs);
-  let decision = decideOutcome(claimed.role_code, result.verdict, {
+  return applyReasoningVerdict(c, claimed, {
+    route,
+    contract,
+    verdict: result.verdict,
+    response: result.response,
+    exchangeId: result.exchangeId,
+    durationMs: result.durationMs,
+  });
+}
+
+// Хвост рассуждающей роли: распознанный вердикт → выходной гейт полей → решение
+// перехода (абстрактный исход + маршрут проекта) → финализация. Вынесен из
+// processClaimedRole, чтобы codex-мост (CODEX-REASONING-001) переиспользовал ту же
+// логику переходов, что и внутренний DeepSeek-путь — отличается только источник
+// вердикта (внешний `codex exec` против сетевого вызова коннектора).
+async function applyReasoningVerdict(c, claimed, { route, contract, verdict, response, exchangeId, durationMs }) {
+  const { values: cardValues, missingRequired: missingOut } = extractOutputs(verdict.fields, contract.outputs);
+  let decision = decideOutcome(claimed.role_code, verdict, {
     reworkCount: claimed.reworkCount,
     maxRework: MAX_REWORK,
   });
@@ -2170,7 +2468,7 @@ async function processClaimedRole(c, claimed) {
   const resolved = claimed.current_stage_key
     ? await resolveGraphTransition(c, claimed, decision)
     : resolveTransition(route, claimed.role_code, decision);
-  return finalizeRole(c, claimed, { ...result, decision, resolved, cardValues });
+  return finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues });
 }
 
 // Применить переход роли по вердикту в отдельной транзакции.
