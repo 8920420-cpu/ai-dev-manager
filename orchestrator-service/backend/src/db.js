@@ -10,6 +10,7 @@ import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey } from './graphRoute
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
 import { buildPipelineClaimContract } from './pipelineDispatch.js';
 import { reconcileClockSkew } from './clockGuard.js';
+import { isDbConnectionError, noteDbConnectionFailure, claimGraceActive } from './bootClaimGuard.js';
 
 const { Client } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1717,6 +1718,14 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     return computeRoleFreeSlots(c, cap, internalRoles);
   });
 
+  // ORCH-BOOT-CLAIM-GRACE-001 (проактивная часть): если недавно ловили обрыв
+  // соединения с БД, придерживаем НОВЫЕ claim'ы на короткое окно. Предшаги выше
+  // (реконсиляция часов, реап осиротевших RUNNING, fork/join) уже отработали и
+  // расчищают залипшие прогоны — а новые claim'ы во время нестабильной БД только
+  // плодили бы новых сирот (claim прошёл, финализация порвалась). opts.now —
+  // монотонные мс (undefined в проде → текущее, заданное число — в тестах).
+  if (claimGraceActive(opts.now)) return [];
+
   // По одному воркеру на каждый свободный слот роли. Каждый claim+process идёт в
   // СВОЁМ соединении и транзакции — задачи разных (и одной) ролей обрабатываются
   // параллельно. Двойной захват исключён FOR UPDATE SKIP LOCKED в claimLlmRoleTask.
@@ -1730,7 +1739,16 @@ export async function advanceAutomatedTasks(s, opts = {}) {
         const claimed = await claimLlmRoleTask(c, roleCode);
         if (!claimed) return null;
         return processClaimedRole(c, claimed);
-      }).catch(() => null),
+      }).catch((error) => {
+        // ORCH-BOOT-CLAIM-GRACE-001 (реактивная часть): обрыв СОЕДИНЕНИЯ именно в
+        // claim/process — главный источник осиротевших RUNNING-прогонов (claim
+        // создан, но финализация порвалась). Фиксируем шторм, чтобы ближайшие тики
+        // придержали новые claim'ы, пока БД не стабилизируется, и не плодили новых
+        // сирот. Сама ошибка по-прежнему гасится (тик неуспешен по этому слоту, но
+        // остальные слоты и предшаги продолжают работать).
+        if (isDbConnectionError(error)) noteDbConnectionFailure(opts.now);
+        return null;
+      }),
     ),
   );
   return results.filter(Boolean);
