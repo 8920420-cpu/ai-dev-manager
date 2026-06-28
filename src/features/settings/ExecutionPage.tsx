@@ -3,28 +3,10 @@ import { Button, Callout, Input, LoadingBlock, PageHeader, Section, Select, useT
 import { appSettingsApi, type AppSettings, type RoleEngine } from '../../api/appSettingsApi';
 import { ClaudeConnectionSection } from './ClaudeConnectionSection';
 import { AuditSection } from './AuditSection';
+import { ENGINE_OPTIONS, REASONING_ROLES } from './roleEngines';
 import styles from './settings.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
-
-// ROLE-ENGINE-ROUTING-001: рассуждающие роли, которым можно назначить движок, и
-// варианты движков. Программист (CODING) — отдельный конвейер Claude Code, здесь
-// не настраивается.
-const REASONING_ROLES: ReadonlyArray<{ code: string; label: string }> = [
-  { code: 'TASK_INTAKE_OFFICER', label: 'Приёмщик задач' },
-  { code: 'ARCHITECT', label: 'Архитектор' },
-  { code: 'DECOMPOSER', label: 'Декомпозитор' },
-  { code: 'TASK_REVIEWER', label: 'Ревьюер' },
-  { code: 'FAILURE_ANALYST', label: 'Аналитик провалов' },
-  { code: 'DOCUMENTATION_AUDITOR', label: 'Аудитор документации' },
-  { code: 'DOCUMENTATION_KEEPER', label: 'Хранитель документации' },
-];
-
-const ENGINE_OPTIONS: ReadonlyArray<{ value: RoleEngine; label: string }> = [
-  { value: 'deepseek', label: 'DeepSeek (внутренний)' },
-  { value: 'codex', label: 'Codex' },
-  { value: 'claude_code', label: 'Claude Code' },
-];
 
 // Карта движков по ролям сравнима поверхностно: ключ есть только у не-deepseek.
 function sameEngines(a: Record<string, RoleEngine>, b: Record<string, RoleEngine>): boolean {

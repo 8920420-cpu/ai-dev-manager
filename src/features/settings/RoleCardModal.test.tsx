@@ -43,6 +43,15 @@ vi.mock('../../api/roleConnectionsApi', () => ({
   },
 }));
 
+const asGet = vi.fn();
+const asSave = vi.fn();
+vi.mock('../../api/appSettingsApi', () => ({
+  appSettingsApi: {
+    get: (...a: unknown[]) => asGet(...a),
+    save: (...a: unknown[]) => asSave(...a),
+  },
+}));
+
 const GROUPS: RoleGroup[] = [
   { id: 'g1', name: 'Разработка', sortOrder: 10 },
   { id: 'g2', name: 'Контроль качества', sortOrder: 20 },
@@ -82,6 +91,18 @@ beforeEach(() => {
   rcList.mockResolvedValue([]);
   rcSaveAll.mockReset();
   rcSaveAll.mockResolvedValue([]);
+  asGet.mockReset();
+  asGet.mockResolvedValue({
+    maxConcurrencyPerRole: 3,
+    programmerConcurrency: 3,
+    roleEngines: { ARCHITECT: 'codex', DECOMPOSER: 'codex' },
+  });
+  asSave.mockReset();
+  asSave.mockResolvedValue({
+    maxConcurrencyPerRole: 3,
+    programmerConcurrency: 3,
+    roleEngines: { ARCHITECT: 'claude_code', DECOMPOSER: 'codex' },
+  });
   listSkills.mockResolvedValue([
     { id: 'a.md', name: 'a.md' },
     { id: 'b.md', name: 'b.md' },
@@ -175,6 +196,55 @@ describe('RoleCardModal — карточка роли', () => {
 
     await waitFor(() => expect(update).toHaveBeenCalled());
     expect(rcSaveAll).not.toHaveBeenCalled();
+  });
+
+  const ARCHITECT: RoleCard = {
+    code: 'ARCHITECT',
+    name: 'Архитектор',
+    description: 'Проектирует',
+    prompt: 'p',
+    groupId: 'g1',
+    skills: [],
+  };
+
+  it('для рассуждающей роли показывает движок из app-settings', async () => {
+    renderModal(ARCHITECT);
+    const sel = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
+    await waitFor(() => expect(sel.value).toBe('codex'));
+  });
+
+  it('не показывает движок для не-рассуждающей роли (PROGRAMMER)', async () => {
+    renderModal();
+    await waitFor(() => expect(intgList).toHaveBeenCalled());
+    expect(screen.queryByLabelText(/Движок \(исполнитель роли\)/i)).not.toBeInTheDocument();
+    expect(asGet).not.toHaveBeenCalled();
+  });
+
+  it('сохраняет движок роли полной картой role_engines (прочие роли не затёрты)', async () => {
+    const user = userEvent.setup();
+    update.mockResolvedValue(ARCHITECT);
+    renderModal(ARCHITECT);
+    const sel = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
+    await waitFor(() => expect(sel.value).toBe('codex'));
+
+    await user.selectOptions(sel, 'claude_code');
+    await user.click(screen.getByRole('button', { name: /^Сохранить$/i }));
+
+    await waitFor(() => expect(asSave).toHaveBeenCalled());
+    const [patch] = asSave.mock.calls[0]!;
+    expect(patch).toEqual({ roleEngines: { ARCHITECT: 'claude_code', DECOMPOSER: 'codex' } });
+  });
+
+  it('не дёргает app-settings, если движок не менялся', async () => {
+    const user = userEvent.setup();
+    update.mockResolvedValue(ARCHITECT);
+    renderModal(ARCHITECT);
+    await waitFor(() => expect(asGet).toHaveBeenCalled());
+
+    await user.click(screen.getByRole('button', { name: /^Сохранить$/i }));
+
+    await waitFor(() => expect(update).toHaveBeenCalled());
+    expect(asSave).not.toHaveBeenCalled();
   });
 
   it('не закрывается по Escape (правило проекта)', async () => {

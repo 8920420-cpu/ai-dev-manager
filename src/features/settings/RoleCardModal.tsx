@@ -16,6 +16,8 @@ import { rolesApi } from '../../api/rolesApi';
 import { toolsApi } from '../../api/toolsApi';
 import { integrationsApi } from '../../api/integrationsApi';
 import { roleConnectionsApi } from '../../api/roleConnectionsApi';
+import { appSettingsApi, type RoleEngine } from '../../api/appSettingsApi';
+import { ENGINE_OPTIONS, isReasoningRole } from './roleEngines';
 import {
   TOOL_CAPABILITIES,
   TOOL_CAPABILITY_LABEL,
@@ -67,6 +69,15 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
   const [integrationId, setIntegrationId] = useState<string>('');
   const loadedIntegration = useRef<string>('');
 
+  // ROLE-ENGINE-ROUTING-001: движок-исполнитель рассуждающей роли. Тот же источник
+  // истины, что и матрица «Движок по ролям» (Настройки→Выполнение) —
+  // app_settings.role_engines. Храним всю карту, чтобы при сохранении одной роли
+  // не затереть назначения остальных (PUT заменяет весь объект role_engines).
+  const canPickEngine = role ? isReasoningRole(role.code) : false;
+  const [roleEngine, setRoleEngineState] = useState<RoleEngine>('deepseek');
+  const allRoleEngines = useRef<Record<string, RoleEngine>>({});
+  const loadedEngine = useRef<RoleEngine>('deepseek');
+
   const [available, setAvailable] = useState<SkillFile[]>([]);
   const [loadingSkills, setLoadingSkills] = useState(false);
   const [skillsError, setSkillsError] = useState(false);
@@ -94,6 +105,9 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
     setFieldsOpen(false);
     setIntegrationId('');
     loadedIntegration.current = '';
+    setRoleEngineState('deepseek');
+    allRoleEngines.current = {};
+    loadedEngine.current = 'deepseek';
 
     const ctrl = new AbortController();
     setLoadingSkills(true);
@@ -143,6 +157,23 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
         /* интеграции недоступны — карточка остаётся рабочей без них */
       });
 
+    // Движок роли (только для рассуждающих) — из общей карты app_settings.
+    if (isReasoningRole(role.code)) {
+      appSettingsApi
+        .get(ctrl.signal)
+        .then((s) => {
+          if (ctrl.signal.aborted) return;
+          const map = s.roleEngines ?? {};
+          allRoleEngines.current = map;
+          const engine = map[role.code] ?? 'deepseek';
+          setRoleEngineState(engine);
+          loadedEngine.current = engine;
+        })
+        .catch(() => {
+          /* настройки недоступны — карточка остаётся рабочей без выбора движка */
+        });
+    }
+
     return () => ctrl.abort();
   }, [open, role]);
 
@@ -155,9 +186,10 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
       JSON.stringify(skills) !== JSON.stringify(role.skills ?? []) ||
       JSON.stringify([...capabilities].sort()) !== loadedCaps.current ||
       JSON.stringify([...mcpToolIds].sort()) !== loadedMcp.current ||
-      integrationId !== loadedIntegration.current
+      integrationId !== loadedIntegration.current ||
+      roleEngine !== loadedEngine.current
     );
-  }, [role, description, prompt, groupId, skills, capabilities, mcpToolIds, integrationId]);
+  }, [role, description, prompt, groupId, skills, capabilities, mcpToolIds, integrationId, roleEngine]);
 
   function toggleCapability(cap: ToolCapability) {
     setCapabilities((prev) => (prev.includes(cap) ? prev.filter((c) => c !== cap) : [...prev, cap]));
@@ -249,6 +281,17 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
       if (integrationId !== loadedIntegration.current) {
         await roleConnectionsApi.saveAll([roleConnectionsApi.make(role.code, integrationId)]);
         loadedIntegration.current = integrationId;
+      }
+      // Движок роли: PUT app-settings заменяет всю карту role_engines, поэтому
+      // шлём ПОЛНУЮ карту с изменённым ключом этой роли. 'deepseek' = дефолт, ключ
+      // убираем (карта хранит только делегирования на внешние движки).
+      if (canPickEngine && roleEngine !== loadedEngine.current) {
+        const nextEngines = { ...allRoleEngines.current };
+        if (roleEngine === 'deepseek') delete nextEngines[role.code];
+        else nextEngines[role.code] = roleEngine;
+        const updated = await appSettingsApi.save({ roleEngines: nextEngines });
+        allRoleEngines.current = updated.roleEngines ?? {};
+        loadedEngine.current = updated.roleEngines?.[role.code] ?? 'deepseek';
       }
       onSaved(saved);
       toast.success(`Роль «${saved.name}» сохранена`);
@@ -343,6 +386,21 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
               <Callout tone="info" title="Нет доступных интеграций">
                 Добавьте коннекторы в разделе «Интеграции», чтобы назначить их роли.
               </Callout>
+            )}
+
+            {canPickEngine && (
+              <Select
+                label="Движок (исполнитель роли)"
+                value={roleEngine}
+                onChange={(e) => setRoleEngineState(e.target.value as RoleEngine)}
+                helper="Кто исполняет роль: DeepSeek (внутренний tool-loop) либо хостовый драйвер Codex / Claude Code. Та же настройка, что «Движок по ролям» в Настройки→Выполнение. Для Codex/Claude нужен запущенный хостовый раннер."
+              >
+                {ENGINE_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </Select>
             )}
 
             <Textarea
