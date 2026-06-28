@@ -246,6 +246,63 @@ export async function acceptScannerCompletionTx(c, payload) {
         throw err;
       }
 
+      // DECOMP-CONTRACT-001: подзадача-на-файл при сдаче закрывается в DONE
+      // (терминально), а её родитель (задача-на-сервис) уходит в REVIEW к Task
+      // Reviewer ТОЛЬКО когда у него не осталось открытых подзадач. Одиночные
+      // legacy-задачи (kind != subtask) ведут себя как раньше — сразу в REVIEW.
+      if (task.task_kind === 'subtask') {
+        await c.query(
+          `UPDATE tasks SET status = 'DONE', assigned_agent_id = NULL, data_card = data_card || $2::jsonb
+            WHERE id = $1`,
+          [payload.taskId, JSON.stringify(progCardValues || {})],
+        );
+        await c.query(
+          `INSERT INTO task_events
+             (task_id, event_type, from_status, to_status, role_id, payload_json)
+           VALUES ($1, 'TASK_DONE', $2::task_status, 'DONE', $3, $4::jsonb)`,
+          [payload.taskId, task.status, task.current_role_id, JSON.stringify({
+            source: 'scanner', completionKey: payload.completionKey, service: payload.service,
+            result: payload.result, changedFiles: payload.changedFiles, fields: progCardValues,
+            parentTaskId: task.parent_task_id, kind: 'subtask',
+          })],
+        );
+        // Промоут родителя, если открытых подзадач не осталось.
+        let parentPromoted = false;
+        if (task.parent_task_id) {
+          const open = await c.query(
+            `SELECT count(*)::int AS n FROM tasks
+              WHERE parent_task_id = $1 AND task_kind = 'subtask'
+                AND status NOT IN ('DONE','CANCELLED')`,
+            [task.parent_task_id],
+          );
+          if (open.rows[0].n === 0) {
+            const parent = await c.query(
+              `UPDATE tasks SET status = $2::task_status, current_role_id = $3, assigned_agent_id = NULL
+                WHERE id = $1 AND status = 'WAITING_FOR_CHILDREN'
+                RETURNING status`,
+              [task.parent_task_id, toStatus, nextRoleId],
+            );
+            if (parent.rowCount) {
+              parentPromoted = true;
+              await c.query(
+                `INSERT INTO task_events
+                   (task_id, event_type, from_status, to_status, role_id, payload_json)
+                 VALUES ($1, 'STATUS_CHANGED', 'WAITING_FOR_CHILDREN', $4::task_status, $2, $3::jsonb)`,
+                [task.parent_task_id, nextRoleId, JSON.stringify({
+                  source: 'scanner', reason: 'all_subtasks_done', nextRole: nextRoleCode, kind: 'service',
+                }), toStatus],
+              );
+            }
+          }
+        }
+        await c.query('COMMIT');
+        return {
+          accepted: true, duplicate: false, autoCreated: created, taskId: payload.taskId,
+          kind: 'subtask', parentTaskId: task.parent_task_id, parentPromoted,
+          nextRole: parentPromoted ? nextRoleCode : null,
+        };
+      }
+
       await c.query(
         `UPDATE tasks
          SET status = $2::task_status, current_role_id = $3, assigned_agent_id = NULL,
@@ -767,7 +824,8 @@ export function normalizeScannerIntake(input) {
 // SELECT задачи в форме, нужной диспетчеру Scanner (FOR UPDATE — блокируем строку).
 const SCANNER_TASK_SELECT = `SELECT t.id, t.status::text AS status, p.id AS project_id,
         p.code AS project_code, s.service_code, rr.id AS reviewer_role_id,
-        t.current_role_id, cr.code AS current_role_code
+        t.current_role_id, cr.code AS current_role_code,
+        t.task_kind, t.parent_task_id
    FROM tasks t
    JOIN projects p ON p.id = t.project_id
    LEFT JOIN services s ON s.id = t.service_id
@@ -890,6 +948,12 @@ export async function claimNextClaudeTask(s) {
              AND t.status = 'CODING'
              AND t.assigned_agent_id IS NULL
              AND t.service_id IS NOT NULL
+             -- DECOMP-CONTRACT-001: программист клеймит ТОЛЬКО подзадачи-на-файл.
+             -- Задачи-на-сервис (kind='service') ждут детей в WAITING_FOR_CHILDREN
+             -- и не клеймятся; одиночные legacy-задачи остаются kind='service' со
+             -- статусом CODING — для них правило не меняется (они клеймятся как
+             -- раньше, см. ниже): поэтому фильтруем по «не epic», а не «= subtask».
+             AND t.task_kind <> 'epic'
              AND p.status <> 'paused'
              -- PROGRAMMER-WORKTREE-PER-SERVICE: не более одной активной CODING-
              -- задачи на микросервис (один worktree на сервис). Если у сервиса уже
@@ -1709,6 +1773,10 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // дети попадали в очередь, а родитель не клеймился на gate-узле.
     await advanceForkNodes(c);
     await advanceJoinNodes(c);
+    // DECOMP-CONTRACT-001: эпик, у которого все задачи-на-сервис стали терминальны,
+    // завершается (DONE) или блокируется (BLOCKED, если сервис упал). Линейный
+    // аналог снятия join-барьера для декомпозиции по микросервисам.
+    await advanceDecompositionParents(c);
     // ROLE-ENGINE-ROUTING-001: роли, делегированные внешнему движку (codex/
     // claude_code), внутренний DeepSeek-цикл НЕ исполняет — их захватывает
     // соответствующий хостовый драйвер через /api/runner/next-reasoning-task.
@@ -2110,6 +2178,58 @@ export async function advanceJoinNodes(c) {
   return advanced;
 }
 
+/**
+ * DECOMP-CONTRACT-001 — роллап эпиков декомпозиции. Эпик (task_kind='epic') стоит в
+ * WAITING_FOR_CHILDREN, пока его задачи-на-сервис (kind='service') не станут
+ * терминальными. Когда все терминальны: если хоть одна BLOCKED/FAILED → эпик
+ * BLOCKED; иначе → DONE. Линейный аналог join-барьера (без графа fork/join).
+ * Идемпотентно, по одному txn на эпик, FOR UPDATE SKIP LOCKED.
+ */
+export async function advanceDecompositionParents(c) {
+  const parents = await c.query(
+    `SELECT t.id, t.status::text AS status, t.current_role_id
+       FROM tasks t
+      WHERE t.task_kind = 'epic'
+        AND t.status = 'WAITING_FOR_CHILDREN'
+        AND t.assigned_agent_id IS NULL
+        AND EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id AND ch.task_kind = 'service')
+        AND NOT EXISTS (
+              SELECT 1 FROM tasks ch
+               WHERE ch.parent_task_id = t.id AND ch.task_kind = 'service'
+                 AND ch.status NOT IN ('DONE','CANCELLED','BLOCKED','FAILED'))
+      FOR UPDATE OF t SKIP LOCKED`,
+  );
+  let advanced = 0;
+  for (const p of parents.rows) {
+    await c.query('BEGIN');
+    try {
+      const bad = await c.query(
+        `SELECT count(*)::int AS n FROM tasks
+          WHERE parent_task_id = $1 AND task_kind = 'service' AND status IN ('BLOCKED','FAILED')`,
+        [p.id],
+      );
+      const toStatus = bad.rows[0].n > 0 ? 'BLOCKED' : 'DONE';
+      await c.query(
+        `UPDATE tasks SET status = $2::task_status, assigned_agent_id = NULL
+          WHERE id = $1 AND status = 'WAITING_FOR_CHILDREN'`,
+        [p.id, toStatus],
+      );
+      await c.query(
+        `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+         VALUES ($1, $2, 'WAITING_FOR_CHILDREN', $3::task_status, $4, $5::jsonb)`,
+        [p.id, toStatus === 'DONE' ? 'TASK_DONE' : 'TASK_BLOCKED', toStatus, p.current_role_id,
+         JSON.stringify({ runner: true, reason: 'epic_rollup', servicesFailed: bad.rows[0].n })],
+      );
+      await c.query('COMMIT');
+      advanced += 1;
+    } catch (error) {
+      await c.query('ROLLBACK');
+      throw error;
+    }
+  }
+  return advanced;
+}
+
 // Снять зависшие захваты: agent_run RUNNING старше таймаута → TIMEOUT, слот свободен.
 async function resetStaleClaims(c) {
   // CLOCK-GUARD-001: до проверки таймаутов компенсируем возможный скачок настенных
@@ -2385,6 +2505,31 @@ async function buildRoleContext(c, claimed) {
     ? await c.query('SELECT service_code FROM services WHERE project_id = $1 ORDER BY service_code', [projectId])
     : { rows: [] };
   const prior = await fetchPriorOutputs(c, claimed.id);
+
+  // DECOMP-CONTRACT-001: если это задача-на-сервис (kind='service' с подзадачами),
+  // её реальные результаты лежат на детях-подзадачах. Соберём их, чтобы Task
+  // Reviewer видел весь сервис целиком, а не пустой programmerResult.
+  const kids = await c.query(
+    `SELECT t.id, t.title, t.status::text AS status,
+            (SELECT e.payload_json FROM task_events e
+              WHERE e.task_id = t.id
+                AND (e.payload_json ? 'result' OR e.payload_json ? 'changedFiles')
+              ORDER BY e.created_at DESC LIMIT 1) AS done_payload
+       FROM tasks t
+      WHERE t.parent_task_id = $1 AND t.task_kind = 'subtask'
+      ORDER BY t.created_at`,
+    [claimed.id],
+  );
+  const subtaskResults = kids.rows.map((k) => ({
+    taskId: k.id,
+    title: k.title,
+    status: k.status,
+    result: k.done_payload?.result ?? '',
+    changedFiles: Array.isArray(k.done_payload?.changedFiles) ? k.done_payload.changedFiles : [],
+  }));
+  const aggregatedChanged = subtaskResults.flatMap((r) => r.changedFiles);
+  const hasChildren = subtaskResults.length > 0;
+
   return {
     taskId: claimed.id,
     title: claimed.title,
@@ -2397,8 +2542,12 @@ async function buildRoleContext(c, claimed) {
     projectPath: meta.rows[0]?.root_path ?? '',
     docsPath: meta.rows[0]?.docs_path ?? '',
     projectServices: svc.rows.map((r) => r.service_code),
-    programmerResult: scan?.payload_json?.result ?? '',
-    changedFiles: scan?.payload_json?.changedFiles ?? [],
+    // Для задачи-на-сервис берём агрегат результатов подзадач; иначе — как раньше.
+    programmerResult: hasChildren
+      ? subtaskResults.map((r) => `• ${r.title}: ${r.result}`).join('\n')
+      : (scan?.payload_json?.result ?? ''),
+    changedFiles: hasChildren ? aggregatedChanged : (scan?.payload_json?.changedFiles ?? []),
+    subtaskResults,
     priorRoleOutputs: prior.priorRoleOutputs,
     lastReview: prior.lastReview,
     recentEvents: ev.rows.slice(0, 8).map((r) => ({ type: r.event_type, from: r.from_status, to: r.to_status })),
@@ -2481,12 +2630,181 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
   if (missingOut.length && decision.outcome !== 'BLOCK') {
     decision = { outcome: 'REWORK', agentRunStatus: 'SUCCESS', reason: `missing_outputs:${missingOut.join(',')}` };
   }
+  // DECOMP-CONTRACT-001: успешный Декомпозитор не просто «forward» — он
+  // МАТЕРИАЛИЗУЕТ из карточки задачи-на-сервис (L1) и подзадачи-на-файл (L2),
+  // а сам эпик паркует в WAITING_FOR_CHILDREN. Только в линейном маршруте (в
+  // граф-режиме fork/join расщепление делают узлы графа, не Декомпозитор).
+  if (claimed.role_code === 'DECOMPOSER' && decision.outcome === 'FORWARD' && !claimed.current_stage_key) {
+    return materializeDecomposition(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, route });
+  }
   // FORK-JOIN-001: задача с current_stage_key идёт ПО РЁБРАМ графа (граф-режим);
   // без него — прежняя позиционная маршрутизация (линейные схемы не затронуты).
   const resolved = claimed.current_stage_key
     ? await resolveGraphTransition(c, claimed, decision)
     : resolveTransition(route, claimed.role_code, decision);
   return finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues });
+}
+
+// DECOMP-CONTRACT-001 — нормализовать разбивку работы из карточки к виду
+// [{ serviceCode, title, files: [{ path, what }] }]. Источник: work_items (если
+// заполнил Архитектор/Декомпозитор), иначе группировка affected_files по сервису.
+export function normalizeWorkItems(card) {
+  const str = (v) => (v == null ? '' : String(v)).trim();
+  const items = Array.isArray(card?.work_items) ? card.work_items : [];
+  const norm = [];
+  for (const it of items) {
+    const serviceCode = str(it?.serviceCode || it?.service);
+    if (!serviceCode) continue;
+    const files = (Array.isArray(it?.files) ? it.files : [])
+      .map((f) => ({ path: str(f?.path), what: str(f?.what || f?.instruction) }))
+      .filter((f) => f.path);
+    norm.push({ serviceCode, title: str(it?.title) || `Изменения в ${serviceCode}`, files });
+  }
+  if (norm.length) return norm;
+  // Фолбэк: собрать work_items из affected_files (плоский список) по serviceCode.
+  const files = Array.isArray(card?.affected_files) ? card.affected_files : [];
+  const byService = new Map();
+  for (const f of files) {
+    const serviceCode = str(f?.serviceCode || f?.service);
+    const path = str(f?.path);
+    if (!serviceCode || !path) continue;
+    if (!byService.has(serviceCode)) byService.set(serviceCode, []);
+    byService.get(serviceCode).push({ path, what: str(f?.what || f?.instruction) });
+  }
+  return Array.from(byService.entries()).map(([serviceCode, fs]) => ({
+    serviceCode, title: `Изменения в ${serviceCode}`, files: fs,
+  }));
+}
+
+// DECOMP-CONTRACT-001 — материализация декомпозиции эпика в задачи-на-сервис (L1)
+// и подзадачи-на-файл (L2). Один txn. Идемпотентно: если у эпика уже есть дети,
+// повторно не создаём. Эпик паркуется в WAITING_FOR_CHILDREN. Если из карточки не
+// удалось получить ни одного зарегистрированного сервиса — эпик уходит в BLOCKED с
+// диагностикой (не молча зависает).
+export async function materializeDecomposition(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, route }) {
+  const card = { ...(claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {}), ...(cardValues || {}) };
+  const plan = normalizeWorkItems(card);
+
+  await c.query('BEGIN');
+  try {
+    // Идемпотентность: эпик уже расщеплён — финализируем прогон без дублей.
+    const hasChildren = await c.query('SELECT 1 FROM tasks WHERE parent_task_id = $1 LIMIT 1', [claimed.id]);
+    if (hasChildren.rowCount) {
+      await c.query(
+        `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb WHERE id = $1`,
+        [claimed.agentRunId, JSON.stringify({ status: verdict.status, summary: verdict.summary, reason: 'already_decomposed' })],
+      );
+      await c.query('COMMIT');
+      return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: claimed.status, reason: 'already_decomposed', durationMs };
+    }
+
+    // Резолвим коды сервисов проекта (нечувствительно к регистру).
+    const svcRows = await c.query('SELECT id, service_code FROM services WHERE project_id = $1', [claimed.project_id]);
+    const svcByCode = new Map(svcRows.rows.map((r) => [String(r.service_code).toLowerCase(), r.id]));
+    const resolved = [];
+    const unresolved = [];
+    for (const item of plan) {
+      const sid = svcByCode.get(item.serviceCode.toLowerCase());
+      if (sid) resolved.push({ ...item, serviceId: sid });
+      else unresolved.push(item.serviceCode);
+    }
+
+    // Нет ни одного зарегистрированного сервиса → BLOCKED с диагностикой.
+    if (!resolved.length) {
+      await c.query(
+        `UPDATE agent_runs SET status = 'FAILED', finished_at = now(), error_text = $2 WHERE id = $1`,
+        [claimed.agentRunId, `decomposition_no_services: ${unresolved.join(', ') || 'пустая разбивка'}`],
+      );
+      await c.query(
+        `UPDATE tasks SET status = 'BLOCKED', assigned_agent_id = NULL WHERE id = $1 AND status NOT IN ('DONE','CANCELLED')`,
+        [claimed.id],
+      );
+      await c.query(
+        `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+         VALUES ($1, 'TASK_BLOCKED', $2::task_status, 'BLOCKED', $3, $4::jsonb)`,
+        [claimed.id, claimed.status, claimed.role_id, JSON.stringify({
+          runner: true, ai: true, role: 'DECOMPOSER', reason: 'decomposition_no_services', unresolved,
+        })],
+      );
+      await c.query('COMMIT');
+      return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: 'BLOCKED', reason: 'decomposition_no_services' };
+    }
+
+    const programmerRole = await c.query(`SELECT id FROM roles WHERE code = 'PROGRAMMER'`);
+    const programmerRoleId = programmerRole.rows[0]?.id ?? null;
+    const baseCard = JSON.stringify(card);
+    let serviceCount = 0;
+    let subtaskCount = 0;
+    const createdServices = [];
+
+    for (const item of resolved) {
+      // L1 — задача-на-сервис: единица приёмки. Пока есть подзадачи — ждёт их.
+      const l1 = await c.query(
+        `INSERT INTO tasks (project_id, service_id, parent_task_id, task_kind, title, description,
+                            status, current_role_id, created_by, data_card)
+         VALUES ($1, $2, $3, 'service', $4, $5, 'WAITING_FOR_CHILDREN', $6, 'decomposer', $7::jsonb)
+         RETURNING id`,
+        [claimed.project_id, item.serviceId, claimed.id, item.title, claimed.description ?? '',
+         programmerRoleId, baseCard],
+      );
+      const l1Id = l1.rows[0].id;
+      serviceCount += 1;
+      createdServices.push({ id: l1Id, serviceCode: item.serviceCode });
+      await c.query(
+        `INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)
+         ON CONFLICT (task_id, depends_on_task_id) DO NOTHING`,
+        [claimed.id, l1Id],
+      );
+
+      // L2 — подзадачи-на-файл (по одной клеймит программист). Без файлов — одна
+      // подзадача на весь сервис (чтобы программисту было что взять).
+      const files = item.files.length ? item.files : [{ path: '', what: item.title }];
+      for (const f of files) {
+        const childCard = JSON.stringify({ ...card, service: item.serviceCode, file: f.path, instruction: f.what });
+        const subTitle = f.path ? `${item.serviceCode}: ${f.path}` : item.title;
+        await c.query(
+          `INSERT INTO tasks (project_id, service_id, parent_task_id, task_kind, title, description,
+                              status, current_role_id, created_by, data_card)
+           VALUES ($1, $2, $3, 'subtask', $4, $5, 'CODING', $6, 'decomposer', $7::jsonb)`,
+          [claimed.project_id, item.serviceId, l1Id, subTitle, f.what || item.title,
+           programmerRoleId, childCard],
+        );
+        subtaskCount += 1;
+      }
+    }
+
+    // Эпик: помечаем видом, паркуем на детях, доливаем карточку Декомпозитора.
+    await c.query(
+      `UPDATE tasks SET task_kind = 'epic', status = 'WAITING_FOR_CHILDREN', assigned_agent_id = NULL,
+              data_card = data_card || $2::jsonb WHERE id = $1`,
+      [claimed.id, JSON.stringify(cardValues || {})],
+    );
+    await c.query(
+      `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb WHERE id = $1`,
+      [claimed.agentRunId, JSON.stringify({
+        status: verdict.status, summary: verdict.summary, findings: verdict.findings,
+        reason: 'decomposed', outcome: decision.outcome, fields: cardValues,
+        services: serviceCount, subtasks: subtaskCount, unresolved,
+      })],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'STATUS_CHANGED', $2::task_status, 'WAITING_FOR_CHILDREN', $3, $4::jsonb)`,
+      [claimed.id, claimed.status, claimed.role_id, JSON.stringify({
+        runner: true, ai: true, role: 'DECOMPOSER', reason: 'decomposed', verdictStatus: verdict.status,
+        summary: verdict.summary, services: createdServices, subtasks: subtaskCount, unresolved, exchangeId,
+      })],
+    );
+    await c.query('COMMIT');
+    return {
+      taskId: claimed.id, fromRole: claimed.role_code, fromStatus: claimed.status,
+      toStatus: 'WAITING_FOR_CHILDREN', nextRole: 'PROGRAMMER', verdict: verdict.status,
+      services: serviceCount, subtasks: subtaskCount, durationMs,
+    };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
 }
 
 // Применить переход роли по вердикту в отдельной транзакции.
