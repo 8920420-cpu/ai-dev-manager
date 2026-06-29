@@ -86,6 +86,7 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
 
   return {
     ok: true,
+    model, // VERSION-KPI-TRACKING-001: модель прогона для атрибуции KPI.
     result: {
       summary: (parsed && parsed.summary) || String(final.result || '').slice(0, 4000),
       outcome: 'DONE',
@@ -131,8 +132,14 @@ export function makeClaudeRunAgent(cfg = {}) {
   const runAgent = async function runAgent(task, { signal } = {}) {
     const { cwd: repoCwd, env } = resolveRepo(task, repoMap);
     const serviceKey = serviceKeyOf(task);
+    // PROGRAMMER-UNIFY-001: модель выбирается движком роли (карточка роли →
+    // назначенный коннектор; оркестратор кладёт её в task.model). Это позволяет
+    // тестировать один и тот же промт на разных моделях/агентах — версии KPI
+    // сравниваются в разрезе модели. Нет назначения → дефолтная модель раннера.
+    const effectiveModel =
+      typeof task?.model === 'string' && task.model.trim() ? task.model.trim() : model;
     return worktrees.runForService(repoCwd, serviceKey, (worktreeCwd) =>
-      runSdkOnce({ cwd: worktreeCwd, env, task, signal, model, maxTurns, allowedTools, log }));
+      runSdkOnce({ cwd: worktreeCwd, env, task, signal, model: effectiveModel, maxTurns, allowedTools, log }));
   };
   // Доступ к менеджеру (для остановки/чистки из bin).
   runAgent.worktrees = worktrees;

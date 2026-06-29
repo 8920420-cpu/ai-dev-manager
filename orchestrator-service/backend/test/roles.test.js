@@ -15,8 +15,73 @@ import {
   uploadSkill,
   composeRoleSystemPrompt,
   RESEARCH_ROLES,
+  promptHash,
+  recordPromptVersion,
 } from '../src/roles.js';
 import { readFile } from 'node:fs/promises';
+
+// --- VERSION-KPI-TRACKING-001: версионирование промтов -----------------------
+
+test('promptHash: одинаковый текст → одинаковый хеш, разный → разный', () => {
+  assert.equal(promptHash('привет'), promptHash('привет'));
+  assert.notEqual(promptHash('привет'), promptHash('пока'));
+});
+
+test('promptHash: косметика (CRLF / хвостовые пробелы) не меняет хеш', () => {
+  assert.equal(promptHash('строка\nдва'), promptHash('строка\r\nдва'));
+  assert.equal(promptHash('строка  \nдва'), promptHash('строка\nдва'));
+});
+
+// Фейковый клиент pg: отвечает по подстроке SQL, копит выполненные запросы.
+function fakeClient(responses) {
+  const calls = [];
+  return {
+    calls,
+    async query(sql, params) {
+      calls.push({ sql, params });
+      for (const [needle, rows] of responses) {
+        if (sql.includes(needle)) return { rowCount: rows.length, rows };
+      }
+      return { rowCount: 0, rows: [] };
+    },
+  };
+}
+
+test('recordPromptVersion: тот же текст что у активной версии → дедуп, новая не создаётся', async () => {
+  const text = 'Ты — Архитектор.';
+  // Дедуп по тексту: даже с косметикой (CRLF) активной версии хеш совпадёт.
+  const c = fakeClient([
+    ['is_active = true LIMIT 1', [{ version: 3, prompt_text: text.replace('\n', '\r\n') }]],
+  ]);
+  const res = await recordPromptVersion(c, 'role-1', text);
+  assert.deepEqual(res, { version: 3, created: false });
+  // Не должно быть INSERT новой версии.
+  assert.ok(!c.calls.some((q) => q.sql.includes('INSERT INTO prompts')));
+});
+
+test('recordPromptVersion: изменённый текст → новая версия = max+1, старые деактивированы', async () => {
+  const c = fakeClient([
+    ['is_active = true LIMIT 1', [{ version: 2, prompt_text: 'старый' }]],
+    ['COALESCE(max(version)', [{ v: 2 }]],
+  ]);
+  const res = await recordPromptVersion(c, 'role-1', 'новый текст', { label: 'эксперимент' });
+  assert.deepEqual(res, { version: 3, created: true });
+  assert.ok(c.calls.some((q) => q.sql.includes('UPDATE prompts SET is_active = false')));
+  const ins = c.calls.find((q) => q.sql.includes('INSERT INTO prompts'));
+  assert.ok(ins);
+  // params: role_id, version, body, hash, label, author
+  assert.equal(ins.params[1], 3);
+  assert.equal(ins.params[4], 'эксперимент');
+});
+
+test('recordPromptVersion: первая версия роли (нет активной) → version=1, created', async () => {
+  const c = fakeClient([
+    ['is_active = true LIMIT 1', []],
+    ['COALESCE(max(version)', [{ v: 0 }]],
+  ]);
+  const res = await recordPromptVersion(c, 'role-1', 'первый промт');
+  assert.deepEqual(res, { version: 1, created: true });
+});
 
 // --- fastForwardHiddenRoles: пропуск скрытых ролей --------------------------
 

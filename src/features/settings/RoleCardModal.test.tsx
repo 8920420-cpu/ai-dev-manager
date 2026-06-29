@@ -211,6 +211,45 @@ describe('RoleCardModal — карточка роли', () => {
     expect(rcSaveAll).not.toHaveBeenCalled();
   });
 
+  it('TASK_INTAKE_OFFICER + Codex-интеграция: «Движок» показывает Codex, не DeepSeek', async () => {
+    const role: RoleCard = { ...ROLE, code: 'TASK_INTAKE_OFFICER', name: 'Приёмщик задач' };
+    // Назначение роли — хостовый драйвер Codex (int3), записанное в role-connectors.
+    rcList.mockResolvedValue([{ id: 'rc-codex', role: 'TASK_INTAKE_OFFICER', integrationId: 'int3' }]);
+    renderModal(role);
+
+    const select = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('int3'));
+    const selected = select.options[select.selectedIndex];
+    expect(selected.textContent).toContain('Codex');
+    expect(selected.textContent).not.toContain('DeepSeek');
+  });
+
+  it('роль с claude_code-интеграцией: «Движок» показывает Claude Code', async () => {
+    // Добавляем драйвер Claude Code в список интеграций и назначаем его роли.
+    intgList.mockResolvedValue([
+      { id: 'int1', name: 'DeepSeek API', provider: 'deepseek', isEnabled: true, status: 'success' },
+      { id: 'int5', name: 'Claude Code (драйвер)', provider: 'claude_code', isEnabled: true },
+    ]);
+    rcList.mockResolvedValue([{ id: 'rc-cc', role: 'PROGRAMMER', integrationId: 'int5' }]);
+    renderModal();
+
+    const select = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('int5'));
+    const selected = select.options[select.selectedIndex];
+    expect(selected.textContent).toContain('Claude Code');
+  });
+
+  it('роль с DeepSeek-интеграцией: «Движок» показывает DeepSeek (backward compat)', async () => {
+    // Старое назначение через API-коннектор DeepSeek (int1) — должно работать как раньше.
+    rcList.mockResolvedValue([{ id: 'rc-ds', role: 'PROGRAMMER', integrationId: 'int1' }]);
+    renderModal();
+
+    const select = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('int1'));
+    const selected = select.options[select.selectedIndex];
+    expect(selected.textContent).toContain('DeepSeek');
+  });
+
   it('не закрывается по Escape (правило проекта)', async () => {
     const { onClose } = renderModal();
     fireEvent.keyDown(screen.getByRole('dialog'), { key: 'Escape' });

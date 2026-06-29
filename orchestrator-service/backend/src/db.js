@@ -176,6 +176,34 @@ export async function getAppliedMigrations(s) {
   });
 }
 
+// PROGRAMMER-UNIFY-001 — финализировать RUNNING-прогон программиста при успешной
+// сдаче. Захват создал ровно один agent_run RUNNING на эту задачу под ролью
+// PROGRAMMER; переводим его в SUCCESS с KPI (turns=passes, model, code_version) —
+// так программист считается в «Мониторе» (roleLoad) и версиях единообразно с
+// рассуждающими ролями. Толерантно: нет прогона (legacy/прямое создание задачи) —
+// 0 строк, сдача не падает. roleId — роль на момент ЗАХВАТА (PROGRAMMER), а не
+// после продвижения задачи.
+async function finalizeProgrammerRunOnCompletion(c, { taskId, roleId, payload }) {
+  if (roleId == null) return;
+  const turns = Number.isFinite(Number(payload?.numTurns)) ? Math.trunc(Number(payload.numTurns)) : null;
+  const summary = typeof payload?.result === 'string'
+    ? payload.result.slice(0, 2000)
+    : (payload?.result?.summary ?? payload?.title ?? 'completed');
+  await c.query(
+    `UPDATE agent_runs
+        SET status = 'SUCCESS', finished_at = now(), turns = $2, outcome = 'success',
+            model = COALESCE($3, model), code_version = COALESCE($4, code_version),
+            output_json = $5::jsonb
+      WHERE id = (
+        SELECT id FROM agent_runs
+         WHERE task_id = $1 AND role_id = $6 AND status = 'RUNNING'
+         ORDER BY started_at DESC LIMIT 1
+      )`,
+    [taskId, turns, payload?.model ?? null, payload?.codeVersion ?? null,
+      JSON.stringify({ status: 'DONE', summary, changedFiles: payload?.changedFiles ?? [] }), roleId],
+  );
+}
+
 /**
  * Принять завершение от файлового Scanner bridge и передать задачу Task Reviewer.
  * scanner_dispatches и транзакция обеспечивают exactly-once переход на стороне БД.
@@ -265,6 +293,7 @@ export async function acceptScannerCompletionTx(c, payload) {
             source: 'scanner', completionKey: payload.completionKey, service: payload.service,
             result: payload.result, changedFiles: payload.changedFiles, fields: progCardValues,
             parentTaskId: task.parent_task_id, kind: 'subtask', passes: payload.numTurns,
+            codeVersion: payload.codeVersion, model: payload.model,
           })],
         );
         // Промоут родителя, если открытых подзадач не осталось.
@@ -296,6 +325,9 @@ export async function acceptScannerCompletionTx(c, payload) {
             }
           }
         }
+        await finalizeProgrammerRunOnCompletion(c, {
+          taskId: payload.taskId, roleId: task.current_role_id, payload,
+        });
         await c.query('COMMIT');
         return {
           accepted: true, duplicate: false, autoCreated: created, taskId: payload.taskId,
@@ -324,8 +356,13 @@ export async function acceptScannerCompletionTx(c, payload) {
           nextRole: nextRoleCode,
           fields: progCardValues,
           passes: payload.numTurns,
+          codeVersion: payload.codeVersion,
+          model: payload.model,
         }), toStatus],
       );
+      await finalizeProgrammerRunOnCompletion(c, {
+        taskId: payload.taskId, roleId: task.current_role_id, payload,
+      });
       await c.query('COMMIT');
       return { accepted: true, duplicate: false, autoCreated: created, taskId: payload.taskId, nextRole: nextRoleCode };
     } catch (error) {
@@ -589,7 +626,7 @@ export async function advanceTaskTx(c, taskId) {
   try {
     const cur = await c.query(
       `SELECT t.id, t.project_id, t.status::text AS status, t.current_role_id,
-              t.current_stage_key, r.code AS role_code
+              t.current_stage_key, t.assigned_agent_id, r.code AS role_code
          FROM tasks t LEFT JOIN roles r ON r.id = t.current_role_id
         WHERE t.id = $1 FOR UPDATE OF t`,
       [id],
@@ -599,6 +636,10 @@ export async function advanceTaskTx(c, taskId) {
     if (!task.project_id) throw scannerError(409, 'task_without_project');
     if (TERMINAL_STATUSES.has(task.status)) throw scannerError(409, 'task_terminal');
     if (task.status === 'BLOCKED') throw scannerError(409, 'task_blocked_use_manual');
+    // Захваченную исполнителем задачу авто-продвигать нельзя: пока её слот занят
+    // (assigned_agent_id != NULL), безусловный перевод дальше потеряет/перетрёт
+    // активный прогон. Такие задачи двигаем только ручным moveTask с аудитом.
+    if (task.assigned_agent_id) throw scannerError(409, 'task_assigned_use_manual');
 
     const route = await loadProjectRoute(c, task.project_id);
     const decision = { outcome: 'FORWARD' };
@@ -609,6 +650,18 @@ export async function advanceTaskTx(c, taskId) {
     const nextRoleId = resolved.done || !resolved.nextRole
       ? null
       : (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null;
+
+    // Человекочитаемое имя целевого этапа (для аудита, как targetStage в moveTask):
+    // в граф-режиме берём имя по nextStageKey, иначе деградируем до кода роли/DONE.
+    let targetStage = null;
+    if (resolved.nextStageKey) {
+      const stRes = await c.query(
+        'SELECT name FROM project_stages WHERE stage_key = $1 AND project_id = $2',
+        [resolved.nextStageKey, task.project_id],
+      );
+      targetStage = stRes.rows[0]?.name ?? null;
+    }
+    if (!targetStage) targetStage = resolved.done ? 'DONE' : (resolved.nextRole ?? null);
 
     await c.query(
       `UPDATE tasks SET status = $2::task_status, current_role_id = $3,
@@ -622,6 +675,7 @@ export async function advanceTaskTx(c, taskId) {
       [id, task.status, resolved.toStatus, nextRoleId, JSON.stringify({
         source: 'manual-advance', via: resolved.via ?? null,
         fromRole: task.role_code ?? null, nextRole: resolved.nextRole ?? null,
+        fromStatus: task.status, toStatus: resolved.toStatus, targetStage,
         done: resolved.done === true,
       })],
     );
@@ -652,7 +706,11 @@ export async function moveTaskTx(c, taskId, input) {
   if (!id) throw scannerError(422, 'task_required');
   const toStageId = String(input?.toStageId ?? '').trim();
   if (!toStageId) throw scannerError(422, 'target_stage_required');
+  // Ручное перемещение обязано нести причину/комментарий: это audit-событие, по
+  // которому видно, кто и зачем сдвинул задачу мимо обычного маршрута. Без неё
+  // запись в task_events теряет смысл, поэтому пустой reason отклоняем.
   const reason = String(input?.reason ?? '').trim();
+  if (!reason) throw scannerError(422, 'reason_required');
   await c.query('BEGIN');
   try {
     const cur = await c.query(
@@ -689,7 +747,7 @@ export async function moveTaskTx(c, taskId, input) {
        VALUES ($1, 'TASK_UPDATED', $2::task_status, $3::task_status, $4, $5::jsonb)`,
       [id, task.status, toStatus, stage.role_id ?? null, JSON.stringify({
         source: 'manual', via: 'manual-move', fromStatus: task.status, toStatus,
-        targetStage: stage.name ?? null, reason: reason || null,
+        targetStage: stage.name ?? null, reason,
       })],
     );
     await c.query('COMMIT');
@@ -1012,6 +1070,47 @@ export async function claimNextClaudeTask(s) {
          RETURNING id`,
         [row.id, row.current_role_id, JSON.stringify({ target: 'claude-tasks.json', agent: 'claude_programmer' })],
       );
+      // PROGRAMMER-UNIFY-001: программист наблюдается так же, как рассуждающие роли —
+      // через agent_runs (а не только task_events). Создаём прогон RUNNING при
+      // захвате; путь сдачи (acceptScannerCompletion) и releaseClaudeTask его
+      // финализируют, осиротевший — закрывает releaseStaleClaudeClaims по
+      // CLAUDE_ASSIGN_TIMEOUT_MS (resetStaleClaims программиста НЕ трогает — у него
+      // более длинный таймаут сессии). Так PROGRAMMER попадает в «Монитор» (roleLoad)
+      // и в версионные KPI единообразно со всеми.
+      //
+      // Движок роли (карточка роли → role_connectors): модель назначенного
+      // включённого коннектора версионирует прогон и реально выбирает агента для
+      // программиста (см. claudeAgent.js). Так «тот же промт, разные модели/агенты»
+      // сравнимы в разрезе версий. Без назначения — модель агента по умолчанию.
+      const progAgent = await c.query(
+        `SELECT id, model FROM agents WHERE code = 'claude_programmer' LIMIT 1`,
+      );
+      const progAgentId = progAgent.rows[0]?.id ?? null;
+      // Программиста исполняет Claude Agent SDK (programmer-runner), поэтому модель
+      // берём ТОЛЬКО у Claude-совместимого движка (драйвер claude_code или
+      // anthropic-API). Модель от deepseek/codex/openai не подсунет SDK имя чужой
+      // модели; такой коннектор → fallback на дефолт агента.
+      const progConn = await c.query(
+        `SELECT cn.model FROM role_connectors rc
+           JOIN connectors cn ON cn.id = rc.connector_id
+          WHERE rc.role_code = 'PROGRAMMER' AND cn.is_enabled = true
+            AND lower(cn.provider) IN ('claude_code', 'anthropic')
+          LIMIT 1`,
+      );
+      const connModel = String(progConn.rows[0]?.model ?? '').trim();
+      const agentModel = String(progAgent.rows[0]?.model ?? '').trim();
+      // Эффективная модель: коннектор роли > дефолт агента > пусто (раннер сам решит).
+      const programmerModel = connModel || agentModel || null;
+      // Прогон закрывают по task_id (на задачу — ровно один RUNNING под PROGRAMMER),
+      // поэтому id прогона дальше не нужен.
+      if (progAgentId) {
+        await c.query(
+          `INSERT INTO agent_runs (task_id, agent_id, role_id, status, started_at, input_json, model)
+           VALUES ($1, $2, $3, 'RUNNING', now(), $4::jsonb, $5)`,
+          [row.id, progAgentId, row.current_role_id,
+            JSON.stringify({ roleCode: 'PROGRAMMER', status: 'CODING' }), programmerModel],
+        );
+      }
       // Ключ сдачи ДОЛЖЕН быть уникален для каждого захвата задачи, а не только для
       // её id. Иначе после повторного входа задачи в CODING (RESTART/refeed/доработка
       // от ревьюера) её сдача попадёт в scanner_dispatches как дубль по уже
@@ -1030,6 +1129,9 @@ export async function claimNextClaudeTask(s) {
           service: service_code ?? '',
           title: row.title,
           description: row.description ?? '',
+          // PROGRAMMER-UNIFY-001: модель из движка роли (или дефолт) — раннер
+          // запускает агента ровно на ней; null = раннер берёт свой дефолт.
+          model: programmerModel,
           priorRoleOutputs: prior.priorRoleOutputs,
           lastReview: prior.lastReview,
           // Инструменты для Claude Code: MCP-конфиг и разрешённые уровни доступа.
@@ -1104,6 +1206,29 @@ export async function releaseClaudeTask(s, taskId, opts = {}) {
           numTurns: Number.isFinite(numTurns) ? numTurns : null,
           maxTurns: Number.isFinite(maxTurns) ? maxTurns : null,
         })],
+      );
+    }
+    // PROGRAMMER-UNIFY-001: освобождение захвата = прогон не дал результата.
+    // Финализируем RUNNING-прогон программиста (созданный при захвате), чтобы он не
+    // висел вечно и корректно считался в KPI. Исход по причине: упор в лимит ходов и
+    // прочие провалы → FAILED; таймаут агента → TIMEOUT. turns берём из meta, если
+    // раннер прислал. Толерантно: нет прогона → 0 строк.
+    if (released) {
+      const reason = String(opts.reason ?? '').trim();
+      const runStatus = reason === 'agent_timeout' ? 'TIMEOUT' : 'FAILED';
+      const outcome = reason || 'released';
+      const turns = Number.isFinite(Number(opts.meta?.numTurns))
+        ? Math.trunc(Number(opts.meta.numTurns)) : null;
+      await c.query(
+        `UPDATE agent_runs
+            SET status = $2::agent_run_status, finished_at = now(), turns = $3, outcome = $4,
+                error_text = $5
+          WHERE id = (
+            SELECT id FROM agent_runs
+             WHERE task_id = $1 AND role_id = $6 AND status = 'RUNNING'
+             ORDER BY started_at DESC LIMIT 1
+          )`,
+        [id, runStatus, turns, outcome, `programmer_released: ${outcome}`, r.rows[0].current_role_id],
       );
     }
     return { released, taskId: id };
@@ -2307,7 +2432,13 @@ async function resetStaleClaims(c) {
        SELECT ar.id, ar.task_id, ar.role_id, t.status::text AS task_status
          FROM agent_runs ar
          JOIN tasks t ON t.id = ar.task_id
+         LEFT JOIN roles r ON r.id = ar.role_id
         WHERE ar.status = 'RUNNING' AND ar.started_at < now() - ($1::bigint * interval '1 millisecond')
+          -- PROGRAMMER-UNIFY-001: у программиста более длинная сессия и свой
+          -- (обычно больший) таймаут CLAUDE_ASSIGN_TIMEOUT_MS — его осиротевшие
+          -- прогоны закрывает releaseStaleClaudeClaims, чтобы общий ROLE_TIMEOUT_MS
+          -- не убивал реально идущую долгую сессию программиста раньше времени.
+          AND COALESCE(r.code, '') <> 'PROGRAMMER'
      ), done AS (
        UPDATE agent_runs
           SET status = 'TIMEOUT',
@@ -2357,6 +2488,15 @@ async function releaseStaleClaudeClaims(c, timeoutMs = CLAUDE_ASSIGN_TIMEOUT_MS,
        UPDATE tasks SET assigned_agent_id = NULL
         WHERE id IN (SELECT id FROM stale)
         RETURNING id, current_role_id, status
+     ), runs AS (
+       -- PROGRAMMER-UNIFY-001: закрыть осиротевший RUNNING-прогон программиста
+       -- (захват создал его, исполнитель умер, не сдав/не освободив) → TIMEOUT, иначе
+       -- он висел бы вечно и искажал KPI. Data-modifying CTE выполняется всегда,
+       -- даже без ссылки из основного запроса.
+       UPDATE agent_runs SET status = 'TIMEOUT', finished_at = now(), outcome = $2::text,
+              error_text = 'programmer claim orphaned (assignment timeout)'
+        WHERE status = 'RUNNING' AND task_id IN (SELECT id FROM released)
+        RETURNING id
      )
      INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
      SELECT id, 'STATUS_CHANGED', status, status, current_role_id,
@@ -2518,6 +2658,13 @@ async function claimLlmRoleTask(c, roleCode = null) {
        VALUES ($1, $2, $3, 'RUNNING', now(), $4::jsonb) RETURNING id`,
       [task.id, agentId, task.role_id, JSON.stringify({ roleCode: task.role_code, status: task.status })],
     );
+    // VERSION-KPI-TRACKING-001: штампуем версию промта роли в момент захвата (а не
+    // сдачи) — именно эта версия исполняется, даже если промт поправят в полёте.
+    const { getActivePromptVersion } = await import('./roles.js');
+    const promptVersion = await getActivePromptVersion(c, task.role_code);
+    if (promptVersion != null) {
+      await c.query('UPDATE agent_runs SET prompt_version = $2 WHERE id = $1', [run.rows[0].id, promptVersion]);
+    }
     const rc = await c.query(
       `SELECT count(*)::int AS n FROM task_events WHERE task_id = $1 AND from_status = 'FAILURE_ANALYSIS'`,
       [task.id],
@@ -2713,6 +2860,7 @@ async function processClaimedRole(c, claimed) {
 export function normalizeRunKpi(input) {
   const int = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : null);
   const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  const str = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : null);
   return {
     tokenInput: int(input?.tokensIn),
     tokenOutput: int(input?.tokensOut),
@@ -2720,17 +2868,23 @@ export function normalizeRunKpi(input) {
     coldStartMs: int(input?.coldStartMs),
     turns: int(input?.turns),
     outcome: typeof input?.outcome === 'string' ? input.outcome : null,
+    // VERSION-KPI-TRACKING-001: метки версии кода раннера и модели из тела сдачи.
+    codeVersion: str(input?.codeVersion, 80),
+    model: str(input?.model, 120),
   };
 }
 
 // Фрагмент SET для дописывания KPI прогона к UPDATE agent_runs после фиксированных
-// $1..$base параметров. Токены/стоимость через COALESCE (не затираем старое NULL'ом).
+// $1..$base параметров. Токены/стоимость/code_version/model через COALESCE (не
+// затираем уже записанное значением NULL при повторной/частичной сдаче).
 function runKpiSet(kpi, base) {
   if (!kpi) return { sql: '', params: [] };
   return {
     sql: `, token_input = COALESCE($${base + 1}, token_input), token_output = COALESCE($${base + 2}, token_output)`
-       + `, cost = COALESCE($${base + 3}, cost), cold_start_ms = $${base + 4}, turns = $${base + 5}, outcome = $${base + 6}`,
-    params: [kpi.tokenInput, kpi.tokenOutput, kpi.cost, kpi.coldStartMs, kpi.turns, kpi.outcome],
+       + `, cost = COALESCE($${base + 3}, cost), cold_start_ms = $${base + 4}, turns = $${base + 5}, outcome = $${base + 6}`
+       + `, code_version = COALESCE($${base + 7}, code_version), model = COALESCE($${base + 8}, model)`,
+    params: [kpi.tokenInput, kpi.tokenOutput, kpi.cost, kpi.coldStartMs, kpi.turns, kpi.outcome,
+      kpi.codeVersion, kpi.model],
   };
 }
 
@@ -3112,6 +3266,13 @@ export function normalizeScannerCompletion(input) {
     // Число проходов (ходов агента) до завершения — скалярная метрика для Монитора.
     // result сериализуется в строку выше, поэтому проходы храним отдельным числом.
     numTurns: Number.isFinite(Number(input?.numTurns)) ? Math.trunc(Number(input.numTurns)) : null,
+    // VERSION-KPI-TRACKING-001: версия кода раннера и модель — у программиста промт
+    // в коде, поэтому code_version версионирует и логику, и промт. Метки идут в
+    // payload события сдачи (KPI программиста живут в task_events, не в agent_runs).
+    codeVersion: typeof input?.codeVersion === 'string' && input.codeVersion.trim()
+      ? input.codeVersion.trim().slice(0, 80) : null,
+    model: typeof input?.model === 'string' && input.model.trim()
+      ? input.model.trim().slice(0, 120) : null,
     completedAt: input?.completedAt ?? null,
     sourceDocument: required('sourceDocument'),
     nextRole: 'TASK_REVIEWER',

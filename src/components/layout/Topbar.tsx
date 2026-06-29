@@ -6,7 +6,7 @@ import styles from './Topbar.module.css';
 const TITLES: Record<RouteKey, string> = {
   projects: 'Проекты',
   tasks: 'Задачи',
-  'development-scheme': 'Схема разработки',
+  'departments-development': 'Разработка',
   'monitor-performance': 'Монитор производительности',
   integrations: 'Интеграции',
   'settings-roles': 'Настройки · Роли',

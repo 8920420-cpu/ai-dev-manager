@@ -12,6 +12,7 @@
 // чистого fastForwardHiddenRoles из rolePipeline.js.
 import { readFile, readdir, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { dirname, resolve, join, relative, sep, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withClient, clientConfig } from './db.js';
@@ -353,6 +354,25 @@ export async function updateRole(s, code, input) {
         await c.query(`UPDATE roles SET ${sets.join(', ')} WHERE id = $1`, params);
       }
 
+      // VERSION-KPI-TRACKING-001: правка промта роли фиксируется как новая версия в
+      // таблице prompts (дедуп по хешу — косметика/повтор версию не плодят). Новая
+      // версия = метка на оси времени KPI (kpi_markers), чтобы привязать скачок
+      // показателей к причине. roles.prompt остаётся кэшем активного текста.
+      if ('prompt' in patch) {
+        const label = typeof input?.promptLabel === 'string' && input.promptLabel.trim()
+          ? input.promptLabel.trim().slice(0, 200) : null;
+        const author = typeof input?.author === 'string' && input.author.trim()
+          ? input.author.trim().slice(0, 120) : null;
+        const v = await recordPromptVersion(c, roleId, patch.prompt ?? '', { label, author });
+        if (v.created) {
+          await c.query(
+            `INSERT INTO kpi_markers (role_id, marker_type, ref, description)
+             VALUES ($1, 'prompt_version', $2, $3)`,
+            [roleId, String(v.version), label || `Промт роли ${roleCode} → v${v.version}`],
+          );
+        }
+      }
+
       if ('skills' in patch) {
         await c.query('DELETE FROM role_skills WHERE role_id = $1', [roleId]);
         for (let i = 0; i < patch.skills.length; i += 1) {
@@ -384,6 +404,55 @@ export async function getRolePromptConfig(c, roleCode) {
   const r = await c.query('SELECT prompt, hidden FROM roles WHERE code = $1', [roleCode]);
   if (!r.rowCount) return null;
   return { prompt: r.rows[0].prompt ?? '', hidden: r.rows[0].hidden === true };
+}
+
+// VERSION-KPI-TRACKING-001 — sha256 текста промта (нормализуем перевод строки и
+// хвостовые пробелы, чтобы косметика не плодила версии). Один источник правды для
+// дедупа версий и сравнения с content_hash в БД.
+export function promptHash(text) {
+  const normalized = String(text ?? '').replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '');
+  return createHash('sha256').update(normalized).digest('hex');
+}
+
+// VERSION-KPI-TRACKING-001 — зафиксировать версию промта роли в таблице prompts.
+// Дедуп по хешу: если активная версия уже хранит ровно этот текст — новую НЕ
+// создаём (сохранение без правок не плодит версии). Иначе деактивируем прежние,
+// заводим version = max+1 (is_active). Вызывается ВНУТРИ транзакции updateRole.
+// Возвращает { version, created } — created=false при дедупе/первичном сиде.
+export async function recordPromptVersion(c, roleId, text, { label = null, author = null } = {}) {
+  const body = String(text ?? '');
+  const hash = promptHash(body);
+  const active = await c.query(
+    'SELECT version, prompt_text FROM prompts WHERE role_id = $1 AND is_active = true LIMIT 1',
+    [roleId],
+  );
+  // Дедуп считаем по ТЕКСТУ активной версии (хешируем здесь же тем же нормализатором),
+  // а не по хранимому content_hash — так результат не зависит от того, чем хеш считал
+  // сид миграции (там «сырой» sha256 без нормализации).
+  if (active.rowCount && promptHash(active.rows[0].prompt_text) === hash) {
+    return { version: active.rows[0].version, created: false };
+  }
+  const maxV = await c.query('SELECT COALESCE(max(version), 0)::int AS v FROM prompts WHERE role_id = $1', [roleId]);
+  const nextVersion = maxV.rows[0].v + 1;
+  await c.query('UPDATE prompts SET is_active = false WHERE role_id = $1 AND is_active = true', [roleId]);
+  await c.query(
+    `INSERT INTO prompts (role_id, version, prompt_text, is_active, content_hash, label, author)
+     VALUES ($1, $2, $3, true, $4, $5, $6)`,
+    [roleId, nextVersion, body, hash, label, author],
+  );
+  return { version: nextVersion, created: true };
+}
+
+// VERSION-KPI-TRACKING-001 — активная версия промта роли (для штампа agent_runs.
+// prompt_version при захвате). null, если у роли нет ни одной зафиксированной
+// версии (роль без промта в БД, например программист).
+export async function getActivePromptVersion(c, roleCode) {
+  const r = await c.query(
+    `SELECT p.version FROM prompts p JOIN roles r ON r.id = p.role_id
+      WHERE r.code = $1 AND p.is_active = true LIMIT 1`,
+    [roleCode],
+  );
+  return r.rowCount ? r.rows[0].version : null;
 }
 
 // Содержимое подключённых к роли skills в порядке position: [{ path, content }].

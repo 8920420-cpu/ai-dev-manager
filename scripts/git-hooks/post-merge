@@ -1,0 +1,5 @@
+#!/bin/sh
+# VERSION-KPI-TRACKING-001 — после git merge/pull ставим авто-метку деплоя.
+# Логика — в общем mark-deploy.sh рядом (чтобы не дублировать в post-rewrite).
+dir=$(dirname "$0")
+. "$dir/mark-deploy.sh"

@@ -22,6 +22,16 @@ const CODEX_BIN = process.env.CODEX_BIN || 'codex';
 // Песочница: рассуждающие роли только читают → read-only (безопасно). Для ролей,
 // которые пишут (напр. Documentation Keeper), задайте workspace-write.
 const CODEX_SANDBOX = process.env.CODEX_SANDBOX || 'read-only';
+// COLDSTART-MCP-ISOLATION-001 / медленный spawn на Windows: каждая read-команда
+// модели — это отдельный процесс, а песочница (`[windows] sandbox="elevated"` в
+// config.toml) оборачивает его в restricted-token launch. На Windows spawn ~50–75 мс
+// (+ Defender real-time scan), и серия мелких чтений выбивает внутренний таймаут
+// codex → модель жалуется «команды чтения на диске медленные, упёрлись в таймаут».
+// Для ДОВЕРЕННЫХ локальных проектов и read-only ролей песочница — чистый оверхед:
+// флагом можно её обойти (codex считает, что окружение изолировано снаружи).
+// По умолчанию ВЫКЛ — поведение не меняется. Включать осознанно (раннер на хосте,
+// проект помечен trusted в ~/.codex/config.toml).
+const CODEX_BYPASS_SANDBOX = /^(1|true|yes|on)$/i.test(String(process.env.CODEX_BYPASS_SANDBOX || '').trim());
 // Модель: по умолчанию пусто → Codex берёт модель из своего config.toml.
 const CODEX_MODEL = process.env.CODEX_MODEL || '';
 
@@ -58,6 +68,7 @@ function linkAbort(child, signal) {
 export function makeCodexRunAgent(cfg = {}) {
   const bin = cfg.bin || CODEX_BIN;
   const sandbox = cfg.sandbox || CODEX_SANDBOX;
+  const bypassSandbox = cfg.bypassSandbox ?? CODEX_BYPASS_SANDBOX;
   const model = cfg.model ?? CODEX_MODEL;
   const log = cfg.log || console;
   const spawnImpl = cfg.spawn || spawn;
@@ -77,8 +88,13 @@ export function makeCodexRunAgent(cfg = {}) {
       // ровно то, что в DeepSeek-пути уходит как messages[system,user].
       const prompt = `${String(task.systemPrompt || '')}\n\n${String(task.userPrompt || '')}`.trim();
 
+      // `--dangerously-bypass-...` и `-s` взаимоисключающи: bypass снимает песочницу
+      // целиком (без per-command restricted-token spawn), -s выбирает её политику.
+      const sandboxArgs = bypassSandbox
+        ? ['--dangerously-bypass-approvals-and-sandbox']
+        : ['-s', sandbox];
       const args = ['exec', '--json', '--ephemeral', '--skip-git-repo-check',
-        '-s', sandbox, '--output-schema', schemaFile, '-o', lastMsgFile];
+        ...sandboxArgs, '--output-schema', schemaFile, '-o', lastMsgFile];
       if (model) args.push('-m', model);
       // Рабочий корень задаём через cwd процесса, а НЕ через аргумент `-C`: на
       // Windows codex — это codex.cmd (нужен shell:true), а пути проектов содержат
@@ -130,11 +146,11 @@ export function makeCodexRunAgent(cfg = {}) {
       const durationMs = Date.now() - started;
 
       if (verdict && typeof verdict === 'object' && !Array.isArray(verdict)) {
-        return { ok: true, verdict, response: raw, durationMs };
+        return { ok: true, verdict, response: raw, durationMs, model };
       }
       // Схема должна была гарантировать JSON; если нет — отдадим текст, оркестратор
       // распарсит толерантно (parseVerdict) либо пометит verdict_unparsed.
-      if (raw) return { ok: true, response: raw, durationMs };
+      if (raw) return { ok: true, response: raw, durationMs, model };
       return { ok: false, error: 'empty_codex_output' };
     } catch (e) {
       return { ok: false, error: `agent_threw: ${e.message}` };

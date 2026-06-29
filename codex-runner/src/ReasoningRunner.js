@@ -7,6 +7,7 @@
 // Concurrency: до N задач одновременно (in-flight счётчик); драйвер (bin) поднимает
 // N воркеров над одним ReasoningRunner. Изоляции правок не нужно — роли работают в
 // read-only песочнице и ничего не коммитят (в отличие от программиста с worktree).
+import { resolveCodeVersion } from './codeVersion.js';
 
 export class ReasoningRunner {
   /**
@@ -121,5 +122,8 @@ export function buildCompletionBody(task, agentResult) {
     response: typeof agentResult.response === 'string' ? agentResult.response : null,
     durationMs: Number.isFinite(Number(agentResult.durationMs)) ? Number(agentResult.durationMs) : null,
     promptText: `${String(task.systemPrompt || '')}\n\n${String(task.userPrompt || '')}`.slice(0, 100000),
+    // VERSION-KPI-TRACKING-001: метки версии кода раннера и использованной модели.
+    codeVersion: resolveCodeVersion(),
+    model: typeof agentResult.model === 'string' && agentResult.model ? agentResult.model : null,
   };
 }

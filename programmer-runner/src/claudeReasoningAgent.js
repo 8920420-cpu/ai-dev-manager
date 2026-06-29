@@ -108,6 +108,7 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
         coldStartMs, reasonMs, turns: turnsKpi, toolUses, rateLimited,
         tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, costUsd: usage.costUsd,
         durationMs: Date.now() - started,
+        model, // VERSION-KPI-TRACKING-001: модель прогона для атрибуции KPI.
       };
     };
 

@@ -5,6 +5,10 @@ services:
       # и кладёт его в backend (см. orchestrator-service/Dockerfile).
       context: .
       dockerfile: orchestrator-service/Dockerfile
+      args:
+        # VERSION-KPI-TRACKING-001: git-SHA сборки → авто-метка деплоя на старте
+        # (kpi_markers type=deploy). scripts/deploy.ps1 проставляет APP_CODE_VERSION сам.
+        APP_CODE_VERSION: "${APP_CODE_VERSION:-}"
     image: orchestrator-service:latest
     container_name: orchestrator-service
     ports:

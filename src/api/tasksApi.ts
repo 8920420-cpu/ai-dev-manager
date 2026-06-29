@@ -208,8 +208,9 @@ export const tasksApi = {
   /**
    * `POST /api/tasks/:id/move` — ручное перемещение задачи на выбранный этап проекта
    * (manual). Пишет audit-событие; используется для BLOCKED/непродвигаемых задач.
+   * Причина (`reason`) обязательна — она попадает в payload события task_events.
    */
-  async move(taskId: string, input: { toStageId: string; reason?: string }): Promise<MoveTaskResult> {
+  async move(taskId: string, input: { toStageId: string; reason: string }): Promise<MoveTaskResult> {
     return http.post<MoveTaskResult>(`/api/tasks/${encodeURIComponent(taskId)}/move`, input);
   },
 

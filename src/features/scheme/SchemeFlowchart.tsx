@@ -346,15 +346,6 @@ export function SchemeFlowchart({
       )}
 
       <div className={styles.head}>
-        <div>
-          <h3 className={styles.title}>Конвейер разработки</h3>
-          <p className={styles.desc}>
-            Задача движется по этапам сверху вниз. На карточке — номер, роль и
-            переключатель этапа; шестерёнка открывает все настройки. Перетаскивайте
-            карточку за <GripVertical size={13} aria-hidden="true" className={styles.inlineIcon} />,
-            чтобы изменить порядок.
-          </p>
-        </div>
         <div className={styles.headActions}>
           <Button
             variant="ghost"

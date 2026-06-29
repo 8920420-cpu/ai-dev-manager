@@ -16,7 +16,7 @@ function CurrentPage() {
   switch (route) {
     case 'tasks':
       return <TasksPage />;
-    case 'development-scheme':
+    case 'departments-development':
       return <DevelopmentSchemePage />;
     case 'integrations':
       return <IntegrationsPage />;

@@ -6,6 +6,7 @@ import { createApp } from '../src/server.js';
 import { loadSettings } from '../src/config.js';
 import { bootstrap, reconcileOnStartup } from '../src/db.js';
 import { createTaskRunner } from '../src/taskRunner.js';
+import { recordDeployMarker } from '../src/performance.js';
 
 const PORT = Number(process.env.PORT || 4186);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -31,6 +32,18 @@ async function main() {
       );
     }
   }
+  // VERSION-KPI-TRACKING-001: авто-метка деплоя. APP_CODE_VERSION задаётся build-arg
+  // образа (git-SHA на момент сборки) → на старте ставим общесистемную метку type=deploy.
+  // Идемпотентно по ref: рестарт того же образа метку не дублирует.
+  if (process.env.APP_CODE_VERSION) {
+    try {
+      const dm = await recordDeployMarker(await loadSettings(), { ref: process.env.APP_CODE_VERSION });
+      if (dm.created) console.error(`[orchestrator-service] метка деплоя поставлена: ${dm.ref}`);
+    } catch (e) {
+      console.error(`[orchestrator-service] метка деплоя не поставлена (продолжаю): ${e.message}`);
+    }
+  }
+
   if (STARTUP_RECONCILE) {
     try {
       const released = await reconcileOnStartup(await loadSettings());

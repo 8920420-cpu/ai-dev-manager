@@ -64,7 +64,11 @@ const http = {
 const runAgent = makeCodexRunAgent();
 const runner = new ReasoningRunner({ http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY });
 
-console.log(`codex-runner: orchestrator=${ORCH}, рассуждающие роли через Codex, role=${ROLE || 'любая делегированная'}`);
+// Видимость песочницы в логе: bypass снимает per-command sandbox-spawn (главный
+// источник медленных read-команд на Windows). Состояние читаем тем же предикатом,
+// что codexAgent, чтобы лог не расходился с реальным поведением.
+const BYPASS_SANDBOX = /^(1|true|yes|on)$/i.test(String(process.env.CODEX_BYPASS_SANDBOX || '').trim());
+console.log(`codex-runner: orchestrator=${ORCH}, рассуждающие роли через Codex, role=${ROLE || 'любая делегированная'}, sandbox=${BYPASS_SANDBOX ? 'bypass (--dangerously-bypass-approvals-and-sandbox)' : 'read-only'}`);
 
 let stopping = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

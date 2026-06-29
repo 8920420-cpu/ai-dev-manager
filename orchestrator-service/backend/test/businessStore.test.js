@@ -147,3 +147,25 @@ test('normalizeRoleConnectors: пустой connectorId трактуется к�
   );
   assert.deepEqual(out, [{ roleCode: 'SCANNER', connectorId: null }]);
 });
+
+test('normalizeRoleConnectors: UUID driver-коннектора (codex/claude_code) принимается', () => {
+  // UUID driver-коннекторов (codex и claude_code) присутствуют в множестве
+  // допустимых connectorId (как их вернул бы запрос к таблице connectors).
+  const CODEX_ID = '11111111-1111-4111-8111-111111111111';
+  const CLAUDE_CODE_ID = '22222222-2222-4222-8222-222222222222';
+  const validConnectorIds = new Set([...VALID_CONNECTORS, CODEX_ID, CLAUDE_CODE_ID]);
+
+  const out = normalizeRoleConnectors(
+    { assignments: [
+      { roleCode: 'PROGRAMMER', connectorId: CODEX_ID },
+      { roleCode: 'ARCHITECT', connectorId: CLAUDE_CODE_ID },
+    ] },
+    { validRoleCodes: VALID_ROLES, validConnectorIds },
+  );
+
+  // Назначение роли на driver-коннектор принимается и НЕ отфильтровывается.
+  assert.deepEqual(out, [
+    { roleCode: 'PROGRAMMER', connectorId: CODEX_ID },
+    { roleCode: 'ARCHITECT', connectorId: CLAUDE_CODE_ID },
+  ]);
+});

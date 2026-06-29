@@ -203,3 +203,14 @@ test('buildCompletionBody: число проходов берётся из resul
   const body = buildCompletionBody(task, { result: { summary: 'ok', agent: { numTurns: 42 } } });
   assert.equal(body.numTurns, 42);
 });
+
+// VERSION-KPI-TRACKING-001: метки версии присутствуют в теле сдачи.
+test('buildCompletionBody: содержит codeVersion и model (метки версии)', () => {
+  const task = { id: 'X', completion: { completionKey: 'k' } };
+  const body = buildCompletionBody(task, { result: {}, model: 'claude-opus-4-8' });
+  assert.equal(body.model, 'claude-opus-4-8');
+  assert.ok('codeVersion' in body); // git-SHA или null — ключ всегда есть
+  // model отсутствует → null, а не undefined (предсказуемо для оркестратора).
+  const body2 = buildCompletionBody(task, { result: {} });
+  assert.equal(body2.model, null);
+});

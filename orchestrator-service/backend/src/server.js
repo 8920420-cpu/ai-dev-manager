@@ -40,7 +40,7 @@ import {
 } from './connectors.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
-import { getPerformanceMetrics } from './performance.js';
+import { getPerformanceMetrics, getVersionMetrics, getKpiMarkers, createKpiMarker } from './performance.js';
 import { createAuditRun, listAuditRuns, completeAuditRun } from './auditRuns.js';
 import { getTaskTree, getTaskStatusCounts, getTasksByStage, getTaskHistory } from './taskTree.js';
 import { openTaskEventsStream, publishTaskChange } from './taskEvents.js';
@@ -359,6 +359,35 @@ export function createApp() {
               projectId: url.searchParams.get('projectId'),
             }),
           );
+
+        // VERSION-KPI-TRACKING-001: KPI роли по версиям (код/промт/модель) + дельты
+        // к предыдущей версии + регресс-флаги. role обязателен.
+        if (req.method === 'GET' && p === '/api/performance/versions')
+          return sendJson(
+            res,
+            200,
+            await getVersionMetrics(await loadSettings(), {
+              role: url.searchParams.get('role'),
+              windowHours: url.searchParams.get('windowHours'),
+              projectId: url.searchParams.get('projectId'),
+            }),
+          );
+
+        // Метки на оси времени KPI (правка промта/деплой/ручная отметка).
+        if (req.method === 'GET' && p === '/api/kpi-markers')
+          return sendJson(
+            res,
+            200,
+            await getKpiMarkers(await loadSettings(), {
+              role: url.searchParams.get('role'),
+              windowHours: url.searchParams.get('windowHours'),
+              limit: url.searchParams.get('limit'),
+            }),
+          );
+
+        // Поставить метку вручную (например, «выкатил коммит abc123»).
+        if (req.method === 'POST' && p === '/api/kpi-markers')
+          return sendJson(res, 200, await createKpiMarker(await loadSettings(), await readBody(req)));
 
         // ORCHESTRATOR-AUDITOR-001: ручной запуск аудита оркестратора (off-route).
         if (req.method === 'POST' && p === '/api/audit/run')

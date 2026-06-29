@@ -34,6 +34,11 @@ COPY roles ./roles
 
 ENV PORT=80
 ENV ROLES_DIR=/app/roles
+# VERSION-KPI-TRACKING-001: git-SHA на момент сборки образа. Прокидывается build-arg
+# из docker-compose (build.args.APP_CODE_VERSION) и читается на старте сервера для
+# авто-метки деплоя (kpi_markers type=deploy). Пусто — метка не ставится.
+ARG APP_CODE_VERSION=
+ENV APP_CODE_VERSION=$APP_CODE_VERSION
 EXPOSE 80
 
 # 127.0.0.1, а не localhost: alpine резолвит localhost в IPv6 ::1, а сервер

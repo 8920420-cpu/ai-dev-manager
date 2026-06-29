@@ -131,7 +131,7 @@ export function DevelopmentSchemePage() {
       const saved = await developmentSchemeApi.save(derived.stages, state.roles, derived.edges);
       dispatch({ type: 'reset', state: toWizardState(saved) });
       setEdges(saved.edges);
-      toast.success('Схема разработки сохранена и применена ко всем проектам');
+      toast.success('Разработка сохранена и применена ко всем проектам');
     } catch (err) {
       if (err instanceof StageSaveError) {
         setSaveErrors(err.errors);
@@ -141,7 +141,7 @@ export function DevelopmentSchemePage() {
             : 'Этапы не прошли проверку — исправьте отмеченные поля.',
         );
       } else {
-        toast.error('Не удалось сохранить схему разработки');
+        toast.error('Не удалось сохранить разработку');
       }
     } finally {
       setSaving(false);
@@ -150,15 +150,7 @@ export function DevelopmentSchemePage() {
 
   return (
     <div className={styles.page}>
-      <PageHeader
-        title="Схема разработки"
-        description="Единый конвейер ролей для всех проектов: задайте порядок этапов, ответственные роли и статусы задач. Изменения применяются ко всем проектам сразу."
-      />
-
-      <Callout tone="info" title="Папка отслеживания задаётся в проекте">
-        Scanner следит за «папкой документов» каждого проекта (поле проекта), поэтому в
-        схеме папка не указывается — здесь только порядок этапов, роли и статусы.
-      </Callout>
+      <PageHeader title="Разработка" />
 
       {loadState === 'loading' && <LoadingBlock />}
 

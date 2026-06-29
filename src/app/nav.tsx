@@ -22,7 +22,14 @@ export const NAV_ITEMS: NavItem[] = [
     icon: FolderGit2,
   },
   { label: 'Задачи', route: 'tasks', icon: ListTree },
-  { label: 'Схема разработки', route: 'development-scheme', icon: Workflow },
+  {
+    label: 'Отделы',
+    route: 'departments-development',
+    icon: Workflow,
+    children: [
+      { label: 'Разработка', route: 'departments-development' },
+    ],
+  },
   { label: 'Монитор производительности', route: 'monitor-performance', icon: Activity },
   { label: 'Интеграции', route: 'integrations', icon: Plug },
   {

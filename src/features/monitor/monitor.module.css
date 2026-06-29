@@ -111,3 +111,73 @@
   color: var(--text-muted);
   font-size: var(--text-sm);
 }
+
+/* VERSION-KPI-TRACKING-001 — управление и дельты раздела «Версии». */
+.versionControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.versionControls label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.versionControls select {
+  padding: var(--space-1) var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 6px);
+  color: inherit;
+  font-size: var(--text-sm);
+}
+
+.delta {
+  font-size: var(--text-xs, 0.75rem);
+  font-variant-numeric: tabular-nums;
+  margin-left: var(--space-1);
+  white-space: nowrap;
+}
+
+.delta.good {
+  color: var(--success, #14804a);
+}
+
+.delta.bad {
+  color: var(--danger, #d92d20);
+}
+
+.delta.neutral {
+  color: var(--text-muted);
+}
+
+.regressionRow td {
+  background: color-mix(in srgb, var(--danger, #d92d20) 8%, transparent);
+}
+
+.regBadge {
+  display: inline-block;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full, 999px);
+  background: var(--danger, #d92d20);
+  color: #fff;
+  font-size: var(--text-xs, 0.7rem);
+  margin-left: var(--space-2);
+}
+
+.versionTag {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.versionTag small {
+  color: var(--text-muted);
+  font-family: var(--font-mono, monospace);
+}

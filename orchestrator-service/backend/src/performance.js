@@ -252,3 +252,306 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
 export function isTerminal(status) {
   return TERMINAL.has(status);
 }
+
+// =====================================================================
+// VERSION-KPI-TRACKING-001 — KPI по версиям (код/промт/модель) и дельты.
+//
+// Отвечает на «поправили код/промт — как изменились показатели роли?». Группируем
+// прогоны роли по тройке (prompt_version, code_version, model), считаем средние,
+// упорядочиваем по времени первого прогона и считаем дельту к предыдущей версии.
+// =====================================================================
+
+// Минимум прогонов на версию, чтобы дельта/регресс считались значимыми (иначе шум
+// из 1–2 прогонов). Регресс — рост «метрики-чем-меньше-тем-лучше» сверх порога.
+export const VERSION_MIN_SAMPLE = 5;
+export const VERSION_REGRESSION_PCT = 0.1;
+
+// Метрики версии и направление «лучше». lowerIsBetter=true → рост = регресс.
+const VERSION_METRICS = [
+  { key: 'avgDurationMs', lowerIsBetter: true },
+  { key: 'avgTokensIn', lowerIsBetter: true },
+  { key: 'avgTokensOut', lowerIsBetter: true },
+  { key: 'avgCost', lowerIsBetter: true },
+  { key: 'avgColdStartMs', lowerIsBetter: true },
+  { key: 'avgTurns', lowerIsBetter: true },
+  { key: 'avgPasses', lowerIsBetter: true },
+  { key: 'successRate', lowerIsBetter: false },
+];
+
+/**
+ * Чистый расчёт дельт и регрессов по упорядоченному во времени списку версий.
+ * Вынесен отдельно для юнит-теста без БД. Для каждой версии (кроме первой) дельта
+ * считается к ПРЕДЫДУЩЕЙ. Регресс отмечается только когда у обеих версий выборка
+ * не меньше minSample (иначе enoughData=false и regression не выставляется).
+ * @param {Array<Object>} rows  версии в хронологическом порядке (поле n — размер выборки)
+ * @returns {Array<Object>} те же строки + { delta, enoughData, regression, regressedMetrics }
+ */
+export function deriveVersionDeltas(rows, { minSample = VERSION_MIN_SAMPLE, regressionPct = VERSION_REGRESSION_PCT } = {}) {
+  const out = [];
+  for (let i = 0; i < rows.length; i += 1) {
+    const cur = rows[i];
+    const prev = i > 0 ? rows[i - 1] : null;
+    const delta = {};
+    const regressedMetrics = [];
+    const enoughData = !!prev && Number(prev.n) >= minSample && Number(cur.n) >= minSample;
+    for (const { key, lowerIsBetter } of VERSION_METRICS) {
+      const a = prev == null ? null : prev[key];
+      const b = cur[key];
+      if (a == null || b == null) { delta[key] = null; continue; }
+      const abs = Math.round((Number(b) - Number(a)) * 1000) / 1000;
+      const pct = Number(a) !== 0 ? (Number(b) - Number(a)) / Math.abs(Number(a)) : null;
+      delta[key] = { abs, pct: pct == null ? null : Math.round(pct * 1000) / 1000 };
+      // Регресс: ухудшение сверх порога (направление зависит от lowerIsBetter).
+      if (enoughData && pct != null) {
+        const worsePct = lowerIsBetter ? pct : -pct;
+        if (worsePct > regressionPct) regressedMetrics.push(key);
+      }
+    }
+    out.push({ ...cur, delta, enoughData, regression: regressedMetrics.length > 0, regressedMetrics });
+  }
+  return out;
+}
+
+/**
+ * GET /api/performance/versions?role=CODE[&windowHours=N&projectId=...]
+ * Рассуждающие роли агрегируются из agent_runs (есть токены/cold_start/turns).
+ * Программист (роль с метриками в task_events) — из событий сдачи: passes/limitHits
+ * по code_version/model. role обязателен (версии имеют смысл в разрезе одной роли).
+ */
+export async function getVersionMetrics(s, { role, windowHours, projectId } = {}) {
+  const roleCode = String(role ?? '').trim();
+  if (!roleCode) throw badRequest('role_required');
+  const hours = Number.isFinite(Number(windowHours)) && Number(windowHours) > 0 ? Number(windowHours) : 720;
+  return withClient(clientConfig(s), async (c) => {
+    const roleRow = await c.query('SELECT id, code, name FROM roles WHERE code = $1', [roleCode]);
+    if (!roleRow.rowCount) throw badRequest('role_not_found');
+    const role0 = roleRow.rows[0];
+    const isProgrammer = roleCode === 'PROGRAMMER';
+    const projectDbId = await resolveProjectId(c, projectId);
+
+    const rows = isProgrammer
+      ? await programmerVersionRows(c, hours, projectDbId)
+      : await reasoningVersionRows(c, role0.id, hours, projectDbId);
+
+    const annotated = deriveVersionDeltas(rows);
+    const markers = await fetchMarkers(c, { roleId: role0.id, hours, limit: 100 });
+    return {
+      generatedAt: new Date().toISOString(),
+      role: { code: role0.code, name: role0.name },
+      windowHours: hours,
+      source: isProgrammer ? 'task_events' : 'agent_runs',
+      minSample: VERSION_MIN_SAMPLE,
+      regressionPct: VERSION_REGRESSION_PCT,
+      versions: annotated,
+      markers,
+    };
+  });
+}
+
+// Версии рассуждающей роли из agent_runs, сгруппированные по (prompt_version,
+// code_version, model), в хронологии первого прогона.
+async function reasoningVersionRows(c, roleId, hours, projectDbId) {
+  const params = [roleId, hours];
+  let projFilter = '';
+  if (projectDbId) {
+    params.push(projectDbId);
+    projFilter = `AND ar.task_id IN (SELECT id FROM tasks WHERE project_id = $${params.length})`;
+  }
+  const r = await c.query(
+    `SELECT ar.prompt_version, ar.code_version, ar.model,
+            (SELECT label FROM prompts p WHERE p.role_id = $1 AND p.version = ar.prompt_version LIMIT 1) AS prompt_label,
+            count(*)::int AS n,
+            count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
+            count(*) FILTER (WHERE ar.status = 'FAILED')::int AS failed,
+            count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
+            avg(extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000)
+              FILTER (WHERE ar.finished_at IS NOT NULL) AS avg_ms,
+            avg(ar.token_input) FILTER (WHERE ar.token_input IS NOT NULL) AS avg_tokens_in,
+            avg(ar.token_output) FILTER (WHERE ar.token_output IS NOT NULL) AS avg_tokens_out,
+            avg(ar.cost) FILTER (WHERE ar.cost IS NOT NULL) AS avg_cost,
+            avg(ar.cold_start_ms) FILTER (WHERE ar.cold_start_ms IS NOT NULL) AS avg_cold_start,
+            avg(ar.turns) FILTER (WHERE ar.turns IS NOT NULL) AS avg_turns,
+            min(ar.started_at) AS first_run, max(ar.started_at) AS last_run
+       FROM agent_runs ar
+      WHERE ar.role_id = $1
+        AND ar.started_at >= now() - ($2::int * interval '1 hour')
+        ${projFilter}
+      GROUP BY ar.prompt_version, ar.code_version, ar.model
+      ORDER BY min(ar.started_at)`,
+    params,
+  );
+  return r.rows.map((row) => ({
+    promptVersion: row.prompt_version,
+    promptLabel: row.prompt_label,
+    codeVersion: row.code_version,
+    model: row.model,
+    n: row.n,
+    success: row.success,
+    failed: row.failed,
+    timeout: row.timeout,
+    successRate: row.n > 0 ? Math.round((row.success / row.n) * 1000) / 1000 : null,
+    avgDurationMs: numOrNull(row.avg_ms, 0),
+    avgTokensIn: numOrNull(row.avg_tokens_in, 0),
+    avgTokensOut: numOrNull(row.avg_tokens_out, 0),
+    avgCost: numOrNull(row.avg_cost, 4),
+    avgColdStartMs: numOrNull(row.avg_cold_start, 0),
+    avgTurns: numOrNull(row.avg_turns, 1),
+    avgPasses: null,
+    firstRun: row.first_run, lastRun: row.last_run,
+  }));
+}
+
+// Версии программиста из событий сдачи: passes/limitHits по (code_version, model).
+async function programmerVersionRows(c, hours, projectDbId) {
+  const params = [hours];
+  let projFilter = '';
+  if (projectDbId) {
+    params.push(projectDbId);
+    projFilter = `AND te.task_id IN (SELECT id FROM tasks WHERE project_id = $${params.length})`;
+  }
+  const r = await c.query(
+    `SELECT te.payload_json->>'codeVersion' AS code_version,
+            te.payload_json->>'model' AS model,
+            count(*) FILTER (WHERE (te.payload_json->>'passes') IS NOT NULL)::int AS n,
+            avg((te.payload_json->>'passes')::numeric)
+              FILTER (WHERE (te.payload_json->>'passes') IS NOT NULL) AS avg_passes,
+            max((te.payload_json->>'passes')::int)
+              FILTER (WHERE (te.payload_json->>'passes') IS NOT NULL) AS max_passes,
+            count(*) FILTER (WHERE te.payload_json->>'kind' = 'programmer_limit_exceeded')::int AS limit_hits,
+            min(te.created_at) AS first_run, max(te.created_at) AS last_run
+       FROM task_events te
+      WHERE te.created_at >= now() - ($1::int * interval '1 hour')
+        AND te.payload_json->>'source' IN ('scanner','programmer-runner')
+        ${projFilter}
+      GROUP BY te.payload_json->>'codeVersion', te.payload_json->>'model'
+      ORDER BY min(te.created_at)`,
+    params,
+  );
+  return r.rows.map((row) => ({
+    promptVersion: null,
+    promptLabel: null,
+    codeVersion: row.code_version,
+    model: row.model,
+    n: row.n,
+    limitHits: row.limit_hits,
+    maxPasses: row.max_passes == null ? null : Number(row.max_passes),
+    successRate: null,
+    avgDurationMs: null,
+    avgTokensIn: null,
+    avgTokensOut: null,
+    avgCost: null,
+    avgColdStartMs: null,
+    avgTurns: null,
+    avgPasses: numOrNull(row.avg_passes, 1),
+    firstRun: row.first_run, lastRun: row.last_run,
+  }));
+}
+
+/**
+ * GET /api/kpi-markers?role=CODE&windowHours=N&limit=M — метки на оси времени
+ * (правка промта/деплой/ручная отметка) для вертикальных линий на графиках KPI.
+ */
+export async function getKpiMarkers(s, { role, windowHours, limit } = {}) {
+  const hours = Number.isFinite(Number(windowHours)) && Number(windowHours) > 0 ? Number(windowHours) : 720;
+  const lim = Number.isFinite(Number(limit)) && Number(limit) > 0 ? Math.min(500, Number(limit)) : 200;
+  return withClient(clientConfig(s), async (c) => {
+    let roleId = null;
+    const roleCode = String(role ?? '').trim();
+    if (roleCode) {
+      const rr = await c.query('SELECT id FROM roles WHERE code = $1', [roleCode]);
+      roleId = rr.rowCount ? rr.rows[0].id : '00000000-0000-0000-0000-000000000000';
+    }
+    return { generatedAt: new Date().toISOString(), markers: await fetchMarkers(c, { roleId, hours, limit: lim }) };
+  });
+}
+
+async function fetchMarkers(c, { roleId = null, hours = 720, limit = 200 } = {}) {
+  const params = [hours, limit];
+  let roleFilter = '';
+  if (roleId) {
+    params.push(roleId);
+    // Метки роли + общесистемные (role_id IS NULL, например деплой).
+    roleFilter = `AND (m.role_id = $${params.length} OR m.role_id IS NULL)`;
+  }
+  const r = await c.query(
+    `SELECT m.id, m.marker_type, m.ref, m.description, m.created_at, r.code AS role_code
+       FROM kpi_markers m LEFT JOIN roles r ON r.id = m.role_id
+      WHERE m.created_at >= now() - ($1::int * interval '1 hour') ${roleFilter}
+      ORDER BY m.created_at DESC
+      LIMIT $2`,
+    params,
+  );
+  return r.rows.map((row) => ({
+    id: row.id, type: row.marker_type, ref: row.ref,
+    description: row.description, roleCode: row.role_code, createdAt: row.created_at,
+  }));
+}
+
+// POST /api/kpi-markers — ручная/деплой-метка (например, после выкатки кода).
+export async function createKpiMarker(s, input) {
+  const type = String(input?.type ?? 'manual').trim().slice(0, 40) || 'manual';
+  const ref = input?.ref == null ? null : String(input.ref).trim().slice(0, 120) || null;
+  const description = input?.description == null ? null : String(input.description).trim().slice(0, 500) || null;
+  const roleCode = String(input?.role ?? '').trim();
+  return withClient(clientConfig(s), async (c) => {
+    let roleId = null;
+    if (roleCode) {
+      const rr = await c.query('SELECT id FROM roles WHERE code = $1', [roleCode]);
+      if (!rr.rowCount) throw badRequest('role_not_found');
+      roleId = rr.rows[0].id;
+    }
+    const ins = await c.query(
+      `INSERT INTO kpi_markers (role_id, marker_type, ref, description)
+       VALUES ($1, $2, $3, $4) RETURNING id, created_at`,
+      [roleId, type, ref, description],
+    );
+    return { id: ins.rows[0].id, type, ref, description, roleCode: roleCode || null, createdAt: ins.rows[0].created_at };
+  });
+}
+
+// VERSION-KPI-TRACKING-001 — самоотметка деплоя на старте оркестратора. Пишет
+// общесистемную метку type=deploy с git-SHA образа (APP_CODE_VERSION). Идемпотентно
+// по ref: повторный рестарт того же образа НЕ плодит метки (вертикальная линия на
+// графике появляется ровно один раз на версию кода). Возвращает { created, ref }.
+export async function recordDeployMarker(s, { ref, description = null } = {}) {
+  const version = String(ref ?? '').trim().slice(0, 120);
+  if (!version) return { created: false, ref: null };
+  return withClient(clientConfig(s), async (c) => {
+    const exists = await c.query(
+      `SELECT 1 FROM kpi_markers WHERE marker_type = 'deploy' AND ref = $1 LIMIT 1`,
+      [version],
+    );
+    if (exists.rowCount) return { created: false, ref: version };
+    await c.query(
+      `INSERT INTO kpi_markers (role_id, marker_type, ref, description)
+       VALUES (NULL, 'deploy', $1, $2)`,
+      [version, description || `Деплой оркестратора ${version}`],
+    );
+    return { created: true, ref: version };
+  });
+}
+
+async function resolveProjectId(c, projectId) {
+  if (projectId == null || String(projectId).trim() === '') return null;
+  const ref = String(projectId).trim();
+  const pr = await c.query(
+    `SELECT id FROM projects WHERE id::text = $1 OR code = $1 OR root_path = $1 OR name = $1
+      ORDER BY created_at LIMIT 1`,
+    [ref],
+  );
+  return pr.rowCount ? pr.rows[0].id : null;
+}
+
+function numOrNull(v, digits) {
+  if (v == null) return null;
+  const n = Number(v);
+  if (!Number.isFinite(n)) return null;
+  const f = 10 ** digits;
+  return Math.round(n * f) / f;
+}
+
+function badRequest(message) {
+  const e = new Error(message);
+  e.statusCode = 400;
+  return e;
+}

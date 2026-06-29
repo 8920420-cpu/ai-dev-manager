@@ -32,15 +32,51 @@ if (-not (Test-Path $LogDir)) { New-Item -ItemType Directory -Path $LogDir | Out
 $Node = (Get-Command node -ErrorAction SilentlyContinue)
 if ($null -eq $Node) { throw 'node не найден в PATH. Установите Node.js >= 18 или добавьте его в PATH.' }
 
-# Опционально подхватываем ORCHESTRATOR_API_TOKEN из .env (если /api закрыт токеном).
+# Подхватываем настройки раннеров из .env и прокидываем их в $env: текущего
+# процесса. Start-Process наследует окружение родителя, поэтому запущенные ниже
+# демоны (в т.ч. programmer-runner) увидят эти значения автоматически.
+#
+# Зачем не только ORCHESTRATOR_API_TOKEN: PROGRAMMER_MAX_TURNS=100 в .env раньше
+# не доходил до раннера — лимит ходов брался из дефолта в коде
+# (programmer-runner/src/claudeAgent.js). Теперь .env — реальный источник истины.
+#
+# Семантика источников:
+#   - ORCHESTRATOR_API_TOKEN: ставим только если ещё не задан в окружении
+#     (внешнее окружение имеет приоритет — токен может прийти из секрет-стора);
+#   - PROGRAMMER_MAX_TURNS / PROGRAMMER_MODEL: значение из .env ПОБЕЖДАЕТ дефолт
+#     кода раннера, поэтому ставим безусловно (если непустое).
 $EnvFile = Join-Path $RepoRoot '.env'
+# Имена переменных, которые забираем из .env. true → .env переопределяет $env:,
+# false → не трогаем уже заданное окружение.
+$EnvKeys = [ordered]@{
+  'ORCHESTRATOR_API_TOKEN' = $false
+  'PROGRAMMER_MAX_TURNS'   = $true
+  'PROGRAMMER_MODEL'       = $true
+  # COLDSTART-MCP-ISOLATION-001: для доверенных read-only reasoning-прогонов снимает
+  # песочницу codex (per-command restricted-token spawn — главный источник медленных
+  # read-команд и их таймаутов на Windows). .env побеждает дефолт кода раннера.
+  'CODEX_BYPASS_SANDBOX'   = $true
+}
 if (Test-Path $EnvFile) {
   foreach ($line in Get-Content $EnvFile) {
-    if ($line -match '^\s*ORCHESTRATOR_API_TOKEN\s*=\s*(.+?)\s*$') {
-      $val = $Matches[1].Trim('"').Trim("'")
-      if ($val) { $env:ORCHESTRATOR_API_TOKEN = $val }
+    if ($line -match '^\s*([A-Z_][A-Z0-9_]*)\s*=\s*(.*?)\s*$') {
+      $key = $Matches[1]
+      if (-not $EnvKeys.Contains($key)) { continue }
+      $val = $Matches[2].Trim('"').Trim("'")
+      if (-not $val) { continue }
+      $override = $EnvKeys[$key]
+      if ($override -or -not (Get-Item -Path "Env:$key" -ErrorAction SilentlyContinue)) {
+        Set-Item -Path "Env:$key" -Value $val
+      }
     }
   }
+}
+
+# Диагностика эффективного лимита ходов программиста и его источника.
+if ($env:PROGRAMMER_MAX_TURNS) {
+  Write-Host "CONFIG: PROGRAMMER_MAX_TURNS=$($env:PROGRAMMER_MAX_TURNS) (источник: .env/окружение)"
+} else {
+  Write-Host 'CONFIG: PROGRAMMER_MAX_TURNS не задан — раннер возьмёт дефолт кода (100)'
 }
 
 # База оркестратора — опубликованный из Docker порт 4186 (если не задано иначе).

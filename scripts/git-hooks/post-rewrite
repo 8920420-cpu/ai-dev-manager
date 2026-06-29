@@ -1,0 +1,4 @@
+#!/bin/sh
+# VERSION-KPI-TRACKING-001 — после rebase/commit --amend ставим авто-метку деплоя.
+dir=$(dirname "$0")
+. "$dir/mark-deploy.sh"

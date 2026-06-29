@@ -1,6 +1,12 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Button, Callout, LoadingBlock, PageHeader, Section } from '../../components/ui';
-import { performanceApi, type PerformanceMetrics } from '../../api/performanceApi';
+import {
+  performanceApi,
+  type PerformanceMetrics,
+  type VersionMetrics,
+  type VersionRow,
+  type VersionDelta,
+} from '../../api/performanceApi';
 import { cn } from '../../lib/cn';
 import styles from './monitor.module.css';
 
@@ -66,6 +72,277 @@ function Metric({
       {hint && <span className={styles.metricHint}>{hint}</span>}
     </div>
   );
+}
+
+// VERSION-KPI-TRACKING-001 — дельта показателя версии: цвет по направлению
+// «лучше/хуже». lowerIsBetter=true → рост значения = ухудшение (красный).
+function DeltaTag({
+  delta,
+  lowerIsBetter,
+  fmt,
+  enoughData,
+}: {
+  delta: VersionDelta | null | undefined;
+  lowerIsBetter: boolean;
+  fmt: (n: number) => string;
+  enoughData: boolean;
+}) {
+  if (!delta || delta.abs === 0) return null;
+  const worse = lowerIsBetter ? delta.abs > 0 : delta.abs < 0;
+  const tone = !enoughData ? 'neutral' : worse ? 'bad' : 'good';
+  const sign = delta.abs > 0 ? '+' : '−';
+  const pct = delta.pct == null ? '' : ` (${delta.abs > 0 ? '+' : '−'}${Math.abs(Math.round(delta.pct * 100))}%)`;
+  return (
+    <span className={cn(styles.delta, styles[tone])} title={enoughData ? '' : 'Мало данных для значимой дельты'}>
+      {sign}
+      {fmt(Math.abs(delta.abs))}
+      {pct}
+    </span>
+  );
+}
+
+const VERSION_WINDOWS = [
+  { label: '24 часа', hours: 24 },
+  { label: '7 дней', hours: 168 },
+  { label: '30 дней', hours: 720 },
+];
+
+// Подпись версии: промт vN [метка] + короткий git-SHA + модель.
+function versionTitle(v: VersionRow) {
+  return (
+    <span className={styles.versionTag}>
+      <span>
+        {v.promptVersion != null ? `промт v${v.promptVersion}` : 'промт —'}
+        {v.promptLabel ? ` · ${v.promptLabel}` : ''}
+        {v.regression && <span className={styles.regBadge}>регресс</span>}
+      </span>
+      <small>
+        {v.codeVersion ?? 'код —'} · {v.model ?? 'модель —'}
+      </small>
+    </span>
+  );
+}
+
+/**
+ * Раздел «Версии и влияние изменений»: KPI выбранной роли по версиям (промт/код/
+ * модель) с дельтой к предыдущей версии. Отвечает на «поправили промт/код — как
+ * сместились показатели». Регресс (рост времени/токенов сверх порога при достаточной
+ * выборке) подсвечивается. Источник: agent_runs (рассуждающие роли) либо task_events
+ * (программист). Метки (правка промта/деплой) — вертикальные отметки на оси времени.
+ */
+function VersionsSection({ roleCodes }: { roleCodes: { code: string; name: string }[] }) {
+  const roles = useMemo(() => {
+    const list = [...roleCodes];
+    // Программист в roleLoad не появляется (его KPI в task_events) — добавим явно.
+    if (!list.some((r) => r.code === 'PROGRAMMER')) list.push({ code: 'PROGRAMMER', name: 'Программист' });
+    return list;
+  }, [roleCodes]);
+
+  const [role, setRole] = useState<string>(roles[0]?.code ?? '');
+  const [hours, setHours] = useState<number>(168);
+  const [modelFilter, setModelFilter] = useState<string>('');
+  const [data, setData] = useState<VersionMetrics | null>(null);
+  const [state, setState] = useState<LoadState>('loading');
+
+  useEffect(() => {
+    if (!role) return;
+    const ctrl = new AbortController();
+    setState('loading');
+    performanceApi
+      .versions(role, { windowHours: hours }, ctrl.signal)
+      .then((v) => {
+        if (ctrl.signal.aborted) return;
+        setData(v);
+        setModelFilter('');
+        setState('ready');
+      })
+      .catch((e) => {
+        if (ctrl.signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) return;
+        setState('error');
+      });
+    return () => ctrl.abort();
+  }, [role, hours]);
+
+  const isProgrammer = data?.source === 'task_events';
+  const models = useMemo(() => {
+    const set = new Set<string>();
+    data?.versions.forEach((v) => v.model && set.add(v.model));
+    return [...set];
+  }, [data]);
+  const versions = useMemo(
+    () => (data?.versions ?? []).filter((v) => !modelFilter || v.model === modelFilter),
+    [data, modelFilter],
+  );
+  const regressed = versions.filter((v) => v.regression);
+
+  return (
+    <Section
+      title="Версии и влияние изменений"
+      description="KPI роли по версиям промта/кода/модели с дельтой к предыдущей версии. Видно, как правка промта или кода сместила время, токены и проходы. Регресс (рост сверх 10% при выборке ≥5) подсвечен. Серая дельта — данных мало, значению доверять рано."
+    >
+      <div className={styles.versionControls}>
+        <label>
+          Роль
+          <select value={role} onChange={(e) => setRole(e.target.value)}>
+            {roles.map((r) => (
+              <option key={r.code} value={r.code}>
+                {r.name ?? r.code}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label>
+          Окно
+          <select value={hours} onChange={(e) => setHours(Number(e.target.value))}>
+            {VERSION_WINDOWS.map((w) => (
+              <option key={w.hours} value={w.hours}>
+                {w.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        {models.length > 1 && (
+          <label>
+            Модель
+            <select value={modelFilter} onChange={(e) => setModelFilter(e.target.value)}>
+              <option value="">все</option>
+              {models.map((m) => (
+                <option key={m} value={m}>
+                  {m}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+      </div>
+
+      {state === 'loading' && <LoadingBlock label="Загрузка версий…" />}
+      {state === 'error' && (
+        <Callout tone="error" title="Не удалось загрузить версии роли" />
+      )}
+
+      {state === 'ready' && data && (
+        <>
+          {regressed.length > 0 && (
+            <Callout tone="warning" title={`Регресс в ${regressed.length} версии(ях)`}>
+              <span className={styles.muted}>
+                У свежих версий показатели ухудшились против предыдущей сверх порога:{' '}
+                {regressed
+                  .map((v) => `${v.promptVersion != null ? `v${v.promptVersion}` : v.codeVersion} (${v.regressedMetrics.join(', ')})`)
+                  .join('; ')}
+                .
+              </span>
+            </Callout>
+          )}
+
+          {versions.length === 0 ? (
+            <span className={styles.muted}>За выбранное окно прогонов с метками версии нет.</span>
+          ) : isProgrammer ? (
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th>Версия</th>
+                  <th className={styles.num}>Сдач</th>
+                  <th className={styles.num}>Ср. проходов</th>
+                  <th className={styles.num}>Макс. проходов</th>
+                  <th className={styles.num}>Упоров в лимит</th>
+                  <th className={styles.num}>Период</th>
+                </tr>
+              </thead>
+              <tbody>
+                {versions.map((v, i) => (
+                  <tr key={i} className={cn(v.regression && styles.regressionRow)}>
+                    <td>{versionTitle(v)}</td>
+                    <td className={styles.num}>{v.n}</td>
+                    <td className={styles.num}>
+                      {v.avgPasses ?? '—'}
+                      <DeltaTag delta={v.delta.avgPasses} lowerIsBetter fmt={(n) => n.toFixed(1)} enoughData={v.enoughData} />
+                    </td>
+                    <td className={styles.num}>{v.maxPasses ?? '—'}</td>
+                    <td className={styles.num} title="задачи, не влезшие в бюджет ходов">
+                      {v.limitHits ?? 0}
+                    </td>
+                    <td className={styles.num}>{fmtRange(v.firstRun, v.lastRun)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          ) : (
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th>Версия</th>
+                  <th className={styles.num}>Прогонов</th>
+                  <th className={styles.num}>Успех</th>
+                  <th className={styles.num}>Ср. время</th>
+                  <th className={styles.num}>Cold start</th>
+                  <th className={styles.num}>Токены вх</th>
+                  <th className={styles.num}>Токены исх</th>
+                  <th className={styles.num}>Стоимость</th>
+                  <th className={styles.num}>Ходов</th>
+                </tr>
+              </thead>
+              <tbody>
+                {versions.map((v, i) => (
+                  <tr key={i} className={cn(v.regression && styles.regressionRow)}>
+                    <td>{versionTitle(v)}</td>
+                    <td className={styles.num}>{v.n}</td>
+                    <td className={styles.num}>
+                      {v.successRate == null ? '—' : `${Math.round(v.successRate * 100)}%`}
+                      <DeltaTag delta={v.delta.successRate} lowerIsBetter={false} fmt={(n) => `${Math.round(n * 100)}%`} enoughData={v.enoughData} />
+                    </td>
+                    <td className={styles.num}>
+                      {fmtDuration(v.avgDurationMs)}
+                      <DeltaTag delta={v.delta.avgDurationMs} lowerIsBetter fmt={(n) => fmtDuration(n)} enoughData={v.enoughData} />
+                    </td>
+                    <td className={styles.num}>
+                      {fmtDuration(v.avgColdStartMs)}
+                      <DeltaTag delta={v.delta.avgColdStartMs} lowerIsBetter fmt={(n) => fmtDuration(n)} enoughData={v.enoughData} />
+                    </td>
+                    <td className={styles.num}>
+                      {fmtTokens(v.avgTokensIn ?? 0)}
+                      <DeltaTag delta={v.delta.avgTokensIn} lowerIsBetter fmt={(n) => fmtTokens(Math.round(n))} enoughData={v.enoughData} />
+                    </td>
+                    <td className={styles.num}>
+                      {fmtTokens(v.avgTokensOut ?? 0)}
+                      <DeltaTag delta={v.delta.avgTokensOut} lowerIsBetter fmt={(n) => fmtTokens(Math.round(n))} enoughData={v.enoughData} />
+                    </td>
+                    <td className={styles.num}>
+                      {fmtCost(v.avgCost ?? 0)}
+                      <DeltaTag delta={v.delta.avgCost} lowerIsBetter fmt={(n) => fmtCost(n)} enoughData={v.enoughData} />
+                    </td>
+                    <td className={styles.num}>
+                      {v.avgTurns ?? '—'}
+                      <DeltaTag delta={v.delta.avgTurns} lowerIsBetter fmt={(n) => n.toFixed(1)} enoughData={v.enoughData} />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+
+          {data.markers.length > 0 && (
+            <div className={styles.statusRow} style={{ marginTop: 'var(--space-3)' }}>
+              {data.markers.slice(0, 12).map((m) => (
+                <span key={m.id} className={styles.statusChip} title={new Date(m.createdAt).toLocaleString('ru-RU')}>
+                  {m.type === 'prompt_version' ? '✎' : m.type === 'deploy' ? '🚀' : '•'}{' '}
+                  {m.description ?? m.ref ?? m.type}
+                </span>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </Section>
+  );
+}
+
+function fmtRange(a: string | null, b: string | null): string {
+  if (!a) return '—';
+  const fa = new Date(a).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+  if (!b) return fa;
+  const fb = new Date(b).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
+  return fa === fb ? fa : `${fa}–${fb}`;
 }
 
 /**
@@ -287,6 +564,8 @@ export function PerformanceMonitorPage() {
               </table>
             )}
           </Section>
+
+          <VersionsSection roleCodes={data.roleLoad.map((r) => ({ code: r.roleCode, name: r.roleName }))} />
 
           <Section
             title="Ёмкость LLM-коннектора"

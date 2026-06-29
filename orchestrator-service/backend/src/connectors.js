@@ -7,6 +7,17 @@ import { invoke as llmInvoke } from './llmConnector.js';
 
 const { Client } = pg;
 
+// Фабрика pg-клиента вынесена отдельно, чтобы unit-тесты могли подменить её
+// (мок connect/query/end) и проверять ветвления invokeConnector без реальной БД.
+// В production всегда используется настоящий pg.Client (см. __setClientFactoryForTest).
+let createClient = (cfg) => new Client(cfg);
+
+// --- Тестовый помощник -------------------------------------------------------
+// Подменить фабрику pg-клиента. Передать null/undefined — вернуть штатную фабрику.
+export function __setClientFactoryForTest(factory) {
+  createClient = factory ?? ((cfg) => new Client(cfg));
+}
+
 // Статусы обмена — те же, что в источнике (ai.prompt_exchange).
 export const EXCHANGE_STATUS = {
   CREATED: 'Создан',
@@ -54,7 +65,7 @@ function clientConfig(s) {
 
 async function withClient(fn) {
   const s = await loadSettings();
-  const client = new Client(clientConfig(s));
+  const client = createClient(clientConfig(s));
   // DB-CONN-RESILIENCE-001: см. db.js — слушатель 'error' делает обрыв соединения
   // (Patroni/PgBouncer переключение лидера) нефатальным, иначе Node роняет процесс.
   client.on('error', (err) => {
@@ -237,6 +248,12 @@ export async function invokeConnector(connectorId, input = {}) {
 
   return withClient(async (c) => {
     const conn = await getRow(c, connectorId);
+    // ROLE-ENGINE-ROUTING-001: коннектор-«драйвер» (Codex / Claude Code) не имеет
+    // сетевого endpoint и access token — его нельзя вызывать напрямую через invoke.
+    // Перехватываем здесь, чтобы не уйти в llmInvoke с пустым endpoint/token.
+    if (isDriverProvider(conn.provider)) {
+      throw httpError(422, 'Driver connector cannot be invoked directly');
+    }
     if (!conn.isEnabled) throw httpError(409, 'connector_disabled');
 
     const promptText = system ? `${system}\n\n${user}` : user;

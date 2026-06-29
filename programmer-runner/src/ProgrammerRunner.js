@@ -8,6 +8,7 @@
 // ProgrammerRunner. Изоляция параллельных правок — в runAgent (git worktree, см.
 // claudeAgent.js): дорогой шаг LLM параллелится, слияние в main сериализуется.
 // concurrency=1 → поведение прежнее (busy-гард не пускает второй tick).
+import { resolveCodeVersion } from './codeVersion.js';
 
 export class ProgrammerRunner {
   /**
@@ -142,5 +143,10 @@ export function buildCompletionBody(task, agentResult) {
     changedFiles: Array.isArray(agentResult.changedFiles) ? agentResult.changedFiles : [],
     result: agentResult.result ?? {},
     numTurns: Number.isFinite(numTurns) ? numTurns : undefined,
+    // VERSION-KPI-TRACKING-001: версия кода раннера (промт программиста в коде → она
+    // же версионирует промт) и использованная модель — оркестратор кладёт в payload
+    // события сдачи (KPI программиста живут в task_events).
+    codeVersion: resolveCodeVersion(),
+    model: typeof agentResult.model === 'string' && agentResult.model ? agentResult.model : null,
   };
 }

@@ -22,6 +22,7 @@ vi.mock('./http', async () => {
 });
 
 import { tasksApi } from './tasksApi';
+import { ApiError } from './http';
 
 beforeEach(() => {
   get.mockReset();
@@ -51,9 +52,31 @@ describe('tasksApi.move', () => {
     expect(res.toStatus).toBe('CODING');
   });
 
-  it('reason необязателен', async () => {
+  it('reason передаётся в теле как обязательное поле', async () => {
     post.mockResolvedValue({ moved: true });
-    await tasksApi.move('t1', { toStageId: 's2' });
-    expect(post).toHaveBeenCalledWith('/api/tasks/t1/move', { toStageId: 's2', reason: undefined });
+    await tasksApi.move('t1', { toStageId: 's2', reason: 'причина' });
+    expect(post).toHaveBeenCalledWith('/api/tasks/t1/move', { toStageId: 's2', reason: 'причина' });
+  });
+
+  it('кодирует taskId в пути', async () => {
+    post.mockResolvedValue({ moved: true });
+    await tasksApi.move('a/b', { toStageId: 's2', reason: 'r' });
+    expect(post).toHaveBeenCalledWith('/api/tasks/a%2Fb/move', { toStageId: 's2', reason: 'r' });
+  });
+});
+
+describe('tasksApi — обработка ошибочных ответов', () => {
+  it('advance пробрасывает ApiError при ошибке сервера', async () => {
+    const err = new ApiError('Нельзя продвинуть терминальную задачу', 409, { error: 'terminal' });
+    post.mockRejectedValue(err);
+    await expect(tasksApi.advance('abc')).rejects.toBe(err);
+    await expect(tasksApi.advance('abc')).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('move пробрасывает ApiError при ошибке сервера', async () => {
+    const err = new ApiError('Этап не найден', 404, { error: 'not_found' });
+    post.mockRejectedValue(err);
+    await expect(tasksApi.move('t1', { toStageId: 's2', reason: 'r' })).rejects.toBe(err);
+    await expect(tasksApi.move('t1', { toStageId: 's2', reason: 'r' })).rejects.toMatchObject({ status: 404 });
   });
 });

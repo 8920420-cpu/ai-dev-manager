@@ -35,6 +35,7 @@ import {
 import { projectsApi } from '../../api/projectsApi';
 import type { Project, Stage } from '../../types/project';
 import { countTopLevelTasks, filterTaskTree } from './filterTaskTree';
+import { expandedForLoad, projectKey, taskKey } from './treeExpansion';
 import styles from './TasksPage.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
@@ -88,7 +89,9 @@ export function TasksPage() {
   const [restarting, setRestarting] = useState(false);
   const [moveTarget, setMoveTarget] = useState<MoveTarget | null>(null);
 
-  const load = useCallback(async (signal?: AbortSignal) => {
+  // initial=true только для самой первой загрузки: тогда раскрываем все проекты.
+  // Обновления после мутаций/событий сохраняют раскрытие пользователя (treeExpansion).
+  const load = useCallback(async (signal?: AbortSignal, initial = false) => {
     setLoadState('loading');
     try {
       const [treeData, projectList] = await Promise.all([
@@ -98,7 +101,9 @@ export function TasksPage() {
       if (signal?.aborted) return;
       setTree(treeData);
       setProjects(projectList);
-      setExpanded(new Set(treeData.projects.map((p) => `p:${p.id}`)));
+      setExpanded((prev) =>
+        expandedForLoad(prev, treeData.projects.map((p) => p.id), initial),
+      );
       setLoadState('ready');
     } catch (e) {
       if (signal?.aborted || (e instanceof DOMException && e.name === 'AbortError')) return;
@@ -108,7 +113,7 @@ export function TasksPage() {
 
   useEffect(() => {
     const ctrl = new AbortController();
-    void load(ctrl.signal);
+    void load(ctrl.signal, true);
     return () => ctrl.abort();
   }, [load]);
 
@@ -292,7 +297,7 @@ function ProjectNode({
   onToggle: (key: string) => void;
   actions: RowActions;
 }) {
-  const key = `p:${project.id}`;
+  const key = projectKey(project.id);
   const isOpen = expanded.has(key);
   const hasTasks = project.tasks.length > 0;
   const childActions: RowActions = { ...actions, projectId: project.id };
@@ -337,7 +342,7 @@ function TaskNode({
   onToggle: (key: string) => void;
   actions: RowActions;
 }) {
-  const key = `t:${task.id}`;
+  const key = taskKey(task.id);
   const isOpen = expanded.has(key);
   const hasSubs = task.subtasks.length > 0;
 
@@ -462,15 +467,21 @@ function MoveModal({
     setReason('');
   }, [target?.taskId]);
 
+  const trimmedReason = reason.trim();
+
   const handleMove = async () => {
     if (!target) return;
     if (!toStageId) {
       toast.error('Выберите целевой этап');
       return;
     }
+    if (!trimmedReason) {
+      toast.error('Укажите причину перемещения');
+      return;
+    }
     setSaving(true);
     try {
-      const res = await tasksApi.move(target.taskId, { toStageId, reason: reason.trim() || undefined });
+      const res = await tasksApi.move(target.taskId, { toStageId, reason: trimmedReason });
       toast.success(`Задача перемещена: ${taskStatusLabel(res.toStatus)}`);
       await onMoved();
     } catch (e) {
@@ -491,7 +502,12 @@ function MoveModal({
           <Button variant="ghost" onClick={onClose} disabled={saving}>
             Отмена
           </Button>
-          <Button variant="primary" onClick={() => void handleMove()} loading={saving}>
+          <Button
+            variant="primary"
+            onClick={() => void handleMove()}
+            loading={saving}
+            disabled={!toStageId || !trimmedReason}
+          >
             Переместить
           </Button>
         </>
@@ -520,10 +536,11 @@ function MoveModal({
           <p className={styles.moveHint}>У проекта нет настроенных этапов для перемещения.</p>
         )}
         <Textarea
-          label="Причина / комментарий (необязательно)"
+          label="Причина / комментарий (обязательно)"
           value={reason}
           onChange={(e) => setReason(e.target.value)}
           rows={3}
+          required
           placeholder="Зачем перемещаем задачу вручную"
         />
       </div>
