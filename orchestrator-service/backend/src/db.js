@@ -1558,6 +1558,7 @@ export async function completeReasoningTaskTx(c, input) {
     response: text,
     exchangeId,
     durationMs: Number.isFinite(Number(input?.durationMs)) ? Number(input.durationMs) : null,
+    kpi: normalizeRunKpi(input),
   });
   return {
     accepted: true,
@@ -2664,6 +2665,11 @@ async function processClaimedRole(c, claimed) {
     response: result.response,
     exchangeId: result.exchangeId,
     durationMs: result.durationMs,
+    // OBSERVABILITY-REASONING-001: токены/ходы in-process DeepSeek-пути в KPI.
+    kpi: normalizeRunKpi({
+      tokensIn: result.tokensIn, tokensOut: result.tokensOut,
+      turns: result.turns, outcome: 'success',
+    }),
   });
 }
 
@@ -2672,7 +2678,33 @@ async function processClaimedRole(c, claimed) {
 // processClaimedRole, чтобы codex-мост (CODEX-REASONING-001) переиспользовал ту же
 // логику переходов, что и внутренний DeepSeek-путь — отличается только источник
 // вердикта (внешний `codex exec` против сетевого вызова коннектора).
-async function applyReasoningVerdict(c, claimed, { route, contract, verdict, response, exchangeId, durationMs }) {
+// OBSERVABILITY-REASONING-001 — нормализовать KPI прогона из тела сдачи раннера
+// (reasoning-completed). Числа округляем; нечисловые → null (COALESCE сохранит старое).
+export function normalizeRunKpi(input) {
+  const int = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : null);
+  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
+  return {
+    tokenInput: int(input?.tokensIn),
+    tokenOutput: int(input?.tokensOut),
+    cost: num(input?.costUsd),
+    coldStartMs: int(input?.coldStartMs),
+    turns: int(input?.turns),
+    outcome: typeof input?.outcome === 'string' ? input.outcome : null,
+  };
+}
+
+// Фрагмент SET для дописывания KPI прогона к UPDATE agent_runs после фиксированных
+// $1..$base параметров. Токены/стоимость через COALESCE (не затираем старое NULL'ом).
+function runKpiSet(kpi, base) {
+  if (!kpi) return { sql: '', params: [] };
+  return {
+    sql: `, token_input = COALESCE($${base + 1}, token_input), token_output = COALESCE($${base + 2}, token_output)`
+       + `, cost = COALESCE($${base + 3}, cost), cold_start_ms = $${base + 4}, turns = $${base + 5}, outcome = $${base + 6}`,
+    params: [kpi.tokenInput, kpi.tokenOutput, kpi.cost, kpi.coldStartMs, kpi.turns, kpi.outcome],
+  };
+}
+
+async function applyReasoningVerdict(c, claimed, { route, contract, verdict, response, exchangeId, durationMs, kpi = null }) {
   const { values: cardValues, missingRequired: missingOut } = extractOutputs(verdict.fields, contract.outputs);
   let decision = decideOutcome(claimed.role_code, verdict, {
     reworkCount: claimed.reworkCount,
@@ -2686,14 +2718,14 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
   // а сам эпик паркует в WAITING_FOR_CHILDREN. Только в линейном маршруте (в
   // граф-режиме fork/join расщепление делают узлы графа, не Декомпозитор).
   if (claimed.role_code === 'DECOMPOSER' && decision.outcome === 'FORWARD' && !claimed.current_stage_key) {
-    return materializeDecomposition(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, route });
+    return materializeDecomposition(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, route, kpi });
   }
   // FORK-JOIN-001: задача с current_stage_key идёт ПО РЁБРАМ графа (граф-режим);
   // без него — прежняя позиционная маршрутизация (линейные схемы не затронуты).
   const resolved = claimed.current_stage_key
     ? await resolveGraphTransition(c, claimed, decision)
     : resolveTransition(route, claimed.role_code, decision);
-  return finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues });
+  return finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues, kpi });
 }
 
 // DECOMP-CONTRACT-001 — нормализовать разбивку работы из карточки к виду
@@ -2732,7 +2764,7 @@ export function normalizeWorkItems(card) {
 // повторно не создаём. Эпик паркуется в WAITING_FOR_CHILDREN. Если из карточки не
 // удалось получить ни одного зарегистрированного сервиса — эпик уходит в BLOCKED с
 // диагностикой (не молча зависает).
-export async function materializeDecomposition(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, route }) {
+export async function materializeDecomposition(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, route, kpi = null }) {
   const card = { ...(claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {}), ...(cardValues || {}) };
   const plan = normalizeWorkItems(card);
 
@@ -2741,9 +2773,10 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
     // Идемпотентность: эпик уже расщеплён — финализируем прогон без дублей.
     const hasChildren = await c.query('SELECT 1 FROM tasks WHERE parent_task_id = $1 LIMIT 1', [claimed.id]);
     if (hasChildren.rowCount) {
+      const kpiSet0 = runKpiSet(kpi, 2);
       await c.query(
-        `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb WHERE id = $1`,
-        [claimed.agentRunId, JSON.stringify({ status: verdict.status, summary: verdict.summary, reason: 'already_decomposed' })],
+        `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet0.sql} WHERE id = $1`,
+        [claimed.agentRunId, JSON.stringify({ status: verdict.status, summary: verdict.summary, reason: 'already_decomposed' }), ...kpiSet0.params],
       );
       await c.query('COMMIT');
       return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: claimed.status, reason: 'already_decomposed', durationMs };
@@ -2762,9 +2795,10 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
 
     // Нет ни одного зарегистрированного сервиса → BLOCKED с диагностикой.
     if (!resolved.length) {
+      const kpiSetF = runKpiSet(kpi, 2);
       await c.query(
-        `UPDATE agent_runs SET status = 'FAILED', finished_at = now(), error_text = $2 WHERE id = $1`,
-        [claimed.agentRunId, `decomposition_no_services: ${unresolved.join(', ') || 'пустая разбивка'}`],
+        `UPDATE agent_runs SET status = 'FAILED', finished_at = now(), error_text = $2${kpiSetF.sql} WHERE id = $1`,
+        [claimed.agentRunId, `decomposition_no_services: ${unresolved.join(', ') || 'пустая разбивка'}`, ...kpiSetF.params],
       );
       await c.query(
         `UPDATE tasks SET status = 'BLOCKED', assigned_agent_id = NULL WHERE id = $1 AND status NOT IN ('DONE','CANCELLED')`,
@@ -2830,13 +2864,14 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
               data_card = data_card || $2::jsonb WHERE id = $1`,
       [claimed.id, JSON.stringify(cardValues || {})],
     );
+    const kpiSet = runKpiSet(kpi, 2);
     await c.query(
-      `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb WHERE id = $1`,
+      `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet.sql} WHERE id = $1`,
       [claimed.agentRunId, JSON.stringify({
         status: verdict.status, summary: verdict.summary, findings: verdict.findings,
         reason: 'decomposed', outcome: decision.outcome, fields: cardValues,
         services: serviceCount, subtasks: subtaskCount, unresolved,
-      })],
+      }), ...kpiSet.params],
     );
     await c.query(
       `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
@@ -2861,7 +2896,7 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
 // Применить переход роли по вердикту в отдельной транзакции.
 // resolved — { nextRole, toStatus, done, blocked } из projectRoute.resolveTransition.
 // cardValues — заполненные ролью исходящие поля → мердж в кумулятивную карточку.
-async function finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues = {} }) {
+async function finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues = {}, kpi = null }) {
   await c.query('BEGIN');
   try {
     const cur = await c.query('SELECT status::text AS status FROM tasks WHERE id = $1 FOR UPDATE', [claimed.id]);
@@ -2879,12 +2914,13 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
       // FORK-JOIN-001: в граф-режиме переносим текущий узел; в линейном — остаётся NULL.
       [claimed.id, resolved.toStatus, nextRoleId, JSON.stringify(cardValues || {}), resolved.nextStageKey ?? null],
     );
+    const kpiSet = runKpiSet(kpi, 3);
     await c.query(
-      `UPDATE agent_runs SET status = $2::agent_run_status, finished_at = now(), output_json = $3::jsonb WHERE id = $1`,
+      `UPDATE agent_runs SET status = $2::agent_run_status, finished_at = now(), output_json = $3::jsonb${kpiSet.sql} WHERE id = $1`,
       [claimed.agentRunId, decision.agentRunStatus, JSON.stringify({
         status: verdict.status, summary: verdict.summary, findings: verdict.findings,
         reason: decision.reason, outcome: decision.outcome, via: resolved.via, fields: cardValues,
-      })],
+      }), ...kpiSet.params],
     );
     if (claimed.role_code === 'TASK_REVIEWER') {
       const rev = ['APPROVED', 'REJECTED', 'NEEDS_FIX'].includes(verdict.status)

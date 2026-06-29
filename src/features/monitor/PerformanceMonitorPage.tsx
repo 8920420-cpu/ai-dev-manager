@@ -35,6 +35,19 @@ function fmtDuration(ms: number | null): string {
   return `${h} ч ${m % 60} мин`;
 }
 
+// OBSERVABILITY-REASONING-001: компактный формат числа токенов (1.2k / 3.4M).
+function fmtTokens(n: number): string {
+  if (!n) return '—';
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}k`;
+  return `${(n / 1_000_000).toFixed(2)}M`;
+}
+
+function fmtCost(usd: number): string {
+  if (!usd) return '—';
+  return `$${usd < 1 ? usd.toFixed(3) : usd.toFixed(2)}`;
+}
+
 function Metric({
   value,
   label,
@@ -233,7 +246,7 @@ export function PerformanceMonitorPage() {
 
           <Section
             title="Нагрузка по ролям (24 часа)"
-            description="Сколько запусков прошла каждая роль, доля провалов и средняя длительность."
+            description="Запуски, доля провалов, средняя длительность, токены и средний холодный старт движка."
           >
             {data.roleLoad.length === 0 ? (
               <span className={styles.muted}>За последние сутки запусков ролей не было.</span>
@@ -248,6 +261,10 @@ export function PerformanceMonitorPage() {
                     <th className={styles.num}>Таймаут</th>
                     <th className={styles.num}>В работе</th>
                     <th className={styles.num}>Ср. время</th>
+                    <th className={styles.num}>Токены вх</th>
+                    <th className={styles.num}>Токены исх</th>
+                    <th className={styles.num}>Стоимость</th>
+                    <th className={styles.num}>Ср. холодн. старт</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -260,6 +277,10 @@ export function PerformanceMonitorPage() {
                       <td className={styles.num}>{r.timeout}</td>
                       <td className={styles.num}>{r.running}</td>
                       <td className={styles.num}>{fmtDuration(r.avgDurationMs)}</td>
+                      <td className={styles.num}>{fmtTokens(r.tokensIn)}</td>
+                      <td className={styles.num}>{fmtTokens(r.tokensOut)}</td>
+                      <td className={styles.num}>{fmtCost(r.cost)}</td>
+                      <td className={styles.num}>{fmtDuration(r.avgColdStartMs)}</td>
                     </tr>
                   ))}
                 </tbody>

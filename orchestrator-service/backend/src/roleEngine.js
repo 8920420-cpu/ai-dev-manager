@@ -95,10 +95,13 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
   ];
   let iterations = 0;
   let toolCalls = 0;
+  let tokensIn = 0;
+  let tokensOut = 0;
   let text = '';
   for (let i = 0; i < TOOL_MAX_ITERS; i += 1) {
     iterations += 1;
-    const { message } = await invokeChat(conn, { messages, tools: toolSchemas }, { timeoutMs: remainingMs() });
+    const { message, tokensIn: ti = 0, tokensOut: to = 0 } = await invokeChat(conn, { messages, tools: toolSchemas }, { timeoutMs: remainingMs() });
+    tokensIn += ti; tokensOut += to;
     const native = Array.isArray(message?.tool_calls) ? message.tool_calls : [];
     const content = String(message?.content ?? '');
 
@@ -164,10 +167,11 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
         + 'данных верни ТОЛЬКО финальный JSON-вердикт в требуемом формате — без разметки tool_calls, '
         + 'без markdown и без пояснений вокруг JSON.',
     });
-    const { message } = await invokeChat(conn, { messages, tools: [] }, { timeoutMs: remainingMs() });
+    const { message, tokensIn: ti = 0, tokensOut: to = 0 } = await invokeChat(conn, { messages, tools: [] }, { timeoutMs: remainingMs() });
+    tokensIn += ti; tokensOut += to;
     text = String(message?.content ?? '').trim();
   }
-  return { text, iterations, toolCalls };
+  return { text, iterations, toolCalls, tokensIn, tokensOut };
 }
 // composeRoleSystemPrompt импортируется по call-time (внутри runReasoningRole):
 // статический импорт замкнул бы цикл roleEngine → roles → db → roleEngine, из-за
@@ -570,16 +574,25 @@ export async function runReasoningRole(client, { roleCode, context, outputFields
     let text;
     let httpStatus = null;
     let durationMs = null;
+    let tokensIn = 0;
+    let tokensOut = 0;
+    let turns = null;
     if (useTools) {
       const started = Date.now();
       const loop = await runToolLoop(conn, { system, user, toolSchemas, executeTool });
       text = loop.text;
       durationMs = Date.now() - started;
+      tokensIn = loop.tokensIn ?? 0;
+      tokensOut = loop.tokensOut ?? 0;
+      turns = loop.iterations ?? null;
     } else {
       const r = await llmInvoke(conn, { system, user }, { timeoutMs: LLM_CALL_TIMEOUT_MS });
       text = r.text;
       httpStatus = r.httpStatus;
       durationMs = r.durationMs;
+      tokensIn = r.tokensIn ?? 0;
+      tokensOut = r.tokensOut ?? 0;
+      turns = 1;
     }
     await client.query(
       `UPDATE prompt_exchanges SET response = $2, status = 'завершен', http_status = $3, duration_ms = $4
@@ -591,7 +604,7 @@ export async function runReasoningRole(client, { roleCode, context, outputFields
     // Вызывающий трактует это как «роль не выполнена», а не как успех.
     const parsed = parseVerdict(text);
     const verdict = normalizeVerdict(roleCode, parsed);
-    return { verdict, parsed, response: text, promptText, connectorId: conn.id, exchangeId, durationMs };
+    return { verdict, parsed, response: text, promptText, connectorId: conn.id, exchangeId, durationMs, tokensIn, tokensOut, turns };
   } catch (e) {
     await client.query(
       `UPDATE prompt_exchanges SET status = 'ошибка', error = $2, http_status = $3, duration_ms = $4

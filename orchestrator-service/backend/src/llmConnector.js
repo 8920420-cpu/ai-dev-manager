@@ -62,6 +62,20 @@ function extractUsageTokens(raw) {
   }
 }
 
+// OBSERVABILITY-REASONING-001 — раздельно вход/выход токенов для KPI по ролям.
+// raw может быть строкой (сырой ответ) или уже разобранным объектом.
+export function extractUsageInOut(raw) {
+  try {
+    const j = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    const u = j?.usage || {};
+    const tokensIn = Number(u.prompt_tokens) || Number(u.input_tokens) || 0;
+    const tokensOut = Number(u.completion_tokens) || Number(u.output_tokens) || 0;
+    return { tokensIn, tokensOut };
+  } catch {
+    return { tokensIn: 0, tokensOut: 0 };
+  }
+}
+
 // Единый сетевой вызов модели под глобальным лимитером + ретрай. Захватывает
 // слот, делает fetch, фиксирует исход (для AIMD/учёта токенов), освобождает слот.
 // Возвращает { status, raw, durationMs } на 2xx; иначе бросает Error (с httpStatus).
@@ -344,7 +358,8 @@ export async function invoke(conn, input, { timeoutMs = DEFAULT_TIMEOUT_MS } = {
   if (String(text).trim() === '') {
     throw new Error(`connector "${conn.name}": empty response`);
   }
-  return { text, httpStatus: status, durationMs };
+  const { tokensIn, tokensOut } = extractUsageInOut(raw);
+  return { text, httpStatus: status, durationMs, tokensIn, tokensOut };
 }
 
 /**
@@ -361,8 +376,8 @@ export async function invokeChat(conn, { messages, tools = [] }, { timeoutMs = D
   if (!usesOpenAIChatAPI(endpoint)) {
     const sys = messages.filter((m) => m.role === 'system').map((m) => m.content).join('\n\n');
     const usr = messages.filter((m) => m.role !== 'system').map((m) => m.content).join('\n\n');
-    const { text, httpStatus, durationMs } = await invoke(conn, { system: sys, user: usr }, { timeoutMs });
-    return { message: { role: 'assistant', content: text, tool_calls: [] }, httpStatus, durationMs };
+    const { text, httpStatus, durationMs, tokensIn, tokensOut } = await invoke(conn, { system: sys, user: usr }, { timeoutMs });
+    return { message: { role: 'assistant', content: text, tool_calls: [] }, httpStatus, durationMs, tokensIn, tokensOut };
   }
 
   endpoint = normalizeChatCompletionsEndpoint(endpoint);
@@ -386,11 +401,12 @@ export async function invokeChat(conn, { messages, tools = [] }, { timeoutMs = D
   try {
     parsed = JSON.parse(raw);
   } catch {
-    return { message: { role: 'assistant', content: raw, tool_calls: [] }, httpStatus: status, durationMs };
+    return { message: { role: 'assistant', content: raw, tool_calls: [] }, httpStatus: status, durationMs, tokensIn: 0, tokensOut: 0 };
   }
   const message = parsed?.choices?.[0]?.message ?? { role: 'assistant', content: '' };
   if (!Array.isArray(message.tool_calls)) message.tool_calls = [];
-  return { message, httpStatus: status, durationMs };
+  const { tokensIn, tokensOut } = extractUsageInOut(parsed);
+  return { message, httpStatus: status, durationMs, tokensIn, tokensOut };
 }
 
 // Экспорт внутренних чистых функций для тестов.

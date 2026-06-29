@@ -52,12 +52,14 @@ export class ReasoningRunner {
 
   async pollOnce() {
     let claimed;
+    const claimStart = Date.now();
     try {
       claimed = await this.http.claim();
     } catch (error) {
       this.log.error?.('reasoning claim failed', { error: error.message });
       return { error: error.message };
     }
+    const claimMs = Date.now() - claimStart;
     // Входной гейт оркестратора заблокировал задачу (нет обязательных полей) —
     // не задача для нас, просто сообщаем и идём дальше.
     if (claimed?.blocked) return { blocked: claimed.blocked };
@@ -74,7 +76,9 @@ export class ReasoningRunner {
       // чтобы задачу не заклинило с назначенным агентом.
       clearTimeout(timer);
       const reason = ac.signal.aborted ? 'agent_timeout' : error.message;
-      this.log.error?.('reasoning agent threw', { taskId: task.id, reason });
+      // OBSERVABILITY-REASONING-001: даже на краше пишем структурную строку, чтобы
+      // отличать coldstart_failed/stuck/working_slow по логу.
+      this.logRun(task, { outcome: ac.signal.aborted ? 'agent_timeout' : 'threw', claimMs }, reason);
       await this.safeRelease(task.id);
       return { taskId: task.id, released: true, reason };
     }
@@ -82,17 +86,18 @@ export class ReasoningRunner {
 
     if (!agentResult || agentResult.ok !== true) {
       const reason = agentResult?.error || 'agent_failed';
+      this.logRun(task, { ...(agentResult || {}), claimMs }, reason);
       this.log.warn?.('reasoning agent did not succeed', { taskId: task.id, reason });
       await this.safeRelease(task.id);
       return { taskId: task.id, released: true, reason };
     }
 
     const body = buildCompletionBody(task, agentResult);
+    const submitStart = Date.now();
     try {
       const res = await this.http.complete(body);
-      this.log.info?.('reasoning task completed', {
-        taskId: task.id, role: task.role, toStatus: res?.toStatus, nextRole: res?.nextRole, verdict: res?.verdict,
-      });
+      const submitMs = Date.now() - submitStart;
+      this.logRun(task, { ...agentResult, claimMs, submitMs }, null, res);
       return { taskId: task.id, success: true, complete: res };
     } catch (error) {
       // Сдача не прошла (сеть/5xx) — освобождаем захват, чтобы не зависнуть.
@@ -100,6 +105,31 @@ export class ReasoningRunner {
       await this.safeRelease(task.id);
       return { taskId: task.id, released: true, reason: `complete_failed: ${error.message}` };
     }
+  }
+
+  // OBSERVABILITY-REASONING-001: одна структурная строка на прогон — единый источник
+  // правды для «что происходило» (фазы, ходы, токены, исход) и для KPI по логам.
+  logRun(task, m = {}, reason = null, complete = null) {
+    this.log.info?.('reasoning run', {
+      taskId: task.id,
+      role: task.role ?? null,
+      outcome: m.outcome ?? (reason ? 'error' : 'success'),
+      reason: reason ?? undefined,
+      coldStartMs: m.coldStartMs ?? null,
+      reasonMs: m.reasonMs ?? null,
+      claimMs: m.claimMs ?? null,
+      submitMs: m.submitMs ?? null,
+      totalMs: m.durationMs ?? null,
+      turns: m.turns ?? null,
+      toolUses: m.toolUses ?? null,
+      tokensIn: m.tokensIn ?? null,
+      tokensOut: m.tokensOut ?? null,
+      costUsd: m.costUsd ?? null,
+      rateLimited: m.rateLimited ?? false,
+      toStatus: complete?.toStatus,
+      nextRole: complete?.nextRole,
+      verdict: complete?.verdict,
+    });
   }
 
   async safeRelease(taskId) {
@@ -114,13 +144,23 @@ export class ReasoningRunner {
 // Тело сдачи для POST /api/runner/reasoning-completed. agentRunId/taskId привязывают
 // сдачу к захвату; verdict — структурированный исход (codex --output-schema), response
 // — сырой текст (фолбэк-парсинг на стороне оркестратора), promptText — для журнала.
+// kpi — метрики прогона для персиста в agent_runs (см. OBSERVABILITY-REASONING-001).
 export function buildCompletionBody(task, agentResult) {
+  const intOrNull = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : null);
+  const numOrNull = (v) => (Number.isFinite(Number(v)) ? Number(v) : null);
   return {
     taskId: task.id,
     agentRunId: task.agentRunId,
     verdict: agentResult.verdict ?? null,
     response: typeof agentResult.response === 'string' ? agentResult.response : null,
-    durationMs: Number.isFinite(Number(agentResult.durationMs)) ? Number(agentResult.durationMs) : null,
+    durationMs: numOrNull(agentResult.durationMs),
     promptText: `${String(task.systemPrompt || '')}\n\n${String(task.userPrompt || '')}`.slice(0, 100000),
+    // KPI прогона (оркестратор запишет в agent_runs.token_input/token_output/cost/cold_start_ms/turns/outcome).
+    tokensIn: intOrNull(agentResult.tokensIn),
+    tokensOut: intOrNull(agentResult.tokensOut),
+    costUsd: numOrNull(agentResult.costUsd),
+    coldStartMs: intOrNull(agentResult.coldStartMs),
+    turns: intOrNull(agentResult.turns),
+    outcome: typeof agentResult.outcome === 'string' ? agentResult.outcome : null,
   };
 }

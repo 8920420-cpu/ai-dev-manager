@@ -13,6 +13,11 @@ export interface RoleLoad {
   timeout: number;
   running: number;
   avgDurationMs: number | null;
+  // OBSERVABILITY-REASONING-001: токены и холодный старт по ролям (за 24ч).
+  tokensIn: number;
+  tokensOut: number;
+  cost: number;
+  avgColdStartMs: number | null;
 }
 
 export interface ConnectorBucket {

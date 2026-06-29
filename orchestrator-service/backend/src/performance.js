@@ -151,7 +151,12 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
               count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
               count(*) FILTER (WHERE ar.status = 'RUNNING')::int AS running,
               avg(extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000)
-                FILTER (WHERE ar.finished_at IS NOT NULL) AS avg_ms
+                FILTER (WHERE ar.finished_at IS NOT NULL) AS avg_ms,
+              -- OBSERVABILITY-REASONING-001: токены и холодный старт по ролям.
+              coalesce(sum(ar.token_input), 0)::bigint AS tokens_in,
+              coalesce(sum(ar.token_output), 0)::bigint AS tokens_out,
+              coalesce(sum(ar.cost), 0)::numeric AS cost,
+              avg(ar.cold_start_ms) FILTER (WHERE ar.cold_start_ms IS NOT NULL) AS avg_cold_start_ms
          FROM agent_runs ar
          JOIN roles r ON r.id = ar.role_id
         WHERE ar.started_at >= now() - interval '24 hours'
@@ -167,6 +172,10 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
       timeout: row.timeout,
       running: row.running,
       avgDurationMs: row.avg_ms == null ? null : Math.round(Number(row.avg_ms)),
+      tokensIn: Number(row.tokens_in) || 0,
+      tokensOut: Number(row.tokens_out) || 0,
+      cost: Number(row.cost) || 0,
+      avgColdStartMs: row.avg_cold_start_ms == null ? null : Math.round(Number(row.avg_cold_start_ms)),
     }));
 
     // 7) Программист: проходы и упоры в лимит ходов (PROGRAMMER-LIMIT-KPI-001).
