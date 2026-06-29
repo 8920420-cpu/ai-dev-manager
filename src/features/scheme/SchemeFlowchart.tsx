@@ -18,7 +18,7 @@ import { TASK_STATUSES, taskStatusLabel } from '../../data/taskStatuses';
 import { cn } from '../../lib/cn';
 import type { StageSaveErrorItem } from '../../api/projectsApi';
 import type { Role, SchemeEdge, Stage, StageKind } from '../../types/project';
-import { buildSchemeLayout } from './schemeLayout';
+import { buildSchemeLayout, type LayoutItem, type PlacedNode } from './schemeLayout';
 
 /** Метаданные типа узла блок-схемы для панели инструментов и рендера карточки. */
 const KIND_META: Record<Exclude<StageKind, 'stage'>, { label: string; hint: string }> = {
@@ -26,6 +26,14 @@ const KIND_META: Record<Exclude<StageKind, 'stage'>, { label: string; hint: stri
   join: { label: 'Объединить', hint: 'Барьер: ждёт завершения всех параллельных веток' },
   condition: { label: 'Условие', hint: 'Ветвление по исходу: задача идёт по одной из веток' },
 };
+
+// «Тесты и анализ сбоя» — Pipeline Service (прогон тестов) и Failure Analyst
+// (диагност падения) образуют один логический шаг: тесты → при провале анализ
+// (при зелёных тестах анализ пропускается). Соседние этапы этих ролей показываем
+// одним визуальным блоком. Группировка чисто презентационная — маршрут/данные
+// этапов не меняются.
+const TESTING_GROUP_ROLES = new Set(['PIPELINE_SERVICE', 'FAILURE_ANALYST']);
+const TESTING_GROUP_LABEL = 'Тесты и анализ сбоя';
 import { StageSettingsModal } from './StageSettingsModal';
 import { StageTasksModal } from './StageTasksModal';
 import { TasksTreeModal } from './TasksTreeModal';
@@ -155,6 +163,31 @@ export function SchemeFlowchart({
   // FORK-JOIN-001: раскладка — участок fork→join сворачивается в параллельные
   // ветки (рисуются колонками рядом), остальное остаётся линейной цепочкой.
   const layout = buildSchemeLayout(stages, edges ?? []);
+
+  // Код роли этапа (для группировки «Тесты и анализ сбоя»).
+  const roleCodeOfStage = (stage: Stage): string =>
+    roles.find((r) => r.id === stage.roleIds[0])?.code ?? '';
+
+  // Единицы рендера: соседние линейные узлы ролей из TESTING_GROUP_ROLES
+  // сворачиваются в один групповой блок. Остальные элементы раскладки (включая
+  // параллельные fork→join) остаются как есть.
+  type RenderUnit =
+    | { type: 'group'; key: string; nodes: PlacedNode[] }
+    | { type: 'layout'; key: string; item: LayoutItem };
+  const renderUnits: RenderUnit[] = [];
+  for (const item of layout) {
+    const inGroup =
+      item.type === 'node' && TESTING_GROUP_ROLES.has(roleCodeOfStage(item.node.stage));
+    const prev = renderUnits[renderUnits.length - 1];
+    if (inGroup && prev && prev.type === 'group') {
+      prev.nodes.push(item.node);
+    } else if (inGroup && item.type === 'node') {
+      renderUnits.push({ type: 'group', key: `grp-${item.node.stage.id}`, nodes: [item.node] });
+    } else {
+      const key = item.type === 'node' ? item.node.stage.id : item.fork.stage.id;
+      renderUnits.push({ type: 'layout', key, item });
+    }
+  }
 
   const connector = (
     <div className={styles.connector} aria-hidden="true">
@@ -412,7 +445,35 @@ export function SchemeFlowchart({
           <ArrowDown size={16} />
         </li>
 
-        {layout.map((item) => {
+        {renderUnits.map((unit) => {
+          // Групповой блок «Тесты и анализ сбоя». Один узел в группе (напр. когда
+          // Failure Analyst удалён) рисуем обычной карточкой — без рамки группы.
+          if (unit.type === 'group') {
+            if (unit.nodes.length === 1) {
+              const { stage, index } = unit.nodes[0]!;
+              return (
+                <li key={unit.key} className={styles.nodeWrap}>
+                  {renderCard(stage, index)}
+                  {connector}
+                </li>
+              );
+            }
+            return (
+              <li key={unit.key} className={styles.nodeWrap}>
+                <div className={styles.groupBlock} role="group" aria-label={TESTING_GROUP_LABEL}>
+                  <span className={styles.groupLabel}>{TESTING_GROUP_LABEL}</span>
+                  {unit.nodes.map((pn, ni) => (
+                    <Fragment key={pn.stage.id}>
+                      {renderCard(pn.stage, pn.index)}
+                      {ni < unit.nodes.length - 1 && connector}
+                    </Fragment>
+                  ))}
+                </div>
+                {connector}
+              </li>
+            );
+          }
+          const { item } = unit;
           if (item.type === 'node') {
             const { stage, index } = item.node;
             return (
