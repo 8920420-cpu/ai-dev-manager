@@ -4,6 +4,7 @@ import { RouterProvider, useRouter } from './app/router';
 import { AppShell } from './components/layout/AppShell';
 import { ConnectedProjectsPage } from './features/projects/ConnectedProjectsPage';
 import { TasksPage } from './features/tasks/TasksPage';
+import { AcceptanceBoardPage } from './features/tasks/AcceptanceBoardPage';
 import { DevelopmentSchemePage } from './features/scheme/DevelopmentSchemePage';
 import { IntegrationsPage } from './features/integrations/IntegrationsPage';
 import { PerformanceMonitorPage } from './features/monitor/PerformanceMonitorPage';
@@ -16,6 +17,10 @@ function CurrentPage() {
   switch (route) {
     case 'tasks':
       return <TasksPage />;
+    case 'tasks-review':
+      return <AcceptanceBoardPage mode="review" />;
+    case 'tasks-done':
+      return <AcceptanceBoardPage mode="done" />;
     case 'departments-development':
       return <DevelopmentSchemePage />;
     case 'integrations':

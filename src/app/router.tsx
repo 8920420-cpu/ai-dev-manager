@@ -11,6 +11,8 @@ import {
 export type RouteKey =
   | 'projects'
   | 'tasks'
+  | 'tasks-review'
+  | 'tasks-done'
   | 'departments-development'
   | 'integrations'
   | 'monitor-performance'
@@ -21,6 +23,8 @@ export type RouteKey =
 const ROUTES: Record<RouteKey, string> = {
   projects: '#/projects',
   tasks: '#/tasks',
+  'tasks-review': '#/tasks/review',
+  'tasks-done': '#/tasks/done',
   'departments-development': '#/departments/development',
   integrations: '#/integrations',
   'monitor-performance': '#/monitor/performance',
@@ -33,7 +37,11 @@ const DEFAULT: RouteKey = 'projects';
 
 function parseHash(): RouteKey {
   const [section, sub] = window.location.hash.replace(/^#\/?/, '').split('/');
-  if (section === 'tasks') return 'tasks';
+  if (section === 'tasks') {
+    if (sub === 'review') return 'tasks-review';
+    if (sub === 'done') return 'tasks-done';
+    return 'tasks';
+  }
   if (section === 'departments' && sub === 'development') return 'departments-development';
   // Обратная совместимость: старый #/scheme (и его вариации) ведёт на тот же раздел.
   if (section === 'scheme' || section === 'development-scheme') return 'departments-development';

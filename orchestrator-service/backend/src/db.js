@@ -736,9 +736,12 @@ export async function moveTaskTx(c, taskId, input) {
     // Контрольные узлы (fork/join) не несут статуса — на них вручную не переводим.
     if (!toStatus) throw scannerError(422, 'target_stage_no_status');
 
+    // accepted_at = NULL: задача снова в работе (в т.ч. «доработка» из «Проверки»),
+    // не должна числиться принятой/«Выполнено».
     await c.query(
       `UPDATE tasks SET status = $2::task_status, current_role_id = $3,
-              current_stage_key = $4::uuid, assigned_agent_id = NULL, updated_at = now()
+              current_stage_key = $4::uuid, assigned_agent_id = NULL,
+              accepted_at = NULL, updated_at = now()
         WHERE id = $1`,
       [id, toStatus, stage.role_id ?? null, stage.stage_key ?? null],
     );
@@ -807,6 +810,88 @@ export async function restartStuckTasksTx(c) {
     );
     await c.query('COMMIT');
     return { restarted: upd.rowCount };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
+}
+
+/**
+ * TASK-ACCEPTANCE-001 — доска приёмки для подразделов «Проверка»/«Выполнено».
+ * Плоский список завершённых конвейером задач (status = DONE) с проектом, сервисом
+ * и признаком приёма. Клиент делит его на «Проверка» (accepted = false) и
+ * «Выполнено» (accepted = true). Подзадачи (parent_task_id) учитываются наравне с
+ * верхним уровнем — приём выполняется по любой задаче, дошедшей до DONE. Read-only.
+ * Возвращает { tasks: [{ id, title, projectId, projectName, serviceName, status,
+ * accepted, acceptedAt, updatedAt, priority }] } в порядке свежести.
+ */
+export async function getAcceptanceBoard(s) {
+  return withClient(clientConfig(s), async (c) => {
+    const r = await c.query(
+      `SELECT t.id, t.title, t.status::text AS status, t.priority::text AS priority,
+              t.accepted_at, t.updated_at,
+              p.id AS project_id, p.name AS project_name,
+              sv.service_name
+         FROM tasks t
+         JOIN projects p ON p.id = t.project_id
+         LEFT JOIN services sv ON sv.id = t.service_id
+        WHERE t.status = 'DONE'
+        ORDER BY t.updated_at DESC NULLS LAST, t.id DESC
+        LIMIT 1000`,
+    );
+    const tasks = r.rows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      status: row.status,
+      priority: row.priority,
+      projectId: row.project_id,
+      projectName: row.project_name,
+      serviceName: row.service_name ?? null,
+      accepted: row.accepted_at != null,
+      acceptedAt: row.accepted_at ? new Date(row.accepted_at).toISOString() : null,
+      updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+    }));
+    return { tasks };
+  });
+}
+
+/**
+ * TASK-ACCEPTANCE-001 — принять задачу из подраздела «Проверка». Проставляет
+ * accepted_at = now() (задача переходит в «Выполнено»). Принять можно только
+ * задачу в статусе DONE (прошедшую конвейер); статус не меняем. Идемпотентно:
+ * повторный приём просто обновляет метку. Пишет audit-событие source='manual-accept'.
+ * Публичная обёртка над Tx.
+ */
+export async function acceptTask(s, taskId) {
+  return withClient(clientConfig(s), (c) => acceptTaskTx(c, taskId));
+}
+
+export async function acceptTaskTx(c, taskId) {
+  const id = String(taskId ?? '').trim();
+  if (!id) throw scannerError(422, 'task_required');
+  await c.query('BEGIN');
+  try {
+    const cur = await c.query(
+      `SELECT id, status::text AS status, accepted_at FROM tasks WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    if (!cur.rowCount) throw scannerError(404, 'task_not_found');
+    const task = cur.rows[0];
+    // Принимать имеет смысл только задачу, завершившую конвейер (DONE). Иначе
+    // приём «через голову» маршрута скрыл бы незаконченную работу из «В работе».
+    if (task.status !== 'DONE') throw scannerError(409, 'task_not_done');
+
+    await c.query(
+      `UPDATE tasks SET accepted_at = now(), updated_at = now() WHERE id = $1`,
+      [id],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'TASK_UPDATED', 'DONE'::task_status, 'DONE'::task_status, NULL, $2::jsonb)`,
+      [id, JSON.stringify({ source: 'manual-accept', via: 'acceptance-gate' })],
+    );
+    await c.query('COMMIT');
+    return { accepted: true, taskId: id };
   } catch (error) {
     await c.query('ROLLBACK');
     throw error;

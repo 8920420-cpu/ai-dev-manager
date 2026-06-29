@@ -83,7 +83,6 @@ export function TasksPage() {
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [tree, setTree] = useState<TaskTree | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
-  const [showDone, setShowDone] = useState(false);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [busyId, setBusyId] = useState<string | null>(null);
   const [restarting, setRestarting] = useState(false);
@@ -135,9 +134,11 @@ export function TasksPage() {
       return next;
     });
 
+  // «В работе» — задачи на любой роли: выполненные (DONE) сюда не входят, они
+  // живут в подразделах «Проверка»/«Выполнено».
   const displayed = useMemo(
-    () => (tree ? filterTaskTree(tree, showDone) : null),
-    [tree, showDone],
+    () => (tree ? filterTaskTree(tree, false) : null),
+    [tree],
   );
 
   // Этапы по проекту для модалки ручного перемещения (только узлы-этапы со статусом).
@@ -201,18 +202,10 @@ export function TasksPage() {
   return (
     <div className={styles.page}>
       <PageHeader
-        title="Задачи"
-        description="Дерево проект → задача → подзадача. Выполненные скрыты по умолчанию. Задачу можно перенести на следующий этап маршрута или переместить вручную (для заблокированных)."
+        title="В работе"
+        description="Дерево проект → задача → подзадача: задачи на ролях конвейера. Выполненные задачи — в подразделах «Проверка» и «Выполнено». Задачу можно перенести на следующий этап маршрута или переместить вручную (для заблокированных)."
         actions={
           <div className={styles.headerActions}>
-            <label className={styles.toggle}>
-              <input
-                type="checkbox"
-                checked={showDone}
-                onChange={(e) => setShowDone(e.target.checked)}
-              />
-              Показать выполненные
-            </label>
             <Button
               variant="secondary"
               leftIcon={<RotateCcw size={16} aria-hidden="true" />}
@@ -256,8 +249,7 @@ export function TasksPage() {
       {loadState === 'ready' && displayed && displayed.projects.length > 0 && (
         <>
           <p className={styles.summary}>
-            Проектов: {displayed.projects.length} · Задач верхнего уровня
-            {showDone ? '' : ' (без выполненных)'}: {totalTopLevel}
+            Проектов: {displayed.projects.length} · Задач верхнего уровня в работе: {totalTopLevel}
           </p>
           <ul className={styles.tree} role="tree">
             {displayed.projects.map((project) => (

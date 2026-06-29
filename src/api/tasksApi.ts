@@ -172,6 +172,32 @@ export interface RestartStuckResult {
   restarted: number;
 }
 
+/** Завершённая конвейером задача (status=DONE) на доске приёмки. */
+export interface AcceptanceTask {
+  id: string;
+  title: string;
+  status: string;
+  priority: string;
+  projectId: string;
+  projectName: string;
+  serviceName: string | null;
+  /** Принята человеком (true) → «Выполнено»; иначе ждёт приёма в «Проверке». */
+  accepted: boolean;
+  acceptedAt: string | null;
+  updatedAt: string | null;
+}
+
+/** Ответ `GET /api/tasks/acceptance-board`. */
+export interface AcceptanceBoard {
+  tasks: AcceptanceTask[];
+}
+
+/** Ответ `POST /api/tasks/:id/accept`. */
+export interface AcceptTaskResult {
+  accepted: boolean;
+  taskId: string;
+}
+
 export const tasksApi = {
   /** `GET /api/tasks/tree` — все проекты с задачами и подзадачами. */
   async tree(signal?: AbortSignal): Promise<TaskTree> {
@@ -226,6 +252,22 @@ export const tasksApi = {
   /** `GET /api/tasks/stats` — число задач на каждом статусе/этапе (по всем проектам). */
   async stats(signal?: AbortSignal): Promise<TaskStatusCounts> {
     return http.get<TaskStatusCounts>('/api/tasks/stats', { signal });
+  },
+
+  /**
+   * `GET /api/tasks/acceptance-board` — завершённые конвейером задачи (DONE) для
+   * подразделов «Проверка» (не приняты) и «Выполнено» (приняты).
+   */
+  async acceptanceBoard(signal?: AbortSignal): Promise<AcceptanceBoard> {
+    return http.get<AcceptanceBoard>('/api/tasks/acceptance-board', { signal });
+  },
+
+  /**
+   * `POST /api/tasks/:id/accept` — принять задачу из «Проверки»: она переходит
+   * в «Выполнено» (accepted_at). Доступно только для задач в статусе DONE.
+   */
+  async accept(taskId: string): Promise<AcceptTaskResult> {
+    return http.post<AcceptTaskResult>(`/api/tasks/${encodeURIComponent(taskId)}/accept`);
   },
 
   /**

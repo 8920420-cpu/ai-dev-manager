@@ -20,6 +20,8 @@ import {
   advanceTask,
   moveTask,
   restartStuckTasks,
+  getAcceptanceBoard,
+  acceptTask,
   claimNextClaudeTask,
   releaseClaudeTask,
   claimNextHostTask,
@@ -565,6 +567,20 @@ export function createApp() {
           const taskId = decodeURIComponent(advanceMatch[1]);
           const result = await advanceTask(await loadSettings(), taskId);
           publishTaskChange('task_advanced', { taskId });
+          return sendJson(res, 200, result);
+        }
+
+        // Доска приёмки: завершённые конвейером задачи (DONE) для подразделов
+        // «Проверка» (не приняты) и «Выполнено» (приняты). Read-only.
+        if (req.method === 'GET' && p === '/api/tasks/acceptance-board')
+          return sendJson(res, 200, await getAcceptanceBoard(await loadSettings()));
+
+        // Принять задачу из «Проверки» → она переходит в «Выполнено» (accepted_at).
+        const acceptMatch = p.match(/^\/api\/tasks\/([^/]+)\/accept$/);
+        if (acceptMatch && req.method === 'POST') {
+          const taskId = decodeURIComponent(acceptMatch[1]);
+          const result = await acceptTask(await loadSettings(), taskId);
+          publishTaskChange('task_accepted', { taskId });
           return sendJson(res, 200, result);
         }
 
