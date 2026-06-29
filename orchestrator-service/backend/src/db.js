@@ -2014,6 +2014,20 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // очередь. ageCheck=true: возраст проверяется по RUNNER_ROLE_TIMEOUT_MS с
     // clockGuard, поэтому реально идущие прогоны не гасятся раньше срока.
     await reapOrphanRunningRuns(c, { ageCheck: true });
+    // ORPHAN-ROLE-REATTACH-001: самоисцеление осиротевших по роли задач. Активная
+    // задача без current_role_id НЕВИДИМА для claim (claimLlmRoleTask/claimHostTask
+    // делают INNER JOIN roles по current_role_id) и висит вечно. Так получается после
+    // массовых ручных операций (напр. bulk_unblock_refeed выставил статус, но не роль).
+    // Восстанавливаем роль из этапов проекта ДО claim, чтобы задача поехала тем же тиком.
+    await reattachOrphanStageRoles(c);
+    // TESTS-GREEN-SKIP-FA-001 (fix B): разорвать бесконечный self-loop аналитика
+    // сбоя. Прогон FAILURE_ANALYST на слабой модели может раз за разом упираться в
+    // таймаут роли — resetStaleClaims возвращает задачу в тот же FAILURE_ANALYSIS, и
+    // она переигрывается вечно, занимая слот. Задачу с РЕАЛЬНЫМ провалом тестов, у
+    // которой накопилось >= MAX_REWORK безрезультатных прогонов аналитика, уводим в
+    // BLOCKED (на человека). Зелёные задачи сюда не попадают — их раньше пропускает
+    // maybeSkipFailureAnalyst (forward), поэтому здесь явно требуем провала пайплайна.
+    await blockExhaustedFailureAnalysis(c);
     // Пропускаемые роли (ROLE-GROUPS-001 / per-project) прокручиваются до первой
     // активной роли ДО любого claim — за пропущенные роли не создаётся agent/host run.
     await advanceSkippedStageRoles(c);
@@ -2655,6 +2669,82 @@ export async function reapOrphanRunningRuns(c, { ageCheck = false } = {}) {
   return r.rowCount;
 }
 
+// ORPHAN-ROLE-REATTACH-001 — восстановить current_role_id у активных задач, потерявших
+// роль (NULL) после массовой ручной операции. Такая задача невидима для claim (INNER
+// JOIN roles по current_role_id) и зависает навсегда. Роль восстанавливаем из этапов
+// проекта двумя путями: ГРАФ-режим (current_stage_key задан) → роль узла по stage_key;
+// ЛИНЕЙНЫЙ режим (stage_key пуст) → роль ВКЛЮЧЁННОГО этапа с минимальной позицией, чей
+// task_status = статусу задачи (вход в фазу). Терминальные/BLOCKED/ожидающие статусы не
+// трогаем. Пишем диагностическое событие. Идемпотентно: чинит только задачи с NULL-ролью.
+async function reattachOrphanStageRoles(c) {
+  const r = await c.query(
+    `WITH orphan AS (
+       SELECT t.id, t.project_id, t.status::text AS status, t.current_stage_key
+         FROM tasks t
+        WHERE t.current_role_id IS NULL
+          AND t.status NOT IN ('DONE','CANCELLED','FAILED','BACKLOG','WAITING_FOR_CHILDREN','BLOCKED')
+     ), resolved AS (
+       SELECT o.id, o.status,
+              COALESCE(
+                -- граф-режим: роль узла, на котором стоит задача (по current_stage_key)
+                (SELECT psr.role_id FROM project_stages ps JOIN project_stage_roles psr ON psr.stage_id = ps.id
+                  WHERE ps.project_id = o.project_id AND ps.enabled = true AND ps.stage_key = o.current_stage_key
+                  ORDER BY ps.position LIMIT 1),
+                -- линейный режим: роль этапа с минимальной позицией для статуса задачи
+                (SELECT psr.role_id FROM project_stages ps JOIN project_stage_roles psr ON psr.stage_id = ps.id
+                  WHERE ps.project_id = o.project_id AND ps.enabled = true AND ps.task_status::text = o.status
+                  ORDER BY ps.position LIMIT 1)
+              ) AS role_id
+         FROM orphan o
+     ), fixed AS (
+       UPDATE tasks t SET current_role_id = r.role_id
+         FROM resolved r
+        WHERE t.id = r.id AND r.role_id IS NOT NULL
+        RETURNING t.id, t.status::text AS status, t.current_role_id
+     )
+     INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     SELECT id, 'TASK_UPDATED', status::task_status, status::task_status, current_role_id,
+            jsonb_build_object('runner', true, 'reason', 'orphan_role_reattached')
+       FROM fixed`,
+  );
+  return r.rowCount;
+}
+
+// TESTS-GREEN-SKIP-FA-001 (fix B) — увести в BLOCKED задачи, застрявшие в анализе
+// сбоя на реальном провале тестов после исчерпания попыток. Считаем таймауты/провалы
+// прогонов аналитика как rework-попытки: при >= maxAttempts безрезультатных прогонов
+// (и при последнем pipeline_run = FAILED) задача блокируется на человека, а не крутится
+// в FAILURE_ANALYSIS бесконечно. Зелёные задачи здесь не трогаем — их продвигает
+// вперёд maybeSkipFailureAnalyst (поэтому условие явно требует last_pipeline = 'FAILED').
+async function blockExhaustedFailureAnalysis(c, maxAttempts = MAX_REWORK) {
+  const r = await c.query(
+    `WITH fa AS (
+       SELECT t.id, t.status::text AS status, t.current_role_id,
+              (SELECT pr.status::text FROM pipeline_runs pr WHERE pr.task_id = t.id
+                ORDER BY pr.finished_at DESC NULLS LAST, pr.started_at DESC LIMIT 1) AS last_pipeline,
+              (SELECT count(*) FROM agent_runs ar
+                WHERE ar.task_id = t.id AND ar.role_id = t.current_role_id
+                  AND ar.status IN ('TIMEOUT','FAILED')) AS bad_runs
+         FROM tasks t JOIN roles r ON r.id = t.current_role_id
+        WHERE t.status = 'FAILURE_ANALYSIS' AND t.assigned_agent_id IS NULL AND r.code = 'FAILURE_ANALYST'
+     ), exhausted AS (
+       SELECT id, status, current_role_id FROM fa
+        WHERE last_pipeline = 'FAILED' AND bad_runs >= $1
+     ), blocked AS (
+       UPDATE tasks SET status = 'BLOCKED'
+        WHERE id IN (SELECT id FROM exhausted) AND status NOT IN ('DONE','CANCELLED')
+        RETURNING id
+     )
+     INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     SELECT e.id, 'STATUS_CHANGED', e.status::task_status, 'BLOCKED', e.current_role_id,
+            jsonb_build_object('runner', true, 'reason', 'failure_analysis_exhausted')
+       FROM exhausted e
+      WHERE e.id IN (SELECT id FROM blocked)`,
+    [Math.max(1, Number(maxAttempts) || 1)],
+  );
+  return r.rowCount;
+}
+
 /**
  * Стартовая реконсиляция (вызывается один раз при запуске оркестратора).
  * Полный перезапуск программы означает, что активных сессий (ни Разработчика,
@@ -2875,8 +2965,55 @@ async function buildRoleContext(c, claimed) {
 //     не запускаем, токены не тратим);
 //   * выходной гейт: роль не заполнила обязательное исходящее поле → REWORK;
 //   * заполненные исходящие поля пишем в кумулятивную карточку задачи.
+// TESTS-GREEN-SKIP-FA-001 — у задачи есть АКТУАЛЬНЫЙ провал тестов? Аналитик сбоя
+// (FAILURE_ANALYST) существует, чтобы диагностировать ПАДЕНИЕ пайплайна. Если
+// последний прогон тестов успешен (или тестов не было) — анализировать нечего.
+// Чистая функция (статус последнего pipeline_run → bool) — покрыта юнит-тестом.
+export function failureAnalysisHasRealFailure(lastPipelineStatus) {
+  return String(lastPipelineStatus ?? '').trim().toUpperCase() === 'FAILED';
+}
+
+// Статус последнего прогона тестов задачи (или null, если прогонов не было).
+async function latestPipelineStatus(c, taskId) {
+  const r = await c.query(
+    `SELECT status::text AS status FROM pipeline_runs
+      WHERE task_id = $1 ORDER BY finished_at DESC NULLS LAST, started_at DESC LIMIT 1`,
+    [taskId],
+  );
+  return r.rows[0]?.status ?? null;
+}
+
+// TESTS-GREEN-SKIP-FA-001 — пропустить этап «Анализ сбоя» для задачи с зелёными
+// тестами: продвигаем её ВПЕРЁД по маршруту (мимо аналитика) со статусом успеха,
+// НЕ запуская модель. Это и реализует правило «тесты пройдены → этап пропускаем»,
+// и разгребает завал задач, осевших в FAILURE_ANALYSIS при зелёном пайплайне
+// (напр. после реджекта ревьюера или таймаутов аналитика). Возвращает результат
+// finalizeRole, либо null — если у задачи РЕАЛЬНЫЙ провал тестов и аналитик нужен.
+async function maybeSkipFailureAnalyst(c, claimed, route) {
+  const last = await latestPipelineStatus(c, claimed.id);
+  if (failureAnalysisHasRealFailure(last)) return null;
+  const verdict = {
+    ok: true, status: 'SKIPPED', findings: [], fields: {},
+    summary: 'Тесты пройдены — анализ сбоя не требуется, этап пропущен.',
+  };
+  const decision = { outcome: 'FORWARD', agentRunStatus: 'SUCCESS', reason: 'tests_passed_skip' };
+  const resolved = claimed.current_stage_key
+    ? await resolveGraphTransition(c, claimed, decision)
+    : resolveTransition(route, claimed.role_code, decision);
+  return finalizeRole(c, claimed, {
+    verdict, response: '', exchangeId: null, durationMs: 0, decision, resolved, cardValues: {}, kpi: null,
+  });
+}
+
 async function processClaimedRole(c, claimed) {
   const route = await loadProjectRoute(c, claimed.project_id);
+  // TESTS-GREEN-SKIP-FA-001: аналитик сбоя на задаче с зелёными тестами — пропуск
+  // вперёд без вызова модели (см. maybeSkipFailureAnalyst). Делаем это ДО гейта
+  // входных полей и тяжёлого tool-loop: пропускаемой задаче они не нужны.
+  if (claimed.role_code === 'FAILURE_ANALYST') {
+    const skipped = await maybeSkipFailureAnalyst(c, claimed, route);
+    if (skipped) return skipped;
+  }
   const contract = await loadRoleContract(c, claimed.role_code);
   const card = claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {};
 
