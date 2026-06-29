@@ -56,6 +56,11 @@ if (-not $env:ORCHESTRATOR_URL) { $env:ORCHESTRATOR_URL = 'http://localhost:4186
 if (-not $env:CODEX_TASK_TIMEOUT_MS)            { $env:CODEX_TASK_TIMEOUT_MS = '540000' }
 if (-not $env:CLAUDE_REASONING_TASK_TIMEOUT_MS) { $env:CLAUDE_REASONING_TASK_TIMEOUT_MS = '540000' }
 
+# OBSERVABILITY-REASONING-001: рассуждающие роли через Claude Code — параллелизм 1.
+# При concurrency=2 подписка упиралась в rate-limit (rateLimited=true в каждом прогоне);
+# 1 агент работает без троттлинга и быстрее доводит задачу. Менять при необходимости.
+if (-not $env:CLAUDE_REASONING_CONCURRENCY)     { $env:CLAUDE_REASONING_CONCURRENCY = '1' }
+
 # Уже запущенные node-процессы демонов (по подстроке скрипта в командной строке).
 function Get-RunnerProcs([string]$ScriptLeaf) {
   Get-CimInstance Win32_Process -Filter "Name='node.exe'" |

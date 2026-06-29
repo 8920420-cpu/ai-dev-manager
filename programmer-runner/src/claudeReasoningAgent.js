@@ -39,13 +39,25 @@ function num(v) {
   return Number.isFinite(n) ? n : 0;
 }
 
-// Токены/стоимость из финального result-сообщения SDK (форматы немного разнятся между
-// версиями — берём толерантно, с фолбэками на 0).
+// Токены/стоимость из финального result-сообщения SDK. ВАЖНО: result.usage —
+// контекст ПОСЛЕДНЕГО хода (не сумма), поэтому для KPI берём result.modelUsage —
+// КУМУЛЯТИВНЫЕ по моделям итоги за всю сессию (сходятся с total_cost_usd). Фолбэк на
+// usage, если modelUsage нет (старые версии SDK).
 function extractUsage(final) {
+  const costUsd = num(final?.total_cost_usd);
+  const mu = final?.modelUsage;
+  if (mu && typeof mu === 'object') {
+    let tokensIn = 0;
+    let tokensOut = 0;
+    for (const m of Object.values(mu)) {
+      tokensIn += num(m?.inputTokens) + num(m?.cacheCreationInputTokens) + num(m?.cacheReadInputTokens);
+      tokensOut += num(m?.outputTokens);
+    }
+    return { tokensIn, tokensOut, costUsd };
+  }
   const u = final?.usage || {};
   const tokensIn = num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
   const tokensOut = num(u.output_tokens);
-  const costUsd = num(final?.total_cost_usd);
   return { tokensIn, tokensOut, costUsd };
 }
 
@@ -101,6 +113,15 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
           maxTurns,
           permissionMode: 'bypassPermissions',
           allowedTools,
+          // COLDSTART-MCP-ISOLATION-001: рассуждающим ролям нужны только встроенные
+          // Read/Glob/Grep/Bash. По умолчанию SDK грузит ВСЕ источники настроек
+          // (проектный .mcp.json, ~/.claude, хуки) и на каждом спавне поднимает MCP-
+          // серверы проекта (у ai-dev-manager — ai-dev-manager+magic+tools-service) →
+          // это ~20с холодного старта, а их tool-схемы раздувают контекст каждый ход
+          // (лишние токены). Полная изоляция: без внешних настроек и MCP.
+          settingSources: [],
+          strictMcpConfig: true,
+          mcpServers: {},
           abortController: ac,
           env: { ...process.env },
         },
