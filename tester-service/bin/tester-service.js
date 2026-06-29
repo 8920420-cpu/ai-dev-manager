@@ -4,6 +4,7 @@ import process from 'node:process';
 
 import { createServer } from '../src/server.js';
 import { TesterService } from '../src/TesterService.js';
+import { resolveInt } from '../src/envConfig.js';
 
 const HELP = `tester-service — микросервис роли «Тестировщик (Pipeline Service)»
 
@@ -63,7 +64,11 @@ async function main() {
     process.exit(result.status === 'success' ? 0 : result.status === 'failed' ? 1 : 2);
   }
 
-  const port = Number(values.port ?? process.env.TESTER_PORT ?? 4187);
+  // CONFIG-AUDIT-001: приоритет CLI-флаг --port > env TESTER_PORT > дефолт 4187.
+  // env разбирается через resolveInt (диапазон портов, безопасный фолбэк на мусор).
+  const port = values.port != null
+    ? Number(values.port)
+    : resolveInt('TESTER_PORT', 4187, { min: 1, max: 65535 }).value;
   const server = createServer();
   server.listen(port, () => {
     process.stderr.write(`[tester-service] слушает порт ${port}\n`);

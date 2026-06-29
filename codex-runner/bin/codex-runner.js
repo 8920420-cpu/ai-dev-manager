@@ -9,16 +9,21 @@
 // предварительно выполните `codex login` на этой машине.
 import { ReasoningRunner } from '../src/ReasoningRunner.js';
 import { makeCodexRunAgent } from '../src/codexAgent.js';
+import { resolveDuration, resolveInt, logEffectiveConfig } from '../src/envConfig.js';
 
 const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');
 const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
-const INTERVAL_MS = Number(process.env.CODEX_INTERVAL_MS || 5000);
-// Жёсткий таймаут на задачу. Держим меньше орфан-таймаута оркестратора
-// (RUNNER_ROLE_TIMEOUT_MS≈15 мин), чтобы освобождать захват раньше реапера.
-const TASK_TIMEOUT_MS = Number(process.env.CODEX_TASK_TIMEOUT_MS || 10 * 60 * 1000);
-// Потолок параллелизма: рассуждающие прогоны лёгкие, но Codex-сессии длинные —
-// держим скромно. Можно поднять CODEX_CONCURRENCY.
-const CONCURRENCY = Math.max(1, Number(process.env.CODEX_CONCURRENCY || 2));
+// CONFIG-AUDIT-001: единый разбор числовых env (единицы, диапазон, источник).
+// КОНТРАКТ: TASK_TIMEOUT < орфан-таймаута оркестратора (RUNNER_ROLE_TIMEOUT_MS,
+// дефолт 10 мин), иначе реапер освободит захват раньше раннера. start-runners.ps1
+// ставит 540000 (9 мин). effectiveConfig в логе показывает source/raw.
+const intervalCfg = resolveDuration('CODEX_INTERVAL_MS', 5000, { min: 200, max: 5 * 60_000 });
+const taskTimeoutCfg = resolveDuration('CODEX_TASK_TIMEOUT_MS', 10 * 60_000, { min: 30_000, max: 60 * 60_000 });
+const concurrencyCfg = resolveInt('CODEX_CONCURRENCY', 2, { min: 1, max: 8 });
+logEffectiveConfig('codex-runner', [intervalCfg, taskTimeoutCfg, concurrencyCfg]);
+const INTERVAL_MS = intervalCfg.value;
+const TASK_TIMEOUT_MS = taskTimeoutCfg.value;
+const CONCURRENCY = concurrencyCfg.value;
 // Если задан CODEX_ROLE — раннер опрашивает только эту роль (полезно разнести
 // воркеры по ролям); иначе берёт любую делегированную Codex задачу.
 const ROLE = String(process.env.CODEX_ROLE || '').trim();
@@ -59,8 +64,7 @@ const http = {
 const runAgent = makeCodexRunAgent();
 const runner = new ReasoningRunner({ http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY });
 
-console.log(`codex-runner: orchestrator=${ORCH} interval=${INTERVAL_MS}ms taskTimeout=${TASK_TIMEOUT_MS}ms`);
-console.log(`codex-runner: рассуждающие роли через Codex, concurrency=${CONCURRENCY}, role=${ROLE || 'любая делегированная'}`);
+console.log(`codex-runner: orchestrator=${ORCH}, рассуждающие роли через Codex, role=${ROLE || 'любая делегированная'}`);
 
 let stopping = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

@@ -2,12 +2,34 @@
 
 > Карта API компонентов оркестратора. HTTP endpoints, CLI и контракты.
 
+## Авторизация
+
+Все `/api/*` оркестратора защищены токеном, если задан `ORCHESTRATOR_API_TOKEN`
+(пусто = выключено, только локальная разработка). Открыты без токена только
+`GET /health` и `GET /api/version`. Передавайте токен заголовком
+`Authorization: Bearer <token>` (или `x-api-token: <token>`); для SSE
+`GET /api/tasks/events` допускается `?token=<token>`. Сервисы (scanner, mcp,
+tools) шлют тот же токен из своего `ORCHESTRATOR_API_TOKEN`.
+
+В сетевом развёртывании токен обязателен: без него опубликованные HTTP-порты
+дают доступ к мутациям БД, файловым инструментам tools-service и MCP.
+
 ## Scanner bridge
+
+Scanner следит за «папкой задач» проекта (`projects.tasks_path`, с откатом на
+`docs_path`); приём включается тумблером `scanner_enabled` на карточке проекта.
+Конфигурация watcher'ов берётся из `GET /api/projects` (режим `SCANNER_API_BASE`).
+Параллельно работает интейк Markdown-очередей (`SCANNER_INTAKE_*`): импорт задач
+из `tasks/<service>.md` (секции с маркером `[x]`) в БД.
+
+Исходящие HTTP-запросы scanner ограничены таймаутом `SCANNER_REQUEST_TIMEOUT_MS`
+(по умолчанию 10000 мс), чтобы зависший оркестратор не блокировал реконфигурацию
+и доставку задач навсегда.
 
 ### `POST /api/scanner/task-completed`
 
-Scanner вызывает endpoint после появления `status: "выполнено"` в
-`tasks/claude-tasks.json`.
+Scanner вызывает endpoint после появления завершённой задачи в наблюдаемом
+документе папки задач проекта (`tasks_path`).
 
 ```json
 {
@@ -18,13 +40,20 @@ Scanner вызывает endpoint после появления `status: "вып
   "title": "Исправить reconnect",
   "result": "Исправлено",
   "changedFiles": ["src/chat.js"],
-  "sourceDocument": "/workspace/claude-tasks.json",
+  "sourceDocument": "/workspace/<service>.md",
   "nextRole": "TASK_REVIEWER"
 }
 ```
 
 Успех: `{"accepted":true,"duplicate":false,"nextRole":"TASK_REVIEWER"}`.
 Повторная доставка возвращает `duplicate:true` и не создаёт второй переход.
+
+### `POST /api/scanner/task-intake`
+
+Интейк (SCANNER-INTAKE-001) импортирует задачи из Markdown-очередей
+`tasks/<service>.md` (секции с маркером `[x]`) в БД проекта-владельца
+(`SCANNER_INTAKE_PROJECT` — `code|name|root_path`). После импорта секция
+вырезается из файла-очереди.
 
 ---
 

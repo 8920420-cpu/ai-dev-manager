@@ -13,6 +13,8 @@ import {
   listAvailableSkills,
   normalizeSkillUpload,
   uploadSkill,
+  composeRoleSystemPrompt,
+  RESEARCH_ROLES,
 } from '../src/roles.js';
 import { readFile } from 'node:fs/promises';
 
@@ -69,6 +71,37 @@ test('порядок объединения: базовый промт, зате
 test('пустые skill-содержимые пропускаются', () => {
   const out = mergePromptAndSkills('BASE', [{ path: 'a.md', content: '   ' }]);
   assert.equal(out, 'BASE');
+});
+
+// --- composeRoleSystemPrompt: бюджет разведки (RESEARCH-BUDGET-001) ----------
+
+// Фейк-клиент БД: роль с заданным prompt, без подключённых skills.
+function fakeRoleClient(prompt) {
+  return {
+    async query(sql) {
+      if (/FROM roles WHERE code/.test(sql)) return { rowCount: 1, rows: [{ prompt, hidden: false }] };
+      return { rowCount: 0, rows: [] }; // role_skills и пр.
+    },
+  };
+}
+
+test('composeRoleSystemPrompt: исследующая роль получает бюджет разведки и правило данных', async () => {
+  const sys = await composeRoleSystemPrompt(fakeRoleClient('BASE'), 'ARCHITECT', { skillsDir: '/no-such-skills' });
+  assert.ok(sys.startsWith('BASE'));
+  assert.match(sys, /ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ДАННЫХ/);
+  assert.match(sys, /БЮДЖЕТ РАЗВЕДКИ/);
+});
+
+test('composeRoleSystemPrompt: роль-исполнитель НЕ получает бюджет разведки', async () => {
+  const sys = await composeRoleSystemPrompt(fakeRoleClient('BASE'), 'PROGRAMMER', { skillsDir: '/no-such-skills' });
+  assert.match(sys, /ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ДАННЫХ/);
+  assert.doesNotMatch(sys, /БЮДЖЕТ РАЗВЕДКИ/);
+});
+
+test('RESEARCH_ROLES включает Архитектора и Декомпозитора', () => {
+  assert.ok(RESEARCH_ROLES.has('ARCHITECT'));
+  assert.ok(RESEARCH_ROLES.has('DECOMPOSER'));
+  assert.ok(!RESEARCH_ROLES.has('PROGRAMMER'));
 });
 
 // --- Валидация skill-путей ---------------------------------------------------

@@ -60,7 +60,7 @@ npm start
 | `ORCHESTRATOR_API_TOKEN` | Bearer-токен, если `/api` закрыт | — |
 | `CODEX_CONCURRENCY` | Параллельных задач | `2` |
 | `CODEX_ROLE` | Опрашивать только одну роль (иначе любую делегированную) | — |
-| `CODEX_TASK_TIMEOUT_MS` | Жёсткий таймаут задачи (< орфан-таймаута оркестратора) | `600000` |
+| `CODEX_TASK_TIMEOUT_MS` | Жёсткий таймаут задачи; КОНТРАКТ: < орфан-таймаута оркестратора `RUNNER_ROLE_TIMEOUT_MS` (10 мин). `start-runners.ps1` ставит `540000` (9 мин). Принимает ms или суффикс `s`/`m`/`h` | `600000` (10 мин) |
 | `CODEX_INTERVAL_MS` | Пауза между опросами при простое | `5000` |
 | `CODEX_SANDBOX` | Песочница codex (`read-only`/`workspace-write`/`danger-full-access`) | `read-only` |
 | `CODEX_MODEL` | Модель (иначе берётся из `~/.codex/config.toml`) | — |

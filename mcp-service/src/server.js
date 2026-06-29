@@ -49,13 +49,52 @@ export async function startStdio(config = loadConfig()) {
   return { server, transport, tools };
 }
 
-async function readJsonBody(req) {
+/** Ошибка HTTP-уровня с привязанным статусом (для 400/401/413 без 500). */
+function httpError(statusCode, code) {
+  const e = new Error(code);
+  e.statusCode = statusCode;
+  return e;
+}
+
+/**
+ * Прочитать JSON-тело с лимитом. Превышение лимита → 413 (поток обрывается,
+ * чтобы не копить память), битый JSON → 400. Пустое тело → undefined.
+ */
+async function readJsonBody(req, limitBytes = 1048576) {
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  let size = 0;
+  for await (const c of req) {
+    size += c.length;
+    if (size > limitBytes) {
+      // Прекращаем читать тело: pause() (а не destroy()) останавливает накопление
+      // памяти/CPU, но оставляет сокет живым — иначе клиент не получит 413, а
+      // увидит обрыв соединения. Выход из цикла прекращает push новых чанков.
+      req.pause();
+      throw httpError(413, 'payload_too_large');
+    }
+    chunks.push(c);
+  }
   if (!chunks.length) return undefined;
   const raw = Buffer.concat(chunks).toString('utf8').trim();
   if (!raw) return undefined;
-  return JSON.parse(raw);
+  try {
+    return JSON.parse(raw);
+  } catch {
+    throw httpError(400, 'invalid_json');
+  }
+}
+
+/**
+ * Авторизация входа на /mcp. Если в конфиге задан токен — требуем совпадение по
+ * Authorization: Bearer <token> или заголовку x-api-token. Пустой токен (локальная
+ * разработка) пропускает всех. /health авторизацию не проверяет.
+ */
+function isMcpAuthorized(req, token) {
+  if (!token) return true;
+  const auth = String(req.headers['authorization'] || '');
+  if (auth === `Bearer ${token}`) return true;
+  if (req.headers['x-api-token'] === token) return true;
+  return false;
 }
 
 /**
@@ -75,9 +114,15 @@ export function startHttp(config = loadConfig(), { logger = console.error } = {}
     }
 
     if (path === '/mcp') {
+      // SECURITY: вход на /mcp под токеном (если задан). /mcp выдаёт инструменты
+      // записи/удаления файлов и мутаций оркестратора — без auth публиковать нельзя.
+      if (!isMcpAuthorized(req, config.orchestratorToken)) {
+        res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'unauthorized' }, id: null }));
+      }
       let body;
       try {
-        if (req.method === 'POST') body = await readJsonBody(req);
+        if (req.method === 'POST') body = await readJsonBody(req, config.bodyLimitBytes);
         const { server } = buildServer(config);
         // stateless: без генерации session id — на каждый запрос свежий transport.
         const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
@@ -89,8 +134,11 @@ export function startHttp(config = loadConfig(), { logger = console.error } = {}
         await transport.handleRequest(req, res, body);
       } catch (e) {
         if (!res.headersSent) {
-          res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-          res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32603, message: e?.message || String(e) }, id: null }));
+          // Битый/слишком большой JSON — клиентская ошибка (400/413), не 500.
+          const status = e?.statusCode || 500;
+          const rpcCode = status === 500 ? -32603 : -32600;
+          res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: rpcCode, message: e?.message || String(e) }, id: null }));
         }
       }
       return;

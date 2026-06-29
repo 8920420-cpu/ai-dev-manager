@@ -37,6 +37,25 @@ test('readBody: пустое тело → {}', async () => {
   assert.deepEqual(body, {});
 });
 
-test('readBody: битый JSON → reject', async () => {
-  await assert.rejects(() => readBody(fakeReq([Buffer.from('{not json', 'utf8')])), /invalid JSON body/);
+test('readBody: битый JSON → reject 400 invalid_json', async () => {
+  await assert.rejects(
+    () => readBody(fakeReq([Buffer.from('{not json', 'utf8')])),
+    (e) => /invalid JSON body/.test(e.message) && e.statusCode === 400 && e.code === 'invalid_json',
+  );
+});
+
+test('readBody: тело больше лимита → reject 413, ровно один settle', async () => {
+  const big = Buffer.alloc(1e6 + 10, 0x61); // > 1 МБ — превышает лимит сразу
+  let settles = 0;
+  await readBody(fakeReq([big, big, big])).then(
+    () => { settles++; },
+    (e) => {
+      settles++;
+      assert.equal(e.statusCode, 413);
+      assert.equal(e.code, 'payload_too_large');
+    },
+  );
+  // Последующие data/end не должны повторно резолвить/реджектить промис.
+  await new Promise((r) => setTimeout(r, 5));
+  assert.equal(settles, 1);
 });

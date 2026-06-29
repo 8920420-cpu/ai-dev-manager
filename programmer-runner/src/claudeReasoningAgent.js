@@ -71,7 +71,11 @@ function extractUsage(final) {
  */
 export function makeClaudeReasoningRunAgent(cfg = {}) {
   const model = cfg.model || process.env.CLAUDE_REASONING_MODEL || 'claude-sonnet-4-6';
-  const maxTurns = Number(cfg.maxTurns || process.env.CLAUDE_REASONING_MAX_TURNS || 24);
+  // RESEARCH-BUDGET-001: кап на глубину разведки. Разведка должна укладываться в
+  // ~2 прохода на карты проекта/сервиса (подаются инлайн) + точечное чтение
+  // релевантных файлов. 12 ходов — сознательно жёсткий потолок: упор в него = роль
+  // плохо нарезана или ходит по всему репозиторию (см. исход max_turns_exceeded).
+  const maxTurns = Number(cfg.maxTurns || process.env.CLAUDE_REASONING_MAX_TURNS || 12);
   const allowedTools = cfg.allowedTools || READONLY_TOOLS;
   const log = cfg.log || console;
   const queryImpl = cfg.query || query;
@@ -97,8 +101,11 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
       const coldStartMs = initAt != null ? initAt - started : null;
       const reasonMs = initAt != null ? Date.now() - initAt : null;
       const usage = extractUsage(final);
+      // KPI ходов берём из result.num_turns (авторитетный счётчик SDK), а ручной
+      // счётчик assistant-сообщений — фолбэк, если result не пришёл (abort/throw).
+      const turnsKpi = num(final?.num_turns) || turns;
       return {
-        coldStartMs, reasonMs, turns, toolUses, rateLimited,
+        coldStartMs, reasonMs, turns: turnsKpi, toolUses, rateLimited,
         tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, costUsd: usage.costUsd,
         durationMs: Date.now() - started,
       };
@@ -154,6 +161,14 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
     if (ac.signal.aborted) {
       return { ok: false, error: 'agent_aborted', outcome: classifyAbort(initAt, turns, lastMsgAt), ...metrics() };
     }
+    // RESEARCH-BUDGET-001: упор в лимит ходов — ОТДЕЛЬНЫЙ помеченный исход (как у
+    // claudeAgent.js программиста), а не безликий claude_failed. Сигнал, что роль
+    // ходит по всему репозиторию вместо двухуровневой карты → видно в KPI.
+    if (final && final.subtype === 'error_max_turns') {
+      log.warn?.('claudeReasoningAgent: упор в лимит ходов', { taskId: task.id, numTurns: final.num_turns, maxTurns });
+      return { ok: false, error: 'max_turns_exceeded', outcome: 'max_turns_exceeded', ...metrics() };
+    }
+
     const ok = !!final && final.subtype === 'success' && final.is_error !== true;
     if (!ok) {
       const reason = final ? `${final.subtype}${final.error ? `: ${final.error}` : ''}` : 'no_result_message';

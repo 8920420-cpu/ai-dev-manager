@@ -6,6 +6,7 @@ import {
   decideTransition,
   buildVerdictInstruction,
   buildUserPayload,
+  renderProjectMaps,
   summarizePriorRuns,
   LLM_ROLE_CODES,
   capToolArgs,
@@ -156,6 +157,30 @@ test('buildVerdictInstruction/buildUserPayload содержат JSON-контр�
   assert.match(payload, /TASK_REVIEWER/);
   // Контекст сериализуется компактно (без отступов) — экономия токенов.
   assert.match(payload, /"title":"T"/);
+});
+
+// --- RESEARCH-BUDGET-001: карта проекта инлайн ------------------------------
+
+test('renderProjectMaps: проект + сервис → markdown-блок; пусто → пустая строка', () => {
+  assert.equal(renderProjectMaps(null), '');
+  assert.equal(renderProjectMaps({}), '');
+  const block = renderProjectMaps({ project: 'P-MAP', service: 'S-MAP', serviceName: 'scanner' });
+  assert.match(block, /Карта проекта/);
+  assert.match(block, /P-MAP/);
+  assert.match(block, /Карта микросервиса scanner/);
+  assert.match(block, /S-MAP/);
+});
+
+test('buildUserPayload: projectMaps рендерится инлайн и НЕ попадает в JSON-контекст', () => {
+  const payload = buildUserPayload('ARCHITECT', {
+    taskId: 'x', title: 'T', projectMaps: { project: 'PROJECT-MAP-TEXT', serviceName: '' },
+  });
+  // Карта — отдельным markdown-блоком до контекста.
+  assert.match(payload, /Карта проекта/);
+  assert.match(payload, /PROJECT-MAP-TEXT/);
+  assert.match(payload, /"title":"T"/);
+  // Карта не должна дублироваться внутри JSON-контекста.
+  assert.ok(!/"projectMaps"/.test(payload));
 });
 
 test('summarizePriorRuns: компактный список из agent_runs', () => {

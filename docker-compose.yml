@@ -24,13 +24,17 @@ services:
       RUNNER_ENABLED: "true"
       RUNNER_INTERVAL_MS: "3000"
       # Таймаут захвата РАССУЖДАЮЩЕЙ роли: прогон без завершения дольше порога →
-      # TIMEOUT, слот свободен. 3 мин (INCIDENT-FIX 2026-06-28): полезная работа
-      # рассуждающей роли = СЕКУНДЫ (Architect 34с, Reviewer 16с), поэтому при сбое
-      # движка/раннера застрявший захват освобождается за 3 мин, а не за 30 — иначе
-      # один аутаж копит часы простоя. Ложные TIMEOUT от скачков часов Docker-VM
+      # TIMEOUT, слот свободен. CONFIG-AUDIT-001: дефолт ВЫРОВНЕН до 10 мин (600000)
+      # с db.js и .env — прежде здесь было 3 мин (180000), а в db.js 15 мин: один
+      # параметр имел три разных дефолта, и эффективное значение зависело от способа
+      # запуска. Почему именно 10 мин: рассуждающие роли Architect/Decomposer переведены
+      # на Claude Code (агентный tool-loop: ~21с холодный старт + многоходовое чтение)
+      # и в прежние 3 мин не влезали → agent_aborted по кругу. КОНТРАКТ: значение должно
+      # быть БОЛЬШЕ hard-timeout раннеров (start-runners.ps1 = 540000 ≈ 9 мин), иначе
+      # реапер освободит захват раньше раннера. Ложные TIMEOUT от скачков часов Docker-VM
       # гасит clockGuard (см. patroni-single-node-flapping, clock-guard-timeout-skew).
       # ВНИМАНИЕ: программист НЕ наследует это значение — см. RUNNER_CLAUDE_TIMEOUT_MS.
-      RUNNER_ROLE_TIMEOUT_MS: "${RUNNER_ROLE_TIMEOUT_MS:-180000}"
+      RUNNER_ROLE_TIMEOUT_MS: "${RUNNER_ROLE_TIMEOUT_MS:-600000}"
       # Таймаут захвата ПРОГРАММИСТА (claude_programmer/CODING) — отдельно от
       # рассуждающих ролей: CODING идёт 10–20 мин, поэтому НЕ наследует короткий
       # RUNNER_ROLE_TIMEOUT_MS (иначе claude-захват реапится посреди написания кода).
@@ -75,12 +79,20 @@ services:
     image: tools-service:latest
     container_name: tools-service
     ports:
-      # Публикуем 4188 на хост, чтобы локальный MCP-клиент (Claude Code/VS Code
-      # через .mcp.json) мог обращаться к builtin-инструментам tools-service.
-      - "4188:4188"
+      # Публикуем 4188 ТОЛЬКО на loopback хоста (127.0.0.1): локальный MCP-клиент
+      # (Claude Code/VS Code через .mcp.json) обращается к builtin-инструментам, а
+      # внешняя сеть к ним не достучится. /execute умеет читать/писать/удалять файлы,
+      # поэтому наружу порт открывать опасно. Чтобы открыть для LAN — переопределите
+      # TOOLS_BIND_HOST=0.0.0.0 в .env (явный opt-in) и обязательно задайте
+      # ORCHESTRATOR_API_TOKEN + TOOLS_ALLOWED_ROOTS.
+      - "${TOOLS_BIND_HOST:-127.0.0.1}:4188:4188"
     environment:
       TOOLS_SERVICE_PORT: "4188"
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      # SECURITY: allowlist серверных корней. /execute принимает root от клиента —
+      # без allowlist любой root в смонтированных томах доступен на чтение/запись.
+      # Список разделяется ':' (как PATH); пусто = allowlist выключен (только dev).
+      TOOLS_ALLOWED_ROOTS: "${TOOLS_ALLOWED_ROOTS:-/projects:/app/ai-dev-manager}"
     volumes:
       # Корни проектов для builtin-инструментов. Проект ai-dev-manager имеет
       # root_path "ai-dev-manager" → внутри контейнера он резолвится в
@@ -108,7 +120,10 @@ services:
     container_name: mcp-service
     ports:
       # HTTP/SSE-режим MCP: health на /health и Streamable MCP на /mcp.
-      - "4190:4190"
+      # Публикуем ТОЛЬКО на loopback хоста: /mcp даёт инструменты записи/удаления
+      # файлов и мутаций оркестратора. Для LAN — opt-in MCP_BIND_HOST=0.0.0.0 в .env
+      # вместе с непустым ORCHESTRATOR_API_TOKEN (вход на /mcp проверяет токен).
+      - "${MCP_BIND_HOST:-127.0.0.1}:4190:4190"
     environment:
       MCP_SERVICE_PORT: "4190"
       # PROJECT_ROOT — это корень, который mcp-service ПЕРЕДАЁТ в tools-service как
@@ -119,10 +134,13 @@ services:
       ORCHESTRATOR_URL: "http://orchestrator-service"
       TOOLS_SERVICE_URL: "http://tools-service:4188"
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
-      # Dev-режим: разрешаем запись/удаление/мутации оркестратора.
-      MCP_ENABLE_WRITE: "1"
-      MCP_ENABLE_DELETE: "1"
-      MCP_ENABLE_ORCHESTRATOR_MUTATIONS: "1"
+      # SECURITY: мутации (запись/удаление файлов, мутации оркестратора) выключены
+      # по умолчанию. Включайте осознанно в .env (MCP_ENABLE_WRITE=1 и т.д.) — и
+      # только вместе с непустым ORCHESTRATOR_API_TOKEN, иначе публичный /mcp
+      # получит инструменты записи/удаления без авторизации.
+      MCP_ENABLE_WRITE: "${MCP_ENABLE_WRITE:-0}"
+      MCP_ENABLE_DELETE: "${MCP_ENABLE_DELETE:-0}"
+      MCP_ENABLE_ORCHESTRATOR_MUTATIONS: "${MCP_ENABLE_ORCHESTRATOR_MUTATIONS:-0}"
     volumes:
       # Зарезервировано на будущее (прямой доступ к файлам). Сейчас файловые
       # операции выполняет tools-service; путь совпадает с его mount.
@@ -139,41 +157,6 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
-
-  scanner-service:
-    build:
-      context: .
-      dockerfile: scanner-service/Dockerfile
-    image: scanner-service:latest
-    container_name: scanner-service
-    environment:
-      # API multi-watcher режим: папки наблюдения берутся из этапов проектов
-      # оркестратора (SCANNER_API_BASE). Legacy single-watcher/feeder удалён.
-      SCANNER_API_BASE: http://orchestrator-service
-      # Каталог exactly-once state-файлов watcher'ов (по projectId+stageId).
-      SCANNER_STATE_DIR: /workspace/scanner-state
-      SCANNER_DEBOUNCE_MS: "150"
-      # bind-mount в Docker не пробрасывает события fs.watch с хоста —
-      # резервный опрос ловит изменения, которые watcher пропустил.
-      SCANNER_FALLBACK_MS: "5000"
-      # Stage 1: после доставки удалять завершённую запись, освобождая слот.
-      SCANNER_CLEAR_ON_DISPATCH: "true"
-      # Интейк (SCANNER-INTAKE-001): импорт задач из Markdown-очередей
-      # tasks/<service>.md (секции с маркером `[x]`) в БД с вырезанием секции.
-      # Включается заданием проекта-владельца; папка очередей — /workspace.
-      # Значение — code|name|root_path проекта (root_path стабильнее всего).
-      SCANNER_INTAKE_PROJECT: "${SCANNER_INTAKE_PROJECT:-ai-dev-manager}"
-      SCANNER_INTAKE_DIR: /workspace
-      SCANNER_INTAKE_INTERVAL_MS: "5000"
-      ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
-    volumes:
-      # Эталонная папка задач проекта: Markdown-очереди интейка (tasks/<service>.md)
-      # и каталог state-файлов сканера. Одна папка — один источник истины.
-      - ./tasks:/workspace
-    depends_on:
-      orchestrator-service:
-        condition: service_healthy
-    restart: unless-stopped
 
 networks:
   shared-network:

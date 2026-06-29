@@ -27,6 +27,31 @@ function toolError(code, message) {
   return e;
 }
 
+/**
+ * Разобрать env-список корней в массив абсолютных путей. Разделители — символ
+ * PATH-разделителя ОС (':' в Linux-контейнере) и запятая. Пустые элементы и
+ * пробелы отбрасываются. Пустой результат = allowlist выключен.
+ */
+export function parseAllowedRoots(value) {
+  return String(value ?? '')
+    .split(/[,;\n]|:(?=\/)|:$/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => resolve(s));
+}
+
+/**
+ * Проверить, что клиентский root попадает в один из разрешённых корней. Пустой
+ * allowlist (allowed.length === 0) пропускает любой root — режим локальной
+ * разработки/тестов; в сетевом развёртывании allowlist задаётся через env.
+ */
+export function isRootAllowed(root, allowed) {
+  if (!Array.isArray(allowed) || allowed.length === 0) return true;
+  const abs = resolve(String(root ?? ''));
+  if (!abs) return false;
+  return allowed.some((base) => abs === base || abs.startsWith(base + sep));
+}
+
 function requireRoot(root) {
   const base = String(root ?? '').trim();
   if (!base) throw toolError('root_required', 'Не задан корень проекта (root).');

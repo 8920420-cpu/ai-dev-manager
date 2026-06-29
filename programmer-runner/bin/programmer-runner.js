@@ -6,21 +6,28 @@
 import { ProgrammerRunner } from '../src/ProgrammerRunner.js';
 import { makeClaudeRunAgent } from '../src/claudeAgent.js';
 import { ensureClaudeToken } from '../src/loadToken.js';
+import { resolveDuration, logEffectiveConfig } from '../src/envConfig.js';
 
 const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');
 const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
-const INTERVAL_MS = Number(process.env.PROGRAMMER_INTERVAL_MS || 5000);
-// Жёсткий таймаут на задачу. Держим меньше орфан-таймаута оркестратора
-// (CLAUDE_ASSIGN_TIMEOUT_MS≈30 мин), чтобы освобождать захват раньше реапера.
-const TASK_TIMEOUT_MS = Number(process.env.PROGRAMMER_TASK_TIMEOUT_MS || 20 * 60 * 1000);
+// CONFIG-AUDIT-001: единый разбор числовых env (единицы, диапазон, источник).
+// КОНТРАКТ: TASK_TIMEOUT < орфан-таймаута программиста оркестратора
+// (RUNNER_CLAUDE_TIMEOUT_MS, .env=1500000≈25 мин), чтобы освобождать захват раньше
+// реапера. effectiveConfig в логе показывает source/raw (см. CONFIG_AUDIT.md).
+const intervalCfg = resolveDuration('PROGRAMMER_INTERVAL_MS', 5000, { min: 200, max: 5 * 60_000 });
+const taskTimeoutCfg = resolveDuration('PROGRAMMER_TASK_TIMEOUT_MS', 20 * 60_000, { min: 60_000, max: 60 * 60_000 });
+const settingsPollCfg = resolveDuration('PROGRAMMER_SETTINGS_POLL_MS', 15000, { min: 1000, max: 5 * 60_000 });
+const INTERVAL_MS = intervalCfg.value;
+const TASK_TIMEOUT_MS = taskTimeoutCfg.value;
+const SETTINGS_POLL_MS = settingsPollCfg.value;
 // Жёсткий потолок параллелизма: не более 3 задач одновременно (защита машины и
 // модели). Реальное значение берётся из настроек (Настройки → Выполнение) на лету
 // и клампится в [1..MAX_CONCURRENCY]. Env PROGRAMMER_CONCURRENCY — лишь стартовый
 // фолбэк, пока настройки не загрузились.
 const MAX_CONCURRENCY = 3;
-const SETTINGS_POLL_MS = Number(process.env.PROGRAMMER_SETTINGS_POLL_MS || 15000);
 const clampConc = (n) => Math.min(MAX_CONCURRENCY, Math.max(1, Math.floor(Number(n) || 1)));
 const START_CONCURRENCY = clampConc(process.env.PROGRAMMER_CONCURRENCY || MAX_CONCURRENCY);
+logEffectiveConfig('programmer-runner', [intervalCfg, taskTimeoutCfg, settingsPollCfg]);
 
 // Авторизация Agent SDK. Возможны варианты:
 //   1) ANTHROPIC_API_KEY — обычный API-ключ (перебивает подписку);
@@ -86,8 +93,7 @@ const runAgent = makeClaudeRunAgent();
 // Стартуем со стартовым значением; фактическое тянем из настроек ниже.
 const runner = new ProgrammerRunner({ http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: START_CONCURRENCY });
 
-console.log(`programmer-runner: orchestrator=${ORCH} interval=${INTERVAL_MS}ms taskTimeout=${TASK_TIMEOUT_MS}ms`);
-console.log(`programmer-runner: роль PROGRAMMER (стадия CODING), maxConcurrency=${MAX_CONCURRENCY}, start=${START_CONCURRENCY}`);
+console.log(`programmer-runner: orchestrator=${ORCH}, роль PROGRAMMER (стадия CODING), maxConcurrency=${MAX_CONCURRENCY}, start=${START_CONCURRENCY}`);
 
 let stopping = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

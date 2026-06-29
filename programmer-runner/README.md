@@ -82,13 +82,27 @@ node bin/programmer-runner.js
 | `ANTHROPIC_API_KEY` | — | API-ключ (альтернатива подписке; перебивает её) |
 | `ORCHESTRATOR_URL` | `http://localhost:4186` | база HTTP оркестратора |
 | `ORCHESTRATOR_API_TOKEN` | — | Bearer, если `/api` закрыт токеном |
-| `PROGRAMMER_CONCURRENCY` | `1` | число параллельных воркеров (каждый — свой worktree) |
-| `PROGRAMMER_WORKTREE` | `1` | изоляция через git worktree; `0` — править прямо в main (только для concurrency=1) |
-| `PROGRAMMER_INTERVAL_MS` | `5000` | пауза между опросами |
-| `PROGRAMMER_TASK_TIMEOUT_MS` | `1200000` | жёсткий таймаут на задачу (< орфан-таймаута оркестратора ≈30 мин) |
+| `PROGRAMMER_CONCURRENCY` | `3` (= MAX_CONCURRENCY) | стартовое число воркеров; на лету берётся из настроек (Настройки → Выполнение), кламп `[1..3]` |
+| `PROGRAMMER_INTERVAL_MS` | `5000` | пауза между опросами (диапазон `200..300000`) |
+| `PROGRAMMER_TASK_TIMEOUT_MS` | `1200000` (20 мин) | жёсткий таймаут на задачу; КОНТРАКТ: < орфан-таймаута программиста `RUNNER_CLAUDE_TIMEOUT_MS` (.env = 1500000 ≈ 25 мин). Единицы: ms или суффикс `s`/`m`/`h` |
+| `PROGRAMMER_SETTINGS_POLL_MS` | `15000` | период опроса настройки параллельности |
 | `PROGRAMMER_MODEL` | `claude-opus-4-8` | модель агента |
-| `PROGRAMMER_MAX_TURNS` | `60` | лимит ходов агента |
+| `PROGRAMMER_MAX_TURNS` | `100` | лимит ходов агента (читается в `claudeAgent.js`) |
 | `PROGRAMMER_REPO_MAP` | — | JSON-переопределение карты `project → {cwd, env}` |
+
+> `PROGRAMMER_WORKTREE` удалён (commit 23d754f): worktree-изоляция на микросервис —
+> единственный режим. См. [CONFIG_AUDIT.md](../CONFIG_AUDIT.md) о едином разборе env.
+
+### Рассуждающий раннер (та же кодовая база, `bin/claude-reasoning-runner.js`)
+
+| Переменная | По умолчанию | Назначение |
+|---|---|---|
+| `CLAUDE_REASONING_INTERVAL_MS` | `5000` | пауза между опросами |
+| `CLAUDE_REASONING_TASK_TIMEOUT_MS` | `600000` (10 мин) | жёсткий таймаут; КОНТРАКТ: < орфан `RUNNER_ROLE_TIMEOUT_MS` (10 мин); `start-runners.ps1` ставит `540000` (9 мин) |
+| `CLAUDE_REASONING_CONCURRENCY` | `2` | воркеры; `start-runners.ps1` ставит `1` (избежать rate-limit подписки) |
+| `CLAUDE_REASONING_MODEL` | `claude-sonnet-4-6` | модель рассуждающей роли |
+| `CLAUDE_REASONING_MAX_TURNS` | `12` | кап глубины разведки |
+| `CLAUDE_REASONING_ROLE` | — | если задана — опрашивать только эту роль |
 
 Карта репозиториев по умолчанию: `PROJECT_2 → …/PS` (с `GOWORK=off`),
 `PROJECT → …/ai-dev-manager`.

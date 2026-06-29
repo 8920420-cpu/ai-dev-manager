@@ -145,6 +145,8 @@ function sendJson(res, code, obj) {
   res.end(JSON.stringify(obj));
 }
 
+const BODY_LIMIT_BYTES = 1e6; // 1 МБ на тело запроса
+
 export function readBody(req) {
   return new Promise((resolve, reject) => {
     // Собираем СЫРЫЕ буферы и декодируем UTF-8 один раз в конце. Нельзя делать
@@ -153,21 +155,50 @@ export function readBody(req) {
     // раздельно → символы-замены «�» (битая кодировка заголовка/описания задачи).
     const chunks = [];
     let size = 0;
+    let settled = false; // single-settle: промис резолвится/реджектится ровно один раз
+
+    // Ошибка с машинным кодом и HTTP-статусом — внешний catch отдаёт 400/413,
+    // а не 500 (битый/слишком большой ввод — вина клиента, не сервера).
+    const fail = (message, code, statusCode) => {
+      if (settled) return;
+      settled = true;
+      const e = new Error(message);
+      e.code = code;
+      e.statusCode = statusCode;
+      // Прекращаем приём тела: pause() останавливает накопление памяти/CPU, но
+      // оставляет сокет живым, чтобы внешний catch успел отдать 413/400 (destroy()
+      // оборвал бы соединение до ответа). Обработчик 'data' ниже после settled
+      // больше не пушит чанки, так что память дальше не растёт.
+      if (typeof req.pause === 'function') req.pause();
+      reject(e);
+    };
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolve(value);
+    };
+
     req.on('data', (c) => {
+      if (settled) return;
       chunks.push(c);
       size += c.length;
-      if (size > 1e6) reject(new Error('payload too large'));
+      if (size > BODY_LIMIT_BYTES) fail('payload too large', 'payload_too_large', 413);
     });
     req.on('end', () => {
-      if (size === 0) return resolve({});
+      if (settled) return;
+      if (size === 0) return done({});
       const data = Buffer.concat(chunks).toString('utf8');
       try {
-        resolve(JSON.parse(data));
+        done(JSON.parse(data));
       } catch {
-        reject(new Error('invalid JSON body'));
+        fail('invalid JSON body', 'invalid_json', 400);
       }
     });
-    req.on('error', reject);
+    req.on('error', (err) => {
+      if (settled) return;
+      settled = true;
+      reject(err);
+    });
   });
 }
 

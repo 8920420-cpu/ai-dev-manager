@@ -9,12 +9,17 @@
 // покрыты юнит-тестами без сети и без Postgres.
 import { ROLE_FLOW } from './rolePipeline.js';
 import { invoke as llmInvoke, invokeChat } from './llmConnector.js';
+import { resolveInt, resolveDuration } from './envConfig.js';
 
+// CONFIG-AUDIT-001: единый разбор числовых env (диапазон, безопасный фолбэк).
+// Прежний паттерн Math.max(1000, Number(env || 12000)) при мусоре давал NaN
+// (Math.max(1000, NaN) === NaN). resolveInt возвращает дефолт + предупреждение;
+// нижний порог сохраняем через Math.max поверх валидного значения.
 // Максимум итераций tool-loop (сколько раз роль может вызвать инструменты подряд).
-const TOOL_MAX_ITERS = Number(process.env.ROLE_TOOL_MAX_ITERS || 8);
-const TOOL_RESULT_MAX_CHARS = Math.max(1000, Number(process.env.ROLE_TOOL_RESULT_MAX_CHARS || 12000));
-const TOOL_READ_FILE_MAX_BYTES = Math.max(1000, Number(process.env.ROLE_TOOL_READ_FILE_MAX_BYTES || 16000));
-const TOOL_SEARCH_MAX_RESULTS = Math.max(1, Number(process.env.ROLE_TOOL_SEARCH_MAX_RESULTS || 25));
+const TOOL_MAX_ITERS = resolveInt('ROLE_TOOL_MAX_ITERS', 8, { min: 1, max: 100 }).value;
+const TOOL_RESULT_MAX_CHARS = Math.max(1000, resolveInt('ROLE_TOOL_RESULT_MAX_CHARS', 12000, { min: 1 }).value);
+const TOOL_READ_FILE_MAX_BYTES = Math.max(1000, resolveInt('ROLE_TOOL_READ_FILE_MAX_BYTES', 16000, { min: 1 }).value);
+const TOOL_SEARCH_MAX_RESULTS = Math.max(1, resolveInt('ROLE_TOOL_SEARCH_MAX_RESULTS', 25, { min: 1 }).value);
 
 // RUNNER-LLM-TIMEOUT-001: таймаут ОДНОГО вызова коннектора в рассуждающей роли.
 // По умолчанию llmConnector ждёт ответ AI до 10 минут. При всплеске нагрузки
@@ -23,7 +28,7 @@ const TOOL_SEARCH_MAX_RESULTS = Math.max(1, Number(process.env.ROLE_TOOL_SEARCH_
 // оказываются заняты повисшими вызовами, и очередь не разгребается. Ограничиваем
 // каждый вызов небольшим таймаутом (по умолчанию 3 мин, env-настройка): зависший
 // вызов падает быстро, роль помечается FAILED и переигрывается, слот освобождается.
-const LLM_CALL_TIMEOUT_MS = Number(process.env.ROLE_LLM_CALL_TIMEOUT_MS || 3 * 60 * 1000);
+const LLM_CALL_TIMEOUT_MS = resolveDuration('ROLE_LLM_CALL_TIMEOUT_MS', 3 * 60 * 1000, { min: 1000, max: 30 * 60 * 1000 }).value;
 
 /**
  * Прогон рассуждающей роли с инструментами (function calling). Ведёт диалог:
@@ -180,7 +185,7 @@ async function runToolLoop(conn, { system, user, toolSchemas, executeTool }) {
 
 // Сколько раз задача может вернуться в CODING через провал ревью/анализа,
 // прежде чем мы остановимся и пометим BLOCKED (защита от бесконечной траты).
-export const MAX_REWORK = Number(process.env.RUNNER_MAX_REWORK || 3);
+export const MAX_REWORK = resolveInt('RUNNER_MAX_REWORK', 3, { min: 0, max: 100 }).value;
 
 // Роли, которые ИИ-движок исполняет «рассуждением»: их продвигает runner через
 // вызов модели по сохранённому в БД промту. Остальные роли цепочки исполняются
@@ -291,19 +296,43 @@ export function buildVerdictJsonSchema(outputFields = []) {
   return schema;
 }
 
-// Пользовательский payload: компактный контекст задачи + требование вердикта.
-// outputFields — объявленные исходящие поля роли (контракт), если есть.
+// RESEARCH-BUDGET-001 — отрендерить карту проекта/сервиса как читаемый markdown
+// (а не закопать её в JSON-контекст). Подаётся ПЕРВЫМ блоком payload: роль видит
+// готовую структуру до того, как соберётся что-то искать. Пусто → пустая строка.
+export function renderProjectMaps(maps) {
+  if (!maps || typeof maps !== 'object') return '';
+  const parts = [];
+  if (maps.project) parts.push(`### Карта проекта\n${maps.project}`);
+  if (maps.service) {
+    parts.push(`### Карта микросервиса${maps.serviceName ? ` ${maps.serviceName}` : ''}\n${maps.service}`);
+  }
+  if (!parts.length) return '';
+  return [
+    '## Карта проекта (готовый контекст — НЕ переоткрывай структуру поиском)',
+    ...parts,
+  ].join('\n\n');
+}
+
+// Пользовательский payload: карта проекта инлайн (если есть) + компактный контекст
+// задачи + требование вердикта. outputFields — объявленные исходящие поля роли.
 // TOKEN-EFFICIENCY: контекст сериализуем КОМПАКТНО (без отступов). Pretty-print
 // (null, 2) добавлял переносы строк и пробелы-отступы в каждый вызов модели — это
 // 10–20% лишних токенов на вложенном контексте (priorRoleOutputs/changedFiles/
 // recentEvents) без какой-либо пользы: модель одинаково читает компактный JSON.
+// projectMaps вынимаем из контекста и рендерим markdown-ом — внутри JSON карта
+// читалась бы хуже и раздувала экранирование.
 export function buildUserPayload(roleCode, context, outputFields = []) {
-  return [
+  const { projectMaps, ...rest } = context && typeof context === 'object' ? context : {};
+  const mapBlock = renderProjectMaps(projectMaps);
+  const sections = [];
+  if (mapBlock) sections.push(mapBlock, '');
+  sections.push(
     `Задача роли ${roleCode}. Контекст задачи (JSON):`,
-    JSON.stringify(context),
+    JSON.stringify(rest),
     '',
     buildVerdictInstruction(outputFields),
-  ].join('\n');
+  );
+  return sections.join('\n');
 }
 
 // Толерантный парсинг: ответ может быть чистым JSON, JSON в ```-блоке или

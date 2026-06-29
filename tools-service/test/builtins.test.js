@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, rm, writeFile, mkdir } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
 import {
   safeResolve,
@@ -12,6 +12,8 @@ import {
   writeFileTool,
   deleteFileTool,
   executeBuiltin,
+  parseAllowedRoots,
+  isRootAllowed,
 } from '../src/builtins.js';
 import { readFile as fsRead, access } from 'node:fs/promises';
 import { buildMcpConfig, toMcpServer } from '../src/mcp.js';
@@ -148,4 +150,51 @@ test('handleRoute: /mcp-config собирает mcpServers', async () => {
   const r = await handleRoute('POST', '/mcp-config', { tools: [{ name: 'fs', config: { command: 'x' } }] });
   assert.equal(r.status, 200);
   assert.ok(r.body.mcpServers.fs);
+});
+
+test('parseAllowedRoots: разбирает PATH-список и запятые в абсолютные пути', () => {
+  const roots = parseAllowedRoots('/projects:/app/ai-dev-manager, /srv/other');
+  assert.deepEqual(roots, ['/projects', '/app/ai-dev-manager', '/srv/other'].map((p) => resolve(p)));
+  assert.deepEqual(parseAllowedRoots(''), []);
+  assert.deepEqual(parseAllowedRoots(undefined), []);
+});
+
+test('isRootAllowed: пустой allowlist пропускает любой root', () => {
+  assert.equal(isRootAllowed('/anything', []), true);
+  assert.equal(isRootAllowed('/anything', undefined), true);
+});
+
+test('isRootAllowed: вне разрешённых корней → false, внутри → true', () => {
+  const allowed = parseAllowedRoots('/projects:/app/ai-dev-manager');
+  assert.equal(isRootAllowed('/projects', allowed), true);
+  assert.equal(isRootAllowed('/projects/ps', allowed), true);
+  assert.equal(isRootAllowed('/app/ai-dev-manager/src', allowed), true);
+  assert.equal(isRootAllowed('/etc', allowed), false);
+  assert.equal(isRootAllowed('/projects-evil', allowed), false); // префикс без разделителя
+});
+
+test('handleRoute: /execute с root вне allowlist → 403 root_not_allowed', async (t) => {
+  const root = await makeProject();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const r = await handleRoute(
+    'POST',
+    '/execute',
+    { tool: 'read_file', args: { root, path: 'README.md' } },
+    { allowedRoots: parseAllowedRoots('/projects') },
+  );
+  assert.equal(r.status, 403);
+  assert.equal(r.body.code, 'root_not_allowed');
+});
+
+test('handleRoute: /execute с root внутри allowlist → 200', async (t) => {
+  const root = await makeProject();
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const r = await handleRoute(
+    'POST',
+    '/execute',
+    { tool: 'read_file', args: { root, path: 'README.md' } },
+    { allowedRoots: [resolve(root)] },
+  );
+  assert.equal(r.status, 200);
+  assert.equal(r.body.ok, true);
 });

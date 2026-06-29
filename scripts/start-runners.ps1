@@ -53,8 +53,16 @@ if (-not $env:ORCHESTRATOR_URL) { $env:ORCHESTRATOR_URL = 'http://localhost:4186
 # Architect/Decomposer на Claude Code (агентный tool-loop, ~21с холодный старт +
 # чтение проекта) не влезали → agent_aborted на 150с по кругу. Подняли до 540с (9 мин),
 # что < орфан-таймаута оркестратора 600с (10 мин). Можно переопределить в окружении.
+# CONFIG-AUDIT-001: фиксируем источник значения. Guard `if (-not $env:X)` означает,
+# что УЖЕ заданное в окружении значение (в т.ч. устаревшее, унаследованное из прежней
+# сессии/Scheduled Task) молча победит дефолт скрипта. Поэтому ниже печатаем
+# эффективное значение и его источник — чтобы было видно, откуда взялся taskTimeout
+# (напр. неожиданные 150000ms = унаследованный env, а не дефолт 540000).
+$codexTimeoutSrc  = if ($env:CODEX_TASK_TIMEOUT_MS) { 'env(inherited)' } else { 'default' }
+$claudeTimeoutSrc = if ($env:CLAUDE_REASONING_TASK_TIMEOUT_MS) { 'env(inherited)' } else { 'default' }
 if (-not $env:CODEX_TASK_TIMEOUT_MS)            { $env:CODEX_TASK_TIMEOUT_MS = '540000' }
 if (-not $env:CLAUDE_REASONING_TASK_TIMEOUT_MS) { $env:CLAUDE_REASONING_TASK_TIMEOUT_MS = '540000' }
+Write-Host "CONFIG: CODEX_TASK_TIMEOUT_MS=$($env:CODEX_TASK_TIMEOUT_MS) ($codexTimeoutSrc), CLAUDE_REASONING_TASK_TIMEOUT_MS=$($env:CLAUDE_REASONING_TASK_TIMEOUT_MS) ($claudeTimeoutSrc)"
 
 # OBSERVABILITY-REASONING-001: рассуждающие роли через Claude Code — параллелизм 1.
 # При concurrency=2 подписка упиралась в rate-limit (rateLimited=true в каждом прогоне);

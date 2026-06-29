@@ -17,6 +17,13 @@ test('loadConfig: значения по умолчанию для локальн
   assert.equal(c.enableDelete, false);
   assert.equal(c.enableOrchestratorMutations, false);
   assert.ok(c.requestTimeoutMs >= 1000);
+  assert.equal(c.bodyLimitBytes, 1048576);
+});
+
+test('loadConfig: MCP_BODY_LIMIT_BYTES переопределяет лимит тела', () => {
+  assert.equal(loadConfig({ MCP_BODY_LIMIT_BYTES: '2048' }).bodyLimitBytes, 2048);
+  // Слишком маленькое значение поднимается до минимума 1024.
+  assert.equal(loadConfig({ MCP_BODY_LIMIT_BYTES: '10' }).bodyLimitBytes, 1024);
 });
 
 test('loadConfig: флаги и обрезка хвостовых слэшей в URL', () => {

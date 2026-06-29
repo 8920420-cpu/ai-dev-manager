@@ -10,13 +10,23 @@
 import { ReasoningRunner } from '../src/ReasoningRunner.js';
 import { makeClaudeReasoningRunAgent } from '../src/claudeReasoningAgent.js';
 import { ensureClaudeToken } from '../src/loadToken.js';
+import { resolveDuration, resolveInt, logEffectiveConfig } from '../src/envConfig.js';
 
 const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');
 const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
-const INTERVAL_MS = Number(process.env.CLAUDE_REASONING_INTERVAL_MS || 5000);
-// Жёсткий таймаут на задачу < орфан-таймаута оркестратора (RUNNER_ROLE_TIMEOUT_MS≈15 мин).
-const TASK_TIMEOUT_MS = Number(process.env.CLAUDE_REASONING_TASK_TIMEOUT_MS || 10 * 60 * 1000);
-const CONCURRENCY = Math.max(1, Number(process.env.CLAUDE_REASONING_CONCURRENCY || 2));
+// CONFIG-AUDIT-001: единый разбор числовых env (единицы, диапазон, источник).
+// КОНТРАКТ: TASK_TIMEOUT < орфан-таймаута оркестратора (RUNNER_ROLE_TIMEOUT_MS,
+// дефолт 10 мин) — иначе реапер освободит захват раньше раннера и прогон сдастся
+// «вхолостую» (agent_aborted по кругу). start-runners.ps1 ставит 540000 (9 мин).
+// effectiveConfig в логе показывает source/raw — видно, если значение пришло из
+// унаследованного окружения, а не из дефолта (см. CONFIG_AUDIT.md).
+const intervalCfg = resolveDuration('CLAUDE_REASONING_INTERVAL_MS', 5000, { min: 200, max: 5 * 60_000 });
+const taskTimeoutCfg = resolveDuration('CLAUDE_REASONING_TASK_TIMEOUT_MS', 10 * 60_000, { min: 30_000, max: 60 * 60_000 });
+const concurrencyCfg = resolveInt('CLAUDE_REASONING_CONCURRENCY', 2, { min: 1, max: 8 });
+logEffectiveConfig('claude-reasoning-runner', [intervalCfg, taskTimeoutCfg, concurrencyCfg]);
+const INTERVAL_MS = intervalCfg.value;
+const TASK_TIMEOUT_MS = taskTimeoutCfg.value;
+const CONCURRENCY = concurrencyCfg.value;
 // Если задан CLAUDE_REASONING_ROLE — опрашиваем только её, иначе любую роль,
 // назначенную движку claude_code.
 const ROLE = String(process.env.CLAUDE_REASONING_ROLE || '').trim();
@@ -64,8 +74,7 @@ const http = {
 const runAgent = makeClaudeReasoningRunAgent();
 const runner = new ReasoningRunner({ http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY });
 
-console.log(`claude-reasoning-runner: orchestrator=${ORCH} interval=${INTERVAL_MS}ms taskTimeout=${TASK_TIMEOUT_MS}ms`);
-console.log(`claude-reasoning-runner: рассуждающие роли через Claude Code, concurrency=${CONCURRENCY}, role=${ROLE || 'любая делегированная'}`);
+console.log(`claude-reasoning-runner: orchestrator=${ORCH}, рассуждающие роли через Claude Code, role=${ROLE || 'любая делегированная'}`);
 
 let stopping = false;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));

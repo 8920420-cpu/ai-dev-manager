@@ -27,6 +27,8 @@ export function loadConfig(env = process.env) {
     orchestratorToken: String(env.ORCHESTRATOR_API_TOKEN || '').trim(),
     port: Number(env.MCP_SERVICE_PORT || 4190),
     requestTimeoutMs: Math.max(1000, Number(env.MCP_REQUEST_TIMEOUT_MS || 30000)),
+    // Лимит тела входящего POST /mcp (защита от DoS большим запросом). 1 МБ.
+    bodyLimitBytes: Math.max(1024, Number(env.MCP_BODY_LIMIT_BYTES || 1048576)),
     // Доступ к записи/удалению/мутациям оркестратора — только по явному флагу.
     enableWrite: truthy(env.MCP_ENABLE_WRITE),
     enableDelete: truthy(env.MCP_ENABLE_DELETE),

@@ -28,3 +28,41 @@ test('HTTP-режим отдаёт health 200 на эфемерном порту
     await new Promise((r) => server.close(r));
   }
 });
+
+test('/mcp без токена при заданном ORCHESTRATOR_API_TOKEN → 401, /health открыт', async () => {
+  const config = loadConfig({ MCP_SERVICE_PORT: '0', ORCHESTRATOR_API_TOKEN: 'secret' });
+  const server = startHttp(config, { logger: () => {} });
+  await new Promise((r) => server.once('listening', r));
+  const port = server.address().port;
+  try {
+    const health = await fetch(`http://127.0.0.1:${port}/health`);
+    assert.equal(health.status, 200);
+
+    const noAuth = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(noAuth.status, 401);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
+test('/mcp с превышением лимита тела → 413', async () => {
+  // Лимит floor'ится до минимума 1024 байт; шлём заведомо больше, чтобы сработал 413.
+  const config = loadConfig({ MCP_SERVICE_PORT: '0', MCP_BODY_LIMIT_BYTES: '1024' });
+  const server = startHttp(config, { logger: () => {} });
+  await new Promise((r) => server.once('listening', r));
+  const port = server.address().port;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pad: 'x'.repeat(4000) }),
+    });
+    assert.equal(res.status, 413);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});

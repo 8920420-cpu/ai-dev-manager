@@ -3,10 +3,13 @@
 import process from 'node:process';
 import { createServer } from 'node:http';
 import { handleRoute } from '../src/server.js';
+import { parseAllowedRoots } from '../src/builtins.js';
 
 const PORT = Number(process.env.TOOLS_SERVICE_PORT || 4188);
 const TOKEN = String(process.env.ORCHESTRATOR_API_TOKEN || '').trim();
 const BODY_LIMIT = 8 << 20; // 8 МБ
+// SECURITY: allowlist серверных корней для args.root в /execute. Пусто = выключен.
+const ALLOWED_ROOTS = parseAllowedRoots(process.env.TOOLS_ALLOWED_ROOTS);
 
 function send(res, status, body) {
   const json = JSON.stringify(body);
@@ -48,7 +51,7 @@ const server = createServer(async (req, res) => {
         return send(res, 400, { ok: false, error: e.message === 'body_too_large' ? 'body_too_large' : 'invalid_json' });
       }
     }
-    const { status, body: out } = await handleRoute(req.method, path, body);
+    const { status, body: out } = await handleRoute(req.method, path, body, { allowedRoots: ALLOWED_ROOTS });
     send(res, status, out);
   } catch (e) {
     send(res, 500, { ok: false, error: e.message });

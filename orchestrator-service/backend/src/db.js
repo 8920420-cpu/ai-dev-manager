@@ -11,6 +11,7 @@ import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
 import { buildPipelineClaimContract } from './pipelineDispatch.js';
 import { reconcileClockSkew } from './clockGuard.js';
 import { isDbConnectionError, noteDbConnectionFailure, claimGraceActive } from './bootClaimGuard.js';
+import { resolveDuration, logEffectiveConfig } from './envConfig.js';
 
 const { Client } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -1598,7 +1599,18 @@ const LLM_FLOW_PAIRS = LLM_ROLE_CODES.flatMap((code) =>
 
 // Захваченная под ролью задача, у которой ИИ-вызов завис, не должна держать
 // слот вечно: по таймауту снимаем захват и помечаем прогон TIMEOUT.
-const ROLE_TIMEOUT_MS = Number(process.env.RUNNER_ROLE_TIMEOUT_MS || 15 * 60 * 1000);
+//
+// CONFIG-AUDIT-001: единый дефолт орфан-таймаута роли = 10 мин — совпадает с
+// docker-compose (RUNNER_ROLE_TIMEOUT_MS:-600000) и .env. Прежде здесь было 15 мин,
+// в compose — 3 мин, в .env — 10 мин: один параметр имел ТРИ разных дефолта, и
+// эффективное значение зависело от способа запуска. КОНТРАКТ: должно быть БОЛЬШЕ
+// hard-timeout раннеров (start-runners.ps1 = 540000 ≈ 9 мин), иначе реапер
+// освобождает захват раньше раннера → agent_aborted по кругу. Парсинг через
+// `Number(env) || default`, а НЕ `Number(env || default)`: мусорный env → дефолт,
+// а не NaN (NaN-таймаут срабатывал бы мгновенно). См. CONFIG_AUDIT.md.
+const DEFAULT_ROLE_TIMEOUT_MS = 10 * 60 * 1000;
+const roleTimeoutCfg = resolveDuration('RUNNER_ROLE_TIMEOUT_MS', DEFAULT_ROLE_TIMEOUT_MS, { min: 30_000, max: 2 * 60 * 60_000 });
+const ROLE_TIMEOUT_MS = roleTimeoutCfg.value;
 
 // Задача, выданная Claude (PROGRAMMER) через файловый мост, помечается
 // assigned_agent_id, но НЕ создаёт agent_run RUNNING. Если completion от Claude
@@ -1606,9 +1618,12 @@ const ROLE_TIMEOUT_MS = Number(process.env.RUNNER_ROLE_TIMEOUT_MS || 15 * 60 * 1
 // доставки), задача навсегда зависает в CODING: фидер её не переподаёт (нужен
 // assigned_agent_id IS NULL), а runner роль PROGRAMMER не ведёт. По таймауту
 // освобождаем назначение — фидер переподаст её, как только слот освободится.
-const CLAUDE_ASSIGN_TIMEOUT_MS = Number(
-  process.env.RUNNER_CLAUDE_TIMEOUT_MS || ROLE_TIMEOUT_MS,
-);
+const claudeAssignCfg = resolveDuration('RUNNER_CLAUDE_TIMEOUT_MS', ROLE_TIMEOUT_MS, { min: 30_000, max: 2 * 60 * 60_000 });
+const CLAUDE_ASSIGN_TIMEOUT_MS = claudeAssignCfg.value;
+
+// CONFIG-AUDIT-001: стартовый лог эффективных орфан-таймаутов с атрибуцией
+// источника (env|default) — чтобы по логу было видно, что реально применилось.
+logEffectiveConfig('orchestrator timeouts', [roleTimeoutCfg, claudeAssignCfg]);
 
 // --- Динамический маршрут проекта (PIPELINE-DYNAMIC-ROUTE-001) ---------------
 
@@ -2582,6 +2597,19 @@ async function buildRoleContext(c, claimed) {
   const aggregatedChanged = subtaskResults.flatMap((r) => r.changedFiles);
   const hasChildren = subtaskResults.length > 0;
 
+  // RESEARCH-BUDGET-001: исследующим ролям (Архитектор/Декомпозитор и пр.) подаём
+  // карту проекта и карту микросервиса инлайн — чтобы они не переоткрывали
+  // структуру широкими Grep-свипами. Карты кэшируются на час (projectMap.js).
+  const { RESEARCH_ROLES } = await import('./roles.js');
+  let projectMaps = null;
+  if (RESEARCH_ROLES.has(claimed.role_code)) {
+    const { loadProjectMaps } = await import('./projectMap.js');
+    projectMaps = await loadProjectMaps(meta.rows[0]?.root_path ?? '', {
+      service: meta.rows[0]?.service ?? '',
+      docsPath: meta.rows[0]?.docs_path ?? '',
+    }).catch(() => null);
+  }
+
   return {
     taskId: claimed.id,
     title: claimed.title,
@@ -2593,6 +2621,8 @@ async function buildRoleContext(c, claimed) {
     // Реальные координаты проекта — источник истины для ролей (не выдумывать пути).
     projectPath: meta.rows[0]?.root_path ?? '',
     docsPath: meta.rows[0]?.docs_path ?? '',
+    // Карта проекта/сервиса инлайн (только для исследующих ролей; иначе null).
+    projectMaps,
     projectServices: svc.rows.map((r) => r.service_code),
     // Для задачи-на-сервис берём агрегат результатов подзадач; иначе — как раньше.
     programmerResult: hasChildren
