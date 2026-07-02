@@ -44,6 +44,24 @@ test('buildVerdictJsonSchema: с полями — добавляет строг�
   assert.equal(s.properties.fields.properties.task_type.description, 'Тип задачи');
 });
 
+test('buildVerdictJsonSchema: учитывает valueType для Codex structured output', () => {
+  const s = buildVerdictJsonSchema([
+    { key: 'task_type', name: 'Тип задачи', valueType: 'list' },
+    { key: 'blocking_questions', valueType: 'list' },
+    { key: 'confidence_score', valueType: 'number' },
+    { key: 'needs_user_input', valueType: 'boolean' },
+    { key: 'debug_payload', valueType: 'json' },
+  ]);
+  const props = s.properties.fields.properties;
+  assert.equal(props.task_type.type, 'array');
+  assert.equal(props.task_type.items.type, 'string');
+  assert.equal(props.blocking_questions.type, 'array');
+  assert.equal(props.confidence_score.type, 'number');
+  assert.equal(props.needs_user_input.type, 'boolean');
+  assert.equal(props.debug_payload.type, 'string');
+  assert.match(props.debug_payload.description, /JSON serialized/);
+});
+
 // --- completeReasoningTaskTx: гварды и идемпотентность -----------------------
 
 const FOUND = /FROM tasks t\s+LEFT JOIN roles r/;

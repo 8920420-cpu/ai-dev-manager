@@ -240,6 +240,14 @@ export function summarizePriorRuns(rows = []) {
 // роли объявлены исходящие поля (outputFields), просим заполнить блок "fields".
 export function buildVerdictInstruction(outputFields = []) {
   const fields = Array.isArray(outputFields) ? outputFields : [];
+  const typeHint = (f) => {
+    const vt = String(f?.valueType ?? f?.value_type ?? 'text').trim().toLowerCase();
+    if (vt === 'list') return 'список строк';
+    if (vt === 'number') return 'число';
+    if (vt === 'boolean') return 'boolean';
+    if (vt === 'json') return 'JSON-строка';
+    return 'текст';
+  };
   const lines = [
     'Верни ОТВЕТ СТРОГО как JSON-объект (valid json), без markdown и текста вокруг.',
     'Структура: {',
@@ -248,7 +256,7 @@ export function buildVerdictInstruction(outputFields = []) {
     '  "findings": ["<ключевые замечания, если есть>"]',
   ];
   if (fields.length) {
-    const spec = fields.map((f) => `"${f.key}": <значение${f.name ? ` — ${f.name}` : ''}>`).join(', ');
+    const spec = fields.map((f) => `"${f.key}": <${typeHint(f)}${f.name ? ` — ${f.name}` : ''}>`).join(', ');
     lines.push(`  ,"fields": { ${spec} }`);
   }
   lines.push('}');
@@ -258,6 +266,18 @@ export function buildVerdictInstruction(outputFields = []) {
     lines.push('Поля в "fields" — контракт твоего этапа: заполни КАЖДОЕ обязательное поле непустым значением.');
   }
   return lines.join('\n');
+}
+
+function fieldJsonSchema(f) {
+  const valueType = String(f?.valueType ?? f?.value_type ?? 'text').trim().toLowerCase();
+  const description = f.description || f.name || f.key;
+  if (valueType === 'list') return { type: 'array', items: { type: 'string' }, description };
+  if (valueType === 'number') return { type: 'number', description };
+  if (valueType === 'boolean') return { type: 'boolean', description };
+  // Arbitrary json fields are encoded as strings: Codex/OpenAI strict schemas
+  // require object shapes to be explicit, while role metadata only says "json".
+  if (valueType === 'json') return { type: 'string', description: `${description} (JSON serialized as a string)` };
+  return { type: 'string', description };
 }
 
 // CODEX-REASONING-001: JSON-схема вердикта для `codex exec --output-schema`.
@@ -283,7 +303,7 @@ export function buildVerdictJsonSchema(outputFields = []) {
   };
   if (fields.length) {
     const props = {};
-    for (const f of fields) props[f.key] = { type: 'string', description: f.name || f.key };
+    for (const f of fields) props[f.key] = fieldJsonSchema(f);
     schema.properties.fields = {
       type: 'object',
       additionalProperties: false,
