@@ -3175,10 +3175,17 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
   // DECOMPOSER-REMOVE-001: Приёмщик кладёт развёрнутое описание (structured_description)
   // в tasks.description — чтобы Архитектор и карточка задачи видели полный контекст, а не
   // только заголовок, пришедший при создании задачи.
+  // TASK-INTAKE-COMMIT-001: он же кладёт человекочитаемое название (short_title →
+  // task_title) в tasks.title — чтобы весь конвейер, карточка задачи и коммит
+  // Git Integrator использовали название, придуманное Приёмщиком, а не сырой заголовок.
   let setDescription;
+  let setTitle;
   if (claimed.role_code === 'TASK_INTAKE_OFFICER') {
     const dd = verdict.fields?.structured_description ?? cardValues?.structured_description;
     if (typeof dd === 'string' && dd.trim()) setDescription = dd.trim().slice(0, 20000);
+    const tt = verdict.fields?.short_title ?? cardValues?.short_title
+      ?? verdict.fields?.task_title ?? cardValues?.task_title;
+    if (typeof tt === 'string' && tt.trim()) setTitle = tt.trim().slice(0, 300);
   }
 
   // FORK-JOIN-001: задача с current_stage_key идёт ПО РЁБРАМ графа (граф-режим);
@@ -3187,7 +3194,7 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
     ? await resolveGraphTransition(c, claimed, decision)
     : resolveTransition(route, claimed.role_code, decision);
   return finalizeRole(c, claimed, {
-    verdict, response, exchangeId, durationMs, decision, resolved, cardValues, kpi, setServiceId, setDescription,
+    verdict, response, exchangeId, durationMs, decision, resolved, cardValues, kpi, setServiceId, setDescription, setTitle,
   });
 }
 
@@ -3415,7 +3422,7 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
 // Применить переход роли по вердикту в отдельной транзакции.
 // resolved — { nextRole, toStatus, done, blocked } из projectRoute.resolveTransition.
 // cardValues — заполненные ролью исходящие поля → мердж в кумулятивную карточку.
-async function finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues = {}, kpi = null, setServiceId, setDescription }) {
+async function finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues = {}, kpi = null, setServiceId, setDescription, setTitle }) {
   await c.query('BEGIN');
   try {
     const cur = await c.query('SELECT status::text AS status FROM tasks WHERE id = $1 FOR UPDATE', [claimed.id]);
@@ -3430,6 +3437,7 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
     // FORK-JOIN-001: в граф-режиме переносим текущий узел; в линейном — остаётся NULL.
     // DECOMPOSER-REMOVE-001: опционально проставляем service_id (Архитектор) и/или
     // description (Приёмщик — structured_description) в том же UPDATE.
+    // TASK-INTAKE-COMMIT-001: и/или title (Приёмщик — short_title).
     const sets = [
       'status = $2::task_status', 'current_role_id = $3', 'assigned_agent_id = NULL',
       'data_card = data_card || $4::jsonb', 'current_stage_key = $5::uuid',
@@ -3442,6 +3450,10 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
     if (typeof setDescription === 'string' && setDescription) {
       params.push(setDescription);
       sets.push(`description = $${params.length}`);
+    }
+    if (typeof setTitle === 'string' && setTitle) {
+      params.push(setTitle);
+      sets.push(`title = $${params.length}`);
     }
     await c.query(`UPDATE tasks SET ${sets.join(', ')} WHERE id = $1`, params);
     const kpiSet = runKpiSet(kpi, 3);

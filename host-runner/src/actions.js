@@ -72,8 +72,11 @@ async function ensureRepo(repoRoot) {
 }
 
 /**
- * GIT_INTEGRATOR: добавить ТОЛЬКО файлы текущей задачи и сделать один локальный
- * коммит. Без push, reset, clean и --no-verify (как требует роль git-integrator).
+ * GIT_INTEGRATOR: добавить ТОЛЬКО файлы текущей задачи, сделать один локальный
+ * коммит и запушить в origin (best-effort). Без reset, clean и --no-verify.
+ * Название и описание коммита берутся из карточки Приёмщика задач: task.title —
+ * короткое название (short_title), task.description — структурированное описание.
+ * Всё чистым кодом, без ИИ.
  */
 export async function runGitAction(task, opts = {}) {
   const repoRoot = opts.repoRoot ?? process.cwd();
@@ -105,10 +108,14 @@ export async function runGitAction(task, opts = {}) {
     return { success: true, output: { commit: null, files: [], note: 'nothing_staged' } };
   }
 
+  // Заголовок = название от Приёмщика (task.title = short_title). Тело = его же
+  // структурированное описание (task.description); если описания нет — падаем на
+  // результат программиста, чтобы не оставлять тело пустым.
+  const body = String(task.description || task.programmerResult || '').trim();
   const message =
-    `${task.title} (task ${task.id})\n\n` +
-    `${task.programmerResult || ''}\n\n` +
-    'Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>';
+    `${task.title} (task ${task.id})` +
+    (body ? `\n\n${body}` : '') +
+    '\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>';
 
   try {
     await git(repoRoot, ['commit', '-m', message]);
@@ -118,13 +125,32 @@ export async function runGitAction(task, opts = {}) {
 
   const head = await git(repoRoot, ['rev-parse', 'HEAD']);
   const branch = await git(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => ({ stdout: '' }));
+
+  // Пуш ТОЛЬКО в origin, best-effort: локальный коммит уже сделан, поэтому провал
+  // пуша (нет origin / нет сети / non-fast-forward) не роняет роль — фиксируем
+  // pushed:false + pushError, задача всё равно считается выполненной (success).
+  let pushed = false;
+  let pushError = null;
+  const hasOrigin = await git(repoRoot, ['remote', 'get-url', 'origin']).then(() => true).catch(() => false);
+  if (!hasOrigin) {
+    pushError = 'no_origin';
+  } else {
+    try {
+      await git(repoRoot, ['push', 'origin', 'HEAD']);
+      pushed = true;
+    } catch (error) {
+      pushError = String(error.stderr || error.message || 'push failed').trim().slice(0, 500);
+    }
+  }
+
   return {
     success: true,
     output: {
       commit: head.stdout.trim(),
       branch: branch.stdout.trim(),
       files: stagedFiles,
-      pushed: false,
+      pushed,
+      pushError,
       repoInitialized: repo.created,
     },
   };
