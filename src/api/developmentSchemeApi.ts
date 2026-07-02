@@ -7,6 +7,7 @@
  * каждый проект (papka документов, projects.docs_path).
  */
 import { http } from './http';
+import { appSettingsApi, type AppSettings } from './appSettingsApi';
 import {
   mapStage,
   toStagePayload,
@@ -57,6 +58,14 @@ function fromResponse(r: SchemeResponse): DevelopmentScheme {
 export const developmentSchemeApi = {
   async get(): Promise<DevelopmentScheme> {
     return fromResponse(await http.get<SchemeResponse>('/api/development-scheme'));
+  },
+
+  async getRuntime(signal?: AbortSignal): Promise<AppSettings> {
+    return appSettingsApi.get(signal);
+  },
+
+  async setOrchestratorEnabled(enabled: boolean): Promise<AppSettings> {
+    return appSettingsApi.save({ orchestratorEnabled: enabled });
   },
 
   async save(stages: Stage[], roles: Role[], edges: SchemeEdge[] = []): Promise<DevelopmentScheme> {

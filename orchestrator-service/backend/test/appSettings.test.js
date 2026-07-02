@@ -23,10 +23,11 @@ function fakeClient(rules) {
 
 test('getAppSettings: значение из БД', async () => {
   const c = fakeClient([
-    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 1, rows: [{ key: 'max_concurrency_per_role', value: 7 }] } },
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 2, rows: [{ key: 'max_concurrency_per_role', value: 7 }, { key: 'orchestrator_enabled', value: false }] } },
   ]);
   const s = await getAppSettingsTx(c);
   assert.equal(s.maxConcurrencyPerRole, 7);
+  assert.equal(s.orchestratorEnabled, false);
 });
 
 test('getAppSettings: пустая таблица → дефолт 3', async () => {
@@ -34,8 +35,21 @@ test('getAppSettings: пустая таблица → дефолт 3', async () 
     { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 0, rows: [] } },
   ]);
   const s = await getAppSettingsTx(c);
+  assert.equal(s.orchestratorEnabled, true);
   assert.equal(s.maxConcurrencyPerRole, 3);
   assert.equal(s.programmerConcurrency, 3);
+});
+
+test('orchestratorEnabled: сохраняется как boolean', async () => {
+  const c = fakeClient([
+    { re: /INSERT INTO app_settings/, reply: { rowCount: 1, rows: [] } },
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 1, rows: [{ key: 'orchestrator_enabled', value: false }] } },
+  ]);
+  const s = await updateAppSettingsTx(c, { orchestratorEnabled: false });
+  assert.equal(s.orchestratorEnabled, false);
+  const upsert = c.calls.find((q) => /INSERT INTO app_settings/.test(q.sql));
+  assert.equal(upsert.params[0], 'orchestrator_enabled');
+  assert.equal(upsert.params[1], 'false');
 });
 
 test('programmerConcurrency: значение из БД, жёсткий потолок 3', async () => {

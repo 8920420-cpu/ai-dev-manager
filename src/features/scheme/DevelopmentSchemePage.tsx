@@ -73,13 +73,19 @@ export function DevelopmentSchemePage() {
   const [saveErrors, setSaveErrors] = useState<StageSaveErrorItem[]>([]);
   const [taskCounts, setTaskCounts] = useState<Record<string, number>>({});
   const [saving, setSaving] = useState(false);
+  const [orchestratorEnabled, setOrchestratorEnabled] = useState(true);
+  const [togglingOrchestrator, setTogglingOrchestrator] = useState(false);
 
   const load = useCallback(async () => {
     setLoadState('loading');
     try {
-      const scheme = await developmentSchemeApi.get();
+      const [scheme, runtime] = await Promise.all([
+        developmentSchemeApi.get(),
+        developmentSchemeApi.getRuntime(),
+      ]);
       dispatch({ type: 'reset', state: toWizardState(scheme) });
       setEdges(scheme.edges);
+      setOrchestratorEnabled(runtime.orchestratorEnabled);
       setLoadState('ready');
     } catch {
       setLoadState('error');
@@ -148,6 +154,24 @@ export function DevelopmentSchemePage() {
     }
   };
 
+  const handleToggleOrchestrator = async () => {
+    const next = !orchestratorEnabled;
+    setTogglingOrchestrator(true);
+    try {
+      const runtime = await developmentSchemeApi.setOrchestratorEnabled(next);
+      setOrchestratorEnabled(runtime.orchestratorEnabled);
+      toast.success(
+        runtime.orchestratorEnabled
+          ? 'Оркестратор включён: сценарий продолжит работу'
+          : 'Оркестратор выключен: сценарий полностью остановлен',
+      );
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : 'Не удалось изменить состояние оркестратора');
+    } finally {
+      setTogglingOrchestrator(false);
+    }
+  };
+
   return (
     <div className={styles.page}>
       <PageHeader title="Разработка" />
@@ -164,6 +188,25 @@ export function DevelopmentSchemePage() {
 
       {loadState === 'ready' && (
         <>
+          <div className={styles.orchestratorBar}>
+            <div>
+              <div className={styles.orchestratorTitle}>Оркестратор</div>
+              <div className={styles.orchestratorText}>
+                {orchestratorEnabled
+                  ? 'Включён: сценарий выполняется и раннеры получают задачи.'
+                  : 'Выключен: сценарий остановлен, новые задачи раннерам не выдаются.'}
+              </div>
+            </div>
+            <Button
+              variant={orchestratorEnabled ? 'dangerGhost' : 'primary'}
+              onClick={handleToggleOrchestrator}
+              loading={togglingOrchestrator}
+              aria-pressed={orchestratorEnabled}
+            >
+              {orchestratorEnabled ? 'Выключить' : 'Включить'}
+            </Button>
+          </div>
+
           <SchemeFlowchart
             stages={state.stages}
             edges={edges}

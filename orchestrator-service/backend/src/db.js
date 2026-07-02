@@ -1079,6 +1079,7 @@ const CLAUDE_CLAIM_LOCK_KEY = 911_017;
 
 export async function claimNextClaudeTask(s) {
   return withClient(clientConfig(s), async (c) => {
+    if (!(await getOrchestratorEnabledTx(c))) return { task: null, paused: true };
     await c.query('BEGIN');
     try {
       await c.query('SELECT pg_advisory_xact_lock($1)', [CLAUDE_CLAIM_LOCK_KEY]);
@@ -1339,6 +1340,7 @@ export async function claimNextHostTask(s, roleCode) {
   const role = HOST_ROLES[roleCode];
   if (!role) throw scannerError(422, 'unsupported_host_role');
   return withClient(clientConfig(s), async (c) => {
+    if (!(await getOrchestratorEnabledTx(c))) return { task: null, paused: true };
     await c.query('BEGIN');
     try {
       const picked = await c.query(
@@ -1618,6 +1620,7 @@ export async function claimNextReasoningTask(s, engineParam = null, roleParam = 
   const engine = String(engineParam ?? '').trim().toLowerCase();
   const role = String(roleParam ?? '').trim() || null;
   return withClient(clientConfig(s), async (c) => {
+    if (!(await getOrchestratorEnabledTx(c))) return { task: null, paused: true };
     if (!EXTERNAL_ENGINES.has(engine)) return { task: null };
     const engines = await getRoleEngines(c);
     const mine = rolesForEngine(engines, engine);
@@ -1996,6 +1999,9 @@ async function loadRoleContract(c, roleCode) {
  * Возвращает массив применённых шагов.
  */
 export async function advanceAutomatedTasks(s, opts = {}) {
+  if (opts.orchestratorEnabled === false) return [];
+  if (opts.orchestratorEnabled === undefined && !(await getOrchestratorEnabled(s))) return [];
+
   // RUNNER-CONCURRENCY-001: лимит «горутин на роль» берём из app_settings (UI),
   // переопределение через opts — для тестов. Минимум 1.
   const cap = Math.max(
@@ -2120,6 +2126,24 @@ async function readAppSetting(c, key, fallback) {
   } catch {
     return fallback;
   }
+}
+
+function parseBoolSetting(value, fallback = true) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(v)) return true;
+    if (['false', '0', 'no', 'off'].includes(v)) return false;
+  }
+  return fallback;
+}
+
+async function getOrchestratorEnabledTx(c) {
+  return parseBoolSetting(await readAppSetting(c, 'orchestrator_enabled', true), true);
+}
+
+export async function getOrchestratorEnabled(s) {
+  return withClient(clientConfig(s), (c) => getOrchestratorEnabledTx(c));
 }
 
 // Лимит параллельных обработок на роль (app_settings.max_concurrency_per_role).

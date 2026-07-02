@@ -12,6 +12,8 @@ import { http } from './http';
 export type RoleEngine = 'deepseek' | 'codex' | 'claude_code';
 
 export interface AppSettings {
+  /** Глобальный выключатель оркестратора: false запрещает выдачу и автоматическое продвижение задач. */
+  orchestratorEnabled: boolean;
   /** Максимум параллельных обработок задач одной роли фоновым runner. */
   maxConcurrencyPerRole: number;
   /** Параллельных задач PROGRAMMER (стадия CODING); жёсткий потолок — 3. */

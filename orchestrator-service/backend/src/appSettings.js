@@ -6,6 +6,7 @@ import { withClient, clientConfig } from './db.js';
 
 // Описание известных параметров: ключ в БД, дефолт и границы валидации.
 export const APP_SETTING_SPECS = {
+  orchestratorEnabled: { key: 'orchestrator_enabled', def: true },
   maxConcurrencyPerRole: { key: 'max_concurrency_per_role', def: 3, min: 1, max: 50 },
   // Сколько задач PROGRAMMER (стадия CODING) исполнитель ведёт параллельно.
   // Каждая идёт в worktree своего микросервиса. Жёсткий потолок — 3.
@@ -19,10 +20,26 @@ function clampInt(value, spec) {
   return Math.min(spec.max, Math.max(spec.min, n));
 }
 
+function boolValue(value, fallback = true) {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'string') {
+    const v = value.trim().toLowerCase();
+    if (['true', '1', 'yes', 'on'].includes(v)) return true;
+    if (['false', '0', 'no', 'off'].includes(v)) return false;
+  }
+  return fallback;
+}
+
 // Собрать настройки из строк app_settings (Map key→value) в объект для клиента.
 function shape(byKey) {
   const pick = (spec) => clampInt(byKey.has(spec.key) ? byKey.get(spec.key) : spec.def, spec);
   return {
+    orchestratorEnabled: boolValue(
+      byKey.has(APP_SETTING_SPECS.orchestratorEnabled.key)
+        ? byKey.get(APP_SETTING_SPECS.orchestratorEnabled.key)
+        : APP_SETTING_SPECS.orchestratorEnabled.def,
+      APP_SETTING_SPECS.orchestratorEnabled.def,
+    ),
     maxConcurrencyPerRole: pick(APP_SETTING_SPECS.maxConcurrencyPerRole),
     programmerConcurrency: pick(APP_SETTING_SPECS.programmerConcurrency),
   };
@@ -39,6 +56,12 @@ export async function getAppSettingsTx(c) {
 
 export async function updateAppSettingsTx(c, patch) {
   const updates = {};
+  if (patch && patch.orchestratorEnabled !== undefined) {
+    updates[APP_SETTING_SPECS.orchestratorEnabled.key] = boolValue(
+      patch.orchestratorEnabled,
+      APP_SETTING_SPECS.orchestratorEnabled.def,
+    );
+  }
   if (patch && patch.maxConcurrencyPerRole !== undefined) {
     updates[APP_SETTING_SPECS.maxConcurrencyPerRole.key] = clampInt(
       patch.maxConcurrencyPerRole, APP_SETTING_SPECS.maxConcurrencyPerRole,
