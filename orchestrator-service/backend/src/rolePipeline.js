@@ -21,7 +21,11 @@ export const ROLE_FLOW = {
   // Приёмщик задач — первая роль: классифицирует входящий запрос и готовит карточку.
   // Задачи приходят либо из Scanner (intake из папки), либо из модального окна.
   TASK_INTAKE_OFFICER:   { auto: true,  from: ['BACKLOG', 'READY'],                 next: 'ARCHITECT',             to: 'ARCHITECTURE' },
-  ARCHITECT:             { auto: true,  from: ['ARCHITECTURE'],                      next: 'DECOMPOSER',            to: 'DECOMPOSITION' },
+  // DECOMPOSER-REMOVE-001: Декомпозитор выведен из маршрута — Архитектор передаёт
+  // задачу прямо Программисту (service_id гарантирует финализация Архитектора в
+  // db.js, см. ensureArchitectService). Роль DECOMPOSER сохранена в roles/ROLE_FLOW
+  // как off-route фолбэк для легаси-задач, ещё стоящих под ней (DECOMPOSITION).
+  ARCHITECT:             { auto: true,  from: ['ARCHITECTURE'],                      next: 'PROGRAMMER',            to: 'CODING' },
   DECOMPOSER:            { auto: true,  from: ['DECOMPOSITION'],                     next: 'PROGRAMMER',            to: 'CODING' },
   // Реализацию пишет Claude Code; завершение возвращает Scanner-мост (REVIEW).
   PROGRAMMER:            { auto: false, from: ['CODING'],                            next: 'TASK_REVIEWER',         to: 'REVIEW' },

@@ -156,7 +156,7 @@ test('resolveTransition BLOCK', () => {
 test('resolveTransition: пустой маршрут → канонический фолбэк ROLE_FLOW', () => {
   const r = resolveTransition([], 'ARCHITECT', { outcome: 'FORWARD' });
   assert.equal(r.via, 'canonical');
-  assert.deepEqual([r.nextRole, r.toStatus], ['DECOMPOSER', 'DECOMPOSITION']);
+  assert.deepEqual([r.nextRole, r.toStatus], ['PROGRAMMER', 'CODING']);
 });
 
 test('canonicalForward: из ROLE_FLOW', () => {

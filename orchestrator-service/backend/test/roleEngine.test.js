@@ -105,11 +105,11 @@ test('decideTransition: FAILURE_ANALYST INFRASTRUCTURE_BLOCKED => BLOCKED', () =
   assert.equal(d.blocked, true);
 });
 
-test('decideTransition: ARCHITECT BLOCKED => BLOCKED, READY => DECOMPOSITION', () => {
+test('decideTransition: ARCHITECT BLOCKED => BLOCKED, READY => CODING (Programmer)', () => {
   assert.equal(decideTransition('ARCHITECT', { ok: false, status: 'BLOCKED' }).blocked, true);
   const ok = decideTransition('ARCHITECT', { ok: true, status: 'READY' });
-  assert.equal(ok.toStatus, 'DECOMPOSITION');
-  assert.equal(ok.nextRole, 'DECOMPOSER');
+  assert.equal(ok.toStatus, 'CODING');
+  assert.equal(ok.nextRole, 'PROGRAMMER');
 });
 
 test('decideTransition: DOCUMENTATION_AUDITOR UPDATE_REQUIRED => DOCUMENTATION_KEEPER', () => {

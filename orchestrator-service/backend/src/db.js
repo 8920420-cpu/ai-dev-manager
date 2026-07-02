@@ -1974,7 +1974,7 @@ async function loadRoleContract(c, roleCode) {
   const empty = { inputs: [], outputs: [] };
   if (!(await roleFieldsTablePresent(c))) return empty;
   const r = await c.query(
-    `SELECT rf.direction, rf.required, f.key
+    `SELECT rf.direction, rf.required, f.key, f.name, f.description, f.value_type
        FROM role_fields rf
        JOIN roles ro ON ro.id = rf.role_id
        JOIN fields f ON f.id = rf.field_id
@@ -1983,7 +1983,13 @@ async function loadRoleContract(c, roleCode) {
   );
   const out = { inputs: [], outputs: [] };
   for (const row of r.rows) {
-    (row.direction === 'in' ? out.inputs : out.outputs).push({ key: row.key, required: row.required !== false });
+    (row.direction === 'in' ? out.inputs : out.outputs).push({
+      key: row.key,
+      required: row.required !== false,
+      name: row.name ?? row.key,
+      description: row.description ?? '',
+      valueType: row.value_type ?? 'text',
+    });
   }
   return out;
 }
@@ -2946,9 +2952,10 @@ async function buildRoleContext(c, claimed) {
   // RESEARCH-BUDGET-001: исследующим ролям (Архитектор/Декомпозитор и пр.) подаём
   // карту проекта и карту микросервиса инлайн — чтобы они не переоткрывали
   // структуру широкими Grep-свипами. Карты кэшируются на час (projectMap.js).
-  const { RESEARCH_ROLES } = await import('./roles.js');
+  // DECOMPOSER-REMOVE-001: карту подаём по MAP_ROLES (исследующие роли + Приёмщик).
+  const { MAP_ROLES } = await import('./roles.js');
   let projectMaps = null;
-  if (RESEARCH_ROLES.has(claimed.role_code)) {
+  if (MAP_ROLES.has(claimed.role_code)) {
     const { loadProjectMaps } = await import('./projectMap.js');
     projectMaps = await loadProjectMaps(meta.rows[0]?.root_path ?? '', {
       service: meta.rows[0]?.service ?? '',
@@ -3150,12 +3157,94 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
   if (claimed.role_code === 'DECOMPOSER' && decision.outcome === 'FORWARD' && !claimed.current_stage_key) {
     return materializeDecomposition(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, route, kpi });
   }
+
+  // DECOMPOSER-REMOVE-001: Архитектор — последняя проектная роль перед Программистом.
+  // Декомпозитор больше не материализует подзадачи с service_id, поэтому Архитектор при
+  // форварде ГАРАНТИРУЕТ, что у задачи есть service_id (иначе claim_next_claude_task её
+  // не выдаст — тихий висяк в CODING). Резолвим главный сервис из вердикта; если у задачи
+  // service_id ещё нет и резолв не удался — BLOCKED с диагностикой, а не молчаливый висяк.
+  let setServiceId;
+  if (claimed.role_code === 'ARCHITECT' && decision.outcome === 'FORWARD') {
+    const ensured = await ensureArchitectService(c, claimed, verdict.fields, cardValues);
+    if (ensured.blocked) {
+      return blockClaimedReason(c, claimed, ensured.reason, { verdict, cardValues, kpi, event: 'architect_no_service' });
+    }
+    setServiceId = ensured.serviceId; // uuid, либо undefined если service_id уже задан
+  }
+
+  // DECOMPOSER-REMOVE-001: Приёмщик кладёт развёрнутое описание (structured_description)
+  // в tasks.description — чтобы Архитектор и карточка задачи видели полный контекст, а не
+  // только заголовок, пришедший при создании задачи.
+  let setDescription;
+  if (claimed.role_code === 'TASK_INTAKE_OFFICER') {
+    const dd = verdict.fields?.structured_description ?? cardValues?.structured_description;
+    if (typeof dd === 'string' && dd.trim()) setDescription = dd.trim().slice(0, 20000);
+  }
+
   // FORK-JOIN-001: задача с current_stage_key идёт ПО РЁБРАМ графа (граф-режим);
   // без него — прежняя позиционная маршрутизация (линейные схемы не затронуты).
   const resolved = claimed.current_stage_key
     ? await resolveGraphTransition(c, claimed, decision)
     : resolveTransition(route, claimed.role_code, decision);
-  return finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues, kpi });
+  return finalizeRole(c, claimed, {
+    verdict, response, exchangeId, durationMs, decision, resolved, cardValues, kpi, setServiceId, setDescription,
+  });
+}
+
+// DECOMPOSER-REMOVE-001 — гарантировать service_id у задачи Архитектора перед CODING.
+// service_id уже задан (напр. при создании/форке) → { serviceId: undefined } (форвардим как
+// есть). Иначе резолвим ГЛАВНЫЙ сервис из вердикта Архитектора (affected_services/work_items →
+// первый зарегистрированный сервис проекта). Не удалось → { blocked, reason }.
+async function ensureArchitectService(c, claimed, verdictFields, cardValues) {
+  const cur = await c.query('SELECT service_id FROM tasks WHERE id = $1', [claimed.id]);
+  if (cur.rows[0]?.service_id) return { serviceId: undefined };
+
+  const card = {
+    ...(claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {}),
+    ...(verdictFields && typeof verdictFields === 'object' ? verdictFields : {}),
+    ...(cardValues || {}),
+  };
+  const plan = normalizeWorkItems(card); // [{ serviceCode, ... }] из work_items/affected_files
+  const svcRows = await c.query('SELECT id, service_code FROM services WHERE project_id = $1', [claimed.project_id]);
+  const byCode = new Map(svcRows.rows.map((r) => [String(r.service_code).toLowerCase(), r.id]));
+  for (const item of plan) {
+    const sid = byCode.get(String(item.serviceCode).toLowerCase());
+    if (sid) return { serviceId: sid };
+  }
+  const attempted = plan.map((p) => p.serviceCode).filter(Boolean);
+  return { blocked: true, reason: `architect_no_service:${attempted.join(',') || 'empty'}` };
+}
+
+// DECOMPOSER-REMOVE-001 — заблокировать задачу с понятной причиной, СОХРАНИВ роль
+// (current_role_id не обнуляем — задача остаётся видимой под своей ролью как BLOCKED).
+// Прогон роли помечаем SUCCESS (роль отработала; блок — из-за нерезолвимых данных).
+async function blockClaimedReason(c, claimed, reason, { verdict, cardValues, kpi = null, event = 'blocked' } = {}) {
+  await c.query('BEGIN');
+  try {
+    const kpiSet = runKpiSet(kpi, 2);
+    await c.query(
+      `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet.sql} WHERE id = $1`,
+      [claimed.agentRunId, JSON.stringify({
+        status: verdict?.status, summary: verdict?.summary, reason, outcome: 'BLOCK', fields: cardValues,
+      }), ...kpiSet.params],
+    );
+    await c.query(
+      `UPDATE tasks SET status = 'BLOCKED', assigned_agent_id = NULL WHERE id = $1 AND status NOT IN ('DONE','CANCELLED')`,
+      [claimed.id],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'TASK_BLOCKED', $2::task_status, 'BLOCKED', $3, $4::jsonb)`,
+      [claimed.id, claimed.status, claimed.role_id, JSON.stringify({
+        runner: true, ai: true, role: claimed.role_code, reason, event,
+      })],
+    );
+    await c.query('COMMIT');
+    return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: 'BLOCKED', reason };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
 }
 
 // DECOMP-CONTRACT-001 — нормализовать разбивку работы из карточки к виду
@@ -3326,7 +3415,7 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
 // Применить переход роли по вердикту в отдельной транзакции.
 // resolved — { nextRole, toStatus, done, blocked } из projectRoute.resolveTransition.
 // cardValues — заполненные ролью исходящие поля → мердж в кумулятивную карточку.
-async function finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues = {}, kpi = null }) {
+async function finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues = {}, kpi = null, setServiceId, setDescription }) {
   await c.query('BEGIN');
   try {
     const cur = await c.query('SELECT status::text AS status FROM tasks WHERE id = $1 FOR UPDATE', [claimed.id]);
@@ -3338,12 +3427,23 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
       ? null
       : (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null;
 
-    await c.query(
-      `UPDATE tasks SET status = $2::task_status, current_role_id = $3, assigned_agent_id = NULL,
-              data_card = data_card || $4::jsonb, current_stage_key = $5::uuid WHERE id = $1`,
-      // FORK-JOIN-001: в граф-режиме переносим текущий узел; в линейном — остаётся NULL.
-      [claimed.id, resolved.toStatus, nextRoleId, JSON.stringify(cardValues || {}), resolved.nextStageKey ?? null],
-    );
+    // FORK-JOIN-001: в граф-режиме переносим текущий узел; в линейном — остаётся NULL.
+    // DECOMPOSER-REMOVE-001: опционально проставляем service_id (Архитектор) и/или
+    // description (Приёмщик — structured_description) в том же UPDATE.
+    const sets = [
+      'status = $2::task_status', 'current_role_id = $3', 'assigned_agent_id = NULL',
+      'data_card = data_card || $4::jsonb', 'current_stage_key = $5::uuid',
+    ];
+    const params = [claimed.id, resolved.toStatus, nextRoleId, JSON.stringify(cardValues || {}), resolved.nextStageKey ?? null];
+    if (setServiceId) {
+      params.push(setServiceId);
+      sets.push(`service_id = $${params.length}::uuid`);
+    }
+    if (typeof setDescription === 'string' && setDescription) {
+      params.push(setDescription);
+      sets.push(`description = $${params.length}`);
+    }
+    await c.query(`UPDATE tasks SET ${sets.join(', ')} WHERE id = $1`, params);
     const kpiSet = runKpiSet(kpi, 3);
     await c.query(
       `UPDATE agent_runs SET status = $2::agent_run_status, finished_at = now(), output_json = $3::jsonb${kpiSet.sql} WHERE id = $1`,
