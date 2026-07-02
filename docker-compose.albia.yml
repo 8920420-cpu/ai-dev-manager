@@ -1,0 +1,19 @@
+# Legacy compatibility compose for Albia-only runs.
+# The full Server subsystem lives in server/docker-compose.yml.
+name: albia
+
+services:
+  albia:
+    image: "${ALBIA_IMAGE:-localhost:5000/albia:latest}"
+    pull_policy: always
+    container_name: albia
+    command: ["sleep", "infinity"]
+    networks:
+      - default
+      - shared-network
+    restart: unless-stopped
+
+networks:
+  shared-network:
+    name: shared-network
+    external: true

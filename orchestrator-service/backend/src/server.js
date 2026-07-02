@@ -56,6 +56,7 @@ import {
   deleteProject,
 } from './projects.js';
 import { listDatabases } from './databases.js';
+import { listServers, runServerAction } from './servers.js';
 import { listRoleConnectors, saveRoleConnectors } from './roleConnectors.js';
 import {
   listTools,
@@ -295,6 +296,13 @@ function matchIntegrationRoute(pathname) {
   return { kind: 'item', id };
 }
 
+function matchServerRoute(pathname) {
+  if (pathname === '/api/servers') return { kind: 'collection' };
+  const m = pathname.match(/^\/api\/servers\/([^/]+)\/actions$/);
+  if (!m) return null;
+  return { kind: 'actions', id: decodeURIComponent(m[1]) };
+}
+
 export function createApp() {
   return createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -347,6 +355,19 @@ export function createApp() {
         // canSend=false → есть смысл подождать, а не слать вызов вхолостую.
         if (req.method === 'GET' && p === '/api/connector/capacity')
           return sendJson(res, 200, { ...connectorCapacity(), buckets: connectorCapacityBuckets() });
+
+        const serverRoute = matchServerRoute(p);
+        if (serverRoute) {
+          if (serverRoute.kind === 'collection') {
+            if (req.method === 'GET') return sendJson(res, 200, await listServers());
+          } else if (serverRoute.kind === 'actions') {
+            if (req.method === 'POST') {
+              const body = await readBody(req);
+              return sendJson(res, 200, await runServerAction(serverRoute.id, body.action));
+            }
+          }
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
 
         if (req.method === 'PUT' && p === '/api/app-settings')
           return sendJson(res, 200, await updateAppSettings(await loadSettings(), await readBody(req)));

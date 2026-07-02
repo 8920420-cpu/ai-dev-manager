@@ -14,6 +14,7 @@ export type RouteKey =
   | 'tasks-review'
   | 'tasks-done'
   | 'departments-development'
+  | 'servers'
   | 'integrations'
   | 'monitor-performance'
   | 'settings-roles'
@@ -26,6 +27,7 @@ const ROUTES: Record<RouteKey, string> = {
   'tasks-review': '#/tasks/review',
   'tasks-done': '#/tasks/done',
   'departments-development': '#/departments/development',
+  servers: '#/servers',
   integrations: '#/integrations',
   'monitor-performance': '#/monitor/performance',
   'settings-roles': '#/settings/roles',
@@ -45,6 +47,7 @@ function parseHash(): RouteKey {
   if (section === 'departments' && sub === 'development') return 'departments-development';
   // Обратная совместимость: старый #/scheme (и его вариации) ведёт на тот же раздел.
   if (section === 'scheme' || section === 'development-scheme') return 'departments-development';
+  if (section === 'servers') return 'servers';
   if (section === 'integrations') return 'integrations';
   if (section === 'monitor') return 'monitor-performance';
   if (section === 'settings') {

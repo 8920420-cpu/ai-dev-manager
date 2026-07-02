@@ -1,0 +1,13 @@
+#!ipxe
+
+set server-ip ${next-server}
+set http-port 8087
+set base-url http://${server-ip}:${http-port}
+set ubuntu-version 24.04
+set ubuntu-path ${base-url}/ubuntu/${ubuntu-version}
+set seed-url ${base-url}/autoinstall/
+
+dhcp
+kernel ${ubuntu-path}/casper/vmlinuz ip=dhcp url=${ubuntu-path}/ubuntu-live-server.iso autoinstall ds=nocloud-net;s=${seed-url} ---
+initrd ${ubuntu-path}/casper/initrd
+boot

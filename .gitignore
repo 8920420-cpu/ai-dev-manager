@@ -22,3 +22,10 @@ dist/
 
 # Логи хост-раннеров
 logs/
+
+# Server PXE local artifacts: ISO images, extracted installers, iPXE binaries and netboot cache.
+server/data/
+server/tftp/*
+!server/tftp/README.md
+server/www/ubuntu/*/*
+!server/www/ubuntu/*/README.md
