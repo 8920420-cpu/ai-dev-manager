@@ -252,7 +252,7 @@ export async function invokeConnector(connectorId, input = {}) {
     // сетевого endpoint и access token — его нельзя вызывать напрямую через invoke.
     // Перехватываем здесь, чтобы не уйти в llmInvoke с пустым endpoint/token.
     if (isDriverProvider(conn.provider)) {
-      throw httpError(422, 'Driver connector cannot be invoked directly');
+      throw httpError(422, 'connector_driver_not_invocable');
     }
     if (!conn.isEnabled) throw httpError(409, 'connector_disabled');
 
@@ -296,7 +296,9 @@ export async function invokeConnector(connectorId, input = {}) {
           WHERE id = $1`,
         [exchangeId, EXCHANGE_STATUS.FAILED, e.message, e.httpStatus ?? null, e.durationMs ?? null],
       );
-      throw httpError(502, e.message);
+      // Заголовок ошибки — стабильный код (фронт переведёт его на русский),
+      // техническая деталь ответа внешнего API идёт после «:».
+      throw httpError(502, `connector_invoke_failed: ${e.message}`);
     }
   });
 }

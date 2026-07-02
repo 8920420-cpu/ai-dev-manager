@@ -43,7 +43,7 @@ test('invokeConnector: только пробелы в user/system отклоня
 // ROLE-ENGINE-ROUTING-001: коннектор-«драйвер» (Codex / Claude Code) не имеет
 // сетевого endpoint и access token. invokeConnector обязан перехватить такой
 // провайдер сразу после чтения строки из БД и вернуть 422
-// 'Driver connector cannot be invoked directly', не уходя в llmInvoke с пустым
+// 'connector_driver_not_invocable', не уходя в llmInvoke с пустым
 // endpoint/token. Сам guard живёт внутри withClient (требует БД), поэтому здесь
 // проверяем предикат маршрутизации, на котором он держится.
 test('isDriverProvider: codex/claude_code распознаются как драйверы (любой регистр)', () => {
@@ -118,7 +118,7 @@ test('invokeConnector: driver-коннектор (provider=codex) → 422 без
       () => invokeConnector('c-driver', { user: 'привет' }),
       (e) => {
         assert.equal(e.statusCode, 422, `ожидался HTTP 422, получено ${e.statusCode}`);
-        assert.equal(e.message, 'Driver connector cannot be invoked directly');
+        assert.equal(e.message, 'connector_driver_not_invocable');
         return true;
       },
     );
@@ -140,7 +140,7 @@ test('invokeConnector: driver-коннектор (provider=claude_code) → 422 
       () => invokeConnector('c-driver', { user: 'привет' }),
       (e) => {
         assert.equal(e.statusCode, 422);
-        assert.equal(e.message, 'Driver connector cannot be invoked directly');
+        assert.equal(e.message, 'connector_driver_not_invocable');
         return true;
       },
     );
