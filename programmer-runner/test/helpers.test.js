@@ -52,4 +52,6 @@ test('buildPrompt: включает заголовок, описание и тр
   assert.match(prompt, /ARCHITECT/);
   assert.match(prompt, /files_changed/);
   assert.match(prompt, /PROGRAMMER/);
+  assert.match(prompt, /Do not invent requirements/);
+  assert.match(prompt, /Required Final Response/);
 });

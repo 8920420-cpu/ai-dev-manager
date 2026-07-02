@@ -1,20 +1,16 @@
-// Сборка промпта для headless-агента из payload захваченной задачи. Контекст —
-// то же, что видит живая Claude-сессия: тело задачи с acceptance, выжимки
-// предыдущих ролей (Architect/Decomposer), требуемые поля роли. В финале просим
-// строгий JSON, чтобы исход был машинно-читаемым (хотя список файлов драйвер
-// всё равно перепроверяет через git — самоотчёту агента не доверяем).
+// Build the headless agent prompt from the claimed task payload. The driver still
+// verifies changed files through git, so the agent's self-report is not trusted.
 
 function summarizePriorRuns(priorRoleOutputs = []) {
   if (!Array.isArray(priorRoleOutputs) || priorRoleOutputs.length === 0) return '';
-  // Берём по одному последнему выводу на роль (оркестратор может прислать историю
-  // с повторами после RESTART) — последний обычно самый полный.
+  // Keep the latest output per role; retries may send repeated role history.
   const byRole = new Map();
   for (const o of priorRoleOutputs) {
     if (o && o.role) byRole.set(o.role, o);
   }
   const lines = [];
   for (const o of byRole.values()) {
-    lines.push(`### Роль ${o.role} (${o.status || '—'})`);
+    lines.push(`### Role ${o.role} (${o.status || '-'})`);
     if (o.summary) lines.push(o.summary);
     if (Array.isArray(o.findings) && o.findings.length) {
       for (const f of o.findings.slice(0, 8)) lines.push(`- ${f}`);
@@ -25,8 +21,8 @@ function summarizePriorRuns(priorRoleOutputs = []) {
 }
 
 /**
- * @param {Object} task  захваченная claude-задача
- * @returns {string} промпт для query()
+ * @param {Object} task claimed Claude task
+ * @returns {string} prompt for query()
  */
 export function buildPrompt(task) {
   const prior = summarizePriorRuns(task.priorRoleOutputs);
@@ -36,42 +32,46 @@ export function buildPrompt(task) {
     : '';
 
   const sections = [
-    'Ты — исполнитель роли PROGRAMMER в конвейере разработки (стадия CODING).',
-    'Тебе выдана задача. Реально внеси изменения в код рабочего дерева текущего',
-    'проекта (cwd), используя инструменты (Read/Edit/Write/Bash/Glob/Grep).',
-    'Не оставляй задачу недоделанной и не выдумывай результат — downstream-ревью',
-    'и тесты проверят твою работу.',
+    'You are the PROGRAMMER role in the development pipeline (CODING stage).',
+    'You have been assigned one task. Make real, minimal, correct changes in the',
+    'current project worktree (cwd) using the available tools.',
+    'Do not invent requirements, files, APIs, results, or test outcomes. If a fact',
+    'is not available from the task or repository, state that it is unknown.',
+    'Do not broaden the scope for optional refactoring or cleanup.',
     '',
-    `Проект: ${task.project || '—'}    Сервис: ${task.service || '—'}`,
-    `Задача: ${task.title || '—'}`,
-    caps ? `Разрешения: ${caps}` : '',
-    fields ? `Требуемые поля роли (заполни в summary): ${fields}` : '',
+    `Project: ${task.project || '-'}    Service: ${task.service || '-'}`,
+    `Task: ${task.title || '-'}`,
+    caps ? `Capabilities: ${caps}` : '',
+    fields ? `Required role fields to cover in the summary: ${fields}` : '',
     '',
-    '## Описание задачи',
+    '## Task Description',
     String(task.description || '').trim(),
   ];
 
   if (prior) {
-    sections.push('', '## Контекст предыдущих ролей', prior);
+    sections.push('', '## Previous Role Context', prior);
   }
 
   sections.push(
     '',
-    '## Правила выполнения',
-    '- Если проект на Go и используешь `go` — учитывай, что окружение может требовать GOWORK=off.',
-    '- Сначала разберись в коде, затем вноси минимальные корректные изменения и тесты.',
-    '- Не коммить — коммит сделает отдельная стадия конвейера.',
+    '## Execution Rules',
+    '- Inspect the relevant code before editing.',
+    '- Make the smallest change that satisfies the assigned task.',
+    '- Add or update relevant tests as code when the task changes behavior.',
+    '- If this is a Go project and you use `go`, the environment may require GOWORK=off.',
+    '- Do not commit; a later pipeline stage handles git integration.',
+    '- Do not claim that tests passed unless you actually ran them and saw the result.',
     '',
-    '## Формат финального ответа (обязательно)',
-    'Последним сообщением выведи ОДИН JSON-объект и больше ничего после него:',
-    '{"success": true|false, "summary": "что сделано", "files_changed": ["путь1", "путь2"]}',
-    'success=false — если выполнить задачу не удалось (с пояснением в summary).',
+    '## Required Final Response',
+    'The final message must be exactly one JSON object with nothing after it:',
+    '{"success": true|false, "summary": "what changed or why it is blocked", "files_changed": ["path1", "path2"]}',
+    'Use success=false when the task could not be completed, and explain the blocker in summary.',
   );
 
   return sections.filter((s) => s !== undefined && s !== null).join('\n');
 }
 
-// Достать финальный JSON-блок из текста результата агента. Возвращает объект или null.
+// Extract the final JSON block from the agent output. Returns an object or null.
 export function parseAgentJson(text) {
   if (typeof text !== 'string') return null;
   const m = text.match(/\{[\s\S]*\}\s*$/);

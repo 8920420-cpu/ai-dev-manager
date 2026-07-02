@@ -77,7 +77,7 @@ UPDATE roles r SET group_id = g.id
 -- ---------------------------------------------------------------------
 INSERT INTO prompts (role_id, version, prompt_text, is_active)
 SELECT r.id, 1,
-       'Ты роль ' || r.name || ' в AI Orchestrator. Следуй DECISIONS.md и картам проекта.',
+       'You are the ' || r.name || ' role in AI Orchestrator. Follow DECISIONS.md and the project maps. Use only provided context; do not invent requirements, files, services, results, or checks.',
        true
 FROM roles r
 ON CONFLICT (role_id, version) DO NOTHING;
