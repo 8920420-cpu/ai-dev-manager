@@ -37,7 +37,8 @@ test('getAppSettings: пустая таблица → дефолт 3', async () 
   const s = await getAppSettingsTx(c);
   assert.equal(s.orchestratorEnabled, true);
   assert.equal(s.maxConcurrencyPerRole, 3);
-  assert.equal(s.programmerConcurrency, 3);
+  // PROGRAMMER-PRIORITY-001: программист зафиксирован на ровно 1 выделенном агенте.
+  assert.equal(s.programmerConcurrency, 1);
 });
 
 test('orchestratorEnabled: сохраняется как boolean', async () => {
@@ -52,11 +53,12 @@ test('orchestratorEnabled: сохраняется как boolean', async () => {
   assert.equal(upsert.params[1], 'false');
 });
 
-test('programmerConcurrency: значение из БД, жёсткий потолок 3', async () => {
+test('programmerConcurrency: зафиксирован на 1 (PROGRAMMER-PRIORITY-001)', async () => {
+  // Старое значение из БД (2) читается как 1 — потолок опущен до 1.
   const c = fakeClient([
     { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 1, rows: [{ key: 'programmer_concurrency', value: 2 }] } },
   ]);
-  assert.equal((await getAppSettingsTx(c)).programmerConcurrency, 2);
+  assert.equal((await getAppSettingsTx(c)).programmerConcurrency, 1);
 
   const high = fakeClient([
     { re: /INSERT INTO app_settings/, reply: { rowCount: 1, rows: [] } },
@@ -65,7 +67,7 @@ test('programmerConcurrency: значение из БД, жёсткий пото
   await updateAppSettingsTx(high, { programmerConcurrency: 9 });
   const upsert = high.calls.find((q) => /INSERT/.test(q.sql));
   assert.equal(upsert.params[0], 'programmer_concurrency');
-  assert.equal(upsert.params[1], '3', '9 клампится до потолка 3');
+  assert.equal(upsert.params[1], '1', 'любое значение клампится до фиксированного 1');
 });
 
 test('updateAppSettings: валидное значение → upsert и возврат', async () => {
@@ -95,6 +97,30 @@ test('updateAppSettings: значение вне границ клампится
   ]);
   await updateAppSettingsTx(high, { maxConcurrencyPerRole: 999 });
   assert.equal(high.calls.find((q) => /INSERT/.test(q.sql)).params[1], '50');
+});
+
+test('autoAcceptDone: дефолт true, читается из БД, сохраняется как boolean', async () => {
+  // Пустая таблица → дефолт true.
+  const empty = fakeClient([
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 0, rows: [] } },
+  ]);
+  assert.equal((await getAppSettingsTx(empty)).autoAcceptDone, true);
+
+  // Значение из БД (false).
+  const off = fakeClient([
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 1, rows: [{ key: 'auto_accept_done', value: false }] } },
+  ]);
+  assert.equal((await getAppSettingsTx(off)).autoAcceptDone, false);
+
+  // Патч сохраняется как boolean-строка.
+  const upd = fakeClient([
+    { re: /INSERT INTO app_settings/, reply: { rowCount: 1, rows: [] } },
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 0, rows: [] } },
+  ]);
+  await updateAppSettingsTx(upd, { autoAcceptDone: false });
+  const upsert = upd.calls.find((q) => /INSERT INTO app_settings/.test(q.sql));
+  assert.equal(upsert.params[0], 'auto_accept_done');
+  assert.equal(upsert.params[1], 'false');
 });
 
 test('updateAppSettings: пустой патч → без upsert', async () => {

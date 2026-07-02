@@ -866,6 +866,27 @@ export async function acceptTask(s, taskId) {
   return withClient(clientConfig(s), (c) => acceptTaskTx(c, taskId));
 }
 
+// TASK-AUTO-ACCEPT-001 — «не проверять выполненные задачи»: массово принять все
+// задачи, дошедшие до DONE, но ещё не принятые (accepted_at IS NULL). Вызывается
+// фоновым тиком, когда включена настройка auto_accept_done — тогда гейт «Проверка»
+// пуст, а свежие DONE сразу попадают в «Выполнено». Идемпотентно (WHERE accepted_at
+// IS NULL), пишет audit-событие source='auto-accept'. Возвращает число принятых.
+async function autoAcceptDoneTasks(c) {
+  const r = await c.query(
+    `WITH upd AS (
+       UPDATE tasks SET accepted_at = now(), updated_at = now()
+        WHERE status = 'DONE' AND accepted_at IS NULL
+        RETURNING id
+     )
+     INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     SELECT id, 'TASK_UPDATED', 'DONE'::task_status, 'DONE'::task_status, NULL,
+            jsonb_build_object('source', 'auto-accept', 'via', 'acceptance-gate-disabled')
+       FROM upd
+     RETURNING task_id`,
+  );
+  return r.rowCount;
+}
+
 export async function acceptTaskTx(c, taskId) {
   const id = String(taskId ?? '').trim();
   if (!id) throw scannerError(422, 'task_required');
@@ -2051,6 +2072,13 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // завершается (DONE) или блокируется (BLOCKED, если сервис упал). Линейный
     // аналог снятия join-барьера для декомпозиции по микросервисам.
     await advanceDecompositionParents(c);
+    // TASK-AUTO-ACCEPT-001: если включена авто-приёмка («не проверять выполненные»),
+    // помечаем свежие DONE принятыми в том же тике — задача сразу в «Выполнено», а не
+    // копится в подразделе «Проверка». Делаем ПОСЛЕ шагов, приводящих к DONE (join/
+    // rollup), чтобы не ждать следующего тика. Выключение вернёт ручную приёмку.
+    if (parseBoolSetting(await readAppSetting(c, 'auto_accept_done', true), true)) {
+      await autoAcceptDoneTasks(c);
+    }
     // ROLE-ENGINE-ROUTING-001: роли, делегированные внешнему движку (codex/
     // claude_code), внутренний DeepSeek-цикл НЕ исполняет — их захватывает
     // соответствующий хостовый драйвер через /api/runner/next-reasoning-task.

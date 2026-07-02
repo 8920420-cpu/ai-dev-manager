@@ -531,6 +531,72 @@ export async function recordDeployMarker(s, { ref, description = null } = {}) {
   });
 }
 
+// ORCH-DOWNTIME-MARKER-001 — «метки, когда оркестратор выключен». Живой процесс
+// каждый тик обновляет heartbeat (app_settings.orchestrator_last_seen). Пока сервис
+// лежал (контейнер/процесс не работал), heartbeat не бьётся — на следующем старте
+// разрыв now−last_seen > порога распознаётся как ПРОСТОЙ и превращается в метку
+// type='downtime'. Это отделяет реальные зависания задач от периодов, когда
+// оркестратор просто не работал (иначе застойные stage-таймеры выглядят как баг).
+const HEARTBEAT_KEY = 'orchestrator_last_seen';
+
+// Чистое решение «был ли простой» по last_seen/now/порогу (тестируется без БД).
+// Возвращает { downtime, ref, hours } — ref канонизирует интервал для идемпотентности.
+export function computeDowntime(lastSeenISO, nowISO, thresholdMs = 600000) {
+  if (lastSeenISO == null) return { downtime: false, ref: null, hours: 0 };
+  const last = new Date(String(lastSeenISO));
+  const now = new Date(String(nowISO));
+  const gapMs = now.getTime() - last.getTime();
+  if (!Number.isFinite(gapMs) || gapMs <= thresholdMs) return { downtime: false, ref: null, hours: 0 };
+  const hours = Number((gapMs / 3.6e6).toFixed(1));
+  return { downtime: true, ref: `${last.toISOString()}..${now.toISOString()}`, hours };
+}
+
+// Обновить heartbeat живого процесса. Зовётся каждым тиком runner'а. Дешёвый upsert.
+export async function touchOrchestratorHeartbeat(s) {
+  return withClient(clientConfig(s), async (c) => {
+    await c.query(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ($1, to_jsonb(now()::text), now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [HEARTBEAT_KEY],
+    );
+  });
+}
+
+// На старте: если с последнего heartbeat прошло больше thresholdMs — оркестратор
+// простаивал, ставим метку downtime за интервал [last_seen, now] (идемпотентно по
+// ref). Затем инициализируем heartbeat текущим временем. Первый запуск (ключа ещё
+// нет) метку не плодит — размечать нечего. Возвращает { downtime, ref, hours }.
+export async function recordDowntimeMarker(s, { thresholdMs = 600000 } = {}) {
+  return withClient(clientConfig(s), async (c) => {
+    const prev = await c.query('SELECT value FROM app_settings WHERE key = $1', [HEARTBEAT_KEY]);
+    const now = new Date((await c.query('SELECT now() AS now')).rows[0].now);
+    const lastSeen = prev.rowCount && prev.rows[0].value != null ? String(prev.rows[0].value) : null;
+    const dt = computeDowntime(lastSeen, now.toISOString(), thresholdMs);
+    const touch = () => c.query(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ($1, to_jsonb($2::text), now())
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+      [HEARTBEAT_KEY, now.toISOString()],
+    );
+    if (dt.downtime) {
+      const exists = await c.query(
+        `SELECT 1 FROM kpi_markers WHERE marker_type = 'downtime' AND ref = $1 LIMIT 1`, [dt.ref],
+      );
+      if (!exists.rowCount) {
+        await c.query(
+          `INSERT INTO kpi_markers (role_id, marker_type, ref, description, created_at)
+           VALUES (NULL, 'downtime', $1, $2, $3)`,
+          [dt.ref, `Простой оркестратора ~${dt.hours} ч (${new Date(lastSeen).toISOString()} → ${now.toISOString()})`,
+           new Date(lastSeen)],
+        );
+      }
+    }
+    await touch();
+    return dt;
+  });
+}
+
 async function resolveProjectId(c, projectId) {
   if (projectId == null || String(projectId).trim() === '') return null;
   const ref = String(projectId).trim();

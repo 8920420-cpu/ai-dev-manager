@@ -8,9 +8,20 @@ import { withClient, clientConfig } from './db.js';
 export const APP_SETTING_SPECS = {
   orchestratorEnabled: { key: 'orchestrator_enabled', def: true },
   maxConcurrencyPerRole: { key: 'max_concurrency_per_role', def: 3, min: 1, max: 50 },
-  // Сколько задач PROGRAMMER (стадия CODING) исполнитель ведёт параллельно.
-  // Каждая идёт в worktree своего микросервиса. Жёсткий потолок — 3.
-  programmerConcurrency: { key: 'programmer_concurrency', def: 3, min: 1, max: 3 },
+  // PROGRAMMER-PRIORITY-001: программист держит РОВНО 1 выделенный агент —
+  // приоритетный слот, который работает без остановки, пока есть CODING-задачи.
+  // Значение зафиксировано на 1 (def=min=max), поэтому даже старое значение из БД
+  // (напр. 3) читается как 1. Смысл: единственный агент программиста не конкурирует
+  // сам с собой за подписку Claude, а высвобождённая ёмкость уходит другим ролям
+  // (рассуждающие роли на claude-reasoning-runner/codex-runner). Чтобы снова
+  // разрешить worktree-параллелизм по нескольким сервисам, поднимите max здесь И
+  // MAX_CONCURRENCY в programmer-runner/bin/programmer-runner.js.
+  programmerConcurrency: { key: 'programmer_concurrency', def: 1, min: 1, max: 1 },
+  // TASK-AUTO-ACCEPT-001: «не проверять выполненные задачи». Когда включено (по
+  // умолчанию), дошедшие до DONE задачи автоматически помечаются принятыми
+  // (accepted_at) фоновым тиком — гейт «Проверка» пуст, задачи сразу в «Выполнено».
+  // Выключите, чтобы вернуть ручную приёмку из подраздела «Проверка».
+  autoAcceptDone: { key: 'auto_accept_done', def: true },
 };
 
 // Привести значение к целому в допустимых границах (иначе — дефолт спеки).
@@ -42,6 +53,12 @@ function shape(byKey) {
     ),
     maxConcurrencyPerRole: pick(APP_SETTING_SPECS.maxConcurrencyPerRole),
     programmerConcurrency: pick(APP_SETTING_SPECS.programmerConcurrency),
+    autoAcceptDone: boolValue(
+      byKey.has(APP_SETTING_SPECS.autoAcceptDone.key)
+        ? byKey.get(APP_SETTING_SPECS.autoAcceptDone.key)
+        : APP_SETTING_SPECS.autoAcceptDone.def,
+      APP_SETTING_SPECS.autoAcceptDone.def,
+    ),
   };
 }
 
@@ -72,6 +89,11 @@ export async function updateAppSettingsTx(c, patch) {
       patch.programmerConcurrency, APP_SETTING_SPECS.programmerConcurrency,
     );
   }
+  if (patch && patch.autoAcceptDone !== undefined) {
+    updates[APP_SETTING_SPECS.autoAcceptDone.key] = boolValue(
+      patch.autoAcceptDone, APP_SETTING_SPECS.autoAcceptDone.def,
+    );
+  }
   for (const [key, value] of Object.entries(updates)) {
     await c.query(
       `INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2::jsonb, now())
@@ -88,8 +110,8 @@ export async function getAppSettings(s) {
 }
 
 // PUT /api/app-settings — частичное обновление. Принимает
-// {maxConcurrencyPerRole, programmerConcurrency}. Валидирует/клампит значения,
-// делает upsert по ключам и возвращает итоговый набор.
+// {orchestratorEnabled, maxConcurrencyPerRole, programmerConcurrency, autoAcceptDone}.
+// Валидирует/клампит значения, делает upsert по ключам и возвращает итоговый набор.
 export async function updateAppSettings(s, patch) {
   return withClient(clientConfig(s), (c) => updateAppSettingsTx(c, patch));
 }

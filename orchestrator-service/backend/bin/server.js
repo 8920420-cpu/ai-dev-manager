@@ -6,7 +6,7 @@ import { createApp } from '../src/server.js';
 import { loadSettings } from '../src/config.js';
 import { bootstrap, reconcileOnStartup } from '../src/db.js';
 import { createTaskRunner } from '../src/taskRunner.js';
-import { recordDeployMarker } from '../src/performance.js';
+import { recordDeployMarker, recordDowntimeMarker } from '../src/performance.js';
 
 const PORT = Number(process.env.PORT || 4186);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -42,6 +42,17 @@ async function main() {
     } catch (e) {
       console.error(`[orchestrator-service] метка деплоя не поставлена (продолжаю): ${e.message}`);
     }
+  }
+
+  // ORCH-DOWNTIME-MARKER-001: если сервис только что поднялся после долгого молчания
+  // (heartbeat не бился) — ставим метку простоя за интервал бездействия и
+  // инициализируем heartbeat. Так периоды «оркестратор был выключен» видны на оси KPI
+  // и не путаются с реальными зависаниями задач.
+  try {
+    const dt = await recordDowntimeMarker(await loadSettings());
+    if (dt.downtime) console.error(`[orchestrator-service] отмечен простой ~${dt.hours} ч: ${dt.ref}`);
+  } catch (e) {
+    console.error(`[orchestrator-service] метка простоя не поставлена (продолжаю): ${e.message}`);
   }
 
   if (STARTUP_RECONCILE) {

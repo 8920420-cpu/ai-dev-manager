@@ -16,8 +16,13 @@ export interface AppSettings {
   orchestratorEnabled: boolean;
   /** Максимум параллельных обработок задач одной роли фоновым runner. */
   maxConcurrencyPerRole: number;
-  /** Параллельных задач PROGRAMMER (стадия CODING); жёсткий потолок — 3. */
+  /** Выделенных агентов PROGRAMMER (стадия CODING); зафиксировано на 1 (приоритетный слот). */
   programmerConcurrency: number;
+  /**
+   * TASK-AUTO-ACCEPT-001 — «не проверять выполненные задачи»: когда true (по
+   * умолчанию), дошедшие до DONE задачи авто-принимаются (гейт «Проверка» отключён).
+   */
+  autoAcceptDone: boolean;
 }
 
 export const appSettingsApi = {

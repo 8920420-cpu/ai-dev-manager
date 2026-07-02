@@ -32,7 +32,11 @@ export function ExecutionPage() {
   const toast = useToast();
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [concurrency, setConcurrency] = useState('3');
-  const [programmerConcurrency, setProgrammerConcurrency] = useState('3');
+  // PROGRAMMER-PRIORITY-001: программист зафиксирован на 1 выделенном агенте
+  // (приоритетный слот). Значение приходит с сервера и не редактируется.
+  const [programmerConcurrency, setProgrammerConcurrency] = useState('1');
+  // TASK-AUTO-ACCEPT-001: «не проверять выполненные» — авто-приёмка DONE.
+  const [autoAcceptDone, setAutoAcceptDone] = useState(true);
   const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [assignments, setAssignments] = useState<AssignMap>({});
   const [savedAssignments, setSavedAssignments] = useState<AssignMap>({});
@@ -51,6 +55,7 @@ export function ExecutionPage() {
       setSaved(s);
       setConcurrency(String(s.maxConcurrencyPerRole));
       setProgrammerConcurrency(String(s.programmerConcurrency));
+      setAutoAcceptDone(s.autoAcceptDone);
       setIntegrations(intgs);
       const map: AssignMap = {};
       for (const c of conns) if (c.integrationId) map[c.role] = c.integrationId;
@@ -98,6 +103,7 @@ export function ExecutionPage() {
   const dirty = saved !== null
     && (parsed !== saved.maxConcurrencyPerRole
       || progParsed !== saved.programmerConcurrency
+      || autoAcceptDone !== saved.autoAcceptDone
       || !sameAssignments(assignments, savedAssignments));
 
   const handleSave = async () => {
@@ -114,6 +120,7 @@ export function ExecutionPage() {
       const next = await appSettingsApi.save({
         maxConcurrencyPerRole: parsed,
         programmerConcurrency: progParsed,
+        autoAcceptDone,
       });
       // Назначения движков (интеграций) по ролям — отдельный источник истины
       // (/api/role-connectors). Шлём все рассуждающие роли (upsert по коду роли).
@@ -124,6 +131,7 @@ export function ExecutionPage() {
       setSaved(next);
       setConcurrency(String(next.maxConcurrencyPerRole));
       setProgrammerConcurrency(String(next.programmerConcurrency));
+      setAutoAcceptDone(next.autoAcceptDone);
       setSavedAssignments({ ...assignments });
       toast.success('Настройки выполнения сохранены');
     } catch (e) {
@@ -209,21 +217,44 @@ export function ExecutionPage() {
           </Section>
 
           <Section
-            title="Параллельность программиста (CODING)"
-            description="Сколько задач PROGRAMMER исполняются одновременно. Каждая идёт в отдельном git worktree СВОЕГО микросервиса: задачи одного сервиса не пересекаются (выполняются по очереди), разные сервисы — параллельно. Жёсткий потолок — 3, чтобы не перегружать машину и модель."
+            title="Приёмка выполненных задач"
+            description="Гейт «Проверка»: когда включён, дошедшие до статуса «Выполнено» (DONE) задачи ждут ручного подтверждения в подразделе «Задачи → Проверка». Выключив проверку (по умолчанию), выполненные задачи сразу считаются принятыми и попадают в «Выполнено» — их не нужно проверять вручную."
+          >
+            <div className={styles.executionForm}>
+              <label className={styles.toggleRow}>
+                <input
+                  type="checkbox"
+                  className={styles.checkbox}
+                  checked={autoAcceptDone}
+                  onChange={(e) => setAutoAcceptDone(e.target.checked)}
+                  disabled={saving}
+                />
+                <span className={styles.toggleText}>
+                  <span className={styles.toggleTitle}>Не проверять выполненные задачи</span>
+                  <span className={styles.toggleHint}>
+                    {autoAcceptDone
+                      ? 'Выполненные (DONE) авто-принимаются — гейт «Проверка» отключён.'
+                      : 'Выполненные (DONE) ждут ручного подтверждения в подразделе «Проверка».'}
+                  </span>
+                </span>
+              </label>
+            </div>
+          </Section>
+
+          <Section
+            title="Программист (CODING): приоритетная роль"
+            description="Программист держит ровно 1 выделенный агент и работает без остановки, пока есть CODING-задачи (приоритетный слот). Один агент не конкурирует сам с собой за подписку Claude, а высвобождённая ёмкость уходит другим ролям (рассуждающие роли на Codex/Claude). Значение зафиксировано на 1 и не редактируется."
           >
             <div className={styles.executionForm}>
               <Input
                 type="number"
                 min={1}
-                max={3}
+                max={1}
                 step={1}
-                label="Параллельных задач программиста"
+                label="Выделенных агентов программиста"
                 value={programmerConcurrency}
-                onChange={(e) => setProgrammerConcurrency(e.target.value)}
-                disabled={saving}
-                helper="Целое число от 1 до 3. По умолчанию 3."
-                error={!progValid ? 'Введите целое число от 1 до 3' : undefined}
+                disabled
+                helper="Зафиксировано на 1: приоритетный слот, работает без остановки. Остальная ёмкость — другим ролям."
               />
               <Button
                 variant="primary"

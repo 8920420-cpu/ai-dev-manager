@@ -4,12 +4,17 @@
 // тестировался без живого Postgres.
 import { loadSettings } from './config.js';
 import { advanceAutomatedTasks } from './db.js';
+import { touchOrchestratorHeartbeat } from './performance.js';
 
 export function createTaskRunner({
   intervalMs = Number(process.env.RUNNER_INTERVAL_MS || 3000),
   log = console,
   loadSettings: load = loadSettings,
   advance = advanceAutomatedTasks,
+  // ORCH-DOWNTIME-MARKER-001: живой heartbeat. Каждый тик отмечает, что процесс жив
+  // (даже если orchestratorEnabled=false и advance ничего не делает) — по разрыву в
+  // нём следующий старт распознаёт простой сервиса. Инъектируется для тестов.
+  heartbeat = touchOrchestratorHeartbeat,
 } = {}) {
   let timer = null;
   let inFlight = false;
@@ -21,7 +26,11 @@ export function createTaskRunner({
     if (inFlight) return [];
     inFlight = true;
     try {
-      const applied = await advance(await load());
+      const settings = await load();
+      // Heartbeat отдельно от advance и его ошибок: даже если продвижение упадёт,
+      // отметка «процесс жив» должна пройти, иначе живой сервис выглядел бы простоем.
+      try { await heartbeat(settings); } catch (e) { log.error?.('Heartbeat failed', { error: e.message }); }
+      const applied = await advance(settings);
       if (applied.length) log.info?.('Runner advanced tasks', { count: applied.length, applied });
       return applied;
     } catch (error) {
