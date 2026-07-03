@@ -14,7 +14,7 @@
 // result — собственно многоходовое рассуждение с tool-loop). Снимаем тайминги, число
 // ходов/тулзов, токены и КЛАССИФИЦИРУЕМ исход, чтобы по логу отличать «думает и не
 // успевает» (working_slow) от «висит и ничего не делает» (stuck_no_response/coldstart_failed).
-import { query } from '@anthropic-ai/claude-agent-sdk';
+import { query, SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from '@anthropic-ai/claude-agent-sdk';
 
 // Рассуждающим ролям достаточно чтения: смотрят код/доки и выносят вердикт.
 const READONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash'];
@@ -84,7 +84,16 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
     const started = Date.now();
     // То же, что видит DeepSeek/Codex: system-промпт роли + контекст задачи + строгое
     // требование JSON-вердикта (всё собрано оркестратором в claim).
-    const prompt = `${String(task.systemPrompt || '')}\n\n${String(task.userPrompt || '')}`.trim();
+    // PROMPT-CACHE-001: если оркестратор пометил cachePrefix — держим СТАТИЧНУЮ часть
+    // (промт роли + карта проекта) как system-префикс с кэш-границей
+    // (SYSTEM_PROMPT_DYNAMIC_BOUNDARY): драйвер кэширует её (5-мин ephemeral), и
+    // повторные прогоны того же проекта/роли не переоплачивают карту. Динамику задачи
+    // шлём как user-сообщение. Иначе — прежнее склеенное поведение (одна строка).
+    const sys = String(task.systemPrompt || '');
+    const user = String(task.userPrompt || '');
+    const useCachePrefix = task.cachePrefix === true && sys !== '';
+    const prompt = useCachePrefix ? user : `${sys}\n\n${user}`.trim();
+    const systemPromptOpt = useCachePrefix ? [sys, SYSTEM_PROMPT_DYNAMIC_BOUNDARY] : undefined;
     const ac = linkSignal(signal);
     const cwd = String(task.projectPath || '').trim();
 
@@ -117,6 +126,7 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
         prompt,
         options: {
           ...(cwd ? { cwd } : {}),
+          ...(systemPromptOpt ? { systemPrompt: systemPromptOpt } : {}),
           model,
           maxTurns,
           permissionMode: 'bypassPermissions',

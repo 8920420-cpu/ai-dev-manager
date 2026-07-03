@@ -15,8 +15,14 @@ import path from 'node:path';
 // Сколько держим карту в кэше, не перечитывая диск. Пользовательская модель —
 // «карта живёт в кэше хотя бы час»: структура проекта меняется редко.
 const MAP_TTL_MS = Math.max(0, Number(process.env.PROJECT_MAP_TTL_MS || 60 * 60 * 1000));
-// Потолок размера одной карты в символах: карта — это ориентир, а не весь репозиторий.
-const MAP_MAX_CHARS = Math.max(1000, Number(process.env.PROJECT_MAP_MAX_CHARS || 12000));
+// Потолок размера ПОЛНОЙ карты в символах: карта — это ориентир, а не весь репозиторий.
+// PROMPT-CACHE-001: уменьшен (12000→8000) — полную карту получают роли на движках с
+// prompt-кэшем (claude_code: карта в кэшируемом system-префиксе).
+const MAP_MAX_CHARS = Math.max(1000, Number(process.env.PROJECT_MAP_MAX_CHARS || 8000));
+// Потолок СОКРАЩЁННОЙ карты (отдельное имя, чтобы не путать с полной): её получают
+// движки БЕЗ prompt-кэша (codex) — там карта пересылается на каждый вызов, поэтому
+// режем жёстче и приоритетно отдаём карту сервиса (см. variant='short').
+const MAP_SHORT_MAX_CHARS = Math.max(500, Number(process.env.PROJECT_MAP_SHORT_MAX_CHARS || 2500));
 
 // key (`${root}::${service}`) -> { at, value }
 const cache = new Map();
@@ -45,27 +51,28 @@ async function readFirst(root, candidates) {
 }
 
 // Карта уровня проекта: PROJECT_MAP.md (главная) + ARCHITECTURE.md (если есть),
-// в бюджете символов. Ищем под корнем проекта и под docs-папкой.
-async function loadProjectLevel(root, docsPath) {
+// в бюджете символов. Ищем под корнем проекта и под docs-папкой. В сокращённом
+// варианте (short) ARCHITECTURE.md опускаем — оставляем только PROJECT_MAP.md.
+async function loadProjectLevel(root, docsPath, maxChars, short = false) {
   const mapDoc = await readFirst(root, [
     docsPath ? path.join(docsPath, 'PROJECT_MAP.md') : null,
     'docs/PROJECT_MAP.md',
     'PROJECT_MAP.md',
   ]);
-  const archDoc = await readFirst(root, [
+  const archDoc = short ? null : await readFirst(root, [
     docsPath ? path.join(docsPath, 'ARCHITECTURE.md') : null,
     'docs/ARCHITECTURE.md',
     'ARCHITECTURE.md',
   ]);
   const parts = [];
-  if (mapDoc) parts.push(`<!-- ${mapDoc.path} -->\n${clip(mapDoc.content)}`);
-  if (archDoc) parts.push(`<!-- ${archDoc.path} -->\n${clip(archDoc.content)}`);
+  if (mapDoc) parts.push(`<!-- ${mapDoc.path} -->\n${clip(mapDoc.content, maxChars)}`);
+  if (archDoc) parts.push(`<!-- ${archDoc.path} -->\n${clip(archDoc.content, maxChars)}`);
   return parts.length ? parts.join('\n\n') : '';
 }
 
 // Карта уровня микросервиса: PROJECT_MAP.md внутри каталога сервиса (best-effort
 // по принятым в шаблоне раскладкам). Если не нашли — пусто (общая карта остаётся).
-async function loadServiceLevel(root, service) {
+async function loadServiceLevel(root, service, maxChars) {
   const s = String(service || '').trim();
   if (!s) return '';
   const doc = await readFirst(root, [
@@ -74,30 +81,42 @@ async function loadServiceLevel(root, service) {
     `docs/${s}/PROJECT_MAP.md`,
     `${s}/PROJECT_MAP.md`,
   ]);
-  return doc ? `<!-- ${doc.path} -->\n${clip(doc.content)}` : '';
+  return doc ? `<!-- ${doc.path} -->\n${clip(doc.content, maxChars)}` : '';
 }
 
 /**
  * Прочитать карту проекта и карту микросервиса для контекста роли.
  * @param {string} projectRoot реальный корень проекта (projects.root_path)
- * @param {{service?:string, docsPath?:string, now?:number}} [opts]
+ * @param {{service?:string, docsPath?:string, now?:number, variant?:'full'|'short'}} [opts]
+ *   variant='short' (движки без prompt-кэша, напр. codex): жёсткий бюджет символов
+ *   + приоритет карты сервиса (если она есть — проектную карту опускаем, «капаем до
+ *   сервис-карты»). variant='full' (по умолчанию): полная карта.
  * @returns {Promise<{project:string, service:string, serviceName:string}|null>}
  *   null — если корень не задан или ни одной карты не нашлось.
  */
-export async function loadProjectMaps(projectRoot, { service = '', docsPath = '', now = Date.now() } = {}) {
+export async function loadProjectMaps(
+  projectRoot,
+  { service = '', docsPath = '', now = Date.now(), variant = 'full' } = {},
+) {
   const root = String(projectRoot || '').trim();
   if (!root) return null;
-  const key = `${root}::${service || ''}`;
+  const short = variant === 'short';
+  const maxChars = short ? MAP_SHORT_MAX_CHARS : MAP_MAX_CHARS;
+  // variant в ключе кэша — иначе short/full затирали бы друг друга под одним ключом.
+  const key = `${root}::${service || ''}::${variant}`;
   const hit = cache.get(key);
   if (hit && now - hit.at < MAP_TTL_MS) return hit.value;
 
   const [project, svc] = await Promise.all([
-    loadProjectLevel(root, docsPath).catch(() => ''),
-    loadServiceLevel(root, service).catch(() => ''),
+    loadProjectLevel(root, docsPath, maxChars, short).catch(() => ''),
+    loadServiceLevel(root, service, maxChars).catch(() => ''),
   ]);
-  const value = project || svc
-    ? { project, service: svc, serviceName: String(service || '').trim() }
-    : null;
+  // Сокращённо: если карта сервиса нашлась — отдаём ТОЛЬКО её (капаем до сервис-карты);
+  // иначе оставляем короткую карту проекта. Полный вариант отдаёт обе.
+  const serviceName = String(service || '').trim();
+  let value = null;
+  if (short && svc) value = { project: '', service: svc, serviceName };
+  else if (project || svc) value = { project, service: svc, serviceName };
   cache.set(key, { at: now, value });
   return value;
 }

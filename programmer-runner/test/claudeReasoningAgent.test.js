@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { makeClaudeReasoningRunAgent, classifyAbort } from '../src/claudeReasoningAgent.js';
+import { SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from '@anthropic-ai/claude-agent-sdk';
 
 // Фейк query() Agent SDK: async-генератор сообщений. Захватывает переданные
 // options, чтобы проверить применённый maxTurns.
@@ -47,6 +48,27 @@ test('упор в лимит ходов → отдельный исход max_tu
   assert.equal(out.outcome, 'max_turns_exceeded');
   assert.equal(out.error, 'max_turns_exceeded');
   assert.equal(out.turns, 12);
+});
+
+// PROMPT-CACHE-001: cachePrefix → системный префикс с кэш-границей, задача в user.
+test('cachePrefix=true: systemPrompt=[SYS, BOUNDARY], prompt=USR (не склеено)', async () => {
+  const capture = {};
+  const run = makeClaudeReasoningRunAgent({ query: fakeQuery([
+    { type: 'system' }, { type: 'result', subtype: 'success', result: 'OK', num_turns: 1 },
+  ], capture) });
+  await run({ ...task, cachePrefix: true }, {});
+  assert.deepEqual(capture.options.systemPrompt, ['SYS', SYSTEM_PROMPT_DYNAMIC_BOUNDARY]);
+  assert.equal(capture.prompt, 'USR'); // только динамика задачи
+});
+
+test('без cachePrefix: прежнее склеенное поведение, systemPrompt не задан', async () => {
+  const capture = {};
+  const run = makeClaudeReasoningRunAgent({ query: fakeQuery([
+    { type: 'system' }, { type: 'result', subtype: 'success', result: 'OK', num_turns: 1 },
+  ], capture) });
+  await run(task, {}); // task без cachePrefix
+  assert.equal(capture.options.systemPrompt, undefined);
+  assert.equal(capture.prompt, 'SYS\n\nUSR');
 });
 
 test('classifyAbort: не поднялся / завис / работал — как было', () => {

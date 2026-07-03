@@ -213,6 +213,19 @@ test('buildUserPayload: projectMaps рендерится инлайн и НЕ п
   assert.ok(!/"projectMaps"/.test(payload));
 });
 
+// PROMPT-CACHE-001: includeMap=false исключает карту из user-payload (её выносят в
+// кэшируемый system-префикс для claude_code).
+test('buildUserPayload: includeMap=false не кладёт карту в payload', () => {
+  const ctx = { taskId: 'x', title: 'T', projectMaps: { project: 'PROJECT-MAP-TEXT', serviceName: '' } };
+  const withMap = buildUserPayload('ARCHITECT', ctx, [], { includeMap: true });
+  assert.match(withMap, /PROJECT-MAP-TEXT/);
+  const noMap = buildUserPayload('ARCHITECT', ctx, [], { includeMap: false });
+  assert.ok(!/PROJECT-MAP-TEXT/.test(noMap));
+  assert.ok(!/Карта проекта/.test(noMap));
+  // Контекст задачи при этом сохраняется.
+  assert.match(noMap, /"title":"T"/);
+});
+
 test('summarizePriorRuns: компактный список из agent_runs', () => {
   const out = summarizePriorRuns([
     { role_code: 'ARCHITECT', status: 'SUCCESS', output_json: { status: 'READY', summary: 'дизайн', findings: ['a', 'b'] } },

@@ -341,9 +341,11 @@ export function renderProjectMaps(maps) {
 // recentEvents) без какой-либо пользы: модель одинаково читает компактный JSON.
 // projectMaps вынимаем из контекста и рендерим markdown-ом — внутри JSON карта
 // читалась бы хуже и раздувала экранирование.
-export function buildUserPayload(roleCode, context, outputFields = []) {
+// PROMPT-CACHE-001: includeMap=false — карту НЕ кладём в user-payload (её выносят в
+// кэшируемый system-префикс для claude_code, чтобы не переоплачивать на каждый вызов).
+export function buildUserPayload(roleCode, context, outputFields = [], { includeMap = true } = {}) {
   const { projectMaps, ...rest } = context && typeof context === 'object' ? context : {};
-  const mapBlock = renderProjectMaps(projectMaps);
+  const mapBlock = includeMap ? renderProjectMaps(projectMaps) : '';
   const sections = [];
   if (mapBlock) sections.push(mapBlock, '');
   sections.push(

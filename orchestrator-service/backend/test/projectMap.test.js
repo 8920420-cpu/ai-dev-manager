@@ -61,6 +61,57 @@ test('loadProjectMaps: усечение карты по бюджету симв�
   }
 });
 
+// PROMPT-CACHE-001: сокращённый вариант карты для движков без prompt-кэша (codex).
+test('loadProjectMaps: variant=short приоритетно отдаёт карту сервиса (проектную опускает)', async () => {
+  _clearProjectMapCache();
+  const root = await mkdtemp(join(tmpdir(), 'pmap-short-'));
+  try {
+    await mkdir(join(root, 'docs'), { recursive: true });
+    await writeFile(join(root, 'docs', 'PROJECT_MAP.md'), '# Общая карта');
+    await mkdir(join(root, 'scanner-service', 'docs'), { recursive: true });
+    await writeFile(join(root, 'scanner-service', 'docs', 'PROJECT_MAP.md'), '# Карта scanner');
+
+    const short = await loadProjectMaps(root, { service: 'scanner-service', variant: 'short' });
+    assert.equal(short.project, ''); // проектную карту капнули до сервис-карты
+    assert.match(short.service, /Карта scanner/);
+    // Полный вариант отдаёт обе карты.
+    const full = await loadProjectMaps(root, { service: 'scanner-service', variant: 'full' });
+    assert.match(full.project, /Общая карта/);
+    assert.match(full.service, /Карта scanner/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('loadProjectMaps: variant=short без сервис-карты оставляет короткую карту проекта', async () => {
+  _clearProjectMapCache();
+  const root = await mkdtemp(join(tmpdir(), 'pmap-short2-'));
+  try {
+    await writeFile(join(root, 'PROJECT_MAP.md'), '# Только проект');
+    const short = await loadProjectMaps(root, { service: '', variant: 'short' });
+    assert.match(short.project, /Только проект/);
+    assert.equal(short.service, '');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('loadProjectMaps: variant в ключе кэша — short и full не затирают друг друга', async () => {
+  _clearProjectMapCache();
+  const root = await mkdtemp(join(tmpdir(), 'pmap-vk-'));
+  try {
+    await mkdir(join(root, 'svc', 'docs'), { recursive: true });
+    await writeFile(join(root, 'PROJECT_MAP.md'), '# Проект');
+    await writeFile(join(root, 'svc', 'docs', 'PROJECT_MAP.md'), '# Сервис');
+    const full = await loadProjectMaps(root, { service: 'svc', variant: 'full', now: 5000 });
+    const short = await loadProjectMaps(root, { service: 'svc', variant: 'short', now: 5000 });
+    assert.match(full.project, /Проект/);      // полный вариант из своего ключа
+    assert.equal(short.project, '');            // short не подхватил full из кэша
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('loadProjectMaps: кэш отдаёт прежнее значение в пределах TTL (now)', async () => {
   _clearProjectMapCache();
   const root = await mkdtemp(join(tmpdir(), 'pmap-cache-'));

@@ -4,7 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ROLE_FLOW, fastForwardHiddenRoles } from './rolePipeline.js';
-import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict } from './roleEngine.js';
+import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict, renderProjectMaps } from './roleEngine.js';
 import { buildRoute, resolveTransition, forwardFrom, routeIsUsable, TERMINAL_STATUSES } from './projectRoute.js';
 import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey } from './graphRoute.js';
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
@@ -1764,10 +1764,17 @@ export async function claimNextReasoningTask(s, engineParam = null, roleParam = 
       return { task: null, blocked: { taskId: claimed.id, reason: 'missing_required_inputs', fields: missingIn } };
     }
 
-    const context = await buildRoleContext(c, claimed);
+    const context = await buildRoleContext(c, claimed, { engine });
     const { composeRoleSystemPrompt } = await import('./roles.js');
-    const systemPrompt = await composeRoleSystemPrompt(c, claimed.role_code);
-    const userPrompt = buildUserPayload(claimed.role_code, context, contract.outputs);
+    const roleSystem = await composeRoleSystemPrompt(c, claimed.role_code);
+    // PROMPT-CACHE-001: для claude_code выносим СТАТИЧНУЮ часть (промт роли + карта) в
+    // system-префикс — драйвер держит его в кэше (SYSTEM_PROMPT_DYNAMIC_BOUNDARY, 5-мин
+    // ephemeral), и повторные claim'ы того же проекта/роли не переоплачивают карту. У
+    // codex/deepseek кэша нет: карта остаётся в user-payload как раньше (codex — short).
+    const cacheClaude = engine === 'claude_code';
+    const mapBlock = cacheClaude ? renderProjectMaps(context.projectMaps) : '';
+    const systemPrompt = mapBlock ? `${roleSystem}\n\n${mapBlock}` : roleSystem;
+    const userPrompt = buildUserPayload(claimed.role_code, context, contract.outputs, { includeMap: !cacheClaude });
     const outputSchema = buildVerdictJsonSchema(contract.outputs);
 
     return {
@@ -1785,6 +1792,9 @@ export async function claimNextReasoningTask(s, engineParam = null, roleParam = 
         agentRunId: claimed.agentRunId,
         systemPrompt,
         userPrompt,
+        // PROMPT-CACHE-001: claude-драйвер держит systemPrompt как кэшируемый статичный
+        // префикс (роль+карта), а userPrompt шлёт как динамику. Для codex флаг игнорируется.
+        cachePrefix: cacheClaude,
         outputSchema,
       },
     };
@@ -3138,7 +3148,7 @@ async function fetchPriorOutputs(c, taskId) {
 }
 
 // Собрать компактный контекст задачи для промта роли.
-async function buildRoleContext(c, claimed) {
+async function buildRoleContext(c, claimed, { engine = null } = {}) {
   const ev = await c.query(
     `SELECT event_type, from_status::text AS from_status, to_status::text AS to_status, payload_json
        FROM task_events WHERE task_id = $1 ORDER BY created_at DESC LIMIT 12`,
@@ -3191,9 +3201,13 @@ async function buildRoleContext(c, claimed) {
   let projectMaps = null;
   if (MAP_ROLES.has(claimed.role_code)) {
     const { loadProjectMaps } = await import('./projectMap.js');
+    // PROMPT-CACHE-001: codex (нет prompt-кэша, карта шлётся каждый вызов) получает
+    // СОКРАЩЁННУЮ карту; claude_code/deepseek — полную (у claude она кэшируется).
+    const variant = String(engine || '').toLowerCase() === 'codex' ? 'short' : 'full';
     projectMaps = await loadProjectMaps(meta.rows[0]?.root_path ?? '', {
       service: meta.rows[0]?.service ?? '',
       docsPath: meta.rows[0]?.docs_path ?? '',
+      variant,
     }).catch(() => null);
   }
 
