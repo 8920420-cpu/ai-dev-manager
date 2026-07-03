@@ -24,7 +24,12 @@ export interface RoleLoad {
   // ROLE-LOAD-AVG-001: число задач в окне (знаменатель средних на задачу).
   tasks: number;
   success: number;
+  // RELEASE-OUTCOMES-001: «Провал» — только настоящие провалы агента (FAILED-прогоны
+  // с outcome НЕ из служебного набора). «Возвраты» — служебные возвраты захвата в пул
+  // без результата (FAILED с outcome='released' и др.), а НЕ провалы кода. Инцидент
+  // 03.07.2026: 1407 из 1408 «провалов» PROGRAMMER были именно возвратами захвата.
   failed: number;
+  returns: number;
   timeout: number;
   running: number;
   avgDurationMs: number | null;
@@ -154,7 +159,9 @@ export interface RoleLoadTotalRow {
   runs: number;
   tasks: number;
   success: number;
+  // RELEASE-OUTCOMES-001: «Провал» (настоящий) и «Возвраты» (возврат захвата в пул).
   failed: number;
+  returns: number;
   timeout: number;
   tokensIn: number;
   tokensOut: number;
@@ -182,7 +189,9 @@ export interface VersionRow {
   model: string | null;
   n: number;
   success?: number;
+  // RELEASE-OUTCOMES-001: failed — настоящий провал агента; returns — возврат захвата.
   failed?: number;
+  returns?: number;
   timeout?: number;
   limitHits?: number;
   maxPasses?: number | null;

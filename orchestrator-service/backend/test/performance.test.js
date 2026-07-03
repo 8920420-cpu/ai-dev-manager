@@ -12,6 +12,8 @@ import {
   computeMetricDelta,
   attachRoleLoadDeltas,
   attachRoleLoadTaskTotalsDelta,
+  isReleaseOutcome,
+  RELEASE_OUTCOMES,
 } from '../src/performance.js';
 
 test('deriveKpi: базовые агрегаты по статусам', () => {
@@ -464,4 +466,105 @@ test('attachRoleLoadTaskTotalsDelta: нет периода сравнения и
   assert.equal(attachRoleLoadTaskTotalsDelta(current, null).delta, null);
   const emptyPrev = buildRoleLoadTaskTotals({ tasks: 0 });
   assert.equal(attachRoleLoadTaskTotalsDelta(current, emptyPrev).delta, null);
+});
+
+// RELEASE-OUTCOMES-001 — «Возвраты захвата» против «настоящего провала агента».
+// Инцидент 03.07.2026: 1407 из 1408 «провалов» PROGRAMMER были FAILED-прогонами с
+// outcome='released' (петля захват→release), а не реальными провалами кода.
+
+test('isReleaseOutcome: служебные исходы освобождения захвата → true (регистронезависимо)', () => {
+  // Инцидентный исход + прочие служебные возвраты захвата.
+  assert.equal(isReleaseOutcome('released'), true);
+  assert.equal(isReleaseOutcome('RELEASED'), true);          // регистр не важен
+  assert.equal(isReleaseOutcome('  released  '), true);      // пробелы обрезаются
+  assert.equal(isReleaseOutcome('claude_assignment_timeout'), true);
+  assert.equal(isReleaseOutcome('orchestrator_restart_reconcile'), true);
+  assert.equal(isReleaseOutcome('orphan_run_timeout'), true);
+  // Весь эталонный набор классифицируется как возврат.
+  for (const o of RELEASE_OUTCOMES) assert.equal(isReleaseOutcome(o), true);
+});
+
+test('isReleaseOutcome: настоящие провалы агента и NULL/пустой → false (остаются «Провал»)', () => {
+  assert.equal(isReleaseOutcome('max_turns_exceeded'), false);
+  assert.equal(isReleaseOutcome('agent_reported_failure'), false);
+  // Префиксный вариант (agent сам сообщил о провале с текстом) — тоже провал.
+  assert.equal(isReleaseOutcome('agent_reported_failure: не собралось'), false);
+  assert.equal(isReleaseOutcome('verdict_unparsed'), false);
+  assert.equal(isReleaseOutcome('success'), false);
+  // NULL/undefined/пустой outcome → провал (у возврата outcome всегда задан).
+  assert.equal(isReleaseOutcome(null), false);
+  assert.equal(isReleaseOutcome(undefined), false);
+  assert.equal(isReleaseOutcome(''), false);
+});
+
+test('deriveRoleLoad: FAILED разделён на «Провал» (failed) и «Возвраты» (returns)', () => {
+  // Данные инцидента 03.07.2026 для PROGRAMMER: 1 настоящий провал + 1407 возвратов.
+  const rows = [{
+    role_code: 'PROGRAMMER', role_name: 'Программист',
+    runs: 1408, tasks: 2, success: 0, failed: 1, returns: 1407, timeout: 0, running: 0,
+    avg_ms: 5000, tokens_in: 0, tokens_out: 0,
+    tokens_cache_read: 0, tokens_cache_creation: 0, cost: 0, avg_cold_start_ms: null,
+  }];
+  const [m] = deriveRoleLoad(rows);
+  assert.equal(m.failed, 1);       // только настоящий провал агента
+  assert.equal(m.returns, 1407);   // возвраты захвата в пул, не провалы кода
+});
+
+test('deriveRoleLoad: returns отсутствует в строке → 0 (обратная совместимость)', () => {
+  const rows = [{
+    role_code: 'ARCHITECT', role_name: 'Архитектор',
+    runs: 3, tasks: 3, success: 2, failed: 1, timeout: 0, running: 0,
+    avg_ms: 4000, tokens_in: 100, tokens_out: 50,
+    tokens_cache_read: 0, tokens_cache_creation: 0, cost: 0.1, avg_cold_start_ms: null,
+  }];
+  const [m] = deriveRoleLoad(rows);
+  assert.equal(m.failed, 1);
+  assert.equal(m.returns, 0);
+});
+
+test('buildRoleLoadTotals: returns прокидывается наряду с failed (вкладка «Суммы»)', () => {
+  const rows = [{
+    role_code: 'PROGRAMMER', role_name: 'Программист',
+    runs: 1408, tasks: 2, success: 0, failed: 1, returns: 1407, timeout: 0,
+    tokens_in: 0, tokens_out: 0, cost: 0,
+  }];
+  const [m] = buildRoleLoadTotals(rows);
+  assert.equal(m.failed, 1);
+  assert.equal(m.returns, 1407);
+});
+
+test('buildDailyModelStats: returns в строке модели и в итогах дня', () => {
+  const rows = [
+    {
+      day: '2026-07-03', connectorId: 'drv', provider: 'claude_code', model: 'sonnet',
+      driverType: 'driver', roleCode: 'PROGRAMMER', roleName: 'Программист',
+      runs: 1408, success: 0, failed: 1, returns: 1407, timeout: 0, throttle: 0, running: 0,
+      avgMs: 5000, medianMs: 5000, tokensIn: 0, tokensOut: 0, cost: 0,
+    },
+    {
+      day: '2026-07-03', connectorId: 'c1', provider: 'openai', model: 'gpt-4o',
+      driverType: 'api', roleCode: 'ARCHITECT', roleName: 'Архитектор',
+      runs: 5, success: 4, failed: 1, returns: 0, timeout: 0, throttle: 0, running: 0,
+      avgMs: 2000, medianMs: 2000, tokensIn: 10, tokensOut: 5, cost: 0.01,
+    },
+  ];
+  const [day] = buildDailyModelStats(rows);
+  assert.equal(day.models[0].returns, 1407);
+  assert.equal(day.models[0].failed, 1);
+  assert.equal(day.models[1].returns, 0);
+  // Итоги дня суммируют возвраты обеих моделей.
+  assert.equal(day.totals.returns, 1407);
+  assert.equal(day.totals.failed, 2);
+});
+
+test('buildDailyModelStats: returns отсутствует в строке → 0 (обратная совместимость)', () => {
+  const rows = [{
+    day: '2026-07-01', connectorId: 'c1', provider: 'deepseek', model: 'deepseek-chat',
+    driverType: 'api', roleCode: 'REVIEWER', roleName: 'Ревьюер',
+    runs: 4, success: 3, failed: 1, timeout: 0, throttle: 0, running: 0,
+    avgMs: 1000, medianMs: 1000, tokensIn: 0, tokensOut: 0, cost: 0,
+  }];
+  const [day] = buildDailyModelStats(rows);
+  assert.equal(day.models[0].returns, 0);
+  assert.equal(day.totals.returns, 0);
 });

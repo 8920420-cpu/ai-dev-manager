@@ -275,7 +275,8 @@ function RoleLoadSection({
                   <th className={styles.num}>Запуски</th>
                   <th className={styles.num}>Задачи</th>
                   <th className={styles.num}>Успех</th>
-                  <th className={styles.num}>Провал</th>
+                  <th className={styles.num} title="Настоящие провалы агента: FAILED-прогоны, где агент реально не справился (упор в лимит ходов, agent_reported_failure, verdict_unparsed и т.п.)">Провал</th>
+                  <th className={styles.num} title="Возвраты захвата в пул без результата (напр. outcome='released'), а не провалы кода: прогон освобождён из-за петли захват→release, таймаута назначения или рестарта оркестратора">Возвраты</th>
                   <th className={styles.num}>Таймаут</th>
                   <th className={styles.num}>В работе</th>
                   <th className={styles.num}>Ср. время</th>
@@ -300,6 +301,12 @@ function RoleLoadSection({
                       <td className={styles.num}>
                         {r.failed}
                         <PeriodDeltaTag delta={r.delta?.failed} />
+                      </td>
+                      <td
+                        className={styles.num}
+                        title="Возвраты захвата в пул без результата (не провалы кода): прогон освобождён при петле захват→release, таймауте назначения или рестарте оркестратора"
+                      >
+                        {r.returns}
                       </td>
                       <td className={styles.num}>
                         {r.timeout}
@@ -347,6 +354,7 @@ function RoleLoadSection({
                   <td className={styles.num} title="Число завершённых (DONE) задач в окне — знаменатель средних">
                     {taskTotals.tasks || '—'}
                   </td>
+                  <td className={styles.num}>—</td>
                   <td className={styles.num}>—</td>
                   <td className={styles.num}>—</td>
                   <td className={styles.num}>—</td>
@@ -407,6 +415,7 @@ function RoleLoadTotalsTab() {
       runs: rows.reduce((s, r) => s + r.runs, 0),
       success: rows.reduce((s, r) => s + r.success, 0),
       failed: rows.reduce((s, r) => s + r.failed, 0),
+      returns: rows.reduce((s, r) => s + r.returns, 0),
       timeout: rows.reduce((s, r) => s + r.timeout, 0),
       tokensIn: rows.reduce((s, r) => s + r.tokensIn, 0),
       tokensOut: rows.reduce((s, r) => s + r.tokensOut, 0),
@@ -461,7 +470,8 @@ function RoleLoadTotalsTab() {
                   <th className={styles.num}>Запуски</th>
                   <th className={styles.num}>Задачи</th>
                   <th className={styles.num}>Успех</th>
-                  <th className={styles.num}>Провал</th>
+                  <th className={styles.num} title="Настоящие провалы агента (FAILED, где агент реально не справился)">Провал</th>
+                  <th className={styles.num} title="Возвраты захвата в пул без результата (напр. outcome='released'), а не провалы кода">Возвраты</th>
                   <th className={styles.num}>Таймаут</th>
                   <th className={styles.num}>Токены вх (сумма)</th>
                   <th className={styles.num}>Токены исх (сумма)</th>
@@ -476,6 +486,7 @@ function RoleLoadTotalsTab() {
                     <td className={styles.num}>{r.tasks}</td>
                     <td className={styles.num}>{r.success}</td>
                     <td className={styles.num}>{r.failed}</td>
+                    <td className={styles.num}>{r.returns}</td>
                     <td className={styles.num}>{r.timeout}</td>
                     <td className={styles.num}>{fmtTokens(r.tokensIn)}</td>
                     <td className={styles.num}>{fmtTokens(r.tokensOut)}</td>
@@ -492,6 +503,7 @@ function RoleLoadTotalsTab() {
                   </td>
                   <td className={styles.num}>{totals.success}</td>
                   <td className={styles.num}>{totals.failed}</td>
+                  <td className={styles.num}>{totals.returns}</td>
                   <td className={styles.num}>{totals.timeout}</td>
                   <td className={styles.num}>{fmtTokens(totals.tokensIn)}</td>
                   <td className={styles.num}>{fmtTokens(totals.tokensOut)}</td>

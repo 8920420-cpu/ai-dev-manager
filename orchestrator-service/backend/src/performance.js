@@ -238,6 +238,60 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
 // активности (как и основной вид), чтобы простой оркестратора не обнулял блок.
 export const ROLE_LOAD_PERIOD_DAYS = { month: 30, week: 7, day: 1 };
 
+// =====================================================================
+// RELEASE-OUTCOMES-001 — «Возвраты захвата» против «настоящего провала агента».
+//
+// Инцидент 03.07.2026: releaseClaudeTask (db.js, PROGRAMMER-UNIFY-001) финализирует
+// RUNNING-прогон программиста как status='FAILED' при ЛЮБОМ освобождении захвата.
+// Плановый возврат захвата в пул (петля захват→release каждые ~5 c по одной задаче)
+// писал outcome='released', а агрегат «Нагрузка по ролям» считал все FAILED как
+// «Провал» — 1408, из них 1407 ложных по одной задаче. Здесь на стороне чтения
+// отделяем служебные исходы освобождения захвата («Возвраты») от настоящего провала
+// кода агента («Провал»). db.js НЕ меняем: outcome пишется корректно уже сейчас.
+//
+// КЛАССИФИКАЦИЯ ИЗВЕСТНЫХ ЗНАЧЕНИЙ outcome (сверено с db.js на 03.07.2026):
+//   Возвраты (RELEASE_OUTCOMES) — освобождение захвата без результата агента:
+//     'released'                       — releaseClaudeTask при пустом reason: плановый
+//                                        возврат захвата в пул (ИМЕННО он дал 1407
+//                                        ложных «провалов»); пишется как FAILED.
+//     'claude_assignment_timeout'      — releaseStaleClaudeClaims: назначение протухло
+//                                        (пишется как status='TIMEOUT').
+//     'orchestrator_restart_reconcile' — reapOrphanRunningRuns: рестарт процесса
+//                                        (пишется как status='TIMEOUT').
+//     'orphan_run_timeout'             — reapOrphanRunningRuns: осиротевший RUNNING
+//                                        (пишется как status='TIMEOUT').
+//   Провал (НЕ в наборе) — настоящий провал агента, остаётся в колонке «Провал»:
+//     'max_turns_exceeded'             — упор в лимит ходов (status='FAILED').
+//     'agent_reported_failure[: ...]'  — агент сам сообщил о провале (status='FAILED').
+//     'verdict_unparsed'               — роль не вернула валидный вердикт (status='FAILED').
+//     любой иной непустой либо NULL outcome — трактуется как настоящий провал.
+// Из перечисленного как FAILED реально пишется только 'released'; прочие служебные
+// исходы пишутся как TIMEOUT и в «Провал» не попадают. Включение их в набор безопасно
+// и future-proof: если путь освобождения когда-нибудь начнёт писать FAILED — он
+// автоматически уйдёт в «Возвраты». Появится новый reason освобождения захвата —
+// добавить сюда (иначе он снова замаскируется под провал). Сравнение в SQL и в
+// isReleaseOutcome() — по lower(outcome), поэтому набор храним в нижнем регистре.
+export const RELEASE_OUTCOMES = [
+  'released',
+  'claude_assignment_timeout',
+  'orchestrator_restart_reconcile',
+  'orphan_run_timeout',
+];
+
+/**
+ * ЧИСТЫЙ предикат «этот outcome — служебный возврат захвата, а не провал агента».
+ * Регистронезависимо, с обрезкой пробелов. NULL/пустой outcome → false (это провал:
+ * у 'released' outcome всегда задан, а настоящему провалу с NULL-исходом место в
+ * «Провал»). Эталон набора — RELEASE_OUTCOMES выше. Дублирует SQL-фильтр FILTER(...)
+ * шага 6, вынесен отдельно для юнит-теста классификации без БД.
+ * @param {string|null|undefined} outcome значение agent_runs.outcome
+ * @returns {boolean}
+ */
+export function isReleaseOutcome(outcome) {
+  if (outcome == null) return false;
+  return RELEASE_OUTCOMES.includes(String(outcome).trim().toLowerCase());
+}
+
 /**
  * ЧИСТЫЙ маппинг сырых строк агрегата ролей в основной («средние на задачу») вид.
  * Вынесен для юнит-теста без БД. Средние = sum(метрика) / count(DISTINCT task_id);
@@ -265,7 +319,11 @@ export function deriveRoleLoad(rows = []) {
       // Задач в окне (для знаменателя средних и подписи в UI).
       tasks,
       success: Number(row.success) || 0,
+      // RELEASE-OUTCOMES-001: «Провал» — только настоящие провалы агента (FAILED с
+      // outcome НЕ из RELEASE_OUTCOMES). «Возвраты» — служебные возвраты захвата
+      // (FAILED с outcome из набора). Разделение считает SQL шага 6; здесь — маппинг.
       failed: Number(row.failed) || 0,
+      returns: Number(row.returns) || 0,
       timeout: Number(row.timeout) || 0,
       running: Number(row.running) || 0,
       avgDurationMs: row.avg_ms == null ? null : Math.round(Number(row.avg_ms)),
@@ -329,7 +387,9 @@ export function buildRoleLoadTotals(rows = []) {
     runs: Number(row.runs) || 0,
     tasks: Number(row.tasks) || 0,
     success: Number(row.success) || 0,
+    // RELEASE-OUTCOMES-001: те же «Провал» (настоящие) и «Возвраты» (возврат захвата).
     failed: Number(row.failed) || 0,
+    returns: Number(row.returns) || 0,
     timeout: Number(row.timeout) || 0,
     tokensIn: Number(row.tokens_in) || 0,
     tokensOut: Number(row.tokens_out) || 0,
@@ -484,7 +544,12 @@ async function queryRoleLoadRows(c, startISO, endISO) {
             count(*)::int AS runs,
             count(DISTINCT ar.task_id)::int AS tasks,
             count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
-            count(*) FILTER (WHERE ar.status = 'FAILED')::int AS failed,
+            -- RELEASE-OUTCOMES-001: FAILED делим на настоящий провал агента и
+            -- служебный возврат захвата (outcome из RELEASE_OUTCOMES, $3).
+            count(*) FILTER (WHERE ar.status = 'FAILED'
+                             AND coalesce(lower(ar.outcome), '') <> ALL($3::text[]))::int AS failed,
+            count(*) FILTER (WHERE ar.status = 'FAILED'
+                             AND coalesce(lower(ar.outcome), '') = ANY($3::text[]))::int AS returns,
             count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
             count(*) FILTER (WHERE ar.status = 'RUNNING')::int AS running,
             avg(extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000)
@@ -500,7 +565,7 @@ async function queryRoleLoadRows(c, startISO, endISO) {
       WHERE ar.started_at >= $1 AND ar.started_at < $2
       GROUP BY r.code, r.name
       ORDER BY runs DESC`,
-    [startISO, endISO],
+    [startISO, endISO, RELEASE_OUTCOMES],
   );
   return r.rows;
 }
@@ -564,7 +629,12 @@ async function deriveRoleLoadBlock(c, nowISO) {
               count(*)::int AS runs,
               count(DISTINCT ar.task_id)::int AS tasks,
               count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
-              count(*) FILTER (WHERE ar.status = 'FAILED')::int AS failed,
+              -- RELEASE-OUTCOMES-001: FAILED делим на настоящий провал агента и
+              -- служебный возврат захвата (outcome из RELEASE_OUTCOMES, $1).
+              count(*) FILTER (WHERE ar.status = 'FAILED'
+                               AND coalesce(lower(ar.outcome), '') <> ALL($1::text[]))::int AS failed,
+              count(*) FILTER (WHERE ar.status = 'FAILED'
+                               AND coalesce(lower(ar.outcome), '') = ANY($1::text[]))::int AS returns,
               count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
               count(*) FILTER (WHERE ar.status = 'RUNNING')::int AS running,
               avg(extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000)
@@ -581,6 +651,7 @@ async function deriveRoleLoadBlock(c, nowISO) {
         WHERE ar.started_at >= (SELECT last_activity FROM bounds) - interval '24 hours'
         GROUP BY r.code, r.name
         ORDER BY runs DESC`,
+      [RELEASE_OUTCOMES],
     );
     const lastActivity = roleRows.rows[0]?.last_activity ?? null;
     const lastActivityISO = lastActivity ? new Date(lastActivity).toISOString() : null;
@@ -652,7 +723,12 @@ export async function getRoleLoadTotals(s, { period } = {}) {
               count(*)::int AS runs,
               count(DISTINCT ar.task_id)::int AS tasks,
               count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
-              count(*) FILTER (WHERE ar.status = 'FAILED')::int AS failed,
+              -- RELEASE-OUTCOMES-001: FAILED делим на настоящий провал агента и
+              -- служебный возврат захвата (outcome из RELEASE_OUTCOMES, $2).
+              count(*) FILTER (WHERE ar.status = 'FAILED'
+                               AND coalesce(lower(ar.outcome), '') <> ALL($2::text[]))::int AS failed,
+              count(*) FILTER (WHERE ar.status = 'FAILED'
+                               AND coalesce(lower(ar.outcome), '') = ANY($2::text[]))::int AS returns,
               count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
               coalesce(sum(ar.token_input), 0)::bigint AS tokens_in,
               coalesce(sum(ar.token_output), 0)::bigint AS tokens_out,
@@ -663,7 +739,7 @@ export async function getRoleLoadTotals(s, { period } = {}) {
         WHERE ar.started_at >= (SELECT last_activity FROM bounds) - ($1::int * interval '1 day')
         GROUP BY r.code, r.name
         ORDER BY runs DESC`,
-      [days],
+      [days, RELEASE_OUTCOMES],
     );
     const lastActivity = r.rows[0]?.last_activity ?? null;
     const window = computeRoleLoadWindow(
@@ -790,12 +866,21 @@ async function reasoningVersionRows(c, roleId, hours, projectDbId) {
     params.push(projectDbId);
     projFilter = `AND ar.task_id IN (SELECT id FROM tasks WHERE project_id = $${params.length})`;
   }
+  // RELEASE-OUTCOMES-001: набор служебных исходов освобождения захвата отдельным
+  // параметром (индекс зависит от наличия projectId выше). Рассуждающие роли
+  // 'released' не пишут (это исход PROGRAMMER), но split держим единообразным и
+  // future-proof, чтобы «failed» версии не смешивал провал агента с возвратом захвата.
+  params.push(RELEASE_OUTCOMES);
+  const relIdx = params.length;
   const r = await c.query(
     `SELECT ar.prompt_version, ar.code_version, ar.model,
             (SELECT label FROM prompts p WHERE p.role_id = $1 AND p.version = ar.prompt_version LIMIT 1) AS prompt_label,
             count(*)::int AS n,
             count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
-            count(*) FILTER (WHERE ar.status = 'FAILED')::int AS failed,
+            count(*) FILTER (WHERE ar.status = 'FAILED'
+                             AND coalesce(lower(ar.outcome), '') <> ALL($${relIdx}::text[]))::int AS failed,
+            count(*) FILTER (WHERE ar.status = 'FAILED'
+                             AND coalesce(lower(ar.outcome), '') = ANY($${relIdx}::text[]))::int AS returns,
             count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
             avg(extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000)
               FILTER (WHERE ar.finished_at IS NOT NULL) AS avg_ms,
@@ -821,6 +906,7 @@ async function reasoningVersionRows(c, roleId, hours, projectDbId) {
     n: row.n,
     success: row.success,
     failed: row.failed,
+    returns: row.returns,
     timeout: row.timeout,
     successRate: row.n > 0 ? Math.round((row.success / row.n) * 1000) / 1000 : null,
     avgDurationMs: numOrNull(row.avg_ms, 0),
@@ -919,7 +1005,9 @@ export function buildDailyModelStats(rows = []) {
       roleName: row.roleName ?? null,
       runs,
       success,
+      // RELEASE-OUTCOMES-001: настоящий провал агента и служебный возврат захвата.
       failed: Number(row.failed) || 0,
+      returns: Number(row.returns) || 0,
       timeout: Number(row.timeout) || 0,
       throttle: Number(row.throttle) || 0,
       running: Number(row.running) || 0,
@@ -939,10 +1027,11 @@ export function buildDailyModelStats(rows = []) {
     const models = byDay.get(day);
     const totals = models.reduce((acc, m) => {
       acc.runs += m.runs; acc.success += m.success; acc.failed += m.failed;
+      acc.returns += m.returns;
       acc.timeout += m.timeout; acc.throttle += m.throttle; acc.running += m.running;
       acc.tokensIn += m.tokensIn; acc.tokensOut += m.tokensOut; acc.cost += m.cost;
       return acc;
-    }, { runs: 0, success: 0, failed: 0, timeout: 0, throttle: 0, running: 0, tokensIn: 0, tokensOut: 0, cost: 0 });
+    }, { runs: 0, success: 0, failed: 0, returns: 0, timeout: 0, throttle: 0, running: 0, tokensIn: 0, tokensOut: 0, cost: 0 });
     totals.cost = Math.round(totals.cost * 1e6) / 1e6;
     totals.successRate = totals.runs > 0 ? Math.round((totals.success / totals.runs) * 1000) / 1000 : null;
     totals.models = models.length;
@@ -966,6 +1055,10 @@ export async function getDailyModelStats(s, { projectId, windowDays } = {}) {
       params.push(projectDbId);
       projFilter = `AND ar.task_id IN (SELECT id FROM tasks WHERE project_id = $${params.length})`;
     }
+    // RELEASE-OUTCOMES-001: набор служебных исходов освобождения захвата отдельным
+    // параметром (индекс зависит от наличия projectId выше).
+    params.push(RELEASE_OUTCOMES);
+    const relIdx = params.length;
     // День — ровно выражение из индекса (date_trunc по timestamp в UTC). Медиана
     // без FILTER: неоконченным прогонам длительность = NULL, percentile_cont их
     // игнорирует. throttle не отдельный статус enum — классифицируем по outcome.
@@ -979,7 +1072,13 @@ export async function getDailyModelStats(s, { projectId, windowDays } = {}) {
          r.code AS role_code, r.name AS role_name,
          count(*)::int AS runs,
          count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
-         count(*) FILTER (WHERE ar.status = 'FAILED')::int AS failed,
+         -- RELEASE-OUTCOMES-001: «Провал» — настоящий провал агента, «Возвраты» —
+         -- служебный возврат захвата (outcome из RELEASE_OUTCOMES). Иначе PROGRAMMER
+         -- на снимке модели показывал бы 1408 «провалов» вместо 1.
+         count(*) FILTER (WHERE ar.status = 'FAILED'
+                          AND coalesce(lower(ar.outcome), '') <> ALL($${relIdx}::text[]))::int AS failed,
+         count(*) FILTER (WHERE ar.status = 'FAILED'
+                          AND coalesce(lower(ar.outcome), '') = ANY($${relIdx}::text[]))::int AS returns,
          count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
          count(*) FILTER (WHERE ar.outcome ILIKE '%throttle%')::int AS throttle,
          count(*) FILTER (WHERE ar.status = 'RUNNING')::int AS running,
@@ -1012,6 +1111,7 @@ export async function getDailyModelStats(s, { projectId, windowDays } = {}) {
       runs: row.runs,
       success: row.success,
       failed: row.failed,
+      returns: row.returns,
       timeout: row.timeout,
       throttle: row.throttle,
       running: row.running,
