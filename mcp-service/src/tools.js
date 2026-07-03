@@ -267,8 +267,12 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
       {
         title: 'Поставить задачу',
         description:
-          'Завести новую задачу. Она создаётся под ролью «Приёмщик задач» (TASK_INTAKE_OFFICER) ' +
-          'в статусе BACKLOG; дальше оркестратор сам ведёт её по цепочке (Приёмщик → Architect → …). ' +
+          'Завести новую задачу. По умолчанию она создаётся под ролью «Приёмщик задач» ' +
+          '(TASK_INTAKE_OFFICER) в статусе BACKLOG; дальше оркестратор сам ведёт её по цепочке ' +
+          '(Приёмщик → Architect → …). Если ты применяешь роль «Постановщик задач» через MCP ' +
+          '(orchestrator_get_mcp_role TASK_INTAKE_OFFICER) и уже выполнил приёмку — передай ' +
+          'intakeCompleted=true: задача создаётся СРАЗУ в статусе ARCHITECTURE под ролью Architect, ' +
+          'минуя пайплайновый Приёмщик; готовую карточку интейка передавай в card. ' +
           'ОБЯЗАТЕЛЬНО укажи проект, к которому относится задача: задай projectPath — абсолютный путь ' +
           'папки проекта, с которой работаешь (предпочтительно), либо project (code / name / root_path). ' +
           'Без указания проекта задача не маршрутизируется и попадёт в «Неразобранные» у Приёмщика, где её ' +
@@ -281,14 +285,20 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
           externalId: z.string().describe('Уникальный ключ задачи в проекте (идемпотентность по project+externalId).'),
           projectPath: z.string().optional().describe('ОБЯЗАТЕЛЬНО указать проект: абсолютный путь папки проекта, с которой работаешь. Приоритетнее project; backend сопоставит его с зарегистрированным проектом по root_path. Не оставляй пустым.'),
           project: z.string().optional().describe('Проект: code / name / root_path. Используй, если папку указать нельзя. Должен быть задан projectPath ИЛИ project — иначе задача станет «неразобранной».'),
-          title: z.string().describe('Заголовок задачи (корректная UTF-8, без «кракозябр»).'),
+          title: z.string().describe('Заголовок задачи (корректная UTF-8, без «кракозябр»). При intakeCompleted=true — это short_title из карточки интейка.'),
           service: z.string().optional().describe('Код сервиса (авто-регистрируется; можно пусто).'),
-          description: z.string().optional().describe('Исходный запрос пользователя — его прочитает Приёмщик (корректная UTF-8).'),
+          description: z.string().optional().describe('Исходный запрос пользователя — его прочитает Приёмщик (корректная UTF-8). При intakeCompleted=true — это structured_description из карточки интейка.'),
+          intakeCompleted: z.boolean().optional().describe('Постановщик через MCP уже выполнил приёмку: задача создаётся сразу в статусе ARCHITECTURE под ролью Architect, минуя пайплайновый Приёмщик/BACKLOG.'),
+          card: z.record(z.any()).optional().describe('Карточка интейка по контракту роли (short_title, task_title, structured_description, project_understanding, task_type, project, service, component, user_goal, original_request, confidence, blocking_questions, optional_questions, assumptions). Сохраняется в data_card для Architect.'),
           result: z.string().optional(),
           changedFiles: z.array(z.string()).optional(),
         },
       },
-      (args) => run(() => orchestratorClient.post('/api/scanner/task-intake', args)),
+      // intakeCompleted — удобный флаг постановщика: разворачиваем его в entryRole=ARCHITECT
+      // для backend (там маршрутизация по роли входа), сам флаг в тело не отправляем.
+      ({ intakeCompleted, ...rest }) =>
+        run(() => orchestratorClient.post('/api/scanner/task-intake',
+          intakeCompleted ? { ...rest, entryRole: 'ARCHITECT' } : rest)),
     );
 
     tool(

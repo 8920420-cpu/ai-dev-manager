@@ -103,6 +103,46 @@ test('orchestrator_create_task шлёт POST /api/scanner/task-intake с payload
   assert.ok(!out.isError);
 });
 
+test('orchestrator_create_task с intakeCompleted разворачивает entryRole=ARCHITECT и шлёт card', async () => {
+  let seen;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig({ enableOrchestratorMutations: true }),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => ({ ok: true, status: 200, data: {} }),
+      post: async (path, body) => { seen = { path, body }; return { ok: true, status: 200, data: { accepted: true, taskId: 't2', toStatus: 'ARCHITECTURE' } }; },
+    },
+  });
+  const card = { short_title: 'S', structured_description: 'D' };
+  const out = await server.handlers.get('orchestrator_create_task')({
+    externalId: 'mcp-1', projectPath: '/p', title: 'S', description: 'D', intakeCompleted: true, card,
+  });
+  assert.equal(seen.path, '/api/scanner/task-intake');
+  assert.equal(seen.body.entryRole, 'ARCHITECT');
+  assert.equal(seen.body.intakeCompleted, undefined); // флаг развёрнут в entryRole, в тело не идёт
+  assert.deepEqual(seen.body.card, card);
+  const parsed = JSON.parse(out.content[0].text);
+  assert.equal(parsed.data.toStatus, 'ARCHITECTURE');
+  assert.ok(!out.isError);
+});
+
+test('orchestrator_create_task без intakeCompleted НЕ добавляет entryRole', async () => {
+  let seen;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig({ enableOrchestratorMutations: true }),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => ({ ok: true, status: 200, data: {} }),
+      post: async (path, body) => { seen = { path, body }; return { ok: true, status: 200, data: { accepted: true, taskId: 't3' } }; },
+    },
+  });
+  await server.handlers.get('orchestrator_create_task')({ externalId: 'mcp-2', project: 'PS', title: 'T' });
+  assert.equal(seen.body.entryRole, undefined);
+  assert.equal(seen.body.intakeCompleted, undefined);
+});
+
 test('файловый инструмент подставляет root из конфигурации', async () => {
   let seenArgs;
   const server = fakeServer();

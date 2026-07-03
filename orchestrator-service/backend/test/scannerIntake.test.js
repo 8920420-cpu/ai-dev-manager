@@ -40,6 +40,20 @@ test('normalizeScannerIntake: без проекта → project "" (станет
   assert.equal(out.project, '');
 });
 
+// TASK-INTAKE-OFFICER-MCP-001: роль входа + карточка интейка от постановщика через MCP.
+test('normalizeScannerIntake: entryRole нормализуется в верхний регистр, пусто → null', () => {
+  assert.equal(normalizeScannerIntake({ externalId: 'X', title: 't' }).entryRole, null);
+  assert.equal(normalizeScannerIntake({ externalId: 'X', title: 't', entryRole: '  architect  ' }).entryRole, 'ARCHITECT');
+});
+
+test('normalizeScannerIntake: card — только объект; строка/массив → null', () => {
+  const card = { short_title: 'S', structured_description: 'D', confidence: 'high' };
+  assert.deepEqual(normalizeScannerIntake({ externalId: 'X', title: 't', card }).card, card);
+  assert.equal(normalizeScannerIntake({ externalId: 'X', title: 't' }).card, null);
+  assert.equal(normalizeScannerIntake({ externalId: 'X', title: 't', card: 'x' }).card, null);
+  assert.equal(normalizeScannerIntake({ externalId: 'X', title: 't', card: ['a'] }).card, null);
+});
+
 test('looksCorruptedText: чистый текст не считается порчей', () => {
   assert.equal(looksCorruptedText('Заголовок задачи'), false);
   assert.equal(looksCorruptedText('Self-test of the tool loop v3'), false);

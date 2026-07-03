@@ -419,12 +419,41 @@ async function findProject(c, ref) {
   return r.rowCount ? r.rows[0] : null;
 }
 
-// Вычислить роль входа и стартовый узел графа для задачи проекта. В граф-схеме
-// (есть рёбра) задача стартует на узле с ролью-приёмщиком; в линейной — stageKey
-// NULL. Для неразобранной задачи (projectId = null) рёбер нет → stageKey NULL.
-async function computeEntry(c, projectId) {
+// Вычислить роль входа, стартовый узел графа и стартовый статус для задачи проекта.
+// В граф-схеме (есть рёбра) задача стартует на узле с ролью входа; в линейной —
+// stageKey NULL. Для неразобранной задачи (projectId = null) рёбер нет → stageKey NULL.
+//
+// TASK-INTAKE-OFFICER-MCP-001: entryRoleCode позволяет постановщику через MCP сдать
+// уже выполненный интейк напрямую в целевую роль (например ARCHITECT) — задача
+// создаётся сразу в статусе её этапа (ARCHITECTURE), минуя пайплайновый Приёмщик/
+// BACKLOG. Если запрошенная роль входа не разрешается в включённый этап проекта —
+// безопасный откат к штатному входу (Приёмщик, BACKLOG).
+async function computeEntry(c, projectId, entryRoleCode = null) {
+  const requested = String(entryRoleCode ?? '').trim().toUpperCase() || null;
+  if (requested && projectId) {
+    const r = await c.query(
+      `SELECT r.id, r.code, ps.stage_key, ps.task_status::text AS task_status,
+              EXISTS (SELECT 1 FROM project_stage_edges e WHERE e.project_id = $1) AS has_edges
+         FROM project_stages ps
+         JOIN project_stage_roles psr ON psr.stage_id = ps.id
+         JOIN roles r ON r.id = psr.role_id
+        WHERE ps.project_id = $1 AND r.code = $2 AND ps.enabled = true
+          AND ps.task_status IS NOT NULL
+        ORDER BY ps.position LIMIT 1`,
+      [projectId, requested],
+    );
+    if (r.rowCount) {
+      const row = r.rows[0];
+      return {
+        role: { id: row.id, code: row.code },
+        entryStageKey: row.has_edges ? row.stage_key : null,
+        status: row.task_status,
+      };
+    }
+    // Роль входа не нашлась среди включённых этапов проекта — падаем на штатный вход.
+  }
   const role = await entryRole(c);
-  if (!projectId) return { role, entryStageKey: null };
+  if (!projectId) return { role, entryStageKey: null, status: 'BACKLOG' };
   const hasEdges = (await c.query(
     'SELECT 1 FROM project_stage_edges WHERE project_id = $1 LIMIT 1', [projectId],
   )).rowCount > 0;
@@ -439,7 +468,7 @@ async function computeEntry(c, projectId) {
     );
     entryStageKey = es.rows[0]?.stage_key ?? null;
   }
-  return { role, entryStageKey };
+  return { role, entryStageKey, status: 'BACKLOG' };
 }
 
 // Роль входа задачи в конвейер: Приёмщик задач (TASK_INTAKE_OFFICER), иначе первая
@@ -491,14 +520,21 @@ export async function acceptScannerIntake(s, input) {
         };
       }
 
-      const { role, entryStageKey } = await computeEntry(c, project?.id ?? null);
-      // Назначенная задача стартует в BACKLOG (runner ведёт её дальше); неразобранная
-      // паркуется в BLOCKED и ждёт ручного назначения проекта.
-      const status = project ? 'BACKLOG' : 'BLOCKED';
-      // Проект кладём в карточку сразу (детерминированно по папке) — Приёмщику не
-      // нужно угадывать. Для неразобранной фиксируем, что именно прислал постановщик.
+      const entry = await computeEntry(c, project?.id ?? null, payload.entryRole);
+      const { role, entryStageKey } = entry;
+      // Назначенная задача стартует в статусе роли входа: BACKLOG у Приёмщика, либо
+      // ARCHITECTURE, когда постановщик через MCP сдал готовый интейк сразу в Architect
+      // (entryRole=ARCHITECT). Неразобранная паркуется в BLOCKED и ждёт назначения проекта.
+      const status = project ? entry.status : 'BLOCKED';
+      // Проект кладём в карточку сразу (детерминированно по папке). Карточку интейка
+      // (card) от постановщика через MCP сливаем в data_card — Architect получит уже
+      // подготовленные поля (short_title, structured_description, task_type, …).
       const dataCard = project
-        ? { project: project.code, projectPath: project.root_path }
+        ? {
+            project: project.code,
+            projectPath: project.root_path,
+            ...(payload.card && typeof payload.card === 'object' ? payload.card : {}),
+          }
         : { requestedProject: payload.project || null };
 
       const ins = await c.query(
@@ -523,6 +559,8 @@ export async function acceptScannerIntake(s, input) {
           changedFiles: payload.changedFiles,
           requestedProject: payload.project || null,
           unassigned: !project,
+          // TASK-INTAKE-OFFICER-MCP-001: фиксируем прямой вход постановщика в Architect.
+          ...(payload.entryRole ? { entryRole: payload.entryRole } : {}),
           ...(project ? {} : { reason: 'project_unresolved' }),
         })],
       );
@@ -530,7 +568,7 @@ export async function acceptScannerIntake(s, input) {
       return {
         accepted: true, imported: true, duplicate: false, unassigned: !project,
         taskId, externalId: payload.externalId, project: project?.code ?? null,
-        service: payload.service, nextRole: role.code,
+        service: payload.service, nextRole: role.code, toStatus: status,
       };
     } catch (error) {
       await c.query('ROLLBACK');
@@ -1015,6 +1053,12 @@ export function normalizeScannerIntake(input) {
     description,
     result: String(input?.result ?? ''),
     changedFiles: Array.isArray(input?.changedFiles) ? input.changedFiles.map(String) : [],
+    // TASK-INTAKE-OFFICER-MCP-001: роль входа (например ARCHITECT) — постановщик через
+    // MCP сдаёт готовый интейк сразу в Architect, минуя пайплайновый Приёмщик/BACKLOG.
+    entryRole: String(input?.entryRole ?? '').trim().toUpperCase() || null,
+    // Карточка интейка (поля контракта Приёмщика) → сливается в data_card для Architect.
+    card: input?.card && typeof input.card === 'object' && !Array.isArray(input.card)
+      ? input.card : null,
   };
 }
 
