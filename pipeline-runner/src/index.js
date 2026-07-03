@@ -2,6 +2,16 @@ import { ConfigLoader } from './ConfigLoader.js';
 import { PipelineRunner } from './PipelineRunner.js';
 
 export { ConfigLoader, ConfigError } from './ConfigLoader.js';
+export {
+  ConventionConfigBuilder,
+  ConventionError,
+  mergeConvention,
+  detectTestStage,
+  findComposeUp,
+  composeHasHealthcheck,
+  CONVENTION_CONFIG_MARKER,
+  COMPOSE_FILENAMES,
+} from './ConventionConfigBuilder.js';
 export { PipelineRunner } from './PipelineRunner.js';
 export { StageRunner } from './StageRunner.js';
 export { CommandExecutor } from './CommandExecutor.js';

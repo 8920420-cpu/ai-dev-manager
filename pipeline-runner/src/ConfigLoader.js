@@ -75,6 +75,10 @@ export class ConfigLoader {
       timeoutMinutes,
       stages,
       configPath: absPath,
+      // Явный опт-ин на постадийное расширение конвенции (иначе локальный конфиг —
+      // полное переопределение). Прочие незнакомые поля по-прежнему игнорируются;
+      // этот флаг пробрасываем осознанно, чтобы ServicePipelineTask его увидел.
+      extendsConvention: json.extendsConvention === true,
     };
   }
 
@@ -138,4 +142,5 @@ export class ConfigError extends Error {
  * @property {number|null} timeoutMinutes
  * @property {Array<{name: string, commands: string[], enabled: boolean}>} stages
  * @property {string} configPath абсолютный путь
+ * @property {boolean} extendsConvention постадийно расширять конвенцию (опт-ин)
  */

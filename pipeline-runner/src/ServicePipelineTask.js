@@ -3,6 +3,7 @@ import { existsSync, statSync } from 'node:fs';
 
 import { ConfigLoader } from './ConfigLoader.js';
 import { PipelineRunner } from './PipelineRunner.js';
+import { ConventionConfigBuilder, ConventionError, mergeConvention } from './ConventionConfigBuilder.js';
 
 /**
  * ServicePipelineTask — слой «сервисного» исполнения этапа PIPELINE_SERVICE
@@ -223,10 +224,11 @@ export class ServicePipelineTask {
    * @param {(args:{config:Object})=>{execute:Function}} [opts.createRunner] фабрика runner (для тестов)
    * @param {Object} [opts.runnerDeps] зависимости PipelineRunner (executor/logger) для тестов
    */
-  constructor({ projectsRoot, configFilename = DEFAULT_PIPELINE_CONFIG_FILENAME, configLoader, createRunner, runnerDeps } = {}) {
+  constructor({ projectsRoot, configFilename = DEFAULT_PIPELINE_CONFIG_FILENAME, configLoader, conventionBuilder, createRunner, runnerDeps } = {}) {
     this.projectsRoot = projectsRoot;
     this.configFilename = configFilename;
     this.configLoader = configLoader ?? new ConfigLoader();
+    this.conventionBuilder = conventionBuilder ?? new ConventionConfigBuilder();
     this.runnerDeps = runnerDeps ?? {};
     this.createRunner =
       createRunner ?? ((args) => new PipelineRunner({ ...args, ...this.runnerDeps }));
@@ -260,30 +262,32 @@ export class ServicePipelineTask {
       });
     }
 
-    // Сервис существует на диске? Иначе — диагностируемая ошибка до команд.
-    if (!existsSync(resolved.absConfigPath) || !statSync(resolved.absConfigPath).isFile()) {
-      return this.#failure({
-        taskId,
-        startedAt,
-        identity: resolved,
-        failedStage: null,
-        error: new PipelineTaskError(
-          `Pipeline-конфиг сервиса не найден: ${resolved.absConfigPath}`,
-          'pipeline_service_required',
-        ),
-      });
-    }
+    // Локальный .pipeline.json НЕОБЯЗАТЕЛЕН: если его нет — движок собирает стадии
+    // по конвенции монорепо (ConventionConfigBuilder). Если есть — он переопределяет
+    // конвенцию: целиком (по умолчанию) либо постадийно (extendsConvention:true).
+    const hasLocalConfig =
+      existsSync(resolved.absConfigPath) && statSync(resolved.absConfigPath).isFile();
 
-    // Загружаем .pipeline.json ИМЕННО выбранного сервиса.
     let config;
     try {
-      config = await this.configLoader.load(resolved.absConfigPath);
+      if (hasLocalConfig) {
+        const local = await this.configLoader.load(resolved.absConfigPath);
+        config = local.extendsConvention
+          ? mergeConvention(this.#buildConvention(resolved), local)
+          : local; // полное переопределение конвенции локальным конфигом
+      } else {
+        config = this.#buildConvention(resolved);
+      }
     } catch (err) {
       return this.#failure({
         taskId,
         startedAt,
         identity: resolved,
-        failedStage: null,
+        // Отсутствие compose (подсистемы) — диагностируемая ошибка стадии deploy.
+        failedStage:
+          err instanceof ConventionError && err.code === 'pipeline_compose_not_found'
+            ? 'deploy'
+            : null,
         error: err,
       });
     }
@@ -335,6 +339,19 @@ export class ServicePipelineTask {
       success: result.success === true,
       output,
     };
+  }
+
+  /**
+   * Построить конфиг по конвенции монорепо для выбранного сервиса.
+   * workingDirectory и граница изоляции (projectRoot) берутся из resolved —
+   * поиск compose не выходит за корень проекта.
+   */
+  #buildConvention(resolved) {
+    return this.conventionBuilder.build({
+      serviceDir: resolved.absWorkingDirectory,
+      projectRoot: resolved.absProjectRoot,
+      name: resolved.serviceName || resolved.serviceCode || undefined,
+    });
   }
 
   /** Собрать failure-результат с диагностируемой причиной до/во время запуска. */

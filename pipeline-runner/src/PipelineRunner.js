@@ -62,12 +62,15 @@ export class PipelineRunner {
       // фиксируем его на исходной позиции как SKIPPED и идём дальше. Это не
       // ошибка — fail-fast включённых этапов не затрагивается.
       if (stage.enabled === false) {
-        logger.info(`=== Этап "${stage.name}" пропущен: disabled_by_configuration ===`);
+        // Причина по умолчанию — «отключён конфигом»; конвенция может передать
+        // более точную пометку (например, no_tests_detected / no_healthcheck_in_compose).
+        const reason = stage.reason ?? 'disabled_by_configuration';
+        logger.info(`=== Этап "${stage.name}" пропущен: ${reason} ===`);
         stages.push({
           name: stage.name,
           status: 'SKIPPED',
           durationSeconds: 0,
-          reason: 'disabled_by_configuration',
+          reason,
           commands: [],
         });
         continue;
