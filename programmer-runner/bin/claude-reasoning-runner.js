@@ -23,10 +23,15 @@ const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
 const intervalCfg = resolveDuration('CLAUDE_REASONING_INTERVAL_MS', 5000, { min: 200, max: 5 * 60_000 });
 const taskTimeoutCfg = resolveDuration('CLAUDE_REASONING_TASK_TIMEOUT_MS', 10 * 60_000, { min: 30_000, max: 60 * 60_000 });
 const concurrencyCfg = resolveInt('CLAUDE_REASONING_CONCURRENCY', 2, { min: 1, max: 8 });
-logEffectiveConfig('claude-reasoning-runner', [intervalCfg, taskTimeoutCfg, concurrencyCfg]);
+// PROVIDER-LIMIT-COOLDOWN-002: пауза при превышении лимита подписки Claude/квоты/
+// перегрузке (дефолт 1 час — настройка). По истечении раннер сначала ПРОВЕРЯЕТ движок
+// (probe) и только при успехе снова берёт задачи (см. ReasoningRunner).
+const providerCooldownCfg = resolveDuration('CLAUDE_REASONING_PROVIDER_COOLDOWN_MS', 60 * 60_000, { min: 60_000, max: 6 * 60 * 60_000 });
+logEffectiveConfig('claude-reasoning-runner', [intervalCfg, taskTimeoutCfg, concurrencyCfg, providerCooldownCfg]);
 const INTERVAL_MS = intervalCfg.value;
 const TASK_TIMEOUT_MS = taskTimeoutCfg.value;
 const CONCURRENCY = concurrencyCfg.value;
+const PROVIDER_COOLDOWN_MS = providerCooldownCfg.value;
 // Если задан CLAUDE_REASONING_ROLE — опрашиваем только её, иначе любую роль,
 // назначенную движку claude_code.
 const ROLE = String(process.env.CLAUDE_REASONING_ROLE || '').trim();
@@ -72,7 +77,9 @@ const http = {
 };
 
 const runAgent = makeClaudeReasoningRunAgent();
-const runner = new ReasoningRunner({ http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY });
+const runner = new ReasoningRunner({
+  http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY, providerCooldownMs: PROVIDER_COOLDOWN_MS,
+});
 
 console.log(`claude-reasoning-runner: orchestrator=${ORCH}, рассуждающие роли через Claude Code, role=${ROLE || 'любая делегированная'}`);
 
@@ -92,7 +99,9 @@ async function worker(id) {
     if (out && (out.taskId || out.blocked)) console.log(`claude-reasoning-runner[${id}] tick:`, JSON.stringify(out));
     // released — задача вернулась в пул (агент упал/таймаут). БЕЗ паузы воркер тут же
     // заклеймит её снова → горячий спин claim→fail→release. Бэкофф на INTERVAL_MS.
-    if (!out || out.idle || out.busy || out.error || out.released) await sleep(INTERVAL_MS);
+    // PROVIDER-LIMIT-COOLDOWN-002: cooldown — пауза по лимиту подписки; probe — тик
+    // только проверил движок (реальную задачу не брал). Оба холостые — ждём INTERVAL.
+    if (!out || out.idle || out.busy || out.error || out.released || out.cooldown || out.probe) await sleep(INTERVAL_MS);
   }
 }
 

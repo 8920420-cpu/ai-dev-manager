@@ -167,3 +167,65 @@ test('classifyAbort: различает состояния', () => {
   assert.equal(classifyAbort(now - 50000, 4, now - 1000, now), 'working_slow');
   assert.equal(classifyAbort(now - 200000, 4, now - 120000, now), 'stalled_midway');
 });
+
+// PROVIDER-LIMIT-COOLDOWN-002 — пауза по лимиту Claude + проверка движка перед возобновлением.
+test('isProviderLimit: лимит/квота/перегрузка Claude, но не обычные сбои', () => {
+  assert.equal(ReasoningRunner.isProviderLimit('claude_failed: rate_limit_error'), true);
+  assert.equal(ReasoningRunner.isProviderLimit('overloaded_error 529'), true);
+  assert.equal(ReasoningRunner.isProviderLimit('usage limit reached'), true);
+  assert.equal(ReasoningRunner.isProviderLimit('claude_failed: error_max_turns'), false);
+  assert.equal(ReasoningRunner.isProviderLimit('agent_timeout'), false);
+});
+
+test('лимит → пауза + probePending; в окне tick не клеймит', async () => {
+  let clock = 1_000_000;
+  const http = fakeHttp({ claimReturn: () => ({ task: sampleTask() }) });
+  const runner = new ReasoningRunner({
+    http, log: silent, providerCooldownMs: 3_600_000, now: () => clock,
+    runAgent: async () => ({ ok: false, error: 'claude_failed: rate_limit_error' }),
+  });
+  const first = await runner.tick();
+  assert.equal(first.released, true);
+  assert.equal(runner.probePending, true, 'нужна проверка перед возобновлением');
+  assert.ok(runner.cooldownUntil > clock);
+
+  const claimsBefore = http.calls.claim;
+  const second = await runner.tick();
+  assert.equal(second.cooldown, true, 'в окне паузы не клеймим');
+  assert.equal(http.calls.claim, claimsBefore, 'движок не вызывается во время паузы');
+});
+
+test('после паузы: probe провалился → пауза продлена, реальные задачи не берём', async () => {
+  let clock = 1_000_000;
+  const http = fakeHttp({ claimReturn: () => ({ task: sampleTask() }) });
+  const runner = new ReasoningRunner({
+    http, log: silent, providerCooldownMs: 3_600_000, now: () => clock,
+    runAgent: async () => ({ ok: false, error: 'usage limit reached' }),
+  });
+  await runner.tick();               // лимит → пауза
+  const claimsBefore = http.calls.claim;
+  clock += 3_600_001;                // пауза истекла
+  const t = await runner.tick();     // probe, не реальная задача
+  assert.equal(t.cooldown, true);
+  assert.equal(t.probe, 'failed');
+  assert.equal(http.calls.claim, claimsBefore, 'реальные задачи не клеймятся до успешной проверки');
+});
+
+test('после паузы: probe прошёл → возобновляем работу', async () => {
+  let clock = 1_000_000;
+  const http = fakeHttp({ claimReturn: () => ({ task: sampleTask() }) });
+  const runner = new ReasoningRunner({
+    http, log: silent, providerCooldownMs: 3_600_000, now: () => clock,
+    runAgent: async (task) => task.id === '__provider_probe__'
+      ? { ok: true, response: 'READY' }
+      : okResult(),
+  });
+  runner.probePending = true;
+  runner.cooldownUntil = 0;
+  const probeTick = await runner.tick();
+  assert.equal(probeTick.probe, 'passed');
+  assert.equal(runner.probePending, false);
+
+  const work = await runner.tick();
+  assert.equal(work.success, true, 'после успешной проверки берём реальную задачу');
+});

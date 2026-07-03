@@ -20,10 +20,15 @@ const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
 const intervalCfg = resolveDuration('CODEX_INTERVAL_MS', 5000, { min: 200, max: 5 * 60_000 });
 const taskTimeoutCfg = resolveDuration('CODEX_TASK_TIMEOUT_MS', 10 * 60_000, { min: 30_000, max: 60 * 60_000 });
 const concurrencyCfg = resolveInt('CODEX_CONCURRENCY', 2, { min: 1, max: 8 });
-logEffectiveConfig('codex-runner', [intervalCfg, taskTimeoutCfg, concurrencyCfg]);
+// PROVIDER-LIMIT-COOLDOWN-002: пауза при превышении лимита подписки/квоты/троттлинге
+// (дефолт 1 час — настройка). По истечении раннер сначала ПРОВЕРЯЕТ движок (probe),
+// и только если проверка прошла — снова берёт задачи (см. ReasoningRunner).
+const providerCooldownCfg = resolveDuration('CODEX_PROVIDER_COOLDOWN_MS', 60 * 60_000, { min: 60_000, max: 6 * 60 * 60_000 });
+logEffectiveConfig('codex-runner', [intervalCfg, taskTimeoutCfg, concurrencyCfg, providerCooldownCfg]);
 const INTERVAL_MS = intervalCfg.value;
 const TASK_TIMEOUT_MS = taskTimeoutCfg.value;
 const CONCURRENCY = concurrencyCfg.value;
+const PROVIDER_COOLDOWN_MS = providerCooldownCfg.value;
 // Если задан CODEX_ROLE — раннер опрашивает только эту роль (полезно разнести
 // воркеры по ролям); иначе берёт любую делегированную Codex задачу.
 const ROLE = String(process.env.CODEX_ROLE || '').trim();
@@ -62,7 +67,9 @@ const http = {
 };
 
 const runAgent = makeCodexRunAgent();
-const runner = new ReasoningRunner({ http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY });
+const runner = new ReasoningRunner({
+  http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY, providerCooldownMs: PROVIDER_COOLDOWN_MS,
+});
 
 // Видимость песочницы в логе: bypass снимает per-command sandbox-spawn (главный
 // источник медленных read-команд на Windows). Состояние читаем тем же предикатом,
@@ -87,7 +94,10 @@ async function worker(id) {
     // released — задача вернулась в пул (codex упал/таймаут/сбой бэкенда). БЕЗ паузы
     // воркер тут же заклеймит ту же задачу снова → горячий спин claim→fail→release
     // (сотни CANCELLED/час при недоступном Codex). Бэкофф на INTERVAL_MS.
-    if (!out || out.idle || out.busy || out.error || out.released) await sleep(INTERVAL_MS);
+    // PROVIDER-LIMIT-COOLDOWN-002: cooldown — пауза по лимиту (tick не клеймит codex);
+    // probe — тик только проверил движок (реальную задачу не брал). Оба — холостые,
+    // ждём INTERVAL перед следующим проходом.
+    if (!out || out.idle || out.busy || out.error || out.released || out.cooldown || out.probe) await sleep(INTERVAL_MS);
   }
 }
 
