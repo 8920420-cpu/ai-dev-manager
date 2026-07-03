@@ -37,8 +37,8 @@ test('getAppSettings: пустая таблица → дефолт 3', async () 
   const s = await getAppSettingsTx(c);
   assert.equal(s.orchestratorEnabled, true);
   assert.equal(s.maxConcurrencyPerRole, 3);
-  // PROGRAMMER-PRIORITY-001: программист зафиксирован на ровно 1 выделенном агенте.
-  assert.equal(s.programmerConcurrency, 1);
+  // PROGRAMMER-PRIORITY-001 отменён: параллелизм программиста вернулся к дефолту 3.
+  assert.equal(s.programmerConcurrency, 3);
 });
 
 test('orchestratorEnabled: сохраняется как boolean', async () => {
@@ -53,21 +53,36 @@ test('orchestratorEnabled: сохраняется как boolean', async () => {
   assert.equal(upsert.params[1], 'false');
 });
 
-test('programmerConcurrency: зафиксирован на 1 (PROGRAMMER-PRIORITY-001)', async () => {
-  // Старое значение из БД (2) читается как 1 — потолок опущен до 1.
-  const c = fakeClient([
+test('programmerConcurrency: границы [1..3] (PROGRAMMER-PRIORITY-001 отменён)', async () => {
+  // Старое значение 1 из БД валидно в новых границах — читается как 1.
+  const one = fakeClient([
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 1, rows: [{ key: 'programmer_concurrency', value: 1 }] } },
+  ]);
+  assert.equal((await getAppSettingsTx(one)).programmerConcurrency, 1);
+
+  // Значение в границах читается как есть.
+  const mid = fakeClient([
     { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 1, rows: [{ key: 'programmer_concurrency', value: 2 }] } },
   ]);
-  assert.equal((await getAppSettingsTx(c)).programmerConcurrency, 1);
+  assert.equal((await getAppSettingsTx(mid)).programmerConcurrency, 2);
 
+  // Кламп верхней границы: 9 → 3.
   const high = fakeClient([
     { re: /INSERT INTO app_settings/, reply: { rowCount: 1, rows: [] } },
     { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 0, rows: [] } },
   ]);
   await updateAppSettingsTx(high, { programmerConcurrency: 9 });
-  const upsert = high.calls.find((q) => /INSERT/.test(q.sql));
-  assert.equal(upsert.params[0], 'programmer_concurrency');
-  assert.equal(upsert.params[1], '1', 'любое значение клампится до фиксированного 1');
+  const upsertHigh = high.calls.find((q) => /INSERT/.test(q.sql));
+  assert.equal(upsertHigh.params[0], 'programmer_concurrency');
+  assert.equal(upsertHigh.params[1], '3', 'значение выше потолка клампится до 3');
+
+  // Кламп нижней границы: 0 → 1.
+  const low = fakeClient([
+    { re: /INSERT INTO app_settings/, reply: { rowCount: 1, rows: [] } },
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 0, rows: [] } },
+  ]);
+  await updateAppSettingsTx(low, { programmerConcurrency: 0 });
+  assert.equal(low.calls.find((q) => /INSERT/.test(q.sql)).params[1], '1', 'значение ниже границы клампится до 1');
 });
 
 test('updateAppSettings: валидное значение → upsert и возврат', async () => {

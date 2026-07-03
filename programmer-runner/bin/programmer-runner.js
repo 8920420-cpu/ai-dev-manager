@@ -20,14 +20,14 @@ const settingsPollCfg = resolveDuration('PROGRAMMER_SETTINGS_POLL_MS', 15000, { 
 const INTERVAL_MS = intervalCfg.value;
 const TASK_TIMEOUT_MS = taskTimeoutCfg.value;
 const SETTINGS_POLL_MS = settingsPollCfg.value;
-// PROGRAMMER-PRIORITY-001: программист — приоритетная роль с РОВНО 1 выделенным
-// агентом. Один воркер захватывает и ведёт CODING-задачи без остановки, пока они
-// есть; высвобождённая ёмкость подписки Claude уходит другим ролям (рассуждающие
-// раннеры). Потолок зафиксирован на 1 — совпадает с настройкой programmer_concurrency
-// (appSettings.js, тоже 1), так что refreshConcurrency ниже всегда даёт 1. Чтобы
-// вернуть worktree-параллелизм по нескольким сервисам, поднимите ЭТО значение И max
-// в appSettings.js.
-const MAX_CONCURRENCY = 1;
+// PROGRAMMER-PRIORITY-001: решение отменено. Жёсткий потолок worktree-параллелизма
+// программиста — 3 одновременно работающих агента по РАЗНЫМ сервисам (изначальный
+// cap по PROGRAMMER-WORKTREE-PER-SERVICE). Совпадает с границами настройки
+// programmer_concurrency (appSettings.js, max=3), так что refreshConcurrency ниже
+// клампит значение из настроек в [1..MAX_CONCURRENCY]. Сериализация «один активный
+// CODING на сервис» (оркестратор) + worktree-изоляция по сервису гарантируют, что
+// 3 агента идут по разным сервисам без конфликтов в общем дереве.
+const MAX_CONCURRENCY = 3;
 const clampConc = (n) => Math.min(MAX_CONCURRENCY, Math.max(1, Math.floor(Number(n) || 1)));
 const START_CONCURRENCY = clampConc(process.env.PROGRAMMER_CONCURRENCY || MAX_CONCURRENCY);
 logEffectiveConfig('programmer-runner', [intervalCfg, taskTimeoutCfg, settingsPollCfg]);

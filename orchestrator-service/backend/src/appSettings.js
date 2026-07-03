@@ -8,15 +8,14 @@ import { withClient, clientConfig } from './db.js';
 export const APP_SETTING_SPECS = {
   orchestratorEnabled: { key: 'orchestrator_enabled', def: true },
   maxConcurrencyPerRole: { key: 'max_concurrency_per_role', def: 3, min: 1, max: 50 },
-  // PROGRAMMER-PRIORITY-001: программист держит РОВНО 1 выделенный агент —
-  // приоритетный слот, который работает без остановки, пока есть CODING-задачи.
-  // Значение зафиксировано на 1 (def=min=max), поэтому даже старое значение из БД
-  // (напр. 3) читается как 1. Смысл: единственный агент программиста не конкурирует
-  // сам с собой за подписку Claude, а высвобождённая ёмкость уходит другим ролям
-  // (рассуждающие роли на claude-reasoning-runner/codex-runner). Чтобы снова
-  // разрешить worktree-параллелизм по нескольким сервисам, поднимите max здесь И
-  // MAX_CONCURRENCY в programmer-runner/bin/programmer-runner.js.
-  programmerConcurrency: { key: 'programmer_concurrency', def: 1, min: 1, max: 1 },
+  // PROGRAMMER-PRIORITY-001: решение отменено. Ранее программист был зажат в РОВНО
+  // 1 выделенный агент (def=min=max=1); теперь возвращён worktree-параллелизм до 3
+  // одновременно работающих агентов по РАЗНЫМ сервисам (изначальный cap по
+  // PROGRAMMER-WORKTREE-PER-SERVICE, миграция 0032). Задачи одного сервиса всё равно
+  // сериализуются (один активный CODING на сервис), поэтому 3 агента идут по разным
+  // сервисам и не конфликтуют в общем worktree. Границы [1..3] совпадают с жёстким
+  // потолком MAX_CONCURRENCY в programmer-runner/bin/programmer-runner.js.
+  programmerConcurrency: { key: 'programmer_concurrency', def: 3, min: 1, max: 3 },
   // TASK-AUTO-ACCEPT-001: «не проверять выполненные задачи». Когда включено (по
   // умолчанию), дошедшие до DONE задачи автоматически помечаются принятыми
   // (accepted_at) фоновым тиком — гейт «Проверка» пуст, задачи сразу в «Выполнено».
