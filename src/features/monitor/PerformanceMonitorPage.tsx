@@ -802,6 +802,13 @@ export function PerformanceMonitorPage() {
 
       {loadState === 'ready' && data && (
         <>
+          <RoleLoadSection
+            roleLoad={data.roleLoad}
+            window={data.roleLoadWindow}
+            taskTotals={data.roleLoadTaskTotals}
+            periods={data.roleLoadPeriods}
+          />
+
           <Section
             title="Пропускная способность и очередь"
             description="Сколько задач закрывается и сколько ждёт исполнителя прямо сейчас."
@@ -915,13 +922,6 @@ export function PerformanceMonitorPage() {
               )}
             </div>
           </Section>
-
-          <RoleLoadSection
-            roleLoad={data.roleLoad}
-            window={data.roleLoadWindow}
-            taskTotals={data.roleLoadTaskTotals}
-            periods={data.roleLoadPeriods}
-          />
 
           <VersionsSection roleCodes={data.roleLoad.map((r) => ({ code: r.roleCode, name: r.roleName }))} />
 
