@@ -112,6 +112,27 @@ test('composeHasHealthcheck: true при объявленном healthcheck, fal
   assert.equal(composeHasHealthcheck(noHc), false);
 });
 
+test('composeHasHealthcheck: настоящий healthcheck → true', (t) => {
+  const dir = tmpDir(t);
+  const p = path.join(dir, 'real.yml');
+  write(p, 'services:\n  web:\n    image: x\n    healthcheck:\n      test: ["CMD","true"]\n');
+  assert.equal(composeHasHealthcheck(p), true);
+});
+
+test('composeHasHealthcheck: только закомментированный # healthcheck: → false', (t) => {
+  const dir = tmpDir(t);
+  const p = path.join(dir, 'commented.yml');
+  write(p, 'services:\n  web:\n    image: x\n    # healthcheck:\n    #   test: ["CMD","true"]\n');
+  assert.equal(composeHasHealthcheck(p), false);
+});
+
+test('composeHasHealthcheck: healthcheck с хвостовым инлайн-комментарием → true', (t) => {
+  const dir = tmpDir(t);
+  const p = path.join(dir, 'inline.yml');
+  write(p, 'services:\n  web:\n    image: x\n    healthcheck:  # ждём healthy\n      test: ["CMD","true"]\n');
+  assert.equal(composeHasHealthcheck(p), true);
+});
+
 // ── build (полный набор стадий) ──────────────────────────────────────────────
 
 test('build: go-сервис + compose с healthcheck → test/build/deploy/smoke', (t) => {

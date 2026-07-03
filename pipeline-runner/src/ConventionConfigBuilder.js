@@ -145,8 +145,15 @@ export function findComposeUp(serviceDir, projectRoot) {
 export function composeHasHealthcheck(composePath) {
   try {
     const text = readFileSync(composePath, 'utf8');
-    // Ключ healthcheck: как поле сервиса (с отступом), не в комментарии.
-    return /^[ \t]+healthcheck[ \t]*:/m.test(text);
+    // Построчно: отбрасываем закомментированную часть строки (всё от первого '#')
+    // и лишь к «кодовому» остатку применяем проверку ключа. Так '# healthcheck:'
+    // (целиком комментарий) → false, а 'healthcheck:  # inline' (реальный ключ с
+    // хвостовым комментарием) → true. Без YAML-парсера, только текст по строкам.
+    return text.split(/\r?\n/).some((line) => {
+      const hashIndex = line.indexOf('#');
+      const code = hashIndex === -1 ? line : line.slice(0, hashIndex);
+      return /^[ \t]*healthcheck[ \t]*:/.test(code);
+    });
   } catch {
     return false;
   }
