@@ -358,7 +358,17 @@ export function buildUserPayload(roleCode, context, outputFields = [], { include
 }
 
 // Толерантный парсинг: ответ может быть чистым JSON, JSON в ```-блоке или
-// JSON с мусором вокруг. Возвращает объект или null.
+// JSON с прозой/рассуждением вокруг. Возвращает объект-вердикт или null.
+//
+// VERDICT-PARSE-ROBUST-001: наивный срез «первая `{` … последняя `}`» ронял
+// почти-валидные вердикты — если модель писала прозу с фигурными скобками до/после
+// JSON или несколько объектов (черновик + финал), срез захватывал мусор и падал в
+// verdict_unparsed → FAILED. Теперь: (1) пробуем весь текст, (2) снимаем висячие
+// запятые (частый огрех LLM), (3) собираем ВСЕ сбалансированные {...}-блоки (учёт
+// строк/экранирования) плюс содержимое ```-блоков и выбираем среди валидных
+// объектов ПОСЛЕДНИЙ со ключом `status` (это финальный вердикт роли), иначе любой
+// валидный объект. Мусор/массив/пустота/DSML без JSON по-прежнему дают null —
+// защита SILENT-FAIL-GUARD-001 не ослаблена.
 export function parseVerdict(text) {
   const raw = String(text ?? '').trim();
   if (raw === '') return null;
@@ -370,21 +380,52 @@ export function parseVerdict(text) {
       return null;
     }
   };
-  let v = tryParse(raw);
+  // Висячие запятые перед } или ] (`{"a":1,}`, `[1,2,]`) — не меняет семантику
+  // валидного JSON, но частая причина отказа JSON.parse у LLM-ответов.
+  const stripTrailingCommas = (s) => s.replace(/,(\s*[}\]])/g, '$1');
+  const parseLoose = (s) => tryParse(s) || tryParse(stripTrailingCommas(s));
+
+  // 1. Весь текст целиком.
+  let v = parseLoose(raw);
   if (v) return v;
-  // Вырезать ```json ... ``` или первый {...} блок.
-  const fence = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fence) {
-    v = tryParse(fence[1].trim());
-    if (v) return v;
+
+  // 2. Кандидаты: содержимое всех ```-блоков + все сбалансированные {...}-блоки.
+  const candidates = [];
+  const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+  let m;
+  while ((m = fenceRe.exec(raw)) !== null) candidates.push(m[1].trim());
+
+  // Финальный вердикт всегда в конце ответа: на огромных «болтливых» ответах
+  // балансный скан ведём только по хвосту, чтобы не деградировать до O(n²).
+  const scan = raw.length > 100000 ? raw.slice(-100000) : raw;
+  for (let i = 0; i < scan.length; i += 1) {
+    if (scan[i] !== '{') continue;
+    let depth = 0; let inStr = false; let esc = false;
+    for (let j = i; j < scan.length; j += 1) {
+      const ch = scan[j];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === '\\') esc = true;
+        else if (ch === '"') inStr = false;
+      } else if (ch === '"') inStr = true;
+      else if (ch === '{') depth += 1;
+      else if (ch === '}') {
+        depth -= 1;
+        if (depth === 0) { candidates.push(scan.slice(i, j + 1)); i = j; break; }
+      }
+    }
   }
-  const first = raw.indexOf('{');
-  const last = raw.lastIndexOf('}');
-  if (first !== -1 && last > first) {
-    v = tryParse(raw.slice(first, last + 1));
-    if (v) return v;
+
+  // 3. Выбрать вердикт: последний валидный объект со `status`; иначе любой валидный.
+  let withStatus = null;
+  let anyObj = null;
+  for (const cand of candidates) {
+    const parsed = parseLoose(cand);
+    if (!parsed) continue;
+    anyObj = parsed;
+    if (Object.prototype.hasOwnProperty.call(parsed, 'status')) withStatus = parsed;
   }
-  return null;
+  return withStatus || anyObj;
 }
 
 // Нормализация вердикта роли в { ok, status, summary, nextRoleHint, findings }.

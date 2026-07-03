@@ -34,6 +34,34 @@ test('parseVerdict: не-объект и мусор => null', () => {
   assert.equal(parseVerdict(''), null);
 });
 
+// VERDICT-PARSE-ROBUST-001 — устойчивость к почти-валидному JSON, ронявшему verdict_unparsed.
+test('parseVerdict: висячая запятая перед }', () => {
+  assert.deepEqual(
+    parseVerdict('{"status":"READY","summary":"ok",}'),
+    { status: 'READY', summary: 'ok' },
+  );
+});
+
+test('parseVerdict: проза с фигурными скобками до финального JSON', () => {
+  const v = parseVerdict('Сначала черновик {набросок}. Итоговый вердикт: {"status":"READY"}.');
+  assert.deepEqual(v, { status: 'READY' });
+});
+
+test('parseVerdict: несколько объектов — берём последний со status', () => {
+  const v = parseVerdict('{"note":"промежуточно"}\n{"status":"BLOCKED","summary":"s"}');
+  assert.deepEqual(v, { status: 'BLOCKED', summary: 's' });
+});
+
+test('parseVerdict: вложенный fields сохраняется', () => {
+  const v = parseVerdict('бла {"status":"READY","fields":{"short_title":"T","tags":["a","b"]}} бла');
+  assert.deepEqual(v, { status: 'READY', fields: { short_title: 'T', tags: ['a', 'b'] } });
+});
+
+test('parseVerdict: ```-блок среди прозы с другими скобками', () => {
+  const v = parseVerdict('Мысли: {x}\n```json\n{"status":"APPROVED"}\n```\nещё {y}');
+  assert.deepEqual(v, { status: 'APPROVED' });
+});
+
 // SILENT-FAIL-GUARD-001 (B): ответ DeepSeek с tool-call разметкой DSML (без финального
 // JSON) НЕ должен распознаваться как вердикт → parsed=null → роль помечается «не выполнен».
 test('parseVerdict: DeepSeek DSML tool-calls без JSON => null (триггер failRoleUnparsed)', () => {
