@@ -25,6 +25,60 @@ test('по умолчанию maxTurns=12 (кап разведки)', async () =
   assert.equal(capture.options.maxTurns, 12);
 });
 
+// ARCHITECT-TURN-CAP-001: task.maxTurns в приоритете над дефолтом драйвера.
+test('task.maxTurns переопределяет дефолт (персональный кап роли)', async () => {
+  const capture = {};
+  const run = makeClaudeReasoningRunAgent({ query: fakeQuery([
+    { type: 'system' },
+    { type: 'result', subtype: 'success', result: 'OK', num_turns: 2 },
+  ], capture) });
+  await run({ ...task, maxTurns: 20 }, {});
+  assert.equal(capture.options.maxTurns, 20);
+});
+
+test('task.maxTurns невалиден (0/мусор) → дефолт 12', async () => {
+  const capture = {};
+  const run = makeClaudeReasoningRunAgent({ query: fakeQuery([
+    { type: 'system' },
+    { type: 'result', subtype: 'success', result: 'OK', num_turns: 2 },
+  ], capture) });
+  await run({ ...task, maxTurns: 0 }, {});
+  assert.equal(capture.options.maxTurns, 12);
+});
+
+// TOKEN-SPLIT-001: extractUsage разносит вход на свежий/запись/чтение; tokensIn = сумма.
+test('разбивка входа из modelUsage: свежий + запись в кэш + чтение из кэша', async () => {
+  const run = makeClaudeReasoningRunAgent({ query: fakeQuery([
+    { type: 'system' },
+    { type: 'result', subtype: 'success', result: 'ВЕРДИКТ', num_turns: 5, total_cost_usd: 0.5,
+      modelUsage: {
+        'claude-sonnet-4-6': {
+          inputTokens: 1000, cacheCreationInputTokens: 200, cacheReadInputTokens: 8000, outputTokens: 300,
+        },
+      } },
+  ]) });
+  const out = await run(task, {});
+  assert.equal(out.tokensInput, 1000);
+  assert.equal(out.tokensCacheCreation, 200);
+  assert.equal(out.tokensCacheRead, 8000);
+  assert.equal(out.tokensOut, 300);
+  assert.equal(out.tokensIn, 9200); // сумма трёх составляющих входа
+});
+
+// Фолбэк на result.usage (старый SDK без modelUsage) — та же разбивка.
+test('разбивка входа из usage (фолбэк без modelUsage)', async () => {
+  const run = makeClaudeReasoningRunAgent({ query: fakeQuery([
+    { type: 'system' },
+    { type: 'result', subtype: 'success', result: 'OK', num_turns: 1,
+      usage: { input_tokens: 500, cache_creation_input_tokens: 100, cache_read_input_tokens: 4000, output_tokens: 50 } },
+  ]) });
+  const out = await run(task, {});
+  assert.equal(out.tokensInput, 500);
+  assert.equal(out.tokensCacheCreation, 100);
+  assert.equal(out.tokensCacheRead, 4000);
+  assert.equal(out.tokensIn, 4600);
+});
+
 test('успех: turns берётся из result.num_turns, исход success', async () => {
   const run = makeClaudeReasoningRunAgent({ query: fakeQuery([
     { type: 'system' },

@@ -43,22 +43,41 @@ function num(v) {
 // контекст ПОСЛЕДНЕГО хода (не сумма), поэтому для KPI берём result.modelUsage —
 // КУМУЛЯТИВНЫЕ по моделям итоги за всю сессию (сходятся с total_cost_usd). Фолбэк на
 // usage, если modelUsage нет (старые версии SDK).
+//
+// TOKEN-SPLIT-001: разносим ВХОДЯЩИЕ токены на три составляющих, а не только сумму:
+//   inputTokens (свежий, uncached ввод), cacheCreationInputTokens (запись в
+//   prompt-кэш) и cacheReadInputTokens (чтение из кэша — накапливается по ходам
+//   tool-loop и обычно доминирует). tokensIn остаётся ПОЛНОЙ суммой (обратная
+//   совместимость с buildCompletionBody/логами), но рядом отдаём разбивку, чтобы
+//   оркестратор записал её в agent_runs и «Монитор» показал честное деление.
 function extractUsage(final) {
   const costUsd = num(final?.total_cost_usd);
   const mu = final?.modelUsage;
   if (mu && typeof mu === 'object') {
-    let tokensIn = 0;
+    let tokensInput = 0;
+    let tokensCacheCreation = 0;
+    let tokensCacheRead = 0;
     let tokensOut = 0;
     for (const m of Object.values(mu)) {
-      tokensIn += num(m?.inputTokens) + num(m?.cacheCreationInputTokens) + num(m?.cacheReadInputTokens);
+      tokensInput += num(m?.inputTokens);
+      tokensCacheCreation += num(m?.cacheCreationInputTokens);
+      tokensCacheRead += num(m?.cacheReadInputTokens);
       tokensOut += num(m?.outputTokens);
     }
-    return { tokensIn, tokensOut, costUsd };
+    return {
+      tokensIn: tokensInput + tokensCacheCreation + tokensCacheRead,
+      tokensInput, tokensCacheCreation, tokensCacheRead, tokensOut, costUsd,
+    };
   }
   const u = final?.usage || {};
-  const tokensIn = num(u.input_tokens) + num(u.cache_creation_input_tokens) + num(u.cache_read_input_tokens);
+  const tokensInput = num(u.input_tokens);
+  const tokensCacheCreation = num(u.cache_creation_input_tokens);
+  const tokensCacheRead = num(u.cache_read_input_tokens);
   const tokensOut = num(u.output_tokens);
-  return { tokensIn, tokensOut, costUsd };
+  return {
+    tokensIn: tokensInput + tokensCacheCreation + tokensCacheRead,
+    tokensInput, tokensCacheCreation, tokensCacheRead, tokensOut, costUsd,
+  };
 }
 
 /**
@@ -70,12 +89,15 @@ function extractUsage(final) {
  * @param {Console} [cfg.log]
  */
 export function makeClaudeReasoningRunAgent(cfg = {}) {
-  const model = cfg.model || process.env.CLAUDE_REASONING_MODEL || 'claude-sonnet-4-6';
+  // CLAUDE-POOL-001: дефолт — Opus 4.8 (решение пользователя 2026-07-03): все
+  // рассуждающие роли на едином Claude-пуле, качество рассуждения приоритетнее цены.
+  // Переопределяется CLAUDE_REASONING_MODEL (или cfg.model в тестах).
+  const model = cfg.model || process.env.CLAUDE_REASONING_MODEL || 'claude-opus-4-8';
   // RESEARCH-BUDGET-001: кап на глубину разведки. Разведка должна укладываться в
   // ~2 прохода на карты проекта/сервиса (подаются инлайн) + точечное чтение
   // релевантных файлов. 12 ходов — сознательно жёсткий потолок: упор в него = роль
   // плохо нарезана или ходит по всему репозиторию (см. исход max_turns_exceeded).
-  const maxTurns = Number(cfg.maxTurns || process.env.CLAUDE_REASONING_MAX_TURNS || 12);
+  const defaultMaxTurns = Number(cfg.maxTurns || process.env.CLAUDE_REASONING_MAX_TURNS || 12);
   const allowedTools = cfg.allowedTools || READONLY_TOOLS;
   const log = cfg.log || console;
   const queryImpl = cfg.query || query;
@@ -94,6 +116,13 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
     const useCachePrefix = task.cachePrefix === true && sys !== '';
     const prompt = useCachePrefix ? user : `${sys}\n\n${user}`.trim();
     const systemPromptOpt = useCachePrefix ? [sys, SYSTEM_PROMPT_DYNAMIC_BOUNDARY] : undefined;
+    // ARCHITECT-TURN-CAP-001: персональный кап ходов из задачи (оркестратор задаёт по
+    // роли) в приоритете над глобальным дефолтом драйвера. Рунавей-гард для длинных
+    // исследующих ролей (Архитектор): режет патологический хвост ходов, не трогая норму.
+    const taskMaxTurns = Number(task.maxTurns);
+    const maxTurns = Number.isFinite(taskMaxTurns) && taskMaxTurns > 0
+      ? Math.trunc(taskMaxTurns)
+      : defaultMaxTurns;
     const ac = linkSignal(signal);
     const cwd = String(task.projectPath || '').trim();
 
@@ -116,6 +145,10 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
       return {
         coldStartMs, reasonMs, turns: turnsKpi, toolUses, rateLimited,
         tokensIn: usage.tokensIn, tokensOut: usage.tokensOut, costUsd: usage.costUsd,
+        // TOKEN-SPLIT-001: разбивка входа (свежий/запись в кэш/чтение из кэша).
+        tokensInput: usage.tokensInput,
+        tokensCacheCreation: usage.tokensCacheCreation,
+        tokensCacheRead: usage.tokensCacheRead,
         durationMs: Date.now() - started,
         model, // VERSION-KPI-TRACKING-001: модель прогона для атрибуции KPI.
       };

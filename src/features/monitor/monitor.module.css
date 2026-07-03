@@ -112,6 +112,18 @@
   font-size: var(--text-sm);
 }
 
+/* TOKEN-SPLIT-001 — деление входящих токенов (свежий / кэш-запись / кэш-чтение)
+   под основным числом «Токены вх». Мелкой строкой, чтобы не раздувать таблицу. */
+.tokenSplit {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.72rem;
+  line-height: 1.25;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
 /* VERSION-KPI-TRACKING-001 — управление и дельты раздела «Версии». */
 .versionControls {
   display: flex;

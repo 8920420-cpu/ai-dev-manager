@@ -34,6 +34,12 @@ export interface TaskTree {
 /** Счётчики задач по статусам (этапам) — для бейджей в «Схеме разработки». */
 export interface TaskStatusCounts {
   byStatus: Record<string, number>;
+  /**
+   * Число параллельно работающих процессов (agent_runs в статусе RUNNING),
+   * сгруппированное по текущему статусу задачи. Для счётчика активных процессов
+   * рядом со счётчиком задач на карточке этапа.
+   */
+  runningByStatus: Record<string, number>;
   total: number;
 }
 

@@ -56,6 +56,10 @@ $EnvKeys = [ordered]@{
   # песочницу codex (per-command restricted-token spawn — главный источник медленных
   # read-команд и их таймаутов на Windows). .env побеждает дефолт кода раннера.
   'CODEX_BYPASS_SANDBOX'   = $true
+  # CLAUDE-POOL-001: параллелизм и модель единого пула рассуждающих Claude-агентов.
+  # .env — источник истины (побеждает унаследованное окружение Scheduled Task).
+  'CLAUDE_REASONING_CONCURRENCY' = $true
+  'CLAUDE_REASONING_MODEL'       = $true
 }
 if (Test-Path $EnvFile) {
   foreach ($line in Get-Content $EnvFile) {
@@ -100,10 +104,13 @@ if (-not $env:CODEX_TASK_TIMEOUT_MS)            { $env:CODEX_TASK_TIMEOUT_MS = '
 if (-not $env:CLAUDE_REASONING_TASK_TIMEOUT_MS) { $env:CLAUDE_REASONING_TASK_TIMEOUT_MS = '540000' }
 Write-Host "CONFIG: CODEX_TASK_TIMEOUT_MS=$($env:CODEX_TASK_TIMEOUT_MS) ($codexTimeoutSrc), CLAUDE_REASONING_TASK_TIMEOUT_MS=$($env:CLAUDE_REASONING_TASK_TIMEOUT_MS) ($claudeTimeoutSrc)"
 
-# OBSERVABILITY-REASONING-001: рассуждающие роли через Claude Code — параллелизм 1.
-# При concurrency=2 подписка упиралась в rate-limit (rateLimited=true в каждом прогоне);
-# 1 агент работает без троттлинга и быстрее доводит задачу. Менять при необходимости.
-if (-not $env:CLAUDE_REASONING_CONCURRENCY)     { $env:CLAUDE_REASONING_CONCURRENCY = '1' }
+# CLAUDE-POOL-001 (2026-07-03): единый пул Claude-агентов на все рассуждающие роли —
+# минимум 3 одновременных агента (решение пользователя), дефолт 4. Значение обычно
+# приходит из .env (whitelist выше); этот guard — фолбэк, если .env недоступен.
+# История: при concurrency=2 подписка упиралась в rate-limit — теперь это гасится
+# PROVIDER-LIMIT-COOLDOWN-002 (пауза 1ч + probe перед возобновлением работы).
+if (-not $env:CLAUDE_REASONING_CONCURRENCY)     { $env:CLAUDE_REASONING_CONCURRENCY = '4' }
+Write-Host "CONFIG: CLAUDE_REASONING_CONCURRENCY=$($env:CLAUDE_REASONING_CONCURRENCY), CLAUDE_REASONING_MODEL=$(if ($env:CLAUDE_REASONING_MODEL) { $env:CLAUDE_REASONING_MODEL } else { 'дефолт кода (claude-opus-4-8)' })"
 
 # Уже запущенные node-процессы демонов (по подстроке скрипта в командной строке).
 function Get-RunnerProcs([string]$ScriptLeaf) {

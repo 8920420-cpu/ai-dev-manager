@@ -72,6 +72,8 @@ export function DevelopmentSchemePage() {
   const [edges, setEdges] = useState<SchemeEdge[]>([]);
   const [saveErrors, setSaveErrors] = useState<StageSaveErrorItem[]>([]);
   const [taskCounts, setTaskCounts] = useState<Record<string, number>>({});
+  // Число параллельно работающих процессов (RUNNING agent_runs) по статусам этапов.
+  const [runningCounts, setRunningCounts] = useState<Record<string, number>>({});
   const [saving, setSaving] = useState(false);
   const [orchestratorEnabled, setOrchestratorEnabled] = useState(true);
   const [togglingOrchestrator, setTogglingOrchestrator] = useState(false);
@@ -96,7 +98,10 @@ export function DevelopmentSchemePage() {
   const loadCounts = useCallback(async (signal?: AbortSignal) => {
     try {
       const stats = await tasksApi.stats(signal);
-      if (!signal?.aborted) setTaskCounts(stats.byStatus);
+      if (!signal?.aborted) {
+        setTaskCounts(stats.byStatus);
+        setRunningCounts(stats.runningByStatus);
+      }
     } catch {
       /* счётчики некритичны — молча игнорируем */
     }
@@ -218,6 +223,7 @@ export function DevelopmentSchemePage() {
             saveErrors={saveErrors}
             hideScanPath
             taskCounts={taskCounts}
+            runningCounts={runningCounts}
             onAddStage={() => dispatch({ type: 'addStage' })}
             onAddNode={(kind) => dispatch({ type: 'addNode', kind })}
             onRemoveStage={(stageId) => dispatch({ type: 'removeStage', stageId })}

@@ -1765,8 +1765,11 @@ export async function claimNextReasoningTask(s, engineParam = null, roleParam = 
     }
 
     const context = await buildRoleContext(c, claimed, { engine });
-    const { composeRoleSystemPrompt } = await import('./roles.js');
+    const { composeRoleSystemPrompt, resolveRoleMaxTurns } = await import('./roles.js');
     const roleSystem = await composeRoleSystemPrompt(c, claimed.role_code);
+    // ARCHITECT-TURN-CAP-001: персональный кап ходов роли (рунавей-гард). Драйвер
+    // claude_code применит его вместо своего дефолта; codex maxTurns игнорирует.
+    const roleMaxTurns = resolveRoleMaxTurns(claimed.role_code);
     // PROMPT-CACHE-001: для claude_code выносим СТАТИЧНУЮ часть (промт роли + карта) в
     // system-префикс — драйвер держит его в кэше (SYSTEM_PROMPT_DYNAMIC_BOUNDARY, 5-мин
     // ephemeral), и повторные claim'ы того же проекта/роли не переоплачивают карту. У
@@ -1795,6 +1798,8 @@ export async function claimNextReasoningTask(s, engineParam = null, roleParam = 
         // PROMPT-CACHE-001: claude-драйвер держит systemPrompt как кэшируемый статичный
         // префикс (роль+карта), а userPrompt шлёт как динамику. Для codex флаг игнорируется.
         cachePrefix: cacheClaude,
+        // ARCHITECT-TURN-CAP-001: персональный кап ходов (null → драйвер возьмёт дефолт).
+        maxTurns: roleMaxTurns,
         outputSchema,
       },
     };
@@ -3365,6 +3370,10 @@ export function normalizeRunKpi(input) {
   return {
     tokenInput: int(input?.tokensIn),
     tokenOutput: int(input?.tokensOut),
+    // TOKEN-SPLIT-001: разбивка входа (чтение/запись prompt-кэша). null → COALESCE
+    // сохранит уже записанное (движки без кэша не затирают детализацию).
+    tokenCacheRead: int(input?.tokensCacheRead),
+    tokenCacheCreation: int(input?.tokensCacheCreation),
     cost: num(input?.costUsd),
     coldStartMs: int(input?.coldStartMs),
     turns: int(input?.turns),
@@ -3383,9 +3392,12 @@ function runKpiSet(kpi, base) {
   return {
     sql: `, token_input = COALESCE($${base + 1}, token_input), token_output = COALESCE($${base + 2}, token_output)`
        + `, cost = COALESCE($${base + 3}, cost), cold_start_ms = $${base + 4}, turns = $${base + 5}, outcome = $${base + 6}`
-       + `, code_version = COALESCE($${base + 7}, code_version), model = COALESCE($${base + 8}, model)`,
+       + `, code_version = COALESCE($${base + 7}, code_version), model = COALESCE($${base + 8}, model)`
+       // TOKEN-SPLIT-001: детализация входа (COALESCE — null не затирает записанное).
+       + `, token_cache_read = COALESCE($${base + 9}, token_cache_read)`
+       + `, token_cache_creation = COALESCE($${base + 10}, token_cache_creation)`,
     params: [kpi.tokenInput, kpi.tokenOutput, kpi.cost, kpi.coldStartMs, kpi.turns, kpi.outcome,
-      kpi.codeVersion, kpi.model],
+      kpi.codeVersion, kpi.model, kpi.tokenCacheRead, kpi.tokenCacheCreation],
   };
 }
 

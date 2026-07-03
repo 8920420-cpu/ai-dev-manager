@@ -42,6 +42,42 @@ test('loadProjectMaps: нет ни одной карты → null', async () => 
   }
 });
 
+// RESEARCH-BUDGET-002: авто-индекс структуры репозитория (каталог сервисов для
+// монорепо) дописывается к проектной карте в ПОЛНОМ варианте.
+test('loadProjectMaps: авто-индекс каталогов верхнего уровня в full', async () => {
+  _clearProjectMapCache();
+  const root = await mkdtemp(join(tmpdir(), 'pmap-outline-'));
+  try {
+    await writeFile(join(root, 'PROJECT_MAP.md'), '# Проект');
+    await mkdir(join(root, 'Auth'), { recursive: true });
+    await mkdir(join(root, 'CRM'), { recursive: true });
+    await mkdir(join(root, 'node_modules'), { recursive: true }); // шум — не в индексе
+    const maps = await loadProjectMaps(root, {});
+    assert.match(maps.project, /Проект/);              // карта-док осталась
+    assert.match(maps.project, /структура репозитория/);
+    assert.match(maps.project, /Auth/);
+    assert.match(maps.project, /CRM/);
+    assert.doesNotMatch(maps.project, /node_modules/);  // шумовые папки исключены
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+// В short-варианте (codex, без prompt-кэша) индекс НЕ добавляем — экономим символы.
+test('loadProjectMaps: авто-индекс НЕ добавляется в short', async () => {
+  _clearProjectMapCache();
+  const root = await mkdtemp(join(tmpdir(), 'pmap-outline-short-'));
+  try {
+    await writeFile(join(root, 'PROJECT_MAP.md'), '# Проект');
+    await mkdir(join(root, 'Auth'), { recursive: true });
+    const short = await loadProjectMaps(root, { variant: 'short' });
+    assert.match(short.project, /Проект/);
+    assert.doesNotMatch(short.project, /структура репозитория/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('loadProjectMaps: усечение карты по бюджету символов', async () => {
   _clearProjectMapCache();
   const prev = process.env.PROJECT_MAP_MAX_CHARS;

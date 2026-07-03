@@ -523,7 +523,7 @@ export function PerformanceMonitorPage() {
 
           <Section
             title="Нагрузка по ролям (24 часа)"
-            description="Запуски, доля провалов, средняя длительность, токены и средний холодный старт движка."
+            description="Запуски, доля провалов, средняя длительность, токены и средний холодный старт движка. «Токены вх» разложены: свеж — свежий (uncached) ввод; зап — запись в prompt-кэш; чт — чтение из кэша (копится по ходам tool-loop, обычно доминирует, billed ~10%)."
           >
             {data.roleLoad.length === 0 ? (
               <span className={styles.muted}>За последние сутки запусков ролей не было.</span>
@@ -554,7 +554,17 @@ export function PerformanceMonitorPage() {
                       <td className={styles.num}>{r.timeout}</td>
                       <td className={styles.num}>{r.running}</td>
                       <td className={styles.num}>{fmtDuration(r.avgDurationMs)}</td>
-                      <td className={styles.num}>{fmtTokens(r.tokensIn)}</td>
+                      <td className={styles.num}>
+                        {fmtTokens(r.tokensIn)}
+                        {r.tokensIn > 0 && (
+                          <span
+                            className={styles.tokenSplit}
+                            title={`свежий ${r.tokensInputFresh} · запись в кэш ${r.tokensCacheCreation} · чтение из кэша ${r.tokensCacheRead}`}
+                          >
+                            свеж {fmtTokens(r.tokensInputFresh)} · зап {fmtTokens(r.tokensCacheCreation)} · чт {fmtTokens(r.tokensCacheRead)}
+                          </span>
+                        )}
+                      </td>
                       <td className={styles.num}>{fmtTokens(r.tokensOut)}</td>
                       <td className={styles.num}>{fmtCost(r.cost)}</td>
                       <td className={styles.num}>{fmtDuration(r.avgColdStartMs)}</td>

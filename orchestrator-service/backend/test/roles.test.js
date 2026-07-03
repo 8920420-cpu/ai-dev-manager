@@ -17,8 +17,40 @@ import {
   RESEARCH_ROLES,
   promptHash,
   recordPromptVersion,
+  resolveRoleMaxTurns,
 } from '../src/roles.js';
 import { readFile } from 'node:fs/promises';
+
+// --- ARCHITECT-TURN-CAP-001: персональный кап ходов роли ---------------------
+
+test('resolveRoleMaxTurns: дефолт Архитектора = 24, у прочих ролей null', () => {
+  const prev = process.env.ARCHITECT_MAX_TURNS;
+  delete process.env.ARCHITECT_MAX_TURNS;
+  try {
+    assert.equal(resolveRoleMaxTurns('ARCHITECT'), 24);
+    assert.equal(resolveRoleMaxTurns('TASK_REVIEWER'), null);
+    assert.equal(resolveRoleMaxTurns(''), null);
+    assert.equal(resolveRoleMaxTurns(null), null);
+  } finally {
+    if (prev === undefined) delete process.env.ARCHITECT_MAX_TURNS;
+    else process.env.ARCHITECT_MAX_TURNS = prev;
+  }
+});
+
+test('resolveRoleMaxTurns: env ${ROLE}_MAX_TURNS переопределяет дефолт', () => {
+  const prev = process.env.ARCHITECT_MAX_TURNS;
+  try {
+    process.env.ARCHITECT_MAX_TURNS = '16';
+    assert.equal(resolveRoleMaxTurns('ARCHITECT'), 16);
+    process.env.ARCHITECT_MAX_TURNS = '0'; // невалидно → дефолт
+    assert.equal(resolveRoleMaxTurns('ARCHITECT'), 24);
+    process.env.ARCHITECT_MAX_TURNS = 'abc'; // мусор → дефолт
+    assert.equal(resolveRoleMaxTurns('ARCHITECT'), 24);
+  } finally {
+    if (prev === undefined) delete process.env.ARCHITECT_MAX_TURNS;
+    else process.env.ARCHITECT_MAX_TURNS = prev;
+  }
+});
 
 // --- VERSION-KPI-TRACKING-001: версионирование промтов -----------------------
 

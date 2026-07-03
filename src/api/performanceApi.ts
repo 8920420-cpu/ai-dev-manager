@@ -16,6 +16,11 @@ export interface RoleLoad {
   // OBSERVABILITY-REASONING-001: токены и холодный старт по ролям (за 24ч).
   tokensIn: number;
   tokensOut: number;
+  // TOKEN-SPLIT-001: деление входа. tokensIn = свежий + запись в кэш + чтение из кэша.
+  // cacheRead копится по ходам tool-loop и обычно доминирует (billed ~10%).
+  tokensInputFresh: number;
+  tokensCacheCreation: number;
+  tokensCacheRead: number;
   cost: number;
   avgColdStartMs: number | null;
 }

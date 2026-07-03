@@ -150,6 +150,16 @@ test('buildCompletionBody: метрики нормализуются (int/num/nu
   assert.equal(body.durationMs, 1234.7);
 });
 
+// TOKEN-SPLIT-001: разбивка входа прокидывается в тело сдачи (int/null).
+test('buildCompletionBody: разбивка входа (cache_read/cache_creation) нормализуется', () => {
+  const task = { id: 'X', agentRunId: 'r', systemPrompt: 's', userPrompt: 'u' };
+  const body = buildCompletionBody(task, {
+    response: 'txt', tokensIn: 1000, tokensCacheRead: 820.6, tokensCacheCreation: 30,
+  });
+  assert.equal(body.tokensCacheRead, 821); // округление
+  assert.equal(body.tokensCacheCreation, 30);
+});
+
 test('buildCompletionBody: отсутствующие метрики → null', () => {
   const body = buildCompletionBody({ id: 'X' }, { response: 'txt' });
   assert.equal(body.tokensIn, null);
@@ -158,6 +168,9 @@ test('buildCompletionBody: отсутствующие метрики → null', 
   assert.equal(body.coldStartMs, null);
   assert.equal(body.turns, null);
   assert.equal(body.outcome, null);
+  // TOKEN-SPLIT-001: разбивки нет → null (COALESCE на сервере не затрёт записанное).
+  assert.equal(body.tokensCacheRead, null);
+  assert.equal(body.tokensCacheCreation, null);
 });
 
 test('classifyAbort: различает состояния', () => {

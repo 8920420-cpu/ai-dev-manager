@@ -155,6 +155,10 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
               -- OBSERVABILITY-REASONING-001: токены и холодный старт по ролям.
               coalesce(sum(ar.token_input), 0)::bigint AS tokens_in,
               coalesce(sum(ar.token_output), 0)::bigint AS tokens_out,
+              -- TOKEN-SPLIT-001: разбивка входа (чтение/запись prompt-кэша). Свежий
+              -- ввод считаем на сервере как tokens_in − cache_read − cache_creation.
+              coalesce(sum(ar.token_cache_read), 0)::bigint AS tokens_cache_read,
+              coalesce(sum(ar.token_cache_creation), 0)::bigint AS tokens_cache_creation,
               coalesce(sum(ar.cost), 0)::numeric AS cost,
               avg(ar.cold_start_ms) FILTER (WHERE ar.cold_start_ms IS NOT NULL) AS avg_cold_start_ms
          FROM agent_runs ar
@@ -174,6 +178,16 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
       avgDurationMs: row.avg_ms == null ? null : Math.round(Number(row.avg_ms)),
       tokensIn: Number(row.tokens_in) || 0,
       tokensOut: Number(row.tokens_out) || 0,
+      // TOKEN-SPLIT-001: деление входа. tokensCacheRead — чтение из кэша (billed ~10%,
+      // копится по ходам tool-loop и обычно доминирует), tokensCacheCreation — запись
+      // в кэш (~125%), tokensInputFresh — свежий (uncached) ввод. Сумма трёх = tokensIn.
+      // Свежий ≥ 0: у исторических прогонов разбивки нет (cache-поля = 0) → fresh = tokensIn.
+      tokensCacheRead: Number(row.tokens_cache_read) || 0,
+      tokensCacheCreation: Number(row.tokens_cache_creation) || 0,
+      tokensInputFresh: Math.max(
+        0,
+        (Number(row.tokens_in) || 0) - (Number(row.tokens_cache_read) || 0) - (Number(row.tokens_cache_creation) || 0),
+      ),
       cost: Number(row.cost) || 0,
       avgColdStartMs: row.avg_cold_start_ms == null ? null : Math.round(Number(row.avg_cold_start_ms)),
     }));

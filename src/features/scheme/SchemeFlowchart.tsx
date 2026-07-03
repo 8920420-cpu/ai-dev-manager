@@ -1,5 +1,6 @@
 import { Fragment, useState, type DragEvent } from 'react';
 import {
+  Activity,
   AlertCircle,
   ArrowDown,
   Diamond,
@@ -60,6 +61,11 @@ interface SchemeFlowchartProps {
   hideScanPath?: boolean;
   /** Число задач по статусам (этапам) для бейджа-счётчика на карточке. */
   taskCounts?: Record<string, number>;
+  /**
+   * Число параллельно работающих процессов (RUNNING agent_runs) по статусам
+   * (этапам) — для счётчика активных процессов рядом с кнопкой «Задачи».
+   */
+  runningCounts?: Record<string, number>;
   onAddStage: () => void;
   /** FORK-JOIN-001: добавить узел блок-схемы заданного типа (fork/join/condition/stage). */
   onAddNode?: (kind: StageKind) => void;
@@ -91,6 +97,7 @@ export function SchemeFlowchart({
   generalError,
   hideScanPath = false,
   taskCounts = {},
+  runningCounts = {},
   onAddStage,
   onAddNode,
   onRemoveStage,
@@ -213,6 +220,13 @@ export function SchemeFlowchart({
     const restartHere = role?.code === 'TASK_INTAKE_OFFICER' ? taskCounts['RESTART'] ?? 0 : 0;
     const taskCount =
       (stage.taskStatus ? taskCounts[stage.taskStatus] ?? 0 : 0) + restartHere;
+    // Число параллельно работающих процессов (RUNNING agent_runs) на этом этапе.
+    // Перезапущенные (RESTART) процессы учитываем у Приёмщика задач — по тому же
+    // правилу, что и счётчик задач выше.
+    const restartRunningHere =
+      role?.code === 'TASK_INTAKE_OFFICER' ? runningCounts['RESTART'] ?? 0 : 0;
+    const runningCount =
+      (stage.taskStatus ? runningCounts[stage.taskStatus] ?? 0 : 0) + restartRunningHere;
 
     return (
       <div
@@ -338,6 +352,17 @@ export function SchemeFlowchart({
                   {taskCount}
                 </span>
               </button>
+              <span
+                className={cn(
+                  styles.runningCount,
+                  runningCount > 0 && styles.runningCountActive,
+                )}
+                title={`Параллельно работающих процессов сейчас: ${runningCount}`}
+                aria-label={`Параллельно работающих процессов: ${runningCount}`}
+              >
+                <Activity size={13} aria-hidden="true" />
+                {runningCount}
+              </span>
             </div>
           </>
         )}

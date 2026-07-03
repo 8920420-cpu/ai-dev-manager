@@ -109,6 +109,10 @@ roles ─┬─< agents
 | name | text |
 | description | text |
 | sort_order | int |
+| is_mcp_role | boolean NOT NULL DEFAULT false — роль доступна через MCP (раздел «MCP роли») |
+| requirements | text NULL — требования к MCP-роли (свободный текст: доступы, данные, ограничения) |
+
+Частичный индекс `idx_roles_is_mcp_role ON roles(is_mcp_role) WHERE is_mcp_role = true` (миграция 0041).
 
 ### agents
 Конкретные ИИ, привязаны к роли.

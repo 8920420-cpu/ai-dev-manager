@@ -246,6 +246,11 @@ export function buildCompletionBody(task, agentResult) {
     // KPI прогона (оркестратор запишет в agent_runs.token_input/token_output/cost/cold_start_ms/turns/outcome).
     tokensIn: intOrNull(agentResult.tokensIn),
     tokensOut: intOrNull(agentResult.tokensOut),
+    // TOKEN-SPLIT-001: разбивка входа → agent_runs.token_cache_read/token_cache_creation
+    // (свежий ввод = token_input − cache_read − cache_creation). null для движков без
+    // prompt-кэша — оркестратор через COALESCE не затрёт уже записанное.
+    tokensCacheRead: intOrNull(agentResult.tokensCacheRead),
+    tokensCacheCreation: intOrNull(agentResult.tokensCacheCreation),
     costUsd: numOrNull(agentResult.costUsd),
     coldStartMs: intOrNull(agentResult.coldStartMs),
     turns: intOrNull(agentResult.turns),

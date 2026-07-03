@@ -71,6 +71,8 @@ npm test
 `orchestrator_get_task_statistics` (`GET /api/projects/:id/task-statistics`),
 `orchestrator_list_roles` (`GET /api/roles`),
 `orchestrator_get_role_fields` (`GET /api/roles/:code/fields`),
+`orchestrator_list_mcp_roles` (`GET /api/mcp-roles` — роли, доступные через MCP, с промтом и требованиями),
+`orchestrator_get_mcp_role` (`GET /api/mcp-roles/:code` — карточка MCP-роли: промт и требования),
 `orchestrator_db_status` (`GET /api/db/status`),
 `orchestrator_claim_next_claude_task` (`GET /api/runner/next-claude-task`),
 `orchestrator_claim_next_host_task` (`GET /api/runner/next-host-task?role=`).

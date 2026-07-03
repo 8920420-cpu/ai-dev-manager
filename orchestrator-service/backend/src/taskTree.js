@@ -15,12 +15,22 @@ import { withClient, clientConfig } from './db.js';
 /**
  * GET /api/tasks/stats — счётчики задач по статусам (по всем проектам). Схема
  * разработки общая, поэтому этап (task_status) считается по всем проектам сразу.
- * Возвращает { byStatus: { CODING: 5, REVIEW: 2, ... }, total }. Read-only.
+ * Возвращает { byStatus: { CODING: 5, REVIEW: 2, ... }, runningByStatus, total }.
+ * runningByStatus — число параллельно работающих процессов (agent_runs в статусе
+ * RUNNING), сгруппированных по текущему статусу задачи; без временного окна, чтобы
+ * отражать ровно активные запуски на каждом этапе. Read-only.
  */
 export async function getTaskStatusCounts(s) {
   return withClient(clientConfig(s), async (c) => {
     const r = await c.query(
       `SELECT status::text AS status, count(*)::int AS n FROM tasks GROUP BY status`,
+    );
+    const running = await c.query(
+      `SELECT t.status::text AS status, count(*)::int AS n
+         FROM agent_runs ar
+         JOIN tasks t ON t.id = ar.task_id
+        WHERE ar.status = 'RUNNING'
+        GROUP BY t.status`,
     );
     const byStatus = {};
     let total = 0;
@@ -28,7 +38,11 @@ export async function getTaskStatusCounts(s) {
       byStatus[row.status] = row.n;
       total += row.n;
     }
-    return { byStatus, total };
+    const runningByStatus = {};
+    for (const row of running.rows) {
+      runningByStatus[row.status] = row.n;
+    }
+    return { byStatus, runningByStatus, total };
   });
 }
 

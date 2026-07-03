@@ -4,7 +4,21 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { buildVerdictJsonSchema } from '../src/roleEngine.js';
-import { completeReasoningTaskTx, releaseReasoningTask } from '../src/db.js';
+import { completeReasoningTaskTx, releaseReasoningTask, normalizeRunKpi } from '../src/db.js';
+
+// TOKEN-SPLIT-001 — нормализация разбивки входа из тела сдачи раннера.
+test('normalizeRunKpi: разбивка входа (cache_read/cache_creation) округляется, отсутствие → null', () => {
+  const kpi = normalizeRunKpi({
+    tokensIn: 9200, tokensOut: 300, tokensCacheRead: 8000.4, tokensCacheCreation: 200.9, costUsd: 0.5,
+  });
+  assert.equal(kpi.tokenInput, 9200);
+  assert.equal(kpi.tokenCacheRead, 8000);
+  assert.equal(kpi.tokenCacheCreation, 201);
+  // Движок без prompt-кэша (codex/deepseek) разбивку не шлёт → null (COALESCE не затрёт).
+  const bare = normalizeRunKpi({ tokensIn: 100, tokensOut: 10 });
+  assert.equal(bare.tokenCacheRead, null);
+  assert.equal(bare.tokenCacheCreation, null);
+});
 
 function fakeClient(rules) {
   const calls = [];
