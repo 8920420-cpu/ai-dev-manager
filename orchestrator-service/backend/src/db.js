@@ -11,7 +11,7 @@ import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
 import { buildPipelineClaimContract } from './pipelineDispatch.js';
 import { reconcileClockSkew } from './clockGuard.js';
 import { isDbConnectionError, noteDbConnectionFailure, claimGraceActive } from './bootClaimGuard.js';
-import { resolveDuration, resolveInt, logEffectiveConfig } from './envConfig.js';
+import { resolveDuration, resolveInt, logEffectiveConfig, parseDurationMs } from './envConfig.js';
 import { isDriverProvider } from './connectors.js';
 import { hashToken } from './intakeIntegrations.js';
 
@@ -1347,7 +1347,16 @@ async function requireService(c, projectId, serviceCode) {
 const CLAUDE_CLAIM_LOCK_KEY = 911_017;
 
 export async function claimNextClaudeTask(s) {
-  return withClient(clientConfig(s), async (c) => {
+  return withClient(clientConfig(s), (c) => claimNextClaudeTaskTx(c));
+}
+
+/**
+ * Транзакционное ядро claimNextClaudeTask (тестируется с fake-клиентом без живого
+ * Postgres — как completeHostTaskTx/acceptScannerCompletionTx). Захват программиста
+ * с cooldown-предикатом PROGRAMMER-RELEASE-BACKOFF-001 (см. picked ниже).
+ */
+export async function claimNextClaudeTaskTx(c) {
+  {
     if (!(await getOrchestratorEnabledTx(c))) return { task: null, paused: true };
     await c.query('BEGIN');
     try {
@@ -1382,6 +1391,36 @@ export async function claimNextClaudeTask(s) {
                   AND t2.status = 'CODING'
                   AND t2.assigned_agent_id IS NOT NULL
              )
+             -- PROGRAMMER-RELEASE-BACKOFF-001: cooldown на повторный захват ТОЙ ЖЕ
+             -- задачи после подряд идущих неудачных release. Инцидент 03.07.2026:
+             -- PRINT-054 крутилась в CODING-петле (агент падал за ~5с →
+             -- releaseClaudeTask возвращал захват → задача бралась снова, 1407
+             -- прогонов за 2 часа), и, так как у программиста ровно один агент, петля
+             -- заблокировала стадию CODING для остальных. N = число неуспешных
+             -- PROGRAMMER-прогонов (FAILED/TIMEOUT) ПОСЛЕ последнего SUCCESS этой
+             -- задачи; backoff(N) берём из расписания $1 (int[] мс), индекс = LEAST(N,
+             -- длина) → потолок на хвосте. Пока now() < last_fail + backoff(N) — задачу
+             -- не выдаём (программист свободен разбирать ДРУГИЕ сервисы). Успех
+             -- обнуляет N сам: считаем только прогоны после последнего SUCCESS. Один
+             -- AND-предикат — приоритет (ORDER BY) и worktree-NOT EXISTS не затронуты.
+             AND NOT EXISTS (
+               SELECT 1 FROM (
+                 SELECT count(*) AS n_fail, max(ar.finished_at) AS last_fail
+                   FROM agent_runs ar
+                  WHERE ar.task_id = t.id
+                    AND ar.role_id = t.current_role_id
+                    AND ar.status IN ('FAILED','TIMEOUT')
+                    AND ar.finished_at IS NOT NULL
+                    AND ar.finished_at > COALESCE((
+                          SELECT max(ok.finished_at) FROM agent_runs ok
+                           WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
+                             AND ok.status = 'SUCCESS'), '-infinity'::timestamptz)
+               ) cd
+               WHERE cd.n_fail > 0
+                 AND now() < cd.last_fail
+                             + (($1::int[])[LEAST(cd.n_fail::int, array_length($1::int[], 1))])
+                               * interval '1 millisecond'
+             )
            ORDER BY t.priority DESC, t.created_at
            FOR UPDATE OF t SKIP LOCKED
            LIMIT 1
@@ -1391,6 +1430,7 @@ export async function claimNextClaudeTask(s) {
            FROM picked
           WHERE t.id = picked.id
           RETURNING t.id, t.title, t.description, t.project_id, t.service_id, t.current_role_id`,
+        [PROGRAMMER_RELEASE_BACKOFF_MS],
       );
       if (!picked.rowCount) {
         await c.query('COMMIT');
@@ -1539,7 +1579,7 @@ export async function claimNextClaudeTask(s) {
       await c.query('ROLLBACK');
       throw error;
     }
-  });
+  }
 }
 
 /**
@@ -2232,6 +2272,35 @@ const DOC_BRANCH_MAX_AGE_MS = docBranchAgeCfg.value;
 // источника (env|default) — чтобы по логу было видно, что реально применилось.
 logEffectiveConfig('orchestrator timeouts', [roleTimeoutCfg, claudeAssignCfg, hostTimeoutCfg]);
 
+// PROGRAMMER-RELEASE-BACKOFF-001 — расписание backoff/cooldown на повторный захват
+// одной задачи программистом после подряд идущих неудачных release и порог K для
+// предохранителя от вечной петли (инцидент 03.07.2026, PRINT-054: 1407 бесполезных
+// прогонов за 2 часа, стадия CODING заблокирована для остальных задач). Дефолт —
+// 30с → 2мин → 10мин (потолок на хвосте) и K=5 подряд провалов. Оба параметра
+// переопределяемы через env (рядом с CLAUDE_ASSIGN_TIMEOUT_MS для обозримости).
+const DEFAULT_PROGRAMMER_RELEASE_BACKOFF_MS = [30_000, 120_000, 600_000];
+
+// Разбор расписания backoff из env: CSV длительностей ("30s,2m,10m" или
+// "30000,120000,600000"). Пусто/мусор целиком → дефолт; невалидные/непозитивные
+// элементы отбрасываются, пустой результат → дефолт. Чистая функция (юнит-тест).
+export function parseBackoffScheduleMs(raw, dflt = DEFAULT_PROGRAMMER_RELEASE_BACKOFF_MS) {
+  if (raw == null || String(raw).trim() === '') return [...dflt];
+  const vals = String(raw)
+    .split(',')
+    .map((p) => parseDurationMs(p))
+    .filter((n) => Number.isFinite(n) && n > 0)
+    .map((n) => Math.round(n));
+  return vals.length ? vals : [...dflt];
+}
+
+const PROGRAMMER_RELEASE_BACKOFF_MS = parseBackoffScheduleMs(
+  process.env.PROGRAMMER_RELEASE_BACKOFF_MS_SCHEDULE,
+);
+const programmerLoopMaxCfg = resolveInt('PROGRAMMER_RELEASE_LOOP_MAX', 5, { min: 1, max: 1000 });
+const PROGRAMMER_RELEASE_LOOP_MAX = programmerLoopMaxCfg.value;
+logEffectiveConfig('programmer release loop', [programmerLoopMaxCfg]);
+console.log(`programmer release backoff schedule (ms)=${JSON.stringify(PROGRAMMER_RELEASE_BACKOFF_MS)}`);
+
 // --- Динамический маршрут проекта (PIPELINE-DYNAMIC-ROUTE-001) ---------------
 
 // Прочитать этапы проекта и собрать плоский маршрут (buildRoute). Пустой массив
@@ -2434,6 +2503,12 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // BLOCKED (на человека). Зелёные задачи сюда не попадают — их раньше пропускает
     // maybeSkipFailureAnalyst (forward), поэтому здесь явно требуем провала пайплайна.
     await blockExhaustedFailureAnalysis(c);
+    // PROGRAMMER-RELEASE-BACKOFF-001: предохранитель от вечной петли захвата одной
+    // задачи программистом. После K подряд неуспешных PROGRAMMER-прогонов уводим
+    // CODING-задачу в BLOCKED (см. escalateProgrammerReleaseLoop) — cooldown в
+    // claimNextClaudeTask лишь тормозит захват, а этот свипер разрывает петлю, чтобы
+    // задача не молотила часами и не держала единственный слот программиста.
+    await escalateProgrammerReleaseLoop(c);
     // DOC-BRANCH-LIVENESS-001: документационная fork-ветвь не должна заклинивать
     // родителя на join. Мёртвую ветку документации (BLOCKED/FAILED/исчерпание попыток)
     // продвигаем на узел вперёд к join ДО снятия join-барьера, чтобы родитель поехал.
@@ -3176,6 +3251,60 @@ async function reattachOrphanStageRoles(c) {
   return r.rowCount;
 }
 
+// PROGRAMMER-RELEASE-BACKOFF-001 — предохранитель от вечной петли захвата одной
+// задачи программистом. После K = maxFails ПОДРЯД неуспешных PROGRAMMER-прогонов
+// (FAILED/TIMEOUT) ПОСЛЕ последнего SUCCESS уводим CODING-задачу из активного пула,
+// чтобы она не молотила часами (cooldown лишь тормозит захват, но при бесконечных
+// падениях сам по себе петлю не разрывает). Целевой статус — BLOCKED (на человека),
+// а НЕ FAILURE_ANALYSIS: инцидентные падения инфраструктурные (агент падает за ~5с,
+// кода нет — анализировать нечего), а FAILURE_ANALYST на задаче без реального провала
+// пайплайна мгновенно проматывается обратно в CODING (maybeSkipFailureAnalyst,
+// last_pipeline != 'FAILED') → тот же тик снова эскалировали бы → тесная петля через
+// FAILURE_ANALYSIS. BLOCKED терминально выводит задачу из CODING (её не клеймит ни
+// claim, ни свиперы), человек разбирается с корневой причиной. Требование допускает
+// оба варианта ("FAILURE_ANALYSIS или BLOCKED с причиной programmer_release_loop"),
+// архитектор оставил выбор реализации — выбран BLOCKED как надёжно разрывающий петлю.
+// Успешная сдача обнуляет N сама (SUCCESS сдвигает окно счёта) → до K задача не
+// доходит на здоровом пути. Один свипер, тикает в преамбуле advanceAutomatedTasks
+// рядом с blockExhaustedFailureAnalysis — независимо от фидера.
+export async function escalateProgrammerReleaseLoop(c, maxFails = PROGRAMMER_RELEASE_LOOP_MAX) {
+  const r = await c.query(
+    `WITH loop_tasks AS (
+       SELECT t.id, t.status::text AS status, t.current_role_id, cd.n_fail
+         FROM tasks t
+         JOIN roles r ON r.id = t.current_role_id
+         CROSS JOIN LATERAL (
+           SELECT count(*) AS n_fail
+             FROM agent_runs ar
+            WHERE ar.task_id = t.id
+              AND ar.role_id = t.current_role_id
+              AND ar.status IN ('FAILED','TIMEOUT')
+              AND ar.finished_at IS NOT NULL
+              AND ar.finished_at > COALESCE((
+                    SELECT max(ok.finished_at) FROM agent_runs ok
+                     WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
+                       AND ok.status = 'SUCCESS'), '-infinity'::timestamptz)
+         ) cd
+        WHERE t.status = 'CODING'
+          AND t.assigned_agent_id IS NULL
+          AND r.code = 'PROGRAMMER'
+          AND cd.n_fail >= $1
+     ), blocked AS (
+       UPDATE tasks t
+          SET status = 'BLOCKED', assigned_agent_id = NULL
+         FROM loop_tasks lt
+        WHERE t.id = lt.id AND t.status = 'CODING'
+        RETURNING t.id, lt.status AS from_status, lt.current_role_id AS from_role, lt.n_fail
+     )
+     INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     SELECT b.id, 'STATUS_CHANGED', b.from_status::task_status, 'BLOCKED', b.from_role,
+            jsonb_build_object('runner', true, 'reason', 'programmer_release_loop', 'failedRuns', b.n_fail)
+       FROM blocked b`,
+    [Math.max(1, Number(maxFails) || 1)],
+  );
+  return r.rowCount;
+}
+
 // TESTS-GREEN-SKIP-FA-001 (fix B) — увести в BLOCKED задачи, застрявшие в анализе
 // сбоя на реальном провале тестов после исчерпания попыток. Считаем таймауты/провалы
 // прогонов аналитика как rework-попытки: при >= maxAttempts безрезультатных прогонов
@@ -3768,6 +3897,17 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
   // service_id ещё нет и резолв не удался — BLOCKED с диагностикой, а не молчаливый висяк.
   let setServiceId;
   if (claimed.role_code === 'ARCHITECT' && decision.outcome === 'FORWARD') {
+    // ARCH-SERVICE-SPLIT-001: если разбивка Архитектора (normalizeWorkItems из
+    // data_card + поля вердикта) затрагивает ДВА И БОЛЕЕ разных зарегистрированных
+    // сервиса проекта — материализуем НЕЗАВИСИМЫЕ задачи по одной на сервис (каждая
+    // идёт по конвейеру отдельно), а эпик паркуем в WAITING_FOR_CHILDREN. Иначе —
+    // прежнее поведение: одна задача (ensureArchitectService; 0 сервисов → BLOCKED).
+    const split = await resolveArchitectSplit(c, claimed, verdict.fields, cardValues);
+    if (split.services.length >= 2) {
+      return materializeArchitectSplit(c, claimed, {
+        verdict, response, exchangeId, durationMs, decision, cardValues, route, kpi, split,
+      });
+    }
     const ensured = await ensureArchitectService(c, claimed, verdict.fields, cardValues);
     if (ensured.blocked) {
       return blockClaimedReason(c, claimed, ensured.reason, { verdict, cardValues, kpi, event: 'architect_no_service' });
@@ -3910,6 +4050,42 @@ async function ensureArchitectService(c, claimed, verdictFields, cardValues) {
   }
   const attempted = plan.map((p) => p.serviceCode).filter(Boolean);
   return { blocked: true, reason: `architect_no_service:${attempted.join(',') || 'empty'}` };
+}
+
+// ARCH-SERVICE-SPLIT-001 — резолвим разбивку Архитектора в РАЗНЫЕ зарегистрированные
+// сервисы проекта (регистронезависимо). Источник карточки — data_card задачи + поля
+// вердикта Архитектора + cardValues (как в ensureArchitectService). Возвращает
+// { card, services:[{ serviceId, serviceCode, title, files }], unresolved:[serviceCode],
+// byCode }. services дедуплицированы по serviceId — несколько work_items одного сервиса
+// сливаются (файлы объединяются, заголовок берём первый). Только чтение services.
+export async function resolveArchitectSplit(c, claimed, verdictFields, cardValues) {
+  const card = {
+    ...(claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {}),
+    ...(verdictFields && typeof verdictFields === 'object' ? verdictFields : {}),
+    ...(cardValues || {}),
+  };
+  const plan = normalizeWorkItems(card);
+  const svcRows = await c.query('SELECT id, service_code FROM services WHERE project_id = $1', [claimed.project_id]);
+  const byCode = new Map(svcRows.rows.map((r) => [String(r.service_code).toLowerCase(), r.id]));
+  const byId = new Map();
+  const unresolved = [];
+  for (const item of plan) {
+    const sid = byCode.get(String(item.serviceCode).toLowerCase());
+    if (!sid) { unresolved.push(item.serviceCode); continue; }
+    if (byId.has(sid)) byId.get(sid).files.push(...item.files);
+    else byId.set(sid, { serviceId: sid, serviceCode: item.serviceCode, title: item.title, files: [...item.files] });
+  }
+  return { card, services: Array.from(byId.values()), unresolved, byCode };
+}
+
+// ARCH-SERVICE-SPLIT-001 — карточка дочерней задачи: карточка родителя, но work_items
+// и affected_files оставлены ТОЛЬКО для указанного сервиса (код резолвится по byCode
+// регистронезависимо к serviceId ребёнка). Прочие поля карточки сохраняются как есть.
+function filterCardForService(card, byCode, serviceId) {
+  const belongs = (code) => byCode.get(String(code ?? '').trim().toLowerCase()) === serviceId;
+  const workItems = jsonArray(card?.work_items).filter((it) => belongs(it?.serviceCode ?? it?.service));
+  const affectedFiles = jsonArray(card?.affected_files).filter((f) => belongs(f?.serviceCode ?? f?.service));
+  return { ...card, work_items: workItems, affected_files: affectedFiles };
 }
 
 // DECOMPOSER-REMOVE-001 — заблокировать задачу с понятной причиной, СОХРАНИВ роль
@@ -4118,6 +4294,115 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
       taskId: claimed.id, fromRole: claimed.role_code, fromStatus: claimed.status,
       toStatus: 'WAITING_FOR_CHILDREN', nextRole: 'PROGRAMMER', verdict: verdict.status,
       services: serviceCount, subtasks: subtaskCount, durationMs,
+    };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
+}
+
+// ARCH-SERVICE-SPLIT-001 — расщепление мультисервисной задачи Архитектора на
+// НЕЗАВИСИМЫЕ задачи по сервисам. Вызывается из applyReasoningVerdict (ветка
+// ARCHITECT + FORWARD), когда разбивка Архитектора затрагивает ≥2 РАЗНЫХ
+// зарегистрированных сервиса. Один txn (по образцу materializeDecomposition). Для
+// каждого сервиса создаётся самостоятельная задача-на-сервис (task_kind='service',
+// parent = исходная задача, свой service_id, свой раздел описания и отфильтрованная
+// карточка), которая входит в маршрут FORWARD-переходом Архитектора и идёт по
+// конвейеру ОТДЕЛЬНО (дети друг от друга не зависят). Исходная задача становится
+// эпиком (WAITING_FOR_CHILDREN) и закрывается роллапом advanceDecompositionParents
+// после завершения всех детей. Идемпотентно: есть дети → финал прогона
+// reason='already_decomposed'. Нерезолвленные serviceCode уходят в unresolved
+// события — задач по ним не создаём.
+export async function materializeArchitectSplit(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, route, kpi = null, split = null }) {
+  const { card, services, unresolved, byCode } = split ?? await resolveArchitectSplit(c, claimed, verdict.fields, cardValues);
+
+  await c.query('BEGIN');
+  try {
+    // Идемпотентность: задача уже расщеплена — финализируем прогон без дублей.
+    const hasChildren = await c.query('SELECT 1 FROM tasks WHERE parent_task_id = $1 LIMIT 1', [claimed.id]);
+    if (hasChildren.rowCount) {
+      const kpiSet0 = runKpiSet(kpi, 2);
+      await c.query(
+        `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet0.sql} WHERE id = $1`,
+        [claimed.agentRunId, JSON.stringify({ status: verdict.status, summary: verdict.summary, reason: 'already_decomposed' }), ...kpiSet0.params],
+      );
+      await c.query('COMMIT');
+      return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: claimed.status, reason: 'already_decomposed', durationMs };
+    }
+
+    // Вход детей в маршрут = FORWARD-переход Архитектора по маршруту проекта. Граф-
+    // режим (есть current_stage_key) → целевой узел Programmer (resolveGraphTransition
+    // даёт nextStageKey/статус/роль); линейный — resolveTransition (обычно CODING/
+    // PROGRAMMER). Дети наследуют этот целевой этап/статус/роль.
+    const resolved = claimed.current_stage_key
+      ? await resolveGraphTransition(c, claimed, decision)
+      : resolveTransition(route, claimed.role_code, decision);
+    const childRoleId = resolved.nextRole
+      ? (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null
+      : null;
+    const childStageKey = resolved.nextStageKey ?? null;
+
+    let serviceCount = 0;
+    const createdServices = [];
+    for (const svc of services) {
+      // Карточка ребёнка — карточка родителя (+ поля вердикта Архитектора) с
+      // work_items/affected_files, отфильтрованными по ЭТОМУ сервису.
+      const childCard = filterCardForService(card, byCode, svc.serviceId);
+      const filesText = svc.files
+        .map((f) => (f.path ? `- ${f.path}${f.what ? ` — ${f.what}` : ''}` : (f.what ? `- ${f.what}` : '')))
+        .filter(Boolean)
+        .join('\n');
+      const childDescription = `${claimed.description ?? ''}\n\n## Задание для сервиса ${svc.serviceCode}\n${filesText || svc.title}`
+        .trim()
+        .slice(0, 20000);
+      const child = await c.query(
+        `INSERT INTO tasks (project_id, service_id, parent_task_id, task_kind, title, description,
+                            status, current_role_id, current_stage_key, created_by, data_card)
+         VALUES ($1, $2, $3, 'service', $4, $5, $6::task_status, $7, $8::uuid, 'architect', $9::jsonb)
+         RETURNING id`,
+        [claimed.project_id, svc.serviceId, claimed.id, svc.title, childDescription,
+         resolved.toStatus, childRoleId, childStageKey, JSON.stringify(childCard)],
+      );
+      const childId = child.rows[0].id;
+      serviceCount += 1;
+      createdServices.push({ id: childId, serviceCode: svc.serviceCode });
+      // Эпик зависит от ребёнка (единица приёмки) — как в materializeDecomposition.
+      // Дети друг от друга НЕ зависят: каждый идёт по конвейеру независимо.
+      await c.query(
+        `INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)
+         ON CONFLICT (task_id, depends_on_task_id) DO NOTHING`,
+        [claimed.id, childId],
+      );
+    }
+
+    // Эпик: помечаем видом, паркуем на детях, доливаем поля вердикта Архитектора.
+    await c.query(
+      `UPDATE tasks SET task_kind = 'epic', status = 'WAITING_FOR_CHILDREN', assigned_agent_id = NULL,
+              data_card = data_card || $2::jsonb WHERE id = $1`,
+      [claimed.id, JSON.stringify(cardValues || {})],
+    );
+    const kpiSet = runKpiSet(kpi, 2);
+    await c.query(
+      `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet.sql} WHERE id = $1`,
+      [claimed.agentRunId, JSON.stringify({
+        status: verdict.status, summary: verdict.summary, findings: verdict.findings,
+        reason: 'architect_service_split', outcome: decision.outcome, fields: cardValues,
+        services: serviceCount, unresolved,
+      }), ...kpiSet.params],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'STATUS_CHANGED', $2::task_status, 'WAITING_FOR_CHILDREN', $3, $4::jsonb)`,
+      [claimed.id, claimed.status, claimed.role_id, JSON.stringify({
+        runner: true, ai: true, role: claimed.role_code, reason: 'architect_service_split',
+        verdictStatus: verdict.status, summary: verdict.summary, services: createdServices, unresolved, exchangeId,
+      })],
+    );
+    await c.query('COMMIT');
+    return {
+      taskId: claimed.id, fromRole: claimed.role_code, fromStatus: claimed.status,
+      toStatus: 'WAITING_FOR_CHILDREN', nextRole: resolved.nextRole, verdict: verdict.status,
+      services: serviceCount, unresolved, durationMs,
     };
   } catch (error) {
     await c.query('ROLLBACK');
