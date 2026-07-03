@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   parseVerdict,
+  parseYamlVerdict,
   normalizeVerdict,
   decideTransition,
   decideOutcome,
@@ -60,6 +61,64 @@ test('parseVerdict: вложенный fields сохраняется', () => {
 test('parseVerdict: ```-блок среди прозы с другими скобками', () => {
   const v = parseVerdict('Мысли: {x}\n```json\n{"status":"APPROVED"}\n```\nещё {y}');
   assert.deepEqual(v, { status: 'APPROVED' });
+});
+
+// VERDICT-YAML-FENCE-001 — вердикт в ```yaml-фенсе (claude_code без --output-schema)
+// должен распознаваться в тот же объект-вердикт, а не ронять verdict_unparsed.
+test('parseVerdict: вердикт в ```yaml-фенсе → объект-вердикт', () => {
+  const text = [
+    'Вот мой вывод:',
+    '```yaml',
+    'status: APPROVED',
+    'summary: Всё соответствует требованиям',
+    'findings:',
+    '  - замечание один',
+    '  - замечание два',
+    '```',
+  ].join('\n');
+  assert.deepEqual(parseVerdict(text), {
+    status: 'APPROVED',
+    summary: 'Всё соответствует требованиям',
+    findings: ['замечание один', 'замечание два'],
+  });
+});
+
+test('parseVerdict: ```yml-фенс с вложенным fields (маппинг + список)', () => {
+  const text = [
+    '```yml',
+    'status: READY',
+    'summary: ok',
+    'fields:',
+    '  short_title: Заголовок',
+    '  tags:',
+    '    - a',
+    '    - b',
+    '```',
+  ].join('\n');
+  assert.deepEqual(parseVerdict(text), {
+    status: 'READY',
+    summary: 'ok',
+    fields: { short_title: 'Заголовок', tags: ['a', 'b'] },
+  });
+});
+
+test('parseYamlVerdict: без ключа status → null (прозу в YAML не принимаем за вердикт)', () => {
+  assert.equal(parseYamlVerdict('summary: просто текст\nnote: без статуса'), null);
+  assert.equal(parseYamlVerdict('просто строка без структуры'), null);
+  assert.equal(parseYamlVerdict(''), null);
+});
+
+test('parseYamlVerdict: кавычки и инлайн-список', () => {
+  assert.deepEqual(
+    parseYamlVerdict('status: "NEEDS_FIX"\nfindings: [первое, "второе"]'),
+    { status: 'NEEDS_FIX', findings: ['первое', 'второе'] },
+  );
+});
+
+// ```yaml-фенс без status — НЕ вердикт: parseVerdict должен вернуть null (verdict_unparsed
+// с последующим авто-ретраем), а не выдумать частичный вердикт.
+test('parseVerdict: ```yaml без status → null', () => {
+  assert.equal(parseVerdict('```yaml\nsummary: пояснение без статуса\n```'), null);
 });
 
 // SILENT-FAIL-GUARD-001 (B): ответ DeepSeek с tool-call разметкой DSML (без финального
@@ -210,7 +269,11 @@ test('decideTransition: GIT_INTEGRATOR success => DONE (done=true)', () => {
 });
 
 test('buildVerdictInstruction/buildUserPayload содержат JSON-контракт и контекст', () => {
-  assert.match(buildVerdictInstruction(), /JSON/);
+  const instruction = buildVerdictInstruction();
+  assert.match(instruction, /JSON/);
+  // VERDICT-YAML-FENCE-001: контракт явно запрещает код-фенсы и YAML вокруг вердикта.
+  assert.match(instruction, /код-фенс/);
+  assert.match(instruction, /YAML/);
   const payload = buildUserPayload('TASK_REVIEWER', { taskId: 'x', title: 'T' });
   assert.match(payload, /TASK_REVIEWER/);
   // Контекст сериализуется компактно (без отступов) — экономия токенов.

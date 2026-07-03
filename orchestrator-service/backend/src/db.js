@@ -11,7 +11,7 @@ import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
 import { buildPipelineClaimContract } from './pipelineDispatch.js';
 import { reconcileClockSkew } from './clockGuard.js';
 import { isDbConnectionError, noteDbConnectionFailure, claimGraceActive } from './bootClaimGuard.js';
-import { resolveDuration, logEffectiveConfig } from './envConfig.js';
+import { resolveDuration, resolveInt, logEffectiveConfig } from './envConfig.js';
 import { isDriverProvider } from './connectors.js';
 import { hashToken } from './intakeIntegrations.js';
 
@@ -2101,9 +2101,14 @@ export async function completeReasoningTaskTx(c, input) {
     exchangeId = ins.rows[0].id;
   } catch { /* журнал необязателен */ }
 
-  // SILENT-FAIL-GUARD-001: вердикт не распознан → FAILED (как DeepSeek-путь).
+  // SILENT-FAIL-GUARD-001: вердикт не распознан. VERDICT-RETRY-001: сначала авто-повтор
+  // прогона роли (задача освобождается — тот же внешний движок заберёт её снова), и
+  // только после исчерпания лимита — терминальный FAILED (как DeepSeek-путь).
   if (parsed === null) {
-    await failRoleUnparsed(c, claimed, { response: text, exchangeId });
+    const outcome = await failRoleUnparsed(c, claimed, { response: text, exchangeId });
+    if (outcome === null) {
+      return { accepted: true, taskId, toStatus: null, reason: 'verdict_unparsed', retried: true };
+    }
     return { accepted: true, taskId, toStatus: 'FAILED', reason: 'verdict_unparsed' };
   }
 
@@ -4190,11 +4195,21 @@ async function failRoleRun(c, claimed, err) {
   }
 }
 
+// VERDICT-RETRY-001: verdict_unparsed НЕ должен сразу ронять задачу в терминальный
+// FAILED. Движок claude_code (Claude Agent SDK) не умеет навязать JSON-схему вердикта
+// на уровне CLI (в отличие от codex `--output-schema`), поэтому единичный сбой формата
+// вердикта — обычный шум, а не тупик: сначала минимум один авто-повтор прогона роли
+// (release, по образцу failRoleRun), и только после исчерпания лимита — прежний
+// терминальный FAILED. Лимит настраивается env (0 = прежнее поведение без ретраев).
+const MAX_VERDICT_RETRY = resolveInt('RUNNER_MAX_VERDICT_RETRY', 1, { min: 0, max: 10 }).value;
+
 // SILENT-FAIL-GUARD-001 (B): реасонинг-роль вернула ответ, но без распознаваемого
 // JSON-вердикта. Раньше такой случай молча уходил вперёд как успех (пустые поля).
-// Теперь помечаем задачу «не выполнен» (FAILED) и ПОДРОБНО логируем причину в трёх
-// местах для быстрой диагностики: agent_runs.error_text + output_json, событие
-// STATUS_CHANGED→FAILED с reason, а сырой ответ модели уже лежит в prompt_exchanges.
+// Теперь помечаем прогон «не выполнен» (FAILED) и ПОДРОБНО логируем причину:
+// agent_runs.error_text + output_json (reason=verdict_unparsed), а сырой ответ модели
+// уже лежит в prompt_exchanges. VERDICT-RETRY-001: пока не исчерпан лимит авто-повторов
+// — освобождаем задачу под ретрай (return null, как failRoleRun); только после —
+// терминальный FAILED с событием STATUS_CHANGED→FAILED.
 async function failRoleUnparsed(c, claimed, result) {
   const head = String(result?.response ?? '').replace(/\s+/g, ' ').trim().slice(0, 500);
   const reason = 'verdict_unparsed';
@@ -4206,6 +4221,23 @@ async function failRoleUnparsed(c, claimed, result) {
       `UPDATE agent_runs SET status = 'FAILED', finished_at = now(), error_text = $2, output_json = $3::jsonb WHERE id = $1`,
       [claimed.agentRunId, errorText, JSON.stringify({ reason, exchangeId: result?.exchangeId ?? null, responseHead: head })],
     );
+    // Сколько раз ЭТА роль уже падала на неразобранном вердикте (вкл. только что
+    // помеченный прогон — reason уже записан в output_json выше). Пока лимит не
+    // превышен — освобождаем задачу (status/роль сохраняются) под авто-повтор.
+    const retries = await c.query(
+      `SELECT count(*)::int AS n FROM agent_runs
+        WHERE task_id = $1 AND role_id = $2 AND status = 'FAILED' AND output_json->>'reason' = 'verdict_unparsed'`,
+      [claimed.id, claimed.role_id],
+    );
+    if (retries.rows[0].n <= MAX_VERDICT_RETRY) {
+      await c.query(
+        `UPDATE tasks SET assigned_agent_id = NULL WHERE id = $1 AND status NOT IN ('DONE','CANCELLED')`,
+        [claimed.id],
+      );
+      await c.query('COMMIT');
+      return null; // освобождено под авто-ретрай (тот же движок заберёт задачу снова)
+    }
+    // Лимит авто-повторов исчерпан — прежнее поведение: терминальный FAILED.
     await c.query(
       `UPDATE tasks SET status = 'FAILED', assigned_agent_id = NULL WHERE id = $1 AND status NOT IN ('DONE','CANCELLED')`,
       [claimed.id],

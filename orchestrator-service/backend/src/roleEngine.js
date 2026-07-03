@@ -250,6 +250,10 @@ export function buildVerdictInstruction(outputFields = []) {
   };
   const lines = [
     'Верни ОТВЕТ СТРОГО как JSON-объект (valid json), без markdown и текста вокруг.',
+    // VERDICT-YAML-FENCE-001: reasoning-движки (в т.ч. claude_code) иногда оборачивают
+    // вердикт в код-фенс ```yaml/```json или добавляют прозу — это ронял разбор в
+    // verdict_unparsed. Явно запрещаем фенсы/YAML/пояснения: только сырой JSON-объект.
+    'ВЫВОД — ТОЛЬКО сам JSON-объект: без код-фенсов (``` ), без YAML, без комментариев и текста до/после.',
     'Структура: {',
     '  "status": "<статус из раздела «Формат результата» твоей роли>",',
     '  "summary": "<краткий вывод на русском>",',
@@ -357,6 +361,88 @@ export function buildUserPayload(roleCode, context, outputFields = [], { include
   return sections.join('\n');
 }
 
+// VERDICT-YAML-FENCE-001 — минимальный разбор YAML-вердикта из ```yaml/```yml-фенса.
+// Движок claude_code (Claude Agent SDK) НЕ умеет навязать JSON-схему на уровне CLI
+// (в отличие от codex `--output-schema`), поэтому периодически отдаёт содержательно
+// верный вердикт как YAML в код-фенсе → прежний JSON-only парсер давал null →
+// verdict_unparsed → терминальный FAILED. Полный YAML не нужен — только форма
+// вердикта: скаляры (status/summary), списки (findings) и одноуровневые маппинги
+// (fields) с вложенными списком/скаляром. Возвращает plain-объект того же вида, что
+// JSON-вердикт, ТОЛЬКО если распознан ключ `status` (иначе null — прозу в ```yaml не
+// принимаем за вердикт, SILENT-FAIL-GUARD-001 не ослабляется). Не поддерживает
+// якоря/многострочные литералы/произвольную вложенность — их в вердиктах ролей нет.
+export function parseYamlVerdict(text) {
+  const src = String(text ?? '').replace(/\r\n?/g, '\n').replace(/\t/g, '  ');
+  const rows = [];
+  for (const line of src.split('\n')) {
+    if (!line.trim() || /^\s*#/.test(line)) continue; // пустые строки и комментарии
+    rows.push({ indent: line.length - line.replace(/^ +/, '').length, content: line.trim() });
+  }
+  if (!rows.length) return null;
+
+  const parseScalar = (input) => {
+    const v = String(input).trim();
+    if (v === '' || v === '~' || v === 'null') return v === '' ? '' : null;
+    if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+      return v.slice(1, -1);
+    }
+    const asJson = (s) => { try { return JSON.parse(s); } catch { return undefined; } };
+    if (v.startsWith('[') && v.endsWith(']')) {
+      const j = asJson(v);
+      if (Array.isArray(j)) return j;
+      const inner = v.slice(1, -1).trim();
+      return inner === '' ? [] : inner.split(',').map((x) => parseScalar(x));
+    }
+    if (v.startsWith('{') && v.endsWith('}')) {
+      const j = asJson(v);
+      if (j && typeof j === 'object') return j;
+    }
+    if (v === 'true') return true;
+    if (v === 'false') return false;
+    if (/^-?\d+(\.\d+)?$/.test(v)) return Number(v);
+    return v;
+  };
+
+  let idx = 0;
+  const parseBlock = (indent) => {
+    // Список: строки «- элемент» на одном отступе.
+    if (rows[idx].content === '-' || rows[idx].content.startsWith('- ')) {
+      const arr = [];
+      while (idx < rows.length && rows[idx].indent === indent
+        && (rows[idx].content === '-' || rows[idx].content.startsWith('- '))) {
+        const rest = rows[idx].content === '-' ? '' : rows[idx].content.slice(2).trim();
+        idx += 1;
+        if (rest === '' && idx < rows.length && rows[idx].indent > indent) {
+          arr.push(parseBlock(rows[idx].indent));
+        } else {
+          arr.push(parseScalar(rest));
+        }
+      }
+      return arr;
+    }
+    // Маппинг: строки «key: value» на одном отступе.
+    const obj = {};
+    while (idx < rows.length && rows[idx].indent === indent) {
+      const cm = rows[idx].content.match(/^([^:]+):\s*(.*)$/);
+      if (!cm) { idx += 1; continue; }
+      const key = cm[1].trim().replace(/^["']|["']$/g, '');
+      const val = cm[2];
+      idx += 1;
+      if (val.trim() === '' && idx < rows.length && rows[idx].indent > indent) {
+        obj[key] = parseBlock(rows[idx].indent);
+      } else {
+        obj[key] = parseScalar(val);
+      }
+    }
+    return obj;
+  };
+
+  const result = parseBlock(rows[0].indent);
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  if (!Object.prototype.hasOwnProperty.call(result, 'status')) return null;
+  return result;
+}
+
 // Толерантный парсинг: ответ может быть чистым JSON, JSON в ```-блоке или
 // JSON с прозой/рассуждением вокруг. Возвращает объект-вердикт или null.
 //
@@ -390,10 +476,17 @@ export function parseVerdict(text) {
   if (v) return v;
 
   // 2. Кандидаты: содержимое всех ```-блоков + все сбалансированные {...}-блоки.
-  const candidates = [];
-  const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
+  // VERDICT-YAML-FENCE-001: запоминаем язык фенса — для ```yaml/```yml, если JSON не
+  // распарсился, пробуем YAML-разбор (тот же объект-вердикт). Балансные {...}-блоки —
+  // всегда только JSON.
+  const candidates = []; // { text, allowYaml }
+  const fenceRe = /```[ \t]*([A-Za-z0-9_+-]*)[ \t]*\r?\n?([\s\S]*?)```/g;
   let m;
-  while ((m = fenceRe.exec(raw)) !== null) candidates.push(m[1].trim());
+  while ((m = fenceRe.exec(raw)) !== null) {
+    const lang = String(m[1] ?? '').toLowerCase();
+    const body = m[2].trim();
+    if (body) candidates.push({ text: body, allowYaml: lang === 'yaml' || lang === 'yml' });
+  }
 
   // Финальный вердикт всегда в конце ответа: на огромных «болтливых» ответах
   // балансный скан ведём только по хвосту, чтобы не деградировать до O(n²).
@@ -411,7 +504,7 @@ export function parseVerdict(text) {
       else if (ch === '{') depth += 1;
       else if (ch === '}') {
         depth -= 1;
-        if (depth === 0) { candidates.push(scan.slice(i, j + 1)); i = j; break; }
+        if (depth === 0) { candidates.push({ text: scan.slice(i, j + 1), allowYaml: false }); i = j; break; }
       }
     }
   }
@@ -420,7 +513,9 @@ export function parseVerdict(text) {
   let withStatus = null;
   let anyObj = null;
   for (const cand of candidates) {
-    const parsed = parseLoose(cand);
+    let parsed = parseLoose(cand.text);
+    // ```yaml/```yml-фенс: JSON не распарсился — пробуем YAML-вердикт.
+    if (!parsed && cand.allowYaml) parsed = parseYamlVerdict(cand.text);
     if (!parsed) continue;
     anyObj = parsed;
     if (Object.prototype.hasOwnProperty.call(parsed, 'status')) withStatus = parsed;

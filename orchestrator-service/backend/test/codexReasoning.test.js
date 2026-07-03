@@ -132,6 +132,48 @@ test('completeReasoningTask: taskId обязателен', async () => {
   await assert.rejects(() => completeReasoningTaskTx(c, {}), /taskId_required/);
 });
 
+// --- VERDICT-RETRY-001: неразобранный вердикт → авто-ретрай, затем терминал --------
+const REWORK_COUNT = /from_status = 'FAILURE_ANALYSIS'/;
+const UNPARSED_COUNT = /output_json->>'reason' = 'verdict_unparsed'/;
+
+// Правила для пути verdict_unparsed у роли на claude_code. unparsedCount — сколько
+// FAILED-прогонов с reason=verdict_unparsed насчитает failRoleUnparsed (вкл. текущий).
+function unparsedRules(unparsedCount) {
+  return [
+    { re: FOUND, reply: { rowCount: 1, rows: [{
+      id: 't1', status: 'REVIEW', role_code: 'TASK_REVIEWER', role_id: 'role-rev',
+      agent_run_id: 'run-1', project_id: 'p1',
+    }] } },
+    { re: ROLE_CONNECTORS, reply: { rowCount: 1, rows: [{ role_code: 'TASK_REVIEWER', provider: 'claude_code' }] } },
+    { re: REWORK_COUNT, reply: { rowCount: 1, rows: [{ n: 0 }] } },
+    { re: /INSERT INTO prompt_exchanges/, reply: { rowCount: 1, rows: [{ id: 'ex1' }] } },
+    { re: UNPARSED_COUNT, reply: { rowCount: 1, rows: [{ n: unparsedCount }] } },
+  ];
+}
+
+test('completeReasoningTask: неразобранный вердикт (1-й раз) → авто-ретрай (release, не терминал)', async () => {
+  const c = fakeClient(unparsedRules(1)); // n=1 <= RUNNER_MAX_VERDICT_RETRY(1) → ретрай
+  const res = await completeReasoningTaskTx(c, { taskId: 't1', response: 'болтовня без JSON и YAML' });
+  assert.equal(res.toStatus, null);
+  assert.equal(res.retried, true);
+  assert.equal(res.reason, 'verdict_unparsed');
+  // Прогон помечен FAILED, задача освобождена (assigned_agent_id=NULL), НЕ в терминал.
+  assert.ok(c.calls.some((q) => /UPDATE agent_runs SET status = 'FAILED'/.test(q.sql)), 'прогон FAILED');
+  assert.ok(c.calls.some((q) => /UPDATE tasks SET assigned_agent_id = NULL/.test(q.sql)), 'задача освобождена');
+  assert.ok(!c.calls.some((q) => /UPDATE tasks SET status = 'FAILED'/.test(q.sql)), 'без терминального FAILED');
+  assert.ok(!c.calls.some((q) => /INSERT INTO task_events/.test(q.sql)), 'без события перехода при ретрае');
+});
+
+test('completeReasoningTask: неразобранный вердикт (лимит исчерпан) → терминальный FAILED', async () => {
+  const c = fakeClient(unparsedRules(2)); // n=2 > RUNNER_MAX_VERDICT_RETRY(1) → терминал
+  const res = await completeReasoningTaskTx(c, { taskId: 't1', response: 'опять без вердикта' });
+  assert.equal(res.toStatus, 'FAILED');
+  assert.equal(res.reason, 'verdict_unparsed');
+  assert.ok(!res.retried);
+  assert.ok(c.calls.some((q) => /UPDATE tasks SET status = 'FAILED'/.test(q.sql)), 'терминальный FAILED');
+  assert.ok(c.calls.some((q) => /INSERT INTO task_events/.test(q.sql)), 'событие STATUS_CHANGED→FAILED');
+});
+
 // --- releaseReasoningTask ----------------------------------------------------
 
 test('releaseReasoningTask: снимает захват и гасит RUNNING-прогон', async () => {
