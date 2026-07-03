@@ -4,6 +4,19 @@
  */
 import { http } from './http';
 
+// ROLE-LOAD-DEPLOY-PERIOD-001 — дельта показателя между периодами деплой-маркеров.
+// pct — дробное отношение изменения (0.123 = +12,3%; фронтенд умножает на 100 и
+// форматирует с 1 знаком). improved: true — эффективность выросла (зелёная стрелка),
+// false — снизилась (красная), null — изменения нет (серый). При отсутствии сравнения
+// (нет предыдущего периода/прогонов, база 0) сам объект дельты = null и не рисуется.
+export interface PeriodDelta {
+  pct: number | null;
+  improved: boolean | null;
+}
+
+// Карта дельт по ключам показателей строки (или null, если сравнения нет).
+export type RoleLoadDelta = Record<string, PeriodDelta | null>;
+
 export interface RoleLoad {
   roleCode: string;
   roleName: string;
@@ -29,6 +42,9 @@ export interface RoleLoad {
   avgTokensOutPerTask: number | null;
   avgCostPerTask: number | null;
   avgColdStartMs: number | null;
+  // ROLE-LOAD-DEPLOY-PERIOD-001: дельта показателей к периоду предыдущего обновления
+  // по направленным метрикам (success/failed/timeout/avg*). null — сравнения нет.
+  delta: RoleLoadDelta | null;
 }
 
 // ROLE-LOAD-LAST-DATA-001: окно блока «Нагрузка по ролям» заякорено к последней
@@ -56,6 +72,21 @@ export interface RoleLoadTaskTotals {
   avgWorkMs: number | null;
   // Дополнительно: среднее сквозное календарное время создание → DONE.
   avgLeadMs: number | null;
+  // ROLE-LOAD-DEPLOY-PERIOD-001: дельта средних (avgCost/avgTokens*/avgWorkMs/avgLeadMs)
+  // к периоду предыдущего обновления. null — сравнения нет.
+  delta: RoleLoadDelta | null;
+}
+
+// ROLE-LOAD-DEPLOY-PERIOD-001 — периоды блока «Нагрузка по ролям» по деплой-маркерам.
+// mode='markers' — текущий период [current.start; current.end] с нуля от последнего
+// обновления; previous — период сравнения ([предпоследний; последний] маркер) или null.
+// mode='fallback' — деплой-маркеров нет, показывается окно 24ч без сравнения.
+export interface RoleLoadPeriods {
+  mode: 'markers' | 'fallback';
+  current: { start: string; end: string } | null;
+  previous: { start: string; end: string } | null;
+  marker: { ref: string | null; description: string | null; createdAt: string } | null;
+  previousHasRuns: boolean;
 }
 
 export interface ConnectorBucket {
@@ -109,6 +140,7 @@ export interface PerformanceMetrics {
   roleLoad: RoleLoad[];
   roleLoadWindow: RoleLoadWindow;
   roleLoadTaskTotals: RoleLoadTaskTotals;
+  roleLoadPeriods: RoleLoadPeriods;
   connector: Record<string, ConnectorBucket>;
 }
 

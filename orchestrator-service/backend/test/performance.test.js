@@ -9,6 +9,9 @@ import {
   computeRoleLoadWindow,
   buildRoleLoadTotals,
   buildRoleLoadTaskTotals,
+  computeMetricDelta,
+  attachRoleLoadDeltas,
+  attachRoleLoadTaskTotalsDelta,
 } from '../src/performance.js';
 
 test('deriveKpi: базовые агрегаты по статусам', () => {
@@ -341,4 +344,124 @@ test('buildRoleLoadTaskTotals: пустой/undefined вход → tasks 0, ср
   assert.deepEqual(buildRoleLoadTaskTotals(), empty);
   assert.deepEqual(buildRoleLoadTaskTotals(undefined), empty);
   assert.deepEqual(buildRoleLoadTaskTotals({}), empty);
+});
+
+// ROLE-LOAD-DEPLOY-PERIOD-001 — период с нуля от последнего обновления + сравнение.
+
+test('computeMetricDelta: рост при lowerIsBetter=false (Успех) → улучшение, зелёный', () => {
+  // 8 → 10 успехов: +25%, для «чем больше тем лучше» это улучшение.
+  const d = computeMetricDelta(10, 8, false);
+  assert.equal(d.pct, 0.25);
+  assert.equal(d.improved, true);
+});
+
+test('computeMetricDelta: рост при lowerIsBetter=true (Провал/Ср.время) → ухудшение, красный', () => {
+  // 4 → 5: +25%, для «чем меньше тем лучше» это ухудшение.
+  const d = computeMetricDelta(5, 4, true);
+  assert.equal(d.pct, 0.25);
+  assert.equal(d.improved, false);
+});
+
+test('computeMetricDelta: снижение «чем меньше тем лучше» → улучшение (стрелка вниз, зелёная)', () => {
+  // 5000 → 4000 мс: −20%, улучшение.
+  const d = computeMetricDelta(4000, 5000, true);
+  assert.equal(d.pct, -0.2);
+  assert.equal(d.improved, true);
+});
+
+test('computeMetricDelta: нулевое изменение → improved null (серый), pct 0', () => {
+  const d = computeMetricDelta(100, 100, true);
+  assert.equal(d.pct, 0);
+  assert.equal(d.improved, null);
+});
+
+test('computeMetricDelta: нет сравнения (null-значения или база 0) → null', () => {
+  assert.equal(computeMetricDelta(null, 5, true), null);
+  assert.equal(computeMetricDelta(5, null, true), null);
+  assert.equal(computeMetricDelta(5, 0, true), null); // база 0 → процент не определён
+});
+
+test('attachRoleLoadDeltas: дельта по коду роли для направленных метрик', () => {
+  const current = deriveRoleLoad([{
+    role_code: 'ARCHITECT', role_name: 'Архитектор',
+    runs: 8, tasks: 4, success: 10, failed: 2, timeout: 0, running: 0,
+    avg_ms: 4000, tokens_in: 8000, tokens_out: 2000,
+    tokens_cache_read: 0, tokens_cache_creation: 0, cost: 0.8, avg_cold_start_ms: 1000,
+  }]);
+  const previous = deriveRoleLoad([{
+    role_code: 'ARCHITECT', role_name: 'Архитектор',
+    runs: 6, tasks: 4, success: 8, failed: 4, timeout: 0, running: 0,
+    avg_ms: 5000, tokens_in: 8000, tokens_out: 2000,
+    tokens_cache_read: 0, tokens_cache_creation: 0, cost: 1.0, avg_cold_start_ms: 1000,
+  }]);
+  const [row] = attachRoleLoadDeltas(current, previous);
+  // Успех 8→10: +25%, улучшение (зелёный).
+  assert.equal(row.delta.success.pct, 0.25);
+  assert.equal(row.delta.success.improved, true);
+  // Провал 4→2: −50%, улучшение.
+  assert.equal(row.delta.failed.pct, -0.5);
+  assert.equal(row.delta.failed.improved, true);
+  // Ср. время 5000→4000: −20%, улучшение.
+  assert.equal(row.delta.avgDurationMs.improved, true);
+  // Токены на задачу не менялись → нулевая дельта (серый).
+  assert.equal(row.delta.avgTokensInPerTask.pct, 0);
+  assert.equal(row.delta.avgTokensInPerTask.improved, null);
+});
+
+test('attachRoleLoadDeltas: роли нет в периоде сравнения → delta null (требование 4)', () => {
+  const current = deriveRoleLoad([{
+    role_code: 'REVIEWER', role_name: 'Ревьюер',
+    runs: 3, tasks: 2, success: 3, failed: 0, timeout: 0, running: 0,
+    avg_ms: 1000, tokens_in: 100, tokens_out: 50,
+    tokens_cache_read: 0, tokens_cache_creation: 0, cost: 0.01, avg_cold_start_ms: null,
+  }]);
+  // previous без REVIEWER (в периоде сравнения этой роли не было).
+  const previous = deriveRoleLoad([{
+    role_code: 'ARCHITECT', role_name: 'Архитектор',
+    runs: 1, tasks: 1, success: 1, failed: 0, timeout: 0, running: 0,
+    avg_ms: 1000, tokens_in: 100, tokens_out: 50,
+    tokens_cache_read: 0, tokens_cache_creation: 0, cost: 0.01, avg_cold_start_ms: null,
+  }]);
+  const [row] = attachRoleLoadDeltas(current, previous);
+  assert.equal(row.delta, null);
+});
+
+test('attachRoleLoadDeltas: previousRows = null (первый деплой) → все delta null', () => {
+  const current = deriveRoleLoad([{
+    role_code: 'ARCHITECT', role_name: 'Архитектор',
+    runs: 3, tasks: 2, success: 3, failed: 0, timeout: 0, running: 0,
+    avg_ms: 1000, tokens_in: 100, tokens_out: 50,
+    tokens_cache_read: 0, tokens_cache_creation: 0, cost: 0.01, avg_cold_start_ms: null,
+  }]);
+  const [row] = attachRoleLoadDeltas(current, null);
+  assert.equal(row.delta, null);
+});
+
+test('attachRoleLoadTaskTotalsDelta: дельта средних полных сумм к периоду сравнения', () => {
+  const current = buildRoleLoadTaskTotals({
+    tasks: 5, avg_cost: 0.8, avg_tokens_in: 8000, avg_tokens_out: 2000,
+    avg_work_ms: 400000, avg_lead_ms: 3600000,
+  });
+  const previous = buildRoleLoadTaskTotals({
+    tasks: 4, avg_cost: 1.0, avg_tokens_in: 8000, avg_tokens_out: 2000,
+    avg_work_ms: 500000, avg_lead_ms: 3600000,
+  });
+  const out = attachRoleLoadTaskTotalsDelta(current, previous);
+  // Стоимость 1.0→0.8: −20%, улучшение.
+  assert.equal(out.delta.avgCost.pct, -0.2);
+  assert.equal(out.delta.avgCost.improved, true);
+  // Время работы 500000→400000: −20%, улучшение.
+  assert.equal(out.delta.avgWorkMs.improved, true);
+  // Токены не менялись → серый (improved null).
+  assert.equal(out.delta.avgTokensIn.improved, null);
+});
+
+test('attachRoleLoadTaskTotalsDelta: нет периода сравнения или в нём 0 задач → delta null', () => {
+  const current = buildRoleLoadTaskTotals({
+    tasks: 5, avg_cost: 0.8, avg_tokens_in: 8000, avg_tokens_out: 2000,
+    avg_work_ms: 400000, avg_lead_ms: 3600000,
+  });
+  assert.equal(attachRoleLoadTaskTotalsDelta(current, null).delta, null);
+  const emptyPrev = buildRoleLoadTaskTotals({ tasks: 0 });
+  assert.equal(attachRoleLoadTaskTotalsDelta(current, emptyPrev).delta, null);
 });

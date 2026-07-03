@@ -6,8 +6,10 @@ import {
   type RoleLoad,
   type RoleLoadWindow,
   type RoleLoadTaskTotals,
+  type RoleLoadPeriods,
   type RoleLoadTotals,
   type RoleLoadPeriod,
+  type PeriodDelta,
   type VersionMetrics,
   type VersionRow,
   type VersionDelta,
@@ -106,6 +108,30 @@ function DeltaTag({
   );
 }
 
+// ROLE-LOAD-DEPLOY-PERIOD-001 — процент изменения показателя с 1 знаком после
+// запятой в ru-формате (0.123 → «+12,3%», −0.045 → «−4,5%», 0 → «0,0%»).
+function fmtPercent(pct: number): string {
+  const sign = pct > 0 ? '+' : pct < 0 ? '−' : '';
+  return `${sign}${(Math.abs(pct) * 100).toFixed(1).replace('.', ',')}%`;
+}
+
+// ROLE-LOAD-DEPLOY-PERIOD-001 — сравнение показателя с периодом предыдущего
+// обновления: стрелка вверх/вниз по знаку изменения + процент, тем же цветом.
+// improved=true → зелёный (эффективность выросла), false → красный (снизилась),
+// null → серый (изменения нет). delta=null/pct=null → ничего не показываем
+// (нет периода сравнения либо в нём нет прогонов — требование 4).
+function PeriodDeltaTag({ delta }: { delta: PeriodDelta | null | undefined }) {
+  if (!delta || delta.pct == null) return null;
+  const tone = delta.improved == null ? 'neutral' : delta.improved ? 'good' : 'bad';
+  const arrow = delta.pct > 0 ? '↑' : delta.pct < 0 ? '↓' : '';
+  return (
+    <span className={cn(styles.delta, styles[tone])}>
+      {arrow}
+      {fmtPercent(delta.pct)}
+    </span>
+  );
+}
+
 const VERSION_WINDOWS = [
   { label: '24 часа', hours: 24 },
   { label: '7 дней', hours: 168 },
@@ -161,21 +187,44 @@ function StaleNote({ windowInfo }: { windowInfo: RoleLoadWindow }) {
   );
 }
 
+// ROLE-LOAD-DEPLOY-PERIOD-001 — подпись «период с последнего обновления». В режиме
+// маркеров показывает начало текущего периода (последний деплой) и есть ли сравнение
+// с периодом предыдущего обновления. В фолбэке (маркеров нет) ничего не выводит —
+// его роль берёт на себя StaleNote.
+function PeriodNote({ periods }: { periods: RoleLoadPeriods }) {
+  if (periods.mode !== 'markers' || !periods.current) return null;
+  const start = new Date(periods.current.start).toLocaleString('ru-RU');
+  const ref = periods.marker?.ref ? ` ${periods.marker.ref}` : '';
+  const hasComparison = !!periods.previous && periods.previousHasRuns;
+  return (
+    <span className={styles.muted}>
+      Статистика считается с нуля от последнего обновления{ref} ({start}).{' '}
+      {hasComparison
+        ? 'Рядом с показателями — сравнение с периодом предыдущего обновления: стрелка и процент.'
+        : 'Периода предыдущего обновления с прогонами нет — сравнение не показывается.'}
+    </span>
+  );
+}
+
 /**
  * Блок «Нагрузка по ролям» с двумя вкладками:
  *  — «Средние на задачу» (основной вид): токены/стоимость усреднены на задачу;
  *  — «Суммы (месяц/неделя/день)»: суммарные значения за период.
- * ROLE-LOAD-LAST-DATA-001: окно якорится к последней активности, поэтому при
- * простое оркестратора > 24ч видны последние имевшиеся данные, а не пустой блок.
+ * ROLE-LOAD-DEPLOY-PERIOD-001: основной вид считается с нуля от последнего деплой-
+ * маркера ([последний маркер; now]); рядом с показателями — сравнение с периодом
+ * предыдущего обновления (стрелка ↑/↓ и процент, цвет по направленности метрики).
+ * Фолбэк без деплой-маркеров: окно 24ч от последней активности, без сравнения.
  */
 function RoleLoadSection({
   roleLoad,
   window: windowInfo,
   taskTotals,
+  periods,
 }: {
   roleLoad: RoleLoad[];
   window: RoleLoadWindow;
   taskTotals: RoleLoadTaskTotals;
+  periods: RoleLoadPeriods;
 }) {
   const [tab, setTab] = useState<'avg' | 'totals'>('avg');
   // ROLE-LOAD-TASK-TOTALS-001: «Итого (полная задача)» — ИСТИННОЕ сквозное среднее
@@ -185,8 +234,8 @@ function RoleLoadSection({
   // она ЗАПРЕЩЕНА методикой. Здесь фронтенд только отображает готовые значения.
   return (
     <Section
-      title="Нагрузка по ролям (24 часа)"
-      description="Запуски, доля провалов, средняя длительность и холодный старт движка. «Токены вх/исх» и «Стоимость» в основном виде — средние на задачу; суммарные значения по периодам месяц/неделя/день — на вкладке «Суммы». Окно якорится к последней активности: при простое оркестратора > 24ч видны последние имевшиеся данные."
+      title="Нагрузка по ролям (с последнего обновления)"
+      description="Основной вид считается с нуля от последнего обновления системы (деплой-маркер): данные разных обновлений не смешиваются. Рядом с каждым показателем — сравнение с периодом предыдущего обновления: стрелка ↑/↓ и процент изменения, зелёным при росте эффективности и красным при снижении. «Токены вх/исх» и «Стоимость» — средние на задачу; суммарные значения по периодам месяц/неделя/день — на вкладке «Суммы»."
     >
       <div className={styles.tabs}>
         <button
@@ -207,9 +256,17 @@ function RoleLoadSection({
 
       {tab === 'avg' ? (
         <>
-          <StaleNote windowInfo={windowInfo} />
+          {periods.mode === 'markers' ? (
+            <PeriodNote periods={periods} />
+          ) : (
+            <StaleNote windowInfo={windowInfo} />
+          )}
           {roleLoad.length === 0 ? (
-            <span className={styles.muted}>Запусков ролей ещё не было.</span>
+            <span className={styles.muted}>
+              {periods.mode === 'markers'
+                ? 'С последнего обновления запусков ролей ещё не было.'
+                : 'Запусков ролей ещё не было.'}
+            </span>
           ) : (
             <table className={styles.table}>
               <thead>
@@ -236,13 +293,26 @@ function RoleLoadSection({
                       <td>{r.roleName ?? r.roleCode}</td>
                       <td className={styles.num}>{r.runs}</td>
                       <td className={styles.num}>{r.tasks}</td>
-                      <td className={styles.num}>{r.success}</td>
-                      <td className={styles.num}>{r.failed}</td>
-                      <td className={styles.num}>{r.timeout}</td>
+                      <td className={styles.num}>
+                        {r.success}
+                        <PeriodDeltaTag delta={r.delta?.success} />
+                      </td>
+                      <td className={styles.num}>
+                        {r.failed}
+                        <PeriodDeltaTag delta={r.delta?.failed} />
+                      </td>
+                      <td className={styles.num}>
+                        {r.timeout}
+                        <PeriodDeltaTag delta={r.delta?.timeout} />
+                      </td>
                       <td className={styles.num}>{r.running}</td>
-                      <td className={styles.num}>{fmtDuration(r.avgDurationMs)}</td>
+                      <td className={styles.num}>
+                        {fmtDuration(r.avgDurationMs)}
+                        <PeriodDeltaTag delta={r.delta?.avgDurationMs} />
+                      </td>
                       <td className={styles.num}>
                         {r.avgTokensInPerTask == null ? '—' : fmtTokens(r.avgTokensInPerTask)}
+                        <PeriodDeltaTag delta={r.delta?.avgTokensInPerTask} />
                         {r.tokensIn > 0 && r.tasks > 0 && (
                           <span
                             className={styles.tokenSplit}
@@ -254,11 +324,16 @@ function RoleLoadSection({
                       </td>
                       <td className={styles.num}>
                         {r.avgTokensOutPerTask == null ? '—' : fmtTokens(r.avgTokensOutPerTask)}
+                        <PeriodDeltaTag delta={r.delta?.avgTokensOutPerTask} />
                       </td>
                       <td className={styles.num}>
                         {r.avgCostPerTask == null ? '—' : fmtCost(r.avgCostPerTask)}
+                        <PeriodDeltaTag delta={r.delta?.avgCostPerTask} />
                       </td>
-                      <td className={styles.num}>{fmtDuration(r.avgColdStartMs)}</td>
+                      <td className={styles.num}>
+                        {fmtDuration(r.avgColdStartMs)}
+                        <PeriodDeltaTag delta={r.delta?.avgColdStartMs} />
+                      </td>
                     </tr>
                   );
                 })}
@@ -278,23 +353,28 @@ function RoleLoadSection({
                   <td className={styles.num}>—</td>
                   <td className={styles.num}>
                     {fmtDuration(taskTotals.avgWorkMs)}
+                    <PeriodDeltaTag delta={taskTotals.delta?.avgWorkMs} />
                     {taskTotals.avgLeadMs != null && (
                       <span
                         className={styles.tokenSplit}
                         title="Среднее сквозное календарное время: создание задачи → DONE"
                       >
                         календарно {fmtDuration(taskTotals.avgLeadMs)}
+                        <PeriodDeltaTag delta={taskTotals.delta?.avgLeadMs} />
                       </span>
                     )}
                   </td>
                   <td className={styles.num}>
                     {taskTotals.avgTokensIn == null ? '—' : fmtTokens(taskTotals.avgTokensIn)}
+                    <PeriodDeltaTag delta={taskTotals.delta?.avgTokensIn} />
                   </td>
                   <td className={styles.num}>
                     {taskTotals.avgTokensOut == null ? '—' : fmtTokens(taskTotals.avgTokensOut)}
+                    <PeriodDeltaTag delta={taskTotals.delta?.avgTokensOut} />
                   </td>
                   <td className={styles.num}>
                     {taskTotals.avgCost == null ? '—' : fmtCost(taskTotals.avgCost)}
+                    <PeriodDeltaTag delta={taskTotals.delta?.avgCost} />
                   </td>
                   <td className={styles.num}>—</td>
                 </tr>
@@ -828,6 +908,7 @@ export function PerformanceMonitorPage() {
             roleLoad={data.roleLoad}
             window={data.roleLoadWindow}
             taskTotals={data.roleLoadTaskTotals}
+            periods={data.roleLoadPeriods}
           />
 
           <VersionsSection roleCodes={data.roleLoad.map((r) => ({ code: r.roleCode, name: r.roleName }))} />
