@@ -183,6 +183,52 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
       24,
     );
 
+    // 6b) ROLE-LOAD-TASK-TOTALS-001 — «Итого (полная задача)»: ИСТИННОЕ сквозное
+    //    среднее по задачам (НЕ сумма независимых средних по ролям — тот способ
+    //    считался на клиенте и ЗАПРЕЩЁН методикой). Совокупность: задачи, дошедшие
+    //    до DONE, чьё событие to_status='DONE' (max task_events.created_at) попало
+    //    в окно [last_activity − 24ч, last_activity] — тот же якорь, что у всего
+    //    блока. Для каждой такой задачи суммируются ВСЕ прогоны ВСЕХ ролей
+    //    (agent_runs без фильтра по роли/статусу — автоматически включая повторные
+    //    прогоны, RESTART и доработки): стоимость, токены, время работы ролей
+    //    (finished_at − started_at). «Итого» = avg этих полных сумм по задачам.
+    //    Дополнительно avgLeadMs — сквозное календарное время (создание → DONE).
+    //    Метрика глобальная (как и roleLoad — projectId игнорируется).
+    const taskTotalsRows = await c.query(
+      `WITH bounds AS (SELECT max(started_at) AS last_activity FROM agent_runs),
+       done_tasks AS (
+         SELECT t.id AS task_id, t.created_at AS created_at, ev.done_at AS done_at
+           FROM tasks t
+           JOIN LATERAL (
+             SELECT max(created_at) AS done_at FROM task_events
+              WHERE task_id = t.id AND to_status = 'DONE'
+           ) ev ON true
+          WHERE t.status = 'DONE'
+            AND ev.done_at IS NOT NULL
+            AND ev.done_at >= (SELECT last_activity FROM bounds) - interval '24 hours'
+            AND ev.done_at <= (SELECT last_activity FROM bounds)
+       ),
+       per_task AS (
+         SELECT dt.created_at, dt.done_at,
+                coalesce(sum(ar.cost), 0) AS task_cost,
+                coalesce(sum(ar.token_input), 0) AS task_tokens_in,
+                coalesce(sum(ar.token_output), 0) AS task_tokens_out,
+                coalesce(sum(extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000)
+                         FILTER (WHERE ar.finished_at IS NOT NULL), 0) AS task_work_ms
+           FROM done_tasks dt
+           LEFT JOIN agent_runs ar ON ar.task_id = dt.task_id
+          GROUP BY dt.task_id, dt.created_at, dt.done_at
+       )
+       SELECT count(*)::int AS tasks,
+              avg(task_cost) AS avg_cost,
+              avg(task_tokens_in) AS avg_tokens_in,
+              avg(task_tokens_out) AS avg_tokens_out,
+              avg(task_work_ms) AS avg_work_ms,
+              avg(extract(epoch FROM (done_at - created_at)) * 1000) AS avg_lead_ms
+         FROM per_task`,
+    );
+    const roleLoadTaskTotals = buildRoleLoadTaskTotals(taskTotalsRows.rows[0]);
+
     // 7) Программист: проходы и упоры в лимит ходов (PROGRAMMER-LIMIT-KPI-001).
     //    avgPasses/maxPasses — «за сколько проходов программист справляется» (numTurns
     //    из событий сдачи, поле passes). limitHits — отдельный KPI: задача не влезла
@@ -249,6 +295,7 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
       programmer,
       roleLoad,
       roleLoadWindow,
+      roleLoadTaskTotals,
       connector: connectorBuckets(),
     };
   });
@@ -365,6 +412,34 @@ export function buildRoleLoadTotals(rows = []) {
     tokensOut: Number(row.tokens_out) || 0,
     cost: Math.round((Number(row.cost) || 0) * 1e6) / 1e6,
   }));
+}
+
+/**
+ * ROLE-LOAD-TASK-TOTALS-001 — ЧИСТЫЙ маппинг агрегата «Итого (полная задача)».
+ * Вынесен для юнит-теста без БД. Вход — одна строка агрегата по DONE-задачам окна:
+ * tasks (размер совокупности) и средние ПОЛНЫХ сумм на задачу (avg_cost,
+ * avg_tokens_in, avg_tokens_out, avg_work_ms — суммарное время работы всех ролей)
+ * плюс сквозное календарное время создание→DONE (avg_lead_ms). Стоимость
+ * округляется до 6 знаков, токены/мс — до целого. При tasks = 0 совокупность пуста
+ * → все средние = null (в UI «—»). Это ИСТИННОЕ сквозное среднее по задачам, а не
+ * сумма независимых средних по ролям (последнее ЗАПРЕЩЕНО методикой).
+ * @param {Object} row сырая строка агрегата (одна на всё окно)
+ * @returns {{tasks:number, avgCost:number|null, avgTokensIn:number|null, avgTokensOut:number|null, avgWorkMs:number|null, avgLeadMs:number|null}}
+ */
+export function buildRoleLoadTaskTotals(row = {}) {
+  const tasks = Number(row?.tasks) || 0;
+  if (tasks <= 0) {
+    return { tasks: 0, avgCost: null, avgTokensIn: null, avgTokensOut: null, avgWorkMs: null, avgLeadMs: null };
+  }
+  const roundInt = (v) => (v == null ? null : Math.round(Number(v)));
+  return {
+    tasks,
+    avgCost: row.avg_cost == null ? null : Math.round(Number(row.avg_cost) * 1e6) / 1e6,
+    avgTokensIn: roundInt(row.avg_tokens_in),
+    avgTokensOut: roundInt(row.avg_tokens_out),
+    avgWorkMs: roundInt(row.avg_work_ms),
+    avgLeadMs: roundInt(row.avg_lead_ms),
+  };
 }
 
 /**

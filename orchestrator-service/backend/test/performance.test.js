@@ -8,6 +8,7 @@ import {
   deriveRoleLoad,
   computeRoleLoadWindow,
   buildRoleLoadTotals,
+  buildRoleLoadTaskTotals,
 } from '../src/performance.js';
 
 test('deriveKpi: базовые агрегаты по статусам', () => {
@@ -296,4 +297,48 @@ test('buildRoleLoadTotals: суммы прокидываются как есть
 test('buildRoleLoadTotals: пустой вход не падает', () => {
   assert.deepEqual(buildRoleLoadTotals(), []);
   assert.deepEqual(buildRoleLoadTotals([]), []);
+});
+
+// ROLE-LOAD-TASK-TOTALS-001 — «Итого (полная задача)»: истинное сквозное среднее
+// по DONE-задачам (среднее ПОЛНЫХ сумм задачи, а не сумма средних по ролям).
+
+test('buildRoleLoadTaskTotals: средние полных сумм с округлением (cost 6 знаков, tokens/ms целые)', () => {
+  const m = buildRoleLoadTaskTotals({
+    tasks: 4,
+    avg_cost: 1.23456789,
+    avg_tokens_in: 12345.6,
+    avg_tokens_out: 3456.4,
+    avg_work_ms: 789123.7,
+    avg_lead_ms: 3600000.4,
+  });
+  assert.equal(m.tasks, 4);
+  assert.equal(m.avgCost, 1.234568); // до 6 знаков
+  assert.equal(m.avgTokensIn, 12346); // до целого
+  assert.equal(m.avgTokensOut, 3456);
+  assert.equal(m.avgWorkMs, 789124);
+  assert.equal(m.avgLeadMs, 3600000);
+});
+
+test('buildRoleLoadTaskTotals: tasks = 0 → все средние null (совокупность пуста)', () => {
+  const m = buildRoleLoadTaskTotals({
+    tasks: 0,
+    avg_cost: null,
+    avg_tokens_in: null,
+    avg_tokens_out: null,
+    avg_work_ms: null,
+    avg_lead_ms: null,
+  });
+  assert.equal(m.tasks, 0);
+  assert.equal(m.avgCost, null);
+  assert.equal(m.avgTokensIn, null);
+  assert.equal(m.avgTokensOut, null);
+  assert.equal(m.avgWorkMs, null);
+  assert.equal(m.avgLeadMs, null);
+});
+
+test('buildRoleLoadTaskTotals: пустой/undefined вход → tasks 0, средние null, без падения', () => {
+  const empty = { tasks: 0, avgCost: null, avgTokensIn: null, avgTokensOut: null, avgWorkMs: null, avgLeadMs: null };
+  assert.deepEqual(buildRoleLoadTaskTotals(), empty);
+  assert.deepEqual(buildRoleLoadTaskTotals(undefined), empty);
+  assert.deepEqual(buildRoleLoadTaskTotals({}), empty);
 });

@@ -5,6 +5,7 @@ import {
   type PerformanceMetrics,
   type RoleLoad,
   type RoleLoadWindow,
+  type RoleLoadTaskTotals,
   type RoleLoadTotals,
   type RoleLoadPeriod,
   type VersionMetrics,
@@ -167,8 +168,21 @@ function StaleNote({ windowInfo }: { windowInfo: RoleLoadWindow }) {
  * ROLE-LOAD-LAST-DATA-001: окно якорится к последней активности, поэтому при
  * простое оркестратора > 24ч видны последние имевшиеся данные, а не пустой блок.
  */
-function RoleLoadSection({ roleLoad, window: windowInfo }: { roleLoad: RoleLoad[]; window: RoleLoadWindow }) {
+function RoleLoadSection({
+  roleLoad,
+  window: windowInfo,
+  taskTotals,
+}: {
+  roleLoad: RoleLoad[];
+  window: RoleLoadWindow;
+  taskTotals: RoleLoadTaskTotals;
+}) {
   const [tab, setTab] = useState<'avg' | 'totals'>('avg');
+  // ROLE-LOAD-TASK-TOTALS-001: «Итого (полная задача)» — ИСТИННОЕ сквозное среднее
+  // по задачам, посчитанное на бэкенде (roleLoadTaskTotals): сумма всех прогонов
+  // всех ролей одной DONE-задачи (включая повторы/RESTART/доработки), усреднённая
+  // по завершённым задачам за окно. Клиентская сумма средних по ролям УДАЛЕНА —
+  // она ЗАПРЕЩЕНА методикой. Здесь фронтенд только отображает готовые значения.
   return (
     <Section
       title="Нагрузка по ролям (24 часа)"
@@ -249,6 +263,42 @@ function RoleLoadSection({ roleLoad, window: windowInfo }: { roleLoad: RoleLoad[
                   );
                 })}
               </tbody>
+              <tfoot>
+                <tr className={styles.totalRow}>
+                  <td title="Истинное сквозное среднее по DONE-задачам за окно: суммарные затраты всех прогонов всех ролей одной задачи (включая повторы, RESTART и доработки), усреднённые по завершённым задачам">
+                    Итого (полная задача)
+                  </td>
+                  <td className={styles.num}>—</td>
+                  <td className={styles.num} title="Число завершённых (DONE) задач в окне — знаменатель средних">
+                    {taskTotals.tasks || '—'}
+                  </td>
+                  <td className={styles.num}>—</td>
+                  <td className={styles.num}>—</td>
+                  <td className={styles.num}>—</td>
+                  <td className={styles.num}>—</td>
+                  <td className={styles.num}>
+                    {fmtDuration(taskTotals.avgWorkMs)}
+                    {taskTotals.avgLeadMs != null && (
+                      <span
+                        className={styles.tokenSplit}
+                        title="Среднее сквозное календарное время: создание задачи → DONE"
+                      >
+                        календарно {fmtDuration(taskTotals.avgLeadMs)}
+                      </span>
+                    )}
+                  </td>
+                  <td className={styles.num}>
+                    {taskTotals.avgTokensIn == null ? '—' : fmtTokens(taskTotals.avgTokensIn)}
+                  </td>
+                  <td className={styles.num}>
+                    {taskTotals.avgTokensOut == null ? '—' : fmtTokens(taskTotals.avgTokensOut)}
+                  </td>
+                  <td className={styles.num}>
+                    {taskTotals.avgCost == null ? '—' : fmtCost(taskTotals.avgCost)}
+                  </td>
+                  <td className={styles.num}>—</td>
+                </tr>
+              </tfoot>
             </table>
           )}
         </>
@@ -267,6 +317,22 @@ function RoleLoadTotalsTab() {
   const [period, setPeriod] = useState<RoleLoadPeriod>('month');
   const [data, setData] = useState<RoleLoadTotals | null>(null);
   const [state, setState] = useState<LoadState>('loading');
+
+  // ROLE-LOAD-TOTALS-FOOTER: «Итого» за период — суммарные затраты по всем ролям.
+  // Столбец «Задачи» не суммируем: мультиролевые задачи задвоились бы по этапам,
+  // поэтому в подвале для него «—». Остальные поля — корректные суммы за окно.
+  const totals = useMemo(() => {
+    const rows = data?.roles ?? [];
+    return {
+      runs: rows.reduce((s, r) => s + r.runs, 0),
+      success: rows.reduce((s, r) => s + r.success, 0),
+      failed: rows.reduce((s, r) => s + r.failed, 0),
+      timeout: rows.reduce((s, r) => s + r.timeout, 0),
+      tokensIn: rows.reduce((s, r) => s + r.tokensIn, 0),
+      tokensOut: rows.reduce((s, r) => s + r.tokensOut, 0),
+      cost: rows.reduce((s, r) => s + r.cost, 0),
+    };
+  }, [data]);
 
   useEffect(() => {
     const ctrl = new AbortController();
@@ -337,6 +403,21 @@ function RoleLoadTotalsTab() {
                   </tr>
                 ))}
               </tbody>
+              <tfoot>
+                <tr className={styles.totalRow}>
+                  <td>Итого</td>
+                  <td className={styles.num}>{totals.runs}</td>
+                  <td className={styles.num} title="Задачи мультиролевые — уникальные задачи по ролям суммировать нельзя">
+                    —
+                  </td>
+                  <td className={styles.num}>{totals.success}</td>
+                  <td className={styles.num}>{totals.failed}</td>
+                  <td className={styles.num}>{totals.timeout}</td>
+                  <td className={styles.num}>{fmtTokens(totals.tokensIn)}</td>
+                  <td className={styles.num}>{fmtTokens(totals.tokensOut)}</td>
+                  <td className={styles.num}>{fmtCost(totals.cost)}</td>
+                </tr>
+              </tfoot>
             </table>
           )}
         </>
@@ -743,7 +824,11 @@ export function PerformanceMonitorPage() {
             </div>
           </Section>
 
-          <RoleLoadSection roleLoad={data.roleLoad} window={data.roleLoadWindow} />
+          <RoleLoadSection
+            roleLoad={data.roleLoad}
+            window={data.roleLoadWindow}
+            taskTotals={data.roleLoadTaskTotals}
+          />
 
           <VersionsSection roleCodes={data.roleLoad.map((r) => ({ code: r.roleCode, name: r.roleName }))} />
 

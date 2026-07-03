@@ -42,6 +42,22 @@ export interface RoleLoadWindow {
   lastActivityAt: string | null;
 }
 
+// ROLE-LOAD-TASK-TOTALS-001 — «Итого (полная задача)» вкладки «Средние на задачу».
+// ИСТИННОЕ сквозное среднее по DONE-задачам за окно 24ч: суммарные затраты всех
+// прогонов всех ролей одной задачи (включая повторы/RESTART/доработки), усреднённые
+// по завершённым задачам. Считается на бэкенде; фронтенд только отображает.
+// tasks — размер совокупности (знаменатель). При tasks = 0 все средние = null («—»).
+export interface RoleLoadTaskTotals {
+  tasks: number;
+  avgCost: number | null;
+  avgTokensIn: number | null;
+  avgTokensOut: number | null;
+  // Среднее суммарное время работы ролей на задачу (Σ finished−started всех прогонов).
+  avgWorkMs: number | null;
+  // Дополнительно: среднее сквозное календарное время создание → DONE.
+  avgLeadMs: number | null;
+}
+
 export interface ConnectorBucket {
   key: string;
   limit: number;
@@ -92,6 +108,7 @@ export interface PerformanceMetrics {
   };
   roleLoad: RoleLoad[];
   roleLoadWindow: RoleLoadWindow;
+  roleLoadTaskTotals: RoleLoadTaskTotals;
   connector: Record<string, ConnectorBucket>;
 }
 
