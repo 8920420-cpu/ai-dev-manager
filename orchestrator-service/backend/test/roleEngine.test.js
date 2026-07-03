@@ -336,6 +336,37 @@ test('summarizePriorRuns: пустой и без output_json', () => {
   ]);
 });
 
+test('summarizePriorRuns: длинные summary/findings усечены с маркером, короткие как есть', () => {
+  const longSummary = 'с'.repeat(1000);
+  const longFinding = 'ф'.repeat(500);
+  const [out] = summarizePriorRuns([
+    {
+      role_code: 'ARCHITECT',
+      output_json: { status: 'READY', summary: longSummary, findings: [longFinding, 'коротко'] },
+    },
+  ]);
+  // summary усечён ровно до капа (700), последний символ — маркер усечения.
+  assert.equal(out.summary.length, 700);
+  assert.ok(out.summary.endsWith('…'));
+  assert.equal(out.summary.slice(0, -1), 'с'.repeat(699));
+  // Длинный элемент findings усечён до капа (300) с маркером, короткий — без изменений.
+  assert.equal(out.findings[0].length, 300);
+  assert.ok(out.findings[0].endsWith('…'));
+  assert.equal(out.findings[1], 'коротко');
+});
+
+test('summarizePriorRuns: значения на границе капа проходят без маркера', () => {
+  const exactSummary = 'a'.repeat(700);
+  const exactFinding = 'b'.repeat(300);
+  const [out] = summarizePriorRuns([
+    { role_code: 'ARCHITECT', output_json: { summary: exactSummary, findings: [exactFinding] } },
+  ]);
+  assert.equal(out.summary, exactSummary);
+  assert.ok(!out.summary.endsWith('…'));
+  assert.equal(out.findings[0], exactFinding);
+  assert.ok(!out.findings[0].endsWith('…'));
+});
+
 test('parseTextToolCalls: разбирает текстовый вызов инструмента (DeepSeek DSML)', async () => {
   const { parseTextToolCalls } = await import('../src/roleEngine.js');
   const content = [

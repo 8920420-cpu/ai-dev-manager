@@ -214,6 +214,25 @@ const FAILURE_STATUSES = new Set([
   'INFRASTRUCTURE_BLOCKED', 'ERROR',
 ]);
 
+// Капы длины для сжатого контекста прошлых прогонов. Замер по живой БД: топовые
+// summary Архитектора — до ~1.9-2K символов, а при многократных прогонах
+// (Dynamic Workflow: REWORK/RESTART/доработка) это множится на число прогонов и
+// раздувает промпт каждого вызова модели (p90 priorRoleOutputs ~10.6K, макс ~106K
+// символов). Полный текст остаётся в prompt_exchanges — в контекст тащим только
+// суть, поэтому режем: summary до ~700 симв. (диапазон 600-800), каждый элемент
+// findings — до ~300 симв. При превышении добавляем маркер усечения '…', чтобы
+// роль видела неполноту.
+const SUMMARY_MAX = 700;
+const FINDINGS_ITEM_MAX = 300;
+
+// Обрезать строку до max символов ВКЛЮЧАЯ маркер: короткие значения проходят без
+// изменений (без лишнего '…'), длинные усекаются так, что итоговая длина ровно max.
+function truncateWithMarker(str, max) {
+  const s = String(str);
+  if (s.length <= max) return s;
+  return `${s.slice(0, max - 1)}…`;
+}
+
 // Сжать прошлые успешные прогоны ролей в компактный список для контекста
 // следующей роли: code + статус-вердикт + summary + ключевые findings. Полный
 // текст ответа в контекст не тащим (он есть в prompt_exchanges) — только суть.
@@ -225,8 +244,10 @@ export function summarizePriorRuns(rows = []) {
       return {
         role: r.role_code,
         status: String(o.status ?? r.status ?? '').trim(),
-        summary: typeof o.summary === 'string' ? o.summary : '',
-        findings: Array.isArray(o.findings) ? o.findings.slice(0, 8).map(String) : [],
+        summary: truncateWithMarker(typeof o.summary === 'string' ? o.summary : '', SUMMARY_MAX),
+        findings: Array.isArray(o.findings)
+          ? o.findings.slice(0, 8).map((f) => truncateWithMarker(f, FINDINGS_ITEM_MAX))
+          : [],
       };
     });
 }
