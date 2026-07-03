@@ -1,7 +1,14 @@
 // PERFORMANCE-MONITOR-001 — тесты чистого расчёта производных KPI.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { deriveKpi, deriveVersionDeltas, buildDailyModelStats } from '../src/performance.js';
+import {
+  deriveKpi,
+  deriveVersionDeltas,
+  buildDailyModelStats,
+  deriveRoleLoad,
+  computeRoleLoadWindow,
+  buildRoleLoadTotals,
+} from '../src/performance.js';
 
 test('deriveKpi: базовые агрегаты по статусам', () => {
   const k = deriveKpi({
@@ -192,4 +199,101 @@ test('buildDailyModelStats: несколько дней в исходном по
 test('buildDailyModelStats: пустой вход не падает', () => {
   assert.deepEqual(buildDailyModelStats(), []);
   assert.deepEqual(buildDailyModelStats([]), []);
+});
+
+// ROLE-LOAD-AVG-001 — средние на задачу в основном виде блока «Нагрузка по ролям».
+
+test('deriveRoleLoad: токены/стоимость усредняются на задачу (sum / DISTINCT task_id)', () => {
+  const rows = [{
+    role_code: 'ARCHITECT', role_name: 'Архитектор',
+    runs: 6, tasks: 3, success: 5, failed: 1, timeout: 0, running: 0,
+    avg_ms: 4000, tokens_in: 9000, tokens_out: 3000,
+    tokens_cache_read: 3000, tokens_cache_creation: 1500, cost: 0.6, avg_cold_start_ms: 1200,
+  }];
+  const [m] = deriveRoleLoad(rows);
+  // Суммы сохранены (для вкладки «Суммы» и разбивки кэша).
+  assert.equal(m.tokensIn, 9000);
+  assert.equal(m.tokensOut, 3000);
+  assert.equal(m.cost, 0.6);
+  // Средние на задачу: 9000/3, 3000/3, 0.6/3.
+  assert.equal(m.avgTokensInPerTask, 3000);
+  assert.equal(m.avgTokensOutPerTask, 1000);
+  assert.equal(m.avgCostPerTask, 0.2);
+  // Свежий = tokens_in − cache_read − cache_creation = 9000 − 3000 − 1500.
+  assert.equal(m.tokensInputFresh, 4500);
+  assert.equal(m.tasks, 3);
+});
+
+test('deriveRoleLoad: tasks = 0 → средние = null (без деления на ноль)', () => {
+  const rows = [{
+    role_code: 'REVIEWER', role_name: 'Ревьюер',
+    runs: 2, tasks: 0, success: 2, failed: 0, timeout: 0, running: 0,
+    avg_ms: null, tokens_in: 500, tokens_out: 100,
+    tokens_cache_read: 0, tokens_cache_creation: 0, cost: 0.01, avg_cold_start_ms: null,
+  }];
+  const [m] = deriveRoleLoad(rows);
+  assert.equal(m.avgTokensInPerTask, null);
+  assert.equal(m.avgTokensOutPerTask, null);
+  assert.equal(m.avgCostPerTask, null);
+  assert.equal(m.avgDurationMs, null);
+  assert.equal(m.avgColdStartMs, null);
+});
+
+test('deriveRoleLoad: пустой вход не падает', () => {
+  assert.deepEqual(deriveRoleLoad(), []);
+  assert.deepEqual(deriveRoleLoad([]), []);
+});
+
+// ROLE-LOAD-LAST-DATA-001 — окно якорится к последней активности + флаг устаревания.
+
+test('computeRoleLoadWindow: простой > окна → stale, но границы указывают на последние данные', () => {
+  const last = '2026-07-01T00:00:00.000Z';
+  const now = '2026-07-03T00:00:00.000Z'; // +48 ч
+  const w = computeRoleLoadWindow(last, now, 24);
+  assert.equal(w.stale, true);
+  assert.equal(w.staleHours, 48);
+  assert.equal(w.windowEnd, last);
+  assert.equal(w.lastActivityAt, last);
+  // Начало окна = last − 24ч.
+  assert.equal(w.windowStart, '2026-06-30T00:00:00.000Z');
+});
+
+test('computeRoleLoadWindow: активность внутри окна → не stale', () => {
+  const last = '2026-07-03T00:00:00.000Z';
+  const now = '2026-07-03T06:00:00.000Z'; // +6 ч < 24ч
+  const w = computeRoleLoadWindow(last, now, 24);
+  assert.equal(w.stale, false);
+  assert.equal(w.staleHours, 0);
+  assert.equal(w.windowEnd, last);
+});
+
+test('computeRoleLoadWindow: нет активности (null) → пустое окно без падения', () => {
+  const w = computeRoleLoadWindow(null, '2026-07-03T00:00:00.000Z', 24);
+  assert.equal(w.stale, false);
+  assert.equal(w.windowEnd, null);
+  assert.equal(w.windowStart, null);
+  assert.equal(w.lastActivityAt, null);
+});
+
+// ROLE-LOAD-LAST-DATA-001 — вкладка «Суммы»: суммарные значения по ролям.
+
+test('buildRoleLoadTotals: суммы прокидываются как есть, без усреднения', () => {
+  const rows = [{
+    role_code: 'ARCHITECT', role_name: 'Архитектор',
+    runs: 12, tasks: 5, success: 10, failed: 2, timeout: 0,
+    tokens_in: 20000, tokens_out: 8000, cost: 1.234567,
+  }];
+  const [m] = buildRoleLoadTotals(rows);
+  assert.equal(m.runs, 12);
+  assert.equal(m.tasks, 5);
+  assert.equal(m.success, 10);
+  assert.equal(m.tokensIn, 20000);
+  assert.equal(m.tokensOut, 8000);
+  // Стоимость округляется до 6 знаков.
+  assert.equal(m.cost, 1.234567);
+});
+
+test('buildRoleLoadTotals: пустой вход не падает', () => {
+  assert.deepEqual(buildRoleLoadTotals(), []);
+  assert.deepEqual(buildRoleLoadTotals([]), []);
 });

@@ -3,6 +3,10 @@ import { Button, Callout, LoadingBlock, PageHeader, Section } from '../../compon
 import {
   performanceApi,
   type PerformanceMetrics,
+  type RoleLoad,
+  type RoleLoadWindow,
+  type RoleLoadTotals,
+  type RoleLoadPeriod,
   type VersionMetrics,
   type VersionRow,
   type VersionDelta,
@@ -120,6 +124,224 @@ function versionTitle(v: VersionRow) {
         {v.codeVersion ?? 'код —'} · {v.model ?? 'модель —'}
       </small>
     </span>
+  );
+}
+
+// ROLE-LOAD-LAST-DATA-001 — периоды вкладки «Суммы» блока «Нагрузка по ролям».
+const ROLE_LOAD_PERIODS: { key: RoleLoadPeriod; label: string }[] = [
+  { key: 'month', label: 'Месяц' },
+  { key: 'week', label: 'Неделя' },
+  { key: 'day', label: 'День' },
+];
+
+// Часы простоя в человекочитаемом виде (для метки устаревания блока).
+function fmtHours(h: number): string {
+  if (h < 24) return `${Math.round(h)} ч`;
+  const d = Math.floor(h / 24);
+  const rem = Math.round(h % 24);
+  return rem ? `${d} дн ${rem} ч` : `${d} дн`;
+}
+
+// ROLE-LOAD-LAST-DATA-001 — подпись «последняя активность» + бейдж устаревания.
+// При простое дольше окна показываем предупреждение, но данные остаются видны.
+function StaleNote({ windowInfo }: { windowInfo: RoleLoadWindow }) {
+  if (!windowInfo.windowEnd) return null;
+  const end = new Date(windowInfo.windowEnd).toLocaleString('ru-RU');
+  if (!windowInfo.stale) {
+    return <span className={styles.muted}>Последняя активность: {end}.</span>;
+  }
+  return (
+    <Callout tone="warning" title="Показаны последние имевшиеся данные">
+      <span className={styles.muted}>
+        Оркестратор простаивает ~{fmtHours(windowInfo.staleHours)} — свежих запусков за окно нет.
+        Последняя активность: {end}.
+      </span>
+    </Callout>
+  );
+}
+
+/**
+ * Блок «Нагрузка по ролям» с двумя вкладками:
+ *  — «Средние на задачу» (основной вид): токены/стоимость усреднены на задачу;
+ *  — «Суммы (месяц/неделя/день)»: суммарные значения за период.
+ * ROLE-LOAD-LAST-DATA-001: окно якорится к последней активности, поэтому при
+ * простое оркестратора > 24ч видны последние имевшиеся данные, а не пустой блок.
+ */
+function RoleLoadSection({ roleLoad, window: windowInfo }: { roleLoad: RoleLoad[]; window: RoleLoadWindow }) {
+  const [tab, setTab] = useState<'avg' | 'totals'>('avg');
+  return (
+    <Section
+      title="Нагрузка по ролям (24 часа)"
+      description="Запуски, доля провалов, средняя длительность и холодный старт движка. «Токены вх/исх» и «Стоимость» в основном виде — средние на задачу; суммарные значения по периодам месяц/неделя/день — на вкладке «Суммы». Окно якорится к последней активности: при простое оркестратора > 24ч видны последние имевшиеся данные."
+    >
+      <div className={styles.tabs}>
+        <button
+          type="button"
+          className={cn(styles.tabBtn, tab === 'avg' && styles.tabActive)}
+          onClick={() => setTab('avg')}
+        >
+          Средние на задачу
+        </button>
+        <button
+          type="button"
+          className={cn(styles.tabBtn, tab === 'totals' && styles.tabActive)}
+          onClick={() => setTab('totals')}
+        >
+          Суммы (месяц/неделя/день)
+        </button>
+      </div>
+
+      {tab === 'avg' ? (
+        <>
+          <StaleNote windowInfo={windowInfo} />
+          {roleLoad.length === 0 ? (
+            <span className={styles.muted}>Запусков ролей ещё не было.</span>
+          ) : (
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th>Роль</th>
+                  <th className={styles.num}>Запуски</th>
+                  <th className={styles.num}>Задачи</th>
+                  <th className={styles.num}>Успех</th>
+                  <th className={styles.num}>Провал</th>
+                  <th className={styles.num}>Таймаут</th>
+                  <th className={styles.num}>В работе</th>
+                  <th className={styles.num}>Ср. время</th>
+                  <th className={styles.num}>Токены вх / зад.</th>
+                  <th className={styles.num}>Токены исх / зад.</th>
+                  <th className={styles.num}>Стоимость / зад.</th>
+                  <th className={styles.num}>Ср. холодн. старт</th>
+                </tr>
+              </thead>
+              <tbody>
+                {roleLoad.map((r) => {
+                  const perTask = (v: number) => (r.tasks > 0 ? Math.round(v / r.tasks) : 0);
+                  return (
+                    <tr key={r.roleCode}>
+                      <td>{r.roleName ?? r.roleCode}</td>
+                      <td className={styles.num}>{r.runs}</td>
+                      <td className={styles.num}>{r.tasks}</td>
+                      <td className={styles.num}>{r.success}</td>
+                      <td className={styles.num}>{r.failed}</td>
+                      <td className={styles.num}>{r.timeout}</td>
+                      <td className={styles.num}>{r.running}</td>
+                      <td className={styles.num}>{fmtDuration(r.avgDurationMs)}</td>
+                      <td className={styles.num}>
+                        {r.avgTokensInPerTask == null ? '—' : fmtTokens(r.avgTokensInPerTask)}
+                        {r.tokensIn > 0 && r.tasks > 0 && (
+                          <span
+                            className={styles.tokenSplit}
+                            title={`на задачу: свежий ${perTask(r.tokensInputFresh)} · запись в кэш ${perTask(r.tokensCacheCreation)} · чтение из кэша ${perTask(r.tokensCacheRead)}`}
+                          >
+                            свеж {fmtTokens(perTask(r.tokensInputFresh))} · зап {fmtTokens(perTask(r.tokensCacheCreation))} · чт {fmtTokens(perTask(r.tokensCacheRead))}
+                          </span>
+                        )}
+                      </td>
+                      <td className={styles.num}>
+                        {r.avgTokensOutPerTask == null ? '—' : fmtTokens(r.avgTokensOutPerTask)}
+                      </td>
+                      <td className={styles.num}>
+                        {r.avgCostPerTask == null ? '—' : fmtCost(r.avgCostPerTask)}
+                      </td>
+                      <td className={styles.num}>{fmtDuration(r.avgColdStartMs)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </>
+      ) : (
+        <RoleLoadTotalsTab />
+      )}
+    </Section>
+  );
+}
+
+/**
+ * Вкладка «Суммы» блока «Нагрузка по ролям»: суммарные значения по ролям за
+ * выбранный период (месяц/неделя/день). Отдельный запрос к /role-load-totals.
+ */
+function RoleLoadTotalsTab() {
+  const [period, setPeriod] = useState<RoleLoadPeriod>('month');
+  const [data, setData] = useState<RoleLoadTotals | null>(null);
+  const [state, setState] = useState<LoadState>('loading');
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    setState('loading');
+    performanceApi
+      .roleLoadTotals(period, ctrl.signal)
+      .then((d) => {
+        if (ctrl.signal.aborted) return;
+        setData(d);
+        setState('ready');
+      })
+      .catch((e) => {
+        if (ctrl.signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) return;
+        setState('error');
+      });
+    return () => ctrl.abort();
+  }, [period]);
+
+  return (
+    <>
+      <div className={styles.tabs}>
+        {ROLE_LOAD_PERIODS.map((p) => (
+          <button
+            key={p.key}
+            type="button"
+            className={cn(styles.tabBtn, period === p.key && styles.tabActive)}
+            onClick={() => setPeriod(p.key)}
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
+
+      {state === 'loading' && <LoadingBlock label="Загрузка сумм…" />}
+      {state === 'error' && <Callout tone="error" title="Не удалось загрузить суммарные значения" />}
+      {state === 'ready' && data && (
+        <>
+          <StaleNote windowInfo={data} />
+          {data.roles.length === 0 ? (
+            <span className={styles.muted}>За выбранный период запусков ролей нет.</span>
+          ) : (
+            <table className={styles.table}>
+              <thead>
+                <tr>
+                  <th>Роль</th>
+                  <th className={styles.num}>Запуски</th>
+                  <th className={styles.num}>Задачи</th>
+                  <th className={styles.num}>Успех</th>
+                  <th className={styles.num}>Провал</th>
+                  <th className={styles.num}>Таймаут</th>
+                  <th className={styles.num}>Токены вх (сумма)</th>
+                  <th className={styles.num}>Токены исх (сумма)</th>
+                  <th className={styles.num}>Стоимость (сумма)</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.roles.map((r) => (
+                  <tr key={r.roleCode}>
+                    <td>{r.roleName ?? r.roleCode}</td>
+                    <td className={styles.num}>{r.runs}</td>
+                    <td className={styles.num}>{r.tasks}</td>
+                    <td className={styles.num}>{r.success}</td>
+                    <td className={styles.num}>{r.failed}</td>
+                    <td className={styles.num}>{r.timeout}</td>
+                    <td className={styles.num}>{fmtTokens(r.tokensIn)}</td>
+                    <td className={styles.num}>{fmtTokens(r.tokensOut)}</td>
+                    <td className={styles.num}>{fmtCost(r.cost)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
+    </>
   );
 }
 
@@ -521,59 +743,7 @@ export function PerformanceMonitorPage() {
             </div>
           </Section>
 
-          <Section
-            title="Нагрузка по ролям (24 часа)"
-            description="Запуски, доля провалов, средняя длительность, токены и средний холодный старт движка. «Токены вх» разложены: свеж — свежий (uncached) ввод; зап — запись в prompt-кэш; чт — чтение из кэша (копится по ходам tool-loop, обычно доминирует, billed ~10%)."
-          >
-            {data.roleLoad.length === 0 ? (
-              <span className={styles.muted}>За последние сутки запусков ролей не было.</span>
-            ) : (
-              <table className={styles.table}>
-                <thead>
-                  <tr>
-                    <th>Роль</th>
-                    <th className={styles.num}>Запуски</th>
-                    <th className={styles.num}>Успех</th>
-                    <th className={styles.num}>Провал</th>
-                    <th className={styles.num}>Таймаут</th>
-                    <th className={styles.num}>В работе</th>
-                    <th className={styles.num}>Ср. время</th>
-                    <th className={styles.num}>Токены вх</th>
-                    <th className={styles.num}>Токены исх</th>
-                    <th className={styles.num}>Стоимость</th>
-                    <th className={styles.num}>Ср. холодн. старт</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {data.roleLoad.map((r) => (
-                    <tr key={r.roleCode}>
-                      <td>{r.roleName ?? r.roleCode}</td>
-                      <td className={styles.num}>{r.runs}</td>
-                      <td className={styles.num}>{r.success}</td>
-                      <td className={styles.num}>{r.failed}</td>
-                      <td className={styles.num}>{r.timeout}</td>
-                      <td className={styles.num}>{r.running}</td>
-                      <td className={styles.num}>{fmtDuration(r.avgDurationMs)}</td>
-                      <td className={styles.num}>
-                        {fmtTokens(r.tokensIn)}
-                        {r.tokensIn > 0 && (
-                          <span
-                            className={styles.tokenSplit}
-                            title={`свежий ${r.tokensInputFresh} · запись в кэш ${r.tokensCacheCreation} · чтение из кэша ${r.tokensCacheRead}`}
-                          >
-                            свеж {fmtTokens(r.tokensInputFresh)} · зап {fmtTokens(r.tokensCacheCreation)} · чт {fmtTokens(r.tokensCacheRead)}
-                          </span>
-                        )}
-                      </td>
-                      <td className={styles.num}>{fmtTokens(r.tokensOut)}</td>
-                      <td className={styles.num}>{fmtCost(r.cost)}</td>
-                      <td className={styles.num}>{fmtDuration(r.avgColdStartMs)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            )}
-          </Section>
+          <RoleLoadSection roleLoad={data.roleLoad} window={data.roleLoadWindow} />
 
           <VersionsSection roleCodes={data.roleLoad.map((r) => ({ code: r.roleCode, name: r.roleName }))} />
 

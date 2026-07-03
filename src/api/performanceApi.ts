@@ -8,12 +8,14 @@ export interface RoleLoad {
   roleCode: string;
   roleName: string;
   runs: number;
+  // ROLE-LOAD-AVG-001: число задач в окне (знаменатель средних на задачу).
+  tasks: number;
   success: number;
   failed: number;
   timeout: number;
   running: number;
   avgDurationMs: number | null;
-  // OBSERVABILITY-REASONING-001: токены и холодный старт по ролям (за 24ч).
+  // OBSERVABILITY-REASONING-001: суммарные токены по ролям за окно (для разбивки кэша).
   tokensIn: number;
   tokensOut: number;
   // TOKEN-SPLIT-001: деление входа. tokensIn = свежий + запись в кэш + чтение из кэша.
@@ -22,7 +24,22 @@ export interface RoleLoad {
   tokensCacheCreation: number;
   tokensCacheRead: number;
   cost: number;
+  // ROLE-LOAD-AVG-001: средние на задачу для основного вида (null при tasks = 0).
+  avgTokensInPerTask: number | null;
+  avgTokensOutPerTask: number | null;
+  avgCostPerTask: number | null;
   avgColdStartMs: number | null;
+}
+
+// ROLE-LOAD-LAST-DATA-001: окно блока «Нагрузка по ролям» заякорено к последней
+// активности. stale=true — оркестратор простаивает дольше окна, но показываются
+// последние имевшиеся данные (windowEnd — время последнего прогона).
+export interface RoleLoadWindow {
+  stale: boolean;
+  staleHours: number;
+  windowStart: string | null;
+  windowEnd: string | null;
+  lastActivityAt: string | null;
 }
 
 export interface ConnectorBucket {
@@ -74,7 +91,32 @@ export interface PerformanceMetrics {
     limitHits: number;
   };
   roleLoad: RoleLoad[];
+  roleLoadWindow: RoleLoadWindow;
   connector: Record<string, ConnectorBucket>;
+}
+
+// ROLE-LOAD-LAST-DATA-001 — суммарные значения блока «Нагрузка по ролям» за период
+// (вкладка «Суммы»). Всё суммарно за окно месяц/неделя/день, без усреднения.
+export type RoleLoadPeriod = 'month' | 'week' | 'day';
+
+export interface RoleLoadTotalRow {
+  roleCode: string;
+  roleName: string;
+  runs: number;
+  tasks: number;
+  success: number;
+  failed: number;
+  timeout: number;
+  tokensIn: number;
+  tokensOut: number;
+  cost: number;
+}
+
+export interface RoleLoadTotals extends RoleLoadWindow {
+  generatedAt: string;
+  period: RoleLoadPeriod;
+  windowDays: number;
+  roles: RoleLoadTotalRow[];
 }
 
 // VERSION-KPI-TRACKING-001 — KPI роли по версиям (код/промт/модель) и дельты.
@@ -146,6 +188,17 @@ export const performanceApi = {
     if (opts.windowHours) params.set('windowHours', String(opts.windowHours));
     if (opts.projectId) params.set('projectId', opts.projectId);
     return http.get<VersionMetrics>(`/api/performance/versions?${params.toString()}`, { signal });
+  },
+
+  // ROLE-LOAD-LAST-DATA-001: суммарные значения блока «Нагрузка по ролям» за период.
+  async roleLoadTotals(
+    period: RoleLoadPeriod,
+    signal?: AbortSignal,
+  ): Promise<RoleLoadTotals> {
+    return http.get<RoleLoadTotals>(
+      `/api/performance/role-load-totals?period=${encodeURIComponent(period)}`,
+      { signal },
+    );
   },
 
   async createMarker(

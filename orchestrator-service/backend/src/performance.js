@@ -142,10 +142,17 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
     const averageCompletedDurationMs =
       avg.rows[0].avg_ms == null ? null : Math.max(0, Math.round(Number(avg.rows[0].avg_ms)));
 
-    // 6) Нагрузка по ролям за 24 часа (agent_runs — учёт исполнения).
+    // 6) Нагрузка по ролям (agent_runs — учёт исполнения). ROLE-LOAD-LAST-DATA-001:
+    //    окно якорится к ПОСЛЕДНЕЙ активности (max(started_at) − 24ч), а не к now(),
+    //    чтобы при простое оркестратора > 24ч блок показывал последние имевшиеся
+    //    данные, а не пустоту. Флаг stale/границы окна возвращаются в roleLoadWindow.
+    //    ROLE-LOAD-AVG-001: токены/стоимость в основном виде — средние на задачу
+    //    (deriveRoleLoad: sum / count(DISTINCT task_id)); суммы — на отдельной вкладке.
     const roleRows = await c.query(
-      `SELECT r.code AS role_code, r.name AS role_name,
+      `WITH bounds AS (SELECT max(started_at) AS last_activity FROM agent_runs)
+       SELECT r.code AS role_code, r.name AS role_name,
               count(*)::int AS runs,
+              count(DISTINCT ar.task_id)::int AS tasks,
               count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
               count(*) FILTER (WHERE ar.status = 'FAILED')::int AS failed,
               count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
@@ -160,37 +167,21 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
               coalesce(sum(ar.token_cache_read), 0)::bigint AS tokens_cache_read,
               coalesce(sum(ar.token_cache_creation), 0)::bigint AS tokens_cache_creation,
               coalesce(sum(ar.cost), 0)::numeric AS cost,
-              avg(ar.cold_start_ms) FILTER (WHERE ar.cold_start_ms IS NOT NULL) AS avg_cold_start_ms
+              avg(ar.cold_start_ms) FILTER (WHERE ar.cold_start_ms IS NOT NULL) AS avg_cold_start_ms,
+              (SELECT last_activity FROM bounds) AS last_activity
          FROM agent_runs ar
          JOIN roles r ON r.id = ar.role_id
-        WHERE ar.started_at >= now() - interval '24 hours'
+        WHERE ar.started_at >= (SELECT last_activity FROM bounds) - interval '24 hours'
         GROUP BY r.code, r.name
         ORDER BY runs DESC`,
     );
-    const roleLoad = roleRows.rows.map((row) => ({
-      roleCode: row.role_code,
-      roleName: row.role_name,
-      runs: row.runs,
-      success: row.success,
-      failed: row.failed,
-      timeout: row.timeout,
-      running: row.running,
-      avgDurationMs: row.avg_ms == null ? null : Math.round(Number(row.avg_ms)),
-      tokensIn: Number(row.tokens_in) || 0,
-      tokensOut: Number(row.tokens_out) || 0,
-      // TOKEN-SPLIT-001: деление входа. tokensCacheRead — чтение из кэша (billed ~10%,
-      // копится по ходам tool-loop и обычно доминирует), tokensCacheCreation — запись
-      // в кэш (~125%), tokensInputFresh — свежий (uncached) ввод. Сумма трёх = tokensIn.
-      // Свежий ≥ 0: у исторических прогонов разбивки нет (cache-поля = 0) → fresh = tokensIn.
-      tokensCacheRead: Number(row.tokens_cache_read) || 0,
-      tokensCacheCreation: Number(row.tokens_cache_creation) || 0,
-      tokensInputFresh: Math.max(
-        0,
-        (Number(row.tokens_in) || 0) - (Number(row.tokens_cache_read) || 0) - (Number(row.tokens_cache_creation) || 0),
-      ),
-      cost: Number(row.cost) || 0,
-      avgColdStartMs: row.avg_cold_start_ms == null ? null : Math.round(Number(row.avg_cold_start_ms)),
-    }));
+    const roleLoad = deriveRoleLoad(roleRows.rows);
+    const lastActivity = roleRows.rows[0]?.last_activity ?? null;
+    const roleLoadWindow = computeRoleLoadWindow(
+      lastActivity ? new Date(lastActivity).toISOString() : null,
+      generatedAt.toISOString(),
+      24,
+    );
 
     // 7) Программист: проходы и упоры в лимит ходов (PROGRAMMER-LIMIT-KPI-001).
     //    avgPasses/maxPasses — «за сколько проходов программист справляется» (numTurns
@@ -257,7 +248,167 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
       },
       programmer,
       roleLoad,
+      roleLoadWindow,
       connector: connectorBuckets(),
+    };
+  });
+}
+
+// =====================================================================
+// ROLE-LOAD-LAST-DATA-001 / ROLE-LOAD-AVG-001 — блок «Нагрузка по ролям».
+//
+// Три доработки блока:
+//  1) окно якорится к последней активности (см. getPerformanceMetrics, шаг 6);
+//  2) основной вид — средние на задачу (deriveRoleLoad ниже);
+//  3) отдельная вкладка «Суммы» с суммарными значениями по периодам
+//     месяц/неделя/день (getRoleLoadTotals + buildRoleLoadTotals).
+// =====================================================================
+
+// Периоды вкладки «Суммы» → скользящее окно в днях, заякоренное к последней
+// активности (как и основной вид), чтобы простой оркестратора не обнулял блок.
+export const ROLE_LOAD_PERIOD_DAYS = { month: 30, week: 7, day: 1 };
+
+/**
+ * ЧИСТЫЙ маппинг сырых строк агрегата ролей в основной («средние на задачу») вид.
+ * Вынесен для юнит-теста без БД. Средние = sum(метрика) / count(DISTINCT task_id);
+ * при tasks = 0 (нет task_id по всем прогонам роли) среднее = null (в UI «—»).
+ * Суммарные поля (tokensIn/tokensOut/cost и разбивка кэша) сохраняются для
+ * вкладки «Суммы» и совместимости.
+ * @param {Array<Object>} rows сырые строки (по одной на роль)
+ * @returns {Array<Object>}
+ */
+export function deriveRoleLoad(rows = []) {
+  return rows.map((row) => {
+    const tasks = Number(row.tasks) || 0;
+    const tokensIn = Number(row.tokens_in) || 0;
+    const tokensOut = Number(row.tokens_out) || 0;
+    const cost = Number(row.cost) || 0;
+    const cacheRead = Number(row.tokens_cache_read) || 0;
+    const cacheCreation = Number(row.tokens_cache_creation) || 0;
+    // Свежий ≥ 0: у исторических прогонов разбивки нет (cache-поля = 0) → fresh = tokensIn.
+    const inputFresh = Math.max(0, tokensIn - cacheRead - cacheCreation);
+    const avgInt = (v) => (tasks > 0 ? Math.round(v / tasks) : null);
+    return {
+      roleCode: row.role_code,
+      roleName: row.role_name,
+      runs: Number(row.runs) || 0,
+      // Задач в окне (для знаменателя средних и подписи в UI).
+      tasks,
+      success: Number(row.success) || 0,
+      failed: Number(row.failed) || 0,
+      timeout: Number(row.timeout) || 0,
+      running: Number(row.running) || 0,
+      avgDurationMs: row.avg_ms == null ? null : Math.round(Number(row.avg_ms)),
+      // Суммарные значения (используются вкладкой «Суммы» и для разбивки кэша).
+      tokensIn,
+      tokensOut,
+      cost,
+      // TOKEN-SPLIT-001: деление входа. cacheRead — чтение из кэша (billed ~10%,
+      // копится по ходам tool-loop и обычно доминирует), cacheCreation — запись
+      // в кэш (~125%), inputFresh — свежий (uncached) ввод. Сумма трёх = tokensIn.
+      tokensCacheRead: cacheRead,
+      tokensCacheCreation: cacheCreation,
+      tokensInputFresh: inputFresh,
+      // ROLE-LOAD-AVG-001: средние на задачу для основного вида (null при tasks = 0).
+      avgTokensInPerTask: avgInt(tokensIn),
+      avgTokensOutPerTask: avgInt(tokensOut),
+      avgCostPerTask: tasks > 0 ? Math.round((cost / tasks) * 1e6) / 1e6 : null,
+      avgColdStartMs: row.avg_cold_start_ms == null ? null : Math.round(Number(row.avg_cold_start_ms)),
+    };
+  });
+}
+
+/**
+ * ЧИСТЫЙ расчёт границ окна и признака «устаревания» блока по последней активности.
+ * Вынесен для юнит-теста без БД. stale = данные старше окна относительно now
+ * (оркестратор простаивает дольше окна, но последние данные всё равно показываются).
+ * @param {string|null} lastActivityISO время последнего прогона (max started_at)
+ * @param {string} nowISO текущее время среза
+ * @param {number} windowHours ширина окна в часах (24 для основного вида)
+ * @returns {{stale:boolean, staleHours:number, windowStart:string|null, windowEnd:string|null, lastActivityAt:string|null}}
+ */
+export function computeRoleLoadWindow(lastActivityISO, nowISO, windowHours = 24) {
+  if (lastActivityISO == null) {
+    return { stale: false, staleHours: 0, windowStart: null, windowEnd: null, lastActivityAt: null };
+  }
+  const last = new Date(lastActivityISO);
+  const now = new Date(nowISO);
+  const windowMs = windowHours * 3.6e6;
+  const gapMs = now.getTime() - last.getTime();
+  const stale = Number.isFinite(gapMs) && gapMs > windowMs;
+  const start = new Date(last.getTime() - windowMs);
+  return {
+    stale,
+    staleHours: stale ? Number((gapMs / 3.6e6).toFixed(1)) : 0,
+    windowStart: start.toISOString(),
+    windowEnd: last.toISOString(),
+    lastActivityAt: last.toISOString(),
+  };
+}
+
+/**
+ * ЧИСТЫЙ маппинг сырых строк суммарного агрегата ролей (вкладка «Суммы»).
+ * Вынесен для юнит-теста без БД. Здесь всё суммарно за период, без усреднения.
+ * @param {Array<Object>} rows сырые строки (по одной на роль)
+ * @returns {Array<Object>}
+ */
+export function buildRoleLoadTotals(rows = []) {
+  return rows.map((row) => ({
+    roleCode: row.role_code,
+    roleName: row.role_name,
+    runs: Number(row.runs) || 0,
+    tasks: Number(row.tasks) || 0,
+    success: Number(row.success) || 0,
+    failed: Number(row.failed) || 0,
+    timeout: Number(row.timeout) || 0,
+    tokensIn: Number(row.tokens_in) || 0,
+    tokensOut: Number(row.tokens_out) || 0,
+    cost: Math.round((Number(row.cost) || 0) * 1e6) / 1e6,
+  }));
+}
+
+/**
+ * GET /api/performance/role-load-totals?period=month|week|day — суммарные значения
+ * блока «Нагрузка по ролям» за период (месяц/неделя/день). Окно, как и в основном
+ * виде, заякорено к последней активности (max(started_at) − N дней), поэтому простой
+ * оркестратора не обнуляет вкладку. Роли считаются глобально (как и основной блок).
+ */
+export async function getRoleLoadTotals(s, { period } = {}) {
+  const key = String(period ?? 'month').trim().toLowerCase();
+  const normPeriod = Object.prototype.hasOwnProperty.call(ROLE_LOAD_PERIOD_DAYS, key) ? key : 'month';
+  const days = ROLE_LOAD_PERIOD_DAYS[normPeriod];
+  return withClient(clientConfig(s), async (c) => {
+    const r = await c.query(
+      `WITH bounds AS (SELECT max(started_at) AS last_activity FROM agent_runs)
+       SELECT r.code AS role_code, r.name AS role_name,
+              count(*)::int AS runs,
+              count(DISTINCT ar.task_id)::int AS tasks,
+              count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
+              count(*) FILTER (WHERE ar.status = 'FAILED')::int AS failed,
+              count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
+              coalesce(sum(ar.token_input), 0)::bigint AS tokens_in,
+              coalesce(sum(ar.token_output), 0)::bigint AS tokens_out,
+              coalesce(sum(ar.cost), 0)::numeric AS cost,
+              (SELECT last_activity FROM bounds) AS last_activity
+         FROM agent_runs ar
+         JOIN roles r ON r.id = ar.role_id
+        WHERE ar.started_at >= (SELECT last_activity FROM bounds) - ($1::int * interval '1 day')
+        GROUP BY r.code, r.name
+        ORDER BY runs DESC`,
+      [days],
+    );
+    const lastActivity = r.rows[0]?.last_activity ?? null;
+    const window = computeRoleLoadWindow(
+      lastActivity ? new Date(lastActivity).toISOString() : null,
+      new Date().toISOString(),
+      days * 24,
+    );
+    return {
+      generatedAt: new Date().toISOString(),
+      period: normPeriod,
+      windowDays: days,
+      ...window,
+      roles: buildRoleLoadTotals(r.rows),
     };
   });
 }

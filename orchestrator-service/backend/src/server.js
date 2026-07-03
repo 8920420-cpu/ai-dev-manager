@@ -52,7 +52,7 @@ import {
 } from './intakeIntegrations.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
-import { getPerformanceMetrics, getVersionMetrics, getDailyModelStats, getKpiMarkers, createKpiMarker } from './performance.js';
+import { getPerformanceMetrics, getVersionMetrics, getDailyModelStats, getRoleLoadTotals, getKpiMarkers, createKpiMarker } from './performance.js';
 import { createAuditRun, listAuditRuns, completeAuditRun } from './auditRuns.js';
 import { getTaskTree, getTaskStatusCounts, getTasksByStage, getTaskHistory } from './taskTree.js';
 import { openTaskEventsStream, publishTaskChange } from './taskEvents.js';
@@ -457,6 +457,18 @@ export function createApp() {
             await getDailyModelStats(await loadSettings(), {
               windowDays: url.searchParams.get('windowDays'),
               projectId: url.searchParams.get('projectId'),
+            }),
+          );
+
+        // ROLE-LOAD-LAST-DATA-001: суммарные значения блока «Нагрузка по ролям» за
+        // период (?period=month|week|day) — вкладка «Суммы». Окно заякорено к
+        // последней активности (простой оркестратора не обнуляет данные).
+        if (req.method === 'GET' && p === '/api/performance/role-load-totals')
+          return sendJson(
+            res,
+            200,
+            await getRoleLoadTotals(await loadSettings(), {
+              period: url.searchParams.get('period'),
             }),
           );
 
