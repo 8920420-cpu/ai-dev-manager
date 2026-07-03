@@ -1615,9 +1615,49 @@ const HOST_ROLES = {
 };
 
 /**
+ * FORK-BRANCH-CONTEXT-001 — контекст host-задачи с учётом fork-веток. Ветка fork
+ * (ребёнок, created_by='fork') не несёт событий сдачи программиста — они на
+ * родителе/корне. Раньше scan смотрел только события самой задачи: у ребёнка их
+ * нет → Git Integrator получал пустой changedFiles и завершался
+ * note='no_changed_files', код оставался не закоммиченным. Ищем по всей цепочке
+ * предков; берём ПОСЛЕДНЕЕ событие с непустым changedFiles или непустым result —
+ * пустые ([]/'') не считаются, иначе TASK_CREATED с changedFiles:[] перекрывает
+ * реальную сдачу. rootTask — корень цепочки (карточка Приёмщика для коммита).
+ */
+export async function resolveHostTaskContext(c, taskId) {
+  const chain = await c.query(
+    `WITH RECURSIVE chain AS (
+       SELECT id, parent_task_id, title, description, 0 AS depth
+         FROM tasks WHERE id = $1
+       UNION ALL
+       SELECT p.id, p.parent_task_id, p.title, p.description, chain.depth + 1
+         FROM tasks p JOIN chain ON p.id = chain.parent_task_id
+        WHERE chain.depth < 8
+     )
+     SELECT id, title, description, depth FROM chain ORDER BY depth`,
+    [taskId],
+  );
+  const chainIds = chain.rows.length ? chain.rows.map((r) => r.id) : [taskId];
+  const rootTask = chain.rows[chain.rows.length - 1] ?? null;
+  const ev = await c.query(
+    `SELECT payload_json FROM task_events
+      WHERE task_id = ANY($1::uuid[])
+        AND (
+          (jsonb_typeof(payload_json->'changedFiles') = 'array'
+            AND jsonb_array_length(payload_json->'changedFiles') > 0)
+          OR COALESCE(payload_json->>'result', '') <> ''
+        )
+      ORDER BY created_at DESC LIMIT 1`,
+    [chainIds],
+  );
+  return { chainIds, rootTask, scan: ev.rows[0] ?? null };
+}
+
+/**
  * Захватить следующую задачу для host-роли. Аналог claimNextClaudeTask, но для
  * PIPELINE_SERVICE/GIT_INTEGRATOR. Помечает agent_run RUNNING и возвращает
- * контекст для исполнения на хосте (включая changedFiles из события Scanner).
+ * контекст для исполнения на хосте (включая changedFiles сдачи программиста,
+ * найденные по цепочке предков — см. resolveHostTaskContext).
  */
 export async function claimNextHostTask(s, roleCode) {
   const role = HOST_ROLES[roleCode];
@@ -1690,11 +1730,7 @@ export async function claimNextHostTask(s, roleCode) {
         [t.id],
       );
       const m = meta.rows[0] ?? {};
-      const ev = await c.query(
-        `SELECT payload_json FROM task_events WHERE task_id = $1 ORDER BY created_at DESC LIMIT 12`,
-        [t.id],
-      );
-      const scan = ev.rows.find((r) => r.payload_json && (r.payload_json.changedFiles || r.payload_json.result));
+      const { rootTask, scan } = await resolveHostTaskContext(c, t.id);
 
       // PIPELINE_SERVICE — не-AI исполнитель: контракт claim фиксирует точный
       // микросервис и разрешённую рабочую директорию (без AI agent run/LLM).
@@ -1718,12 +1754,17 @@ export async function claimNextHostTask(s, roleCode) {
       }
 
       await c.query('COMMIT');
+      // FORK-BRANCH-CONTEXT-001: коммит Git Integrator подписывается карточкой
+      // Приёмщика (short_title/structured_description) — они на КОРНЕВОЙ задаче,
+      // а у fork-ребёнка заголовок с суффиксом «[ветка]». Для остальных host-ролей
+      // заголовок оставляем как есть (в коммит он не попадает).
+      const useRoot = roleCode === 'GIT_INTEGRATOR' && rootTask && rootTask.id !== t.id;
       return {
         task: {
           id: t.id,
           role: roleCode,
-          title: t.title,
-          description: t.description ?? '',
+          title: useRoot ? rootTask.title : t.title,
+          description: (useRoot ? rootTask.description : t.description) ?? '',
           projectId: m.project_id ?? null,
           project: m.project ?? '',
           serviceId: m.service_id ?? null,
@@ -2990,14 +3031,20 @@ export async function reapOrphanRunningRuns(c, { ageCheck = false } = {}) {
   const params = [errText, reason];
   let agePredicate = '';
   if (ageCheck) {
-    params.push(ROLE_TIMEOUT_MS);
-    agePredicate = `AND ar.started_at < now() - ($${params.length}::bigint * interval '1 millisecond')`;
+    // PROGRAMMER-UNIFY-001: сессия программиста легально дольше общего ROLE_TIMEOUT_MS
+    // (кодинг идёт 10-25 мин, см. RUNNER_CLAUDE_TIMEOUT_MS) — его RUNNING-прогон
+    // сравниваем с бОльшим таймаутом, синхронно с releaseStaleClaudeClaims. Иначе
+    // тикающий жнец гасит живую сессию ровно на 10-й минуте и освобождает захват.
+    params.push(ROLE_TIMEOUT_MS, CLAUDE_ASSIGN_TIMEOUT_MS);
+    agePredicate = `AND ar.started_at < now() - ((CASE WHEN COALESCE(r.code, '') = 'PROGRAMMER'
+                      THEN $${params.length} ELSE $${params.length - 1} END)::bigint * interval '1 millisecond')`;
   }
   const r = await c.query(
     `WITH stale AS (
        SELECT ar.id, ar.task_id, ar.role_id, t.status::text AS task_status
          FROM agent_runs ar
          JOIN tasks t ON t.id = ar.task_id
+         LEFT JOIN roles r ON r.id = ar.role_id
         WHERE ar.status = 'RUNNING' ${agePredicate}
      ), done AS (
        UPDATE agent_runs
