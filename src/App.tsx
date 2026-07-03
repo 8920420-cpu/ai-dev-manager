@@ -13,6 +13,7 @@ import { McpRolesPage } from './features/settings/McpRolesPage';
 import { RolesPage } from './features/settings/RolesPage';
 import { ToolsPage } from './features/settings/ToolsPage';
 import { ExecutionPage } from './features/settings/ExecutionPage';
+import { FeedbackWidget } from './features/feedback/FeedbackWidget';
 
 function CurrentPage() {
   const { route } = useRouter();
@@ -52,6 +53,7 @@ export function App() {
         <RouterProvider>
           <AppShell>
             <CurrentPage />
+            <FeedbackWidget />
           </AppShell>
         </RouterProvider>
       </ToastProvider>
