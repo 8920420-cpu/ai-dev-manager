@@ -95,6 +95,17 @@ const ERROR_MESSAGES: Record<string, string> = {
   skill_extension_invalid: 'Недопустимое расширение файла навыка.',
   skill_content_empty: 'Содержимое навыка пусто.',
   skill_content_too_long: 'Содержимое навыка слишком большое.',
+  // MCP роли
+  mcp_role_invalid_body: 'Некорректные данные MCP-роли.',
+  mcp_role_code_required: 'Укажите код роли.',
+  mcp_role_code_invalid: 'Недопустимый код роли (латиница, цифры, . _ -; начинается с буквы).',
+  mcp_role_code_exists: 'MCP-роль с таким кодом уже существует.',
+  mcp_role_name_required: 'Укажите название роли.',
+  mcp_role_name_too_long: 'Название роли слишком длинное.',
+  mcp_role_description_too_long: 'Описание роли слишком длинное.',
+  mcp_role_prompt_too_long: 'Промт роли слишком длинный.',
+  mcp_role_requirements_too_long: 'Требования к роли слишком длинные.',
+  mcp_role_not_found: 'MCP-роль не найдена.',
   // Группы ролей
   role_group_name_required: 'Укажите название группы ролей.',
   role_group_name_too_long: 'Название группы ролей слишком длинное.',

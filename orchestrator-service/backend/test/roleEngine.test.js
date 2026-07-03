@@ -4,6 +4,7 @@ import {
   parseVerdict,
   normalizeVerdict,
   decideTransition,
+  decideOutcome,
   buildVerdictInstruction,
   buildUserPayload,
   renderProjectMaps,
@@ -132,10 +133,39 @@ test('decideTransition: DOCUMENTATION_AUDITOR NO_CHANGES => GIT_INTEGRATOR', () 
   assert.equal(d.nextRole, 'GIT_INTEGRATOR');
 });
 
-test('decideTransition: DOCUMENTATION_AUDITOR BLOCKED => BLOCKED', () => {
+// DOC-BRANCH-LIVENESS-001: документация НЕ блокирует основной поток. BLOCKED-вердикт
+// документационной роли не оставляет задачу в BLOCKED, а ведёт её вперёд по маршруту
+// (иначе параллельная документационная fork-ветвь держит join и родителя вечно).
+test('decideTransition: DOCUMENTATION_AUDITOR BLOCKED => forward (не BLOCKED)', () => {
   const d = decideTransition('DOCUMENTATION_AUDITOR', { ok: false, status: 'BLOCKED' });
-  assert.equal(d.blocked, true);
-  assert.equal(d.reason, 'docs_blocked');
+  assert.equal(d.blocked, false, 'документация не блокирует основной поток');
+  assert.equal(d.toStatus, 'COMMIT');
+  assert.equal(d.nextRole, 'GIT_INTEGRATOR');
+  assert.equal(d.agentRunStatus, 'SUCCESS');
+  assert.equal(d.reason, 'docs_blocked_forwarded');
+});
+
+test('decideTransition: DOCUMENTATION_KEEPER BLOCKED => forward (не BLOCKED)', () => {
+  const d = decideTransition('DOCUMENTATION_KEEPER', { ok: false, status: 'BLOCKED' });
+  assert.equal(d.blocked, false);
+  assert.equal(d.nextRole, 'GIT_INTEGRATOR');
+  assert.equal(d.reason, 'docs_blocked_forwarded');
+});
+
+test('decideOutcome (граф): документация BLOCKED => FORWARD, а не BLOCK', () => {
+  const a = decideOutcome('DOCUMENTATION_AUDITOR', { ok: false, status: 'BLOCKED' });
+  assert.equal(a.outcome, 'FORWARD', 'аудитор не блокирует ветку');
+  assert.equal(a.agentRunStatus, 'SUCCESS');
+  assert.equal(a.reason, 'docs_blocked_forwarded');
+  const k = decideOutcome('DOCUMENTATION_KEEPER', { ok: false, status: 'BLOCKED' });
+  assert.equal(k.outcome, 'FORWARD', 'keeper не блокирует ветку');
+  assert.equal(k.reason, 'docs_blocked_forwarded');
+});
+
+test('decideOutcome (граф): документация UPDATE_REQUIRED => BRANCH к Keeper (не тронуто)', () => {
+  const a = decideOutcome('DOCUMENTATION_AUDITOR', { ok: null, status: 'UPDATE_REQUIRED' });
+  assert.equal(a.outcome, 'BRANCH');
+  assert.equal(a.branchRole, 'DOCUMENTATION_KEEPER');
 });
 
 test('decideTransition: DOCUMENTATION_KEEPER UPDATED => GIT_INTEGRATOR', () => {

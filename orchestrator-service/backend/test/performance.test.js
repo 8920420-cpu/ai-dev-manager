@@ -1,7 +1,7 @@
 // PERFORMANCE-MONITOR-001 — тесты чистого расчёта производных KPI.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { deriveKpi, deriveVersionDeltas } from '../src/performance.js';
+import { deriveKpi, deriveVersionDeltas, buildDailyModelStats } from '../src/performance.js';
 
 test('deriveKpi: базовые агрегаты по статусам', () => {
   const k = deriveKpi({
@@ -92,4 +92,104 @@ test('deriveVersionDeltas: пустой и одиночный списки не 
   const one = deriveVersionDeltas([{ n: 3, avgDurationMs: 100, successRate: 1 }]);
   assert.equal(one.length, 1);
   assert.equal(one[0].regression, false);
+});
+
+// ROLE-ENGINE-ROUTING-002 — дневная статистика по коннекторам/моделям.
+
+test('buildDailyModelStats: две модели за один день → две отдельные строки', () => {
+  const rows = [
+    {
+      day: '2026-07-01', connectorId: 'c1', provider: 'deepseek', model: 'deepseek-chat',
+      driverType: 'api', roleCode: 'ARCHITECT', roleName: 'Архитектор',
+      runs: 6, success: 5, failed: 1, timeout: 0, throttle: 0, running: 0,
+      avgMs: 4000, medianMs: 3800, tokensIn: 6000, tokensOut: 3000, cost: 0.12,
+    },
+    {
+      day: '2026-07-01', connectorId: 'c2', provider: 'openai', model: 'gpt-4o',
+      driverType: 'api', roleCode: 'ARCHITECT', roleName: 'Архитектор',
+      runs: 4, success: 4, failed: 0, timeout: 0, throttle: 0, running: 0,
+      avgMs: 2000, medianMs: 2100, tokensIn: 2000, tokensOut: 1000, cost: 0.20,
+    },
+  ];
+  const out = buildDailyModelStats(rows);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].day, '2026-07-01');
+  // Один день — две строки для старой и новой модели.
+  assert.equal(out[0].models.length, 2);
+  assert.deepEqual(out[0].models.map((m) => m.model), ['deepseek-chat', 'gpt-4o']);
+  // Итоги дня агрегируют обе модели.
+  assert.equal(out[0].totals.runs, 10);
+  assert.equal(out[0].totals.success, 9);
+  assert.equal(out[0].totals.models, 2);
+  assert.equal(out[0].totals.successRate, 0.9);
+});
+
+test('buildDailyModelStats: маппинг provider/driver/model/role сохраняется как есть', () => {
+  const rows = [{
+    day: '2026-07-02', connectorId: 'drv', provider: 'claude_code', model: 'sonnet',
+    driverType: 'driver', roleCode: 'PROGRAMMER', roleName: 'Программист',
+    runs: 3, success: 3, failed: 0, timeout: 0, throttle: 0, running: 0,
+    avgMs: 1000, medianMs: 1000, tokensIn: 0, tokensOut: 0, cost: 0,
+  }];
+  const m = buildDailyModelStats(rows)[0].models[0];
+  assert.equal(m.provider, 'claude_code');
+  assert.equal(m.driverType, 'driver');
+  assert.equal(m.model, 'sonnet');
+  assert.equal(m.connectorId, 'drv');
+  assert.equal(m.roleCode, 'PROGRAMMER');
+  assert.equal(m.roleName, 'Программист');
+});
+
+test('buildDailyModelStats: successRate, avgTokens, avgCost, median, timeout/throttle', () => {
+  const rows = [{
+    day: '2026-07-03', connectorId: 'c1', provider: 'deepseek', model: 'deepseek-chat',
+    driverType: 'api', roleCode: 'REVIEWER', roleName: 'Ревьюер',
+    runs: 10, success: 7, failed: 1, timeout: 1, throttle: 1, running: 0,
+    avgMs: 3333.7, medianMs: 2999.4, tokensIn: 8000, tokensOut: 2000, cost: 0.5,
+  }];
+  const m = buildDailyModelStats(rows)[0].models[0];
+  assert.equal(m.successRate, 0.7);       // 7/10
+  assert.equal(m.timeout, 1);
+  assert.equal(m.throttle, 1);
+  assert.equal(m.failed, 1);
+  assert.equal(m.avgDurationMs, 3334);    // округление до целого мс
+  assert.equal(m.medianDurationMs, 2999);
+  assert.equal(m.tokensIn, 8000);
+  assert.equal(m.tokensOut, 2000);
+  assert.equal(m.avgTokens, 1000);        // (8000+2000)/10
+  assert.equal(m.cost, 0.5);
+  assert.equal(m.avgCost, 0.05);          // 0.5/10
+});
+
+test('buildDailyModelStats: несколько дней в исходном порядке; null-метрики без падения', () => {
+  const rows = [
+    {
+      day: '2026-07-05', connectorId: null, provider: null, model: null, driverType: null,
+      roleCode: 'ARCHITECT', roleName: 'Архитектор',
+      runs: 0, success: 0, failed: 0, timeout: 0, throttle: 0, running: 0,
+      avgMs: null, medianMs: null, tokensIn: 0, tokensOut: 0, cost: 0,
+    },
+    {
+      day: '2026-07-04', connectorId: 'c1', provider: 'openai', model: 'gpt-4o', driverType: 'api',
+      roleCode: 'ARCHITECT', roleName: 'Архитектор',
+      runs: 2, success: 1, failed: 0, timeout: 0, throttle: 0, running: 1,
+      avgMs: 500, medianMs: 500, tokensIn: 10, tokensOut: 10, cost: 0.01,
+    },
+  ];
+  const out = buildDailyModelStats(rows);
+  assert.deepEqual(out.map((d) => d.day), ['2026-07-05', '2026-07-04']);
+  // runs=0 → производные null, без деления на ноль.
+  assert.equal(out[0].models[0].successRate, null);
+  assert.equal(out[0].models[0].avgTokens, null);
+  assert.equal(out[0].models[0].avgCost, null);
+  assert.equal(out[0].models[0].avgDurationMs, null);
+  assert.equal(out[0].models[0].medianDurationMs, null);
+  // Второй день: running учитывается, provider/model прокинуты.
+  assert.equal(out[1].models[0].running, 1);
+  assert.equal(out[1].models[0].provider, 'openai');
+});
+
+test('buildDailyModelStats: пустой вход не падает', () => {
+  assert.deepEqual(buildDailyModelStats(), []);
+  assert.deepEqual(buildDailyModelStats([]), []);
 });

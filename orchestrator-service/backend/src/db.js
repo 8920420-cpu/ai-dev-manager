@@ -12,6 +12,7 @@ import { buildPipelineClaimContract } from './pipelineDispatch.js';
 import { reconcileClockSkew } from './clockGuard.js';
 import { isDbConnectionError, noteDbConnectionFailure, claimGraceActive } from './bootClaimGuard.js';
 import { resolveDuration, logEffectiveConfig } from './envConfig.js';
+import { isDriverProvider } from './connectors.js';
 
 const { Client } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -33,6 +34,36 @@ function assertIdentifier(name) {
   if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
     throw new Error(`Недопустимое имя базы данных: "${name}"`);
   }
+}
+
+// ROLE-ENGINE-ROUTING-002 — снимок коннектора роли для agent_runs. Источник истины
+// «чем исполнялся прогон»: включённый коннектор, назначенный коду роли в карточке
+// роли (role_connectors → «Движок»). Возвращает неизменяемый снимок
+// { connectorId, provider, model, driverType } на момент захвата задачи; все поля
+// null, если роли не назначен включённый коннектор (исторические/локальные прогоны).
+// driverType: 'driver' (хостовый движок codex/claude_code) либо 'api' (сетевой AI-API).
+async function resolveConnectorSnapshot(c, roleCode) {
+  const empty = { connectorId: null, provider: null, model: null, driverType: null };
+  const code = String(roleCode ?? '').trim();
+  if (!code) return empty;
+  const r = await c.query(
+    `SELECT cn.id::text AS id, cn.provider, cn.model
+       FROM role_connectors rc
+       JOIN connectors cn ON cn.id = rc.connector_id
+      WHERE rc.role_code = $1 AND cn.is_enabled = true
+      ORDER BY cn.priority ASC, cn.updated_at DESC
+      LIMIT 1`,
+    [code],
+  );
+  if (!r.rowCount) return empty;
+  const row = r.rows[0];
+  const provider = row.provider == null ? null : String(row.provider);
+  return {
+    connectorId: row.id ?? null,
+    provider,
+    model: row.model ? String(row.model) : null,
+    driverType: provider == null ? null : (isDriverProvider(provider) ? 'driver' : 'api'),
+  };
 }
 
 export async function withClient(cfg, fn) {
@@ -1198,7 +1229,7 @@ export async function claimNextClaudeTask(s) {
       // anthropic-API). Модель от deepseek/codex/openai не подсунет SDK имя чужой
       // модели; такой коннектор → fallback на дефолт агента.
       const progConn = await c.query(
-        `SELECT cn.model FROM role_connectors rc
+        `SELECT cn.id::text AS connector_id, cn.provider, cn.model FROM role_connectors rc
            JOIN connectors cn ON cn.id = rc.connector_id
           WHERE rc.role_code = 'PROGRAMMER' AND cn.is_enabled = true
             AND lower(cn.provider) IN ('claude_code', 'anthropic')
@@ -1208,14 +1239,28 @@ export async function claimNextClaudeTask(s) {
       const agentModel = String(progAgent.rows[0]?.model ?? '').trim();
       // Эффективная модель: коннектор роли > дефолт агента > пусто (раннер сам решит).
       const programmerModel = connModel || agentModel || null;
+      // ROLE-ENGINE-ROUTING-002: неизменяемый снимок фактического движка программиста.
+      // Источник истины — назначенный роли Claude-совместимый коннектор (см. выше). Нет
+      // назначения → снимок пустой (раннер исполняет дефолтным агентом, коннектор не
+      // зафиксирован). snapshot_model = эффективная модель, которой реально исполняется.
+      const progProvider = progConn.rows[0]?.provider == null
+        ? null : String(progConn.rows[0].provider);
+      const progSnap = {
+        connectorId: progConn.rows[0]?.connector_id ?? null,
+        provider: progProvider,
+        model: programmerModel,
+        driverType: progProvider == null ? null : (isDriverProvider(progProvider) ? 'driver' : 'api'),
+      };
       // Прогон закрывают по task_id (на задачу — ровно один RUNNING под PROGRAMMER),
       // поэтому id прогона дальше не нужен.
       if (progAgentId) {
         await c.query(
-          `INSERT INTO agent_runs (task_id, agent_id, role_id, status, started_at, input_json, model)
-           VALUES ($1, $2, $3, 'RUNNING', now(), $4::jsonb, $5)`,
+          `INSERT INTO agent_runs (task_id, agent_id, role_id, status, started_at, input_json, model,
+             snapshot_connector_id, snapshot_provider, snapshot_model, snapshot_driver_type)
+           VALUES ($1, $2, $3, 'RUNNING', now(), $4::jsonb, $5, $6, $7, $8, $9)`,
           [row.id, progAgentId, row.current_role_id,
-            JSON.stringify({ roleCode: 'PROGRAMMER', status: 'CODING' }), programmerModel],
+            JSON.stringify({ roleCode: 'PROGRAMMER', status: 'CODING' }), programmerModel,
+            progSnap.connectorId, progSnap.provider, progSnap.model, progSnap.driverType],
         );
       }
       // Ключ сдачи ДОЛЖЕН быть уникален для каждого захвата задачи, а не только для
@@ -1409,10 +1454,16 @@ export async function claimNextHostTask(s, roleCode) {
         return { task: null };
       }
       await c.query('UPDATE tasks SET assigned_agent_id = $2 WHERE id = $1', [t.id, agentId]);
+      // ROLE-ENGINE-ROUTING-002: снимок движка host-роли (обычно локальный
+      // исполнитель без AI-коннектора → все поля NULL; заполняется, если роли явно
+      // назначен включённый коннектор).
+      const hostSnap = await resolveConnectorSnapshot(c, roleCode);
       const run = await c.query(
-        `INSERT INTO agent_runs (task_id, agent_id, role_id, status, started_at, input_json)
-         VALUES ($1, $2, $3, 'RUNNING', now(), $4::jsonb) RETURNING id`,
-        [t.id, agentId, t.current_role_id, JSON.stringify({ roleCode, host: true })],
+        `INSERT INTO agent_runs (task_id, agent_id, role_id, status, started_at, input_json,
+           snapshot_connector_id, snapshot_provider, snapshot_model, snapshot_driver_type)
+         VALUES ($1, $2, $3, 'RUNNING', now(), $4::jsonb, $5, $6, $7, $8) RETURNING id`,
+        [t.id, agentId, t.current_role_id, JSON.stringify({ roleCode, host: true }),
+          hostSnap.connectorId, hostSnap.provider, hostSnap.model, hostSnap.driverType],
       );
       const meta = await c.query(
         `SELECT p.id AS project_id, p.code AS project, p.root_path,
@@ -1855,6 +1906,14 @@ const ROLE_TIMEOUT_MS = roleTimeoutCfg.value;
 const claudeAssignCfg = resolveDuration('RUNNER_CLAUDE_TIMEOUT_MS', ROLE_TIMEOUT_MS, { min: 30_000, max: 2 * 60 * 60_000 });
 const CLAUDE_ASSIGN_TIMEOUT_MS = claudeAssignCfg.value;
 
+// DOC-BRANCH-LIVENESS-001: максимальный возраст «зависания» документационной
+// fork-ветви, после которого она принудительно продвигается к join (чтобы не
+// держать родителя, даже если движок документации вообще не создаёт прогонов —
+// напр. codex-драйвер завис/недоступен, bad_runs не растёт). Документация вправе
+// идти ДОЛЬШЕ коммита (дефолт 1 час — щедро), но не бесконечно.
+const docBranchAgeCfg = resolveDuration('RUNNER_DOC_BRANCH_MAX_AGE_MS', 60 * 60_000, { min: 60_000, max: 24 * 60 * 60_000 });
+const DOC_BRANCH_MAX_AGE_MS = docBranchAgeCfg.value;
+
 // CONFIG-AUDIT-001: стартовый лог эффективных орфан-таймаутов с атрибуцией
 // источника (env|default) — чтобы по логу было видно, что реально применилось.
 logEffectiveConfig('orchestrator timeouts', [roleTimeoutCfg, claudeAssignCfg]);
@@ -2061,6 +2120,10 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // BLOCKED (на человека). Зелёные задачи сюда не попадают — их раньше пропускает
     // maybeSkipFailureAnalyst (forward), поэтому здесь явно требуем провала пайплайна.
     await blockExhaustedFailureAnalysis(c);
+    // DOC-BRANCH-LIVENESS-001: документационная fork-ветвь не должна заклинивать
+    // родителя на join. Мёртвую ветку документации (BLOCKED/FAILED/исчерпание попыток)
+    // продвигаем на узел вперёд к join ДО снятия join-барьера, чтобы родитель поехал.
+    await advanceStuckDocumentationBranches(c);
     // Пропускаемые роли (ROLE-GROUPS-001 / per-project) прокручиваются до первой
     // активной роли ДО любого claim — за пропущенные роли не создаётся agent/host run.
     await advanceSkippedStageRoles(c);
@@ -2803,6 +2866,99 @@ async function blockExhaustedFailureAnalysis(c, maxAttempts = MAX_REWORK) {
   return r.rowCount;
 }
 
+// DOC-BRANCH-LIVENESS-001 — живучесть документационной fork-ветви. Документация
+// (Documentation Auditor/Keeper) идёт ПАРАЛЛЕЛЬНО коммиту через fork/join и вправе
+// выполняться дольше. Но если её этап реально «мёртв» — задача-ветвь ушла в
+// BLOCKED/FAILED, либо накопила >= maxAttempts безрезультатных прогонов
+// (TIMEOUT/FAILED) под текущей документационной ролью — она НЕ должна вечно держать
+// парный join, заклинивая родителя в WAITING_FOR_CHILDREN. Продвигаем такого
+// документационного ребёнка на ОДИН узел вперёд по графу ветки: к следующей
+// документационной роли (честная попытка), а в конце ветки — на join-узел, откуда
+// advanceJoinNodes завершит ветку (DONE) и снимет барьер родителя. A1 (roleEngine)
+// закрывает «здоровый» путь (BLOCKED-вердикт → forward сразу); этот подметатель —
+// сеть безопасности для таймаутов/сбоев вызова ИИ и осиротевших после ручных операций.
+export async function advanceStuckDocumentationBranches(c, maxAttempts = MAX_REWORK, maxAgeMs = DOC_BRANCH_MAX_AGE_MS) {
+  const DOC_ROLES = ['DOCUMENTATION_AUDITOR', 'DOCUMENTATION_KEEPER'];
+  const stuck = await c.query(
+    `SELECT t.id, t.project_id, t.status::text AS status, t.current_role_id,
+            t.current_stage_key, r.code AS role_code,
+            (SELECT count(*) FROM agent_runs ar
+              WHERE ar.task_id = t.id AND ar.role_id = t.current_role_id
+                AND ar.status IN ('TIMEOUT','FAILED'))::int AS bad_runs,
+            (extract(epoch from (now() - t.updated_at)) * 1000)::bigint AS age_ms
+       FROM tasks t JOIN roles r ON r.id = t.current_role_id
+      WHERE t.assigned_agent_id IS NULL
+        AND t.parent_task_id IS NOT NULL
+        AND r.code = ANY($1::text[])
+        AND t.status NOT IN ('DONE','CANCELLED')`,
+    [DOC_ROLES],
+  );
+  const limit = Math.max(1, Number(maxAttempts) || 1);
+  const ageLimit = Math.max(60_000, Number(maxAgeMs) || 0);
+  let moved = 0;
+  for (const t of stuck.rows) {
+    // Ветвь считается «мёртвой» и продвигается к join, если: она в терминальном для
+    // ветки состоянии (BLOCKED/FAILED); ИЛИ исчерпала попытки (bad_runs); ИЛИ просто
+    // висит дольше ageLimit без продвижения (движок документации не создаёт прогонов —
+    // напр. codex-драйвер завис: bad_runs=0, но родитель не должен ждать вечно).
+    const exhausted =
+      t.status === 'BLOCKED' || t.status === 'FAILED' ||
+      Number(t.bad_runs) >= limit || Number(t.age_ms) >= ageLimit;
+    if (!exhausted) continue;
+    const loaded = await loadProjectGraph(c, t.project_id);
+    if (!loaded) continue; // линейный проект — здесь fork-ветвей нет
+    // Восстановить узел ветки, если stage_key потерян (осиротел после ручных операций):
+    // узел с этой ролью (предпочтительно совпадающий по статусу).
+    let stageKey = t.current_stage_key;
+    if (!stageKey) {
+      const byRoleAndStatus = loaded.nodes.find(
+        (n) => n.roleId === t.current_role_id && n.status === t.status,
+      );
+      stageKey = (byRoleAndStatus ?? loaded.nodes.find((n) => n.roleId === t.current_role_id))?.stageKey ?? null;
+    }
+    if (!stageKey) continue;
+    const claimedLike = {
+      id: t.id, project_id: t.project_id, current_stage_key: stageKey,
+      role_code: t.role_code, status: t.status,
+    };
+    const resolved = await resolveGraphTransition(c, claimedLike, {
+      outcome: 'FORWARD', agentRunStatus: 'SUCCESS', reason: 'documentation_exhausted',
+    });
+    const nextRoleId = resolved.done || !resolved.nextRole
+      ? null
+      : (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null;
+    await c.query('BEGIN');
+    try {
+      const upd = await c.query(
+        `UPDATE tasks SET status = $2::task_status, current_role_id = $3,
+                current_stage_key = $4::uuid, assigned_agent_id = NULL
+          WHERE id = $1 AND assigned_agent_id IS NULL AND status NOT IN ('DONE','CANCELLED')`,
+        [t.id, resolved.toStatus, nextRoleId, resolved.nextStageKey ?? null],
+      );
+      if (upd.rowCount) {
+        await c.query(
+          `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+           VALUES ($1, $2, $3::task_status, $4::task_status, $5, $6::jsonb)`,
+          [t.id, resolved.done ? 'TASK_DONE' : 'STATUS_CHANGED', t.status, resolved.toStatus, t.current_role_id,
+           JSON.stringify({
+             runner: true, reason: 'documentation_branch_advanced',
+             from: t.role_code, badRuns: t.bad_runs, ageMs: Number(t.age_ms),
+             trigger: (t.status === 'BLOCKED' || t.status === 'FAILED') ? t.status
+               : (Number(t.bad_runs) >= limit ? 'bad_runs' : 'age'),
+             nextRole: resolved.nextRole,
+           })],
+        );
+        moved += 1;
+      }
+      await c.query('COMMIT');
+    } catch (error) {
+      await c.query('ROLLBACK');
+      throw error;
+    }
+  }
+  return moved;
+}
+
 /**
  * Стартовая реконсиляция (вызывается один раз при запуске оркестратора).
  * Полный перезапуск программы означает, что активных сессий (ни Разработчика,
@@ -2886,10 +3042,16 @@ async function claimLlmRoleTask(c, roleCode = null) {
       return null;
     }
     await c.query('UPDATE tasks SET assigned_agent_id = $2 WHERE id = $1', [task.id, agentId]);
+    // ROLE-ENGINE-ROUTING-002: снимок фактического движка роли (connector/provider/
+    // model/driver) на момент захвата — источник истины для дневной агрегации по
+    // моделям, устойчивый к последующему переименованию/удалению коннектора.
+    const snap = await resolveConnectorSnapshot(c, task.role_code);
     const run = await c.query(
-      `INSERT INTO agent_runs (task_id, agent_id, role_id, status, started_at, input_json)
-       VALUES ($1, $2, $3, 'RUNNING', now(), $4::jsonb) RETURNING id`,
-      [task.id, agentId, task.role_id, JSON.stringify({ roleCode: task.role_code, status: task.status })],
+      `INSERT INTO agent_runs (task_id, agent_id, role_id, status, started_at, input_json,
+         snapshot_connector_id, snapshot_provider, snapshot_model, snapshot_driver_type)
+       VALUES ($1, $2, $3, 'RUNNING', now(), $4::jsonb, $5, $6, $7, $8) RETURNING id`,
+      [task.id, agentId, task.role_id, JSON.stringify({ roleCode: task.role_code, status: task.status }),
+        snap.connectorId, snap.provider, snap.model, snap.driverType],
     );
     // VERSION-KPI-TRACKING-001: штампуем версию промта роли в момент захвата (а не
     // сдачи) — именно эта версия исполняется, даже если промт поправят в полёте.

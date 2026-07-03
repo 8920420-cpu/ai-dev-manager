@@ -10,6 +10,7 @@ const TITLES: Record<RouteKey, string> = {
   'tasks-done': 'Задачи · Выполнено',
   'departments-development': 'Разработка',
   'monitor-performance': 'Монитор производительности',
+  'mcp-roles': 'MCP роли',
   servers: 'Серверы',
   integrations: 'Интеграции',
   'settings-roles': 'Настройки · Роли',

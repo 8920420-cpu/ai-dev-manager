@@ -418,6 +418,10 @@ export function normalizeVerdict(roleCode, parsed) {
  */
 export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = MAX_REWORK } = {}) {
   const forward = { outcome: 'FORWARD', agentRunStatus: 'SUCCESS', reason: 'ok' };
+  // DOC-BRANCH-LIVENESS-001: мягкое движение вперёд с сохранением причины —
+  // прогон НЕ считается упавшим (SUCCESS), но reason фиксирует, что документация
+  // не была выполнена (её ветка просто идёт к join, не блокируя коммит/родителя).
+  const docForward = (reason) => ({ outcome: 'FORWARD', agentRunStatus: 'SUCCESS', reason });
   const block = (reason, blockStatus = 'BLOCKED') => ({
     outcome: 'BLOCK', blockStatus, agentRunStatus: 'FAILED', reason,
   });
@@ -445,12 +449,19 @@ export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = 
       if (verdict.ok === false) return block(verdict.status.toLowerCase() || 'blocked');
       return forward;
     case 'DOCUMENTATION_AUDITOR':
-      if (verdict.status === 'BLOCKED') return block('docs_blocked');
+      // DOC-BRANCH-LIVENESS-001: документация НЕ блокирует основной поток. Ветка
+      // документации идёт параллельно коммиту (fork/join) и вправе выполняться
+      // дольше, но её BLOCKED-вердикт (напр. расхождение код↔документация) НЕ
+      // должен оставлять задачу-ветвь в BLOCKED — иначе join ждёт вечно и держит
+      // родителя. Поэтому «блок» документации = мягкое движение вперёд по ветке
+      // (к Keeper → join), с сохранением причины для наблюдаемости.
+      if (verdict.status === 'BLOCKED') return docForward('docs_blocked_forwarded');
       if (verdict.status === 'UPDATE_REQUIRED') return branch('dockeeper', 'DOCUMENTATION_KEEPER', 'docs_update_required', 'forward');
       if (verdict.status === 'ARCHITECT_REVIEW_REQUIRED') return branch('design', 'ARCHITECT', 'docs_architect_review', 'forward');
       return forward;
     case 'DOCUMENTATION_KEEPER':
-      if (verdict.status === 'BLOCKED') return block('docs_blocked');
+      // DOC-BRANCH-LIVENESS-001: см. выше — Keeper тоже не блокирует основной поток.
+      if (verdict.status === 'BLOCKED') return docForward('docs_blocked_forwarded');
       return forward;
     default:
       return verdict.ok === false ? block('role_failed') : forward;
@@ -514,8 +525,10 @@ export function decideTransition(roleCode, verdict, { reworkCount = 0, maxRework
       //   UPDATE_REQUIRED           → Documentation Keeper (обновить документы);
       //   ARCHITECT_REVIEW_REQUIRED → Architect (незапланированное арх. изменение);
       //   NO_CHANGES / прочее       → Git Integrator (документы актуальны);
-      //   BLOCKED                   → остановка.
-      if (verdict.status === 'BLOCKED') return block('docs_blocked');
+      //   BLOCKED                   → НЕ остановка: документация не блокирует
+      //                               основной поток (DOC-BRANCH-LIVENESS-001) →
+      //                               идём вперёд как при NO_CHANGES.
+      if (verdict.status === 'BLOCKED') return { ...proceed(), reason: 'docs_blocked_forwarded' };
       if (verdict.status === 'UPDATE_REQUIRED') {
         return {
           toStatus: 'COMMIT', nextRole: 'DOCUMENTATION_KEEPER', done: false,
@@ -530,8 +543,9 @@ export function decideTransition(roleCode, verdict, { reworkCount = 0, maxRework
       }
       return proceed(); // NO_CHANGES и любой разборчивый ответ → Git Integrator
     case 'DOCUMENTATION_KEEPER':
-      // Keeper обновил документы → Git Integrator; противоречивое задание → стоп.
-      if (verdict.status === 'BLOCKED') return block('docs_blocked');
+      // Keeper обновил документы → Git Integrator; противоречивое задание НЕ
+      // блокирует основной поток (DOC-BRANCH-LIVENESS-001) → идём вперёд.
+      if (verdict.status === 'BLOCKED') return { ...proceed(), reason: 'docs_blocked_forwarded' };
       return proceed();
     default:
       return verdict.ok === false ? block('role_failed') : proceed();

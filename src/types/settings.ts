@@ -25,6 +25,36 @@ export interface RoleCard {
 export type RoleCardPatch = Partial<Pick<RoleCard, 'description' | 'prompt' | 'skills' | 'groupId'>>;
 
 /**
+ * MCP-роль — роль, используемая через MCP (`/api/mcp-roles/*`, MCP-ROLES-001,
+ * см. orchestrator-service/backend/docs/api-mcp-roles.md). Идентичность — её
+ * `code` (задаётся при создании, далее не меняется). Хранит промт (`prompt`) и
+ * требования к роли (`requirements`).
+ */
+export interface McpRole {
+  code: string;
+  name: string;
+  description: string;
+  /** Промт роли ('' = не задан). */
+  prompt: string;
+  /** Требования к роли: доступы, данные, ограничения ('' = не задано). */
+  requirements: string;
+  /** Всегда true для сущностей раздела «MCP роли». */
+  isMcpRole: boolean;
+}
+
+/** Тело создания MCP-роли (POST /api/mcp-roles). */
+export interface McpRoleCreate {
+  code: string;
+  name: string;
+  description?: string;
+  prompt?: string;
+  requirements?: string;
+}
+
+/** Частичное обновление MCP-роли (PUT /api/mcp-roles/:code); `code` не меняется. */
+export type McpRolePatch = Partial<Pick<McpRole, 'name' | 'description' | 'prompt' | 'requirements'>>;
+
+/**
  * Смысловая группа ролей (`/api/role-groups`, ROLE-GROUPS-001) — управляемая
  * сущность: создание/переименование/удаление. Роли распределяются по группам на
  * экране «Настройки → Роли»; роль без группы попадает в «Прочее».

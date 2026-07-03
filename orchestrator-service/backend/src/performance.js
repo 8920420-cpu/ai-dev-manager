@@ -447,6 +447,156 @@ async function programmerVersionRows(c, hours, projectDbId) {
   }));
 }
 
+// =====================================================================
+// ROLE-ENGINE-ROUTING-002 — дневная статистика по коннекторам/моделям.
+//
+// Отвечает на «сменили модель/коннектор внутри дня — как изменились скорость,
+// ошибки, токены, стоимость, успешность?». Группируем прогоны agent_runs по
+// (календарный день × снимок connector/provider/model/driver × роль) на основе
+// НЕИЗМЕНЯЕМОГО снимка коннектора (snapshot_*), а не текущего названия роли —
+// поэтому две разные модели за один день дают ДВЕ отдельные строки. День берётся
+// в UTC ровно тем выражением, что в индексе idx_agent_runs_day_provider_model.
+// =====================================================================
+
+/**
+ * ЧИСТАЯ группировка сырых агрегатов в «день → [модель/коннектор]» (без БД).
+ * Вынесена отдельно для юнит-теста маппинга и расчёта производных (successRate,
+ * avgTokens, avgCost) и дневных итогов. Порядок дней и строк внутри дня сохраняется
+ * как во входе (SQL сортирует день DESC, затем runs DESC).
+ * @param {Array<Object>} rows  сырые строки агрегата (по одной на день×коннектор×роль)
+ * @returns {Array<{day, totals, models}>}
+ */
+export function buildDailyModelStats(rows = []) {
+  const order = [];
+  const byDay = new Map();
+  for (const row of rows) {
+    const day = row.day == null ? null : String(row.day);
+    const runs = Number(row.runs) || 0;
+    const success = Number(row.success) || 0;
+    const tokensIn = Number(row.tokensIn) || 0;
+    const tokensOut = Number(row.tokensOut) || 0;
+    const cost = Number(row.cost) || 0;
+    const entry = {
+      // Источник истины: фактический снимок коннектора, а не имя роли.
+      connectorId: row.connectorId ?? null,
+      provider: row.provider ?? null,
+      model: row.model ?? null,
+      driverType: row.driverType ?? null,
+      roleCode: row.roleCode ?? null,
+      roleName: row.roleName ?? null,
+      runs,
+      success,
+      failed: Number(row.failed) || 0,
+      timeout: Number(row.timeout) || 0,
+      throttle: Number(row.throttle) || 0,
+      running: Number(row.running) || 0,
+      successRate: runs > 0 ? Math.round((success / runs) * 1000) / 1000 : null,
+      avgDurationMs: numOrNull(row.avgMs, 0),
+      medianDurationMs: numOrNull(row.medianMs, 0),
+      tokensIn,
+      tokensOut,
+      avgTokens: runs > 0 ? Math.round((tokensIn + tokensOut) / runs) : null,
+      cost: Math.round(cost * 1e6) / 1e6,
+      avgCost: runs > 0 ? Math.round((cost / runs) * 1e6) / 1e6 : null,
+    };
+    if (!byDay.has(day)) { byDay.set(day, []); order.push(day); }
+    byDay.get(day).push(entry);
+  }
+  return order.map((day) => {
+    const models = byDay.get(day);
+    const totals = models.reduce((acc, m) => {
+      acc.runs += m.runs; acc.success += m.success; acc.failed += m.failed;
+      acc.timeout += m.timeout; acc.throttle += m.throttle; acc.running += m.running;
+      acc.tokensIn += m.tokensIn; acc.tokensOut += m.tokensOut; acc.cost += m.cost;
+      return acc;
+    }, { runs: 0, success: 0, failed: 0, timeout: 0, throttle: 0, running: 0, tokensIn: 0, tokensOut: 0, cost: 0 });
+    totals.cost = Math.round(totals.cost * 1e6) / 1e6;
+    totals.successRate = totals.runs > 0 ? Math.round((totals.success / totals.runs) * 1000) / 1000 : null;
+    totals.models = models.length;
+    return { day, totals, models };
+  });
+}
+
+/**
+ * GET /api/performance/daily-models?windowDays=N[&projectId=...] — дневная
+ * статистика прогонов в разрезе коннектор/провайдер/модель/драйвер. Frontend НЕ
+ * угадывает модель по роли — берёт фактический снимок из agent_runs.snapshot_*.
+ */
+export async function getDailyModelStats(s, { projectId, windowDays } = {}) {
+  const days = Number.isFinite(Number(windowDays)) && Number(windowDays) > 0
+    ? Math.min(365, Math.trunc(Number(windowDays))) : 7;
+  return withClient(clientConfig(s), async (c) => {
+    const projectDbId = await resolveProjectId(c, projectId);
+    const params = [days];
+    let projFilter = '';
+    if (projectDbId) {
+      params.push(projectDbId);
+      projFilter = `AND ar.task_id IN (SELECT id FROM tasks WHERE project_id = $${params.length})`;
+    }
+    // День — ровно выражение из индекса (date_trunc по timestamp в UTC). Медиана
+    // без FILTER: неоконченным прогонам длительность = NULL, percentile_cont их
+    // игнорирует. throttle не отдельный статус enum — классифицируем по outcome.
+    const r = await c.query(
+      `SELECT
+         to_char(date_trunc('day', ar.started_at AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS day,
+         ar.snapshot_connector_id::text AS connector_id,
+         ar.snapshot_provider AS provider,
+         ar.snapshot_model AS model,
+         ar.snapshot_driver_type AS driver_type,
+         r.code AS role_code, r.name AS role_name,
+         count(*)::int AS runs,
+         count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
+         count(*) FILTER (WHERE ar.status = 'FAILED')::int AS failed,
+         count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
+         count(*) FILTER (WHERE ar.outcome ILIKE '%throttle%')::int AS throttle,
+         count(*) FILTER (WHERE ar.status = 'RUNNING')::int AS running,
+         avg(extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000)
+           FILTER (WHERE ar.finished_at IS NOT NULL) AS avg_ms,
+         percentile_cont(0.5) WITHIN GROUP (
+           ORDER BY CASE WHEN ar.finished_at IS NOT NULL
+                         THEN extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000 END
+         ) AS median_ms,
+         coalesce(sum(ar.token_input), 0)::bigint AS tokens_in,
+         coalesce(sum(ar.token_output), 0)::bigint AS tokens_out,
+         coalesce(sum(ar.cost), 0)::numeric AS cost
+       FROM agent_runs ar
+       LEFT JOIN roles r ON r.id = ar.role_id
+      WHERE ar.started_at >= now() - ($1::int * interval '1 day')
+        ${projFilter}
+      GROUP BY 1, ar.snapshot_connector_id, ar.snapshot_provider, ar.snapshot_model,
+               ar.snapshot_driver_type, r.code, r.name
+      ORDER BY 1 DESC, runs DESC`,
+      params,
+    );
+    const rows = r.rows.map((row) => ({
+      day: row.day,
+      connectorId: row.connector_id,
+      provider: row.provider,
+      model: row.model,
+      driverType: row.driver_type,
+      roleCode: row.role_code,
+      roleName: row.role_name,
+      runs: row.runs,
+      success: row.success,
+      failed: row.failed,
+      timeout: row.timeout,
+      throttle: row.throttle,
+      running: row.running,
+      avgMs: row.avg_ms,
+      medianMs: row.median_ms,
+      tokensIn: row.tokens_in,
+      tokensOut: row.tokens_out,
+      cost: row.cost,
+    }));
+    return {
+      generatedAt: new Date().toISOString(),
+      projectId: projectDbId,
+      windowDays: days,
+      days: buildDailyModelStats(rows),
+    };
+  });
+}
+
 /**
  * GET /api/kpi-markers?role=CODE&windowHours=N&limit=M — метки на оси времени
  * (правка промта/деплой/ручная отметка) для вертикальных линий на графиках KPI.

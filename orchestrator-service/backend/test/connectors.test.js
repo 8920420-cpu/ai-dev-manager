@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import {
   invokeConnector,
   isDriverProvider,
@@ -129,6 +130,28 @@ test('invokeConnector: driver-коннектор (provider=codex) → 422 без
   } finally {
     __setClientFactoryForTest(null);
   }
+});
+
+// ROLE-ENGINE-ROUTING-001: список интеграций (таблица connectors, откуда читает
+// /api/connectors и селектор «Интеграция (коннектор)» в карточке роли) обязан
+// содержать Codex и Claude Code. Их заводит миграция 0036_driver_connectors.sql
+// сидированием двух driver-строк. Проверяем содержимое миграции напрямую (без БД):
+// обе записи присутствуют, привязаны к driver-провайдерам и накат идемпотентен.
+test('миграция 0036: список интеграций получает Codex и Claude Code как driver-коннекторы', async () => {
+  const sql = await readFile(
+    new URL('../db/migrations/0036_driver_connectors.sql', import.meta.url),
+    'utf8',
+  );
+  // Сидирование именно в таблицу интеграций.
+  assert.match(sql, /INSERT\s+INTO\s+connectors/i, 'ожидался INSERT INTO connectors');
+  // Обе интеграции присутствуют с правильными driver-провайдерами.
+  assert.match(sql, /'Codex'\s*,\s*'codex'/, 'ожидался сид Codex → provider codex');
+  assert.match(sql, /'Claude Code'\s*,\s*'claude_code'/, 'ожидался сид Claude Code → provider claude_code');
+  // Провайдеры сидируемых строк — именно драйверы (а не сетевые AI-API).
+  assert.equal(isDriverProvider('codex'), true);
+  assert.equal(isDriverProvider('claude_code'), true);
+  // Идемпотентность: повторный накат миграции не дублирует записи.
+  assert.match(sql, /ON\s+CONFLICT[\s\S]*DO\s+NOTHING/i, 'ожидался ON CONFLICT ... DO NOTHING');
 });
 
 // claude_code — второй драйвер: то же поведение (422, без LLM-вызова).

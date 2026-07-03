@@ -17,6 +17,7 @@ export type RouteKey =
   | 'servers'
   | 'integrations'
   | 'monitor-performance'
+  | 'mcp-roles'
   | 'settings-roles'
   | 'settings-tools'
   | 'settings-execution';
@@ -30,6 +31,7 @@ const ROUTES: Record<RouteKey, string> = {
   servers: '#/servers',
   integrations: '#/integrations',
   'monitor-performance': '#/monitor/performance',
+  'mcp-roles': '#/mcp-roles',
   'settings-roles': '#/settings/roles',
   'settings-tools': '#/settings/tools',
   'settings-execution': '#/settings/execution',
@@ -50,6 +52,7 @@ function parseHash(): RouteKey {
   if (section === 'servers') return 'servers';
   if (section === 'integrations') return 'integrations';
   if (section === 'monitor') return 'monitor-performance';
+  if (section === 'mcp-roles') return 'mcp-roles';
   if (section === 'settings') {
     // Раздел «Базы данных» удалён: БД одна (БД оркестратора).
     if (sub === 'tools') return 'settings-tools';

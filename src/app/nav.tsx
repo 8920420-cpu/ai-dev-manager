@@ -1,4 +1,4 @@
-import { Activity, FolderGit2, ListTree, Plug, Server, Settings, Workflow, type LucideIcon } from 'lucide-react';
+import { Activity, Bot, FolderGit2, ListTree, Plug, Server, Settings, Workflow, type LucideIcon } from 'lucide-react';
 import type { RouteKey } from './router';
 
 export interface NavChild {
@@ -40,6 +40,7 @@ export const NAV_ITEMS: NavItem[] = [
     ],
   },
   { label: 'Монитор производительности', route: 'monitor-performance', icon: Activity },
+  { label: 'MCP роли', route: 'mcp-roles', icon: Bot },
   { label: 'Серверы', route: 'servers', icon: Server },
   { label: 'Интеграции', route: 'integrations', icon: Plug },
   {

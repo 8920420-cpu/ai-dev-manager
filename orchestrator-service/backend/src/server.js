@@ -42,7 +42,7 @@ import {
 } from './connectors.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
-import { getPerformanceMetrics, getVersionMetrics, getKpiMarkers, createKpiMarker } from './performance.js';
+import { getPerformanceMetrics, getVersionMetrics, getDailyModelStats, getKpiMarkers, createKpiMarker } from './performance.js';
 import { createAuditRun, listAuditRuns, completeAuditRun } from './auditRuns.js';
 import { getTaskTree, getTaskStatusCounts, getTasksByStage, getTaskHistory } from './taskTree.js';
 import { openTaskEventsStream, publishTaskChange } from './taskEvents.js';
@@ -70,6 +70,13 @@ import {
   saveRoleTools,
 } from './tools.js';
 import { listRoles, getRole, updateRole, listAvailableSkills, uploadSkill } from './roles.js';
+import {
+  listMcpRoles,
+  getMcpRole,
+  createMcpRole,
+  updateMcpRole,
+  deleteMcpRole,
+} from './mcpRoles.js';
 import {
   listFields,
   createField,
@@ -261,6 +268,14 @@ function matchRoleRoute(pathname) {
   return { kind: 'item', code };
 }
 
+// Разбор путей /api/mcp-roles[/:code] — раздел «MCP роли».
+function matchMcpRoleRoute(pathname) {
+  if (pathname === '/api/mcp-roles') return { kind: 'collection' };
+  const m = pathname.match(/^\/api\/mcp-roles\/([^/]+)$/);
+  if (!m) return null;
+  return { kind: 'item', code: decodeURIComponent(m[1]) };
+}
+
 // Разбор путей /api/tools[/:id] — реестр инструментов.
 function matchToolRoute(pathname) {
   if (pathname === '/api/tools') return { kind: 'collection' };
@@ -392,6 +407,19 @@ export function createApp() {
             await getVersionMetrics(await loadSettings(), {
               role: url.searchParams.get('role'),
               windowHours: url.searchParams.get('windowHours'),
+              projectId: url.searchParams.get('projectId'),
+            }),
+          );
+
+        // ROLE-ENGINE-ROUTING-002: дневная статистика по коннекторам/моделям
+        // (день → фактический connector/provider/model/driver). ?windowDays=N,
+        // опционально ?projectId=<uuid|code|root_path|name>.
+        if (req.method === 'GET' && p === '/api/performance/daily-models')
+          return sendJson(
+            res,
+            200,
+            await getDailyModelStats(await loadSettings(), {
+              windowDays: url.searchParams.get('windowDays'),
               projectId: url.searchParams.get('projectId'),
             }),
           );
@@ -726,6 +754,24 @@ export function createApp() {
             return sendJson(res, 200, await getRole(await loadSettings(), roleRoute.code));
           if (req.method === 'PUT')
             return sendJson(res, 200, await updateRole(await loadSettings(), roleRoute.code, await readBody(req)));
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- Раздел «MCP роли» (роли, используемые через MCP) ---
+        const mcpRoleRoute = matchMcpRoleRoute(p);
+        if (mcpRoleRoute) {
+          if (mcpRoleRoute.kind === 'collection') {
+            if (req.method === 'GET') return sendJson(res, 200, await listMcpRoles(await loadSettings()));
+            if (req.method === 'POST')
+              return sendJson(res, 201, await createMcpRole(await loadSettings(), await readBody(req)));
+            return sendJson(res, 405, { error: 'method_not_allowed' });
+          }
+          if (req.method === 'GET')
+            return sendJson(res, 200, await getMcpRole(await loadSettings(), mcpRoleRoute.code));
+          if (req.method === 'PUT')
+            return sendJson(res, 200, await updateMcpRole(await loadSettings(), mcpRoleRoute.code, await readBody(req)));
+          if (req.method === 'DELETE')
+            return sendJson(res, 200, await deleteMcpRole(await loadSettings(), mcpRoleRoute.code));
           return sendJson(res, 405, { error: 'method_not_allowed' });
         }
 

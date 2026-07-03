@@ -9,6 +9,7 @@ import { DevelopmentSchemePage } from './features/scheme/DevelopmentSchemePage';
 import { ServersPage } from './features/servers/ServersPage';
 import { IntegrationsPage } from './features/integrations/IntegrationsPage';
 import { PerformanceMonitorPage } from './features/monitor/PerformanceMonitorPage';
+import { McpRolesPage } from './features/settings/McpRolesPage';
 import { RolesPage } from './features/settings/RolesPage';
 import { ToolsPage } from './features/settings/ToolsPage';
 import { ExecutionPage } from './features/settings/ExecutionPage';
@@ -28,6 +29,8 @@ function CurrentPage() {
       return <IntegrationsPage />;
     case 'monitor-performance':
       return <PerformanceMonitorPage />;
+    case 'mcp-roles':
+      return <McpRolesPage />;
     case 'servers':
       return <ServersPage />;
     case 'settings-roles':

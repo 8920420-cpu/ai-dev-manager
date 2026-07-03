@@ -200,6 +200,32 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
     ({ roleCode }) => run(() => orchestratorClient.get(`/api/roles/${encodeURIComponent(roleCode)}/fields`)),
   );
 
+  // ─────────────── MCP роли (раздел «MCP роли», read-only) ───────────────
+  // Роли, которые можно использовать через MCP: карточка отдаёт промт и
+  // требования, чтобы MCP-клиент мог применить роль.
+
+  tool(
+    'orchestrator_list_mcp_roles',
+    {
+      title: 'Список MCP-ролей',
+      description: 'GET /api/mcp-roles — роли, доступные для использования через MCP (с промтом и требованиями).',
+      inputSchema: {},
+    },
+    () => run(() => orchestratorClient.get('/api/mcp-roles')),
+  );
+
+  tool(
+    'orchestrator_get_mcp_role',
+    {
+      title: 'Карточка MCP-роли',
+      description:
+        'GET /api/mcp-roles/:code — карточка MCP-роли: промт (prompt) и требования (requirements). ' +
+        'Используй, чтобы применить роль: возьми её промт как системную инструкцию и учти требования.',
+      inputSchema: { roleCode: z.string().describe('Код MCP-роли, например MCP_REVIEWER.') },
+    },
+    ({ roleCode }) => run(() => orchestratorClient.get(`/api/mcp-roles/${encodeURIComponent(roleCode)}`)),
+  );
+
   tool(
     'orchestrator_db_status',
     { title: 'Статус БД', description: 'GET /api/db/status.', inputSchema: {} },
