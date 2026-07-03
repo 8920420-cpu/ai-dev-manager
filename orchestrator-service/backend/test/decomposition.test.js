@@ -56,6 +56,36 @@ test('normalizeWorkItems: фолбэк из affected_files с группиров
   assert.equal(a.files.length, 2);
 });
 
+// json-поля контракта модель возвращает СТРОКОЙ («JSON serialized as a string»,
+// fieldJsonSchema) — normalizeWorkItems обязан их парсить, иначе Архитектор
+// блокируется architect_no_service:empty при валидном вердикте.
+test('normalizeWorkItems: work_items JSON-строкой парсится как массив', () => {
+  const card = {
+    work_items: JSON.stringify([
+      { serviceCode: 'SvcA', title: 'A', files: [{ path: 'a.js', what: 'x' }] },
+    ]),
+  };
+  const out = normalizeWorkItems(card);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].serviceCode, 'SvcA');
+  assert.equal(out[0].files.length, 1);
+});
+
+test('normalizeWorkItems: фолбэк affected_files JSON-строкой', () => {
+  const card = {
+    affected_files: JSON.stringify([{ serviceCode: 'SvcB', path: 'c.js', what: 'z' }]),
+  };
+  const out = normalizeWorkItems(card);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].serviceCode, 'SvcB');
+});
+
+test('normalizeWorkItems: битая JSON-строка или не-массив — пустой план, без исключений', () => {
+  assert.equal(normalizeWorkItems({ work_items: '[{oops' }).length, 0);
+  assert.equal(normalizeWorkItems({ work_items: '{"serviceCode":"SvcA"}' }).length, 0);
+  assert.equal(normalizeWorkItems({ affected_files: 'просто текст' }).length, 0);
+});
+
 // --- materializeDecomposition -----------------------------------------------
 
 function decomposerClaimed() {

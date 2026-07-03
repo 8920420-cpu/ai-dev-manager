@@ -3505,21 +3505,37 @@ async function blockClaimedReason(c, claimed, reason, { verdict, cardValues, kpi
 // DECOMP-CONTRACT-001 — нормализовать разбивку работы из карточки к виду
 // [{ serviceCode, title, files: [{ path, what }] }]. Источник: work_items (если
 // заполнил Архитектор/Декомпозитор), иначе группировка affected_files по сервису.
+// Поля контракта с valueType=json модель по инструкции возвращает JSON-СТРОКОЙ
+// (fieldJsonSchema/buildVerdictInstruction: «JSON serialized as a string»), поэтому
+// принимаем и готовый массив, и его строковую сериализацию.
+function jsonArray(v) {
+  if (Array.isArray(v)) return v;
+  if (typeof v === 'string' && v.trim().startsWith('[')) {
+    try {
+      const parsed = JSON.parse(v);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch {
+      return [];
+    }
+  }
+  return [];
+}
+
 export function normalizeWorkItems(card) {
   const str = (v) => (v == null ? '' : String(v)).trim();
-  const items = Array.isArray(card?.work_items) ? card.work_items : [];
+  const items = jsonArray(card?.work_items);
   const norm = [];
   for (const it of items) {
     const serviceCode = str(it?.serviceCode || it?.service);
     if (!serviceCode) continue;
-    const files = (Array.isArray(it?.files) ? it.files : [])
+    const files = jsonArray(it?.files)
       .map((f) => ({ path: str(f?.path), what: str(f?.what || f?.instruction) }))
       .filter((f) => f.path);
     norm.push({ serviceCode, title: str(it?.title) || `Изменения в ${serviceCode}`, files });
   }
   if (norm.length) return norm;
   // Фолбэк: собрать work_items из affected_files (плоский список) по serviceCode.
-  const files = Array.isArray(card?.affected_files) ? card.affected_files : [];
+  const files = jsonArray(card?.affected_files);
   const byService = new Map();
   for (const f of files) {
     const serviceCode = str(f?.serviceCode || f?.service);
