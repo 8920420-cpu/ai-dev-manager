@@ -596,6 +596,15 @@ function intakeReportTitle(message) {
   return base.length > 120 ? `${base.slice(0, 117)}…` : base;
 }
 
+// INTAKE-CATEGORY-VALIDATION-001 — допустимые категории обращения из виджета.
+// Категория пользователя — лишь ПОДСКАЗКА (не истина): Приёмщик перепроверяет её
+// по тексту сообщения. Невалидное/пустое значение приём не роняет (→ null).
+const INTAKE_CATEGORY_VALUES = new Set(['bug', 'idea', 'feature', 'question']);
+function normalizeIntakeCategory(v) {
+  const c = String(v ?? '').trim().toLowerCase();
+  return INTAKE_CATEGORY_VALUES.has(c) ? c : null;
+}
+
 /**
  * INTAKE-INTEGRATIONS-001 — нормализация обращения из канала «интеграции в
  * приложения» (POST /api/intake/report). Чистая функция (без БД): проверяет
@@ -633,6 +642,9 @@ export function normalizeIntakeReport(input) {
     user,
     service: str(input?.service),      // микросервис-источник
     form: str(input?.form),            // форма/экран, с которого написано сообщение
+    // INTAKE-CATEGORY-VALIDATION-001 — категория из виджета (подсказка пользователя,
+    // не истина). Невалидное/пустое значение → null, приём не роняем.
+    category: normalizeIntakeCategory(input?.category),
     autocontext,
     // Ссылка на объект-скриншот в MinIO (грузит бэкенд приложения-источника).
     screenshotUrl: str(input?.screenshotUrl) || null,
@@ -718,6 +730,10 @@ export async function acceptIntakeReport(s, input) {
         reporterUser: payload.user,
         reporterService: payload.service || null,
         reporterForm: payload.form || null,
+        // INTAKE-CATEGORY-VALIDATION-001 — категория, выбранная пользователем в
+        // виджете (подсказка). Приёмщик перепроверит её и зафиксирует user_category
+        // + resolved_category в карточке.
+        category: payload.category,
         autocontext: payload.autocontext,
         // Ссылка на скриншот в MinIO — сохраняется в карточке и доступна ролям.
         screenshotUrl: payload.screenshotUrl,
@@ -739,6 +755,7 @@ export async function acceptIntakeReport(s, input) {
           source: 'intake-integration', integration: integration.name, integrationId: integration.id,
           reportNumber, externalId: payload.externalId, reporterUser: payload.user,
           reporterService: payload.service || null, reporterForm: payload.form || null,
+          category: payload.category,
           hasScreenshot: Boolean(payload.screenshotUrl),
         })],
       );
@@ -3589,6 +3606,45 @@ export async function fetchPriorOutputs(c, taskId) {
   };
 }
 
+// INTAKE-INTEGRATIONS-001 / INTAKE-CATEGORY-VALIDATION-001 — собрать компактный блок
+// обращения (intakeReport) для контекста роли. Чистая функция (без БД). Блок
+// формируется ТОЛЬКО для задач-обращений (isIntakeTask, т.е. intake_integration_id
+// IS NOT NULL) и ТОЛЬКО под ролью Приёмщика (TASK_INTAKE_OFFICER) — иначе null.
+// Размер капим, чтобы не раздувать вход роли: jsErrors — первые 10 строк, каждая
+// с капом длины; url/userAgent/screenshotUrl тоже обрезаем по длине.
+export function buildIntakeReportContext(dataCard, { roleCode, isIntakeTask } = {}) {
+  if (!isIntakeTask || roleCode !== 'TASK_INTAKE_OFFICER') return null;
+  const card = dataCard && typeof dataCard === 'object' && !Array.isArray(dataCard) ? dataCard : {};
+  const clip = (v, max) => {
+    const s = v == null ? null : String(v);
+    if (s == null) return null;
+    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  };
+  const ac = card.autocontext && typeof card.autocontext === 'object' && !Array.isArray(card.autocontext)
+    ? card.autocontext : {};
+  const jsErrors = Array.isArray(ac.jsErrors)
+    ? ac.jsErrors.slice(0, 10).map((e) => clip(e, 300)).filter((e) => e != null)
+    : [];
+  return {
+    reportNumber: card.reportNumber ?? null,
+    integration: card.integration ?? null,
+    reporterUser: card.reporterUser ?? null,
+    reporterService: card.reporterService ?? null,
+    reporterForm: card.reporterForm ?? null,
+    // Категория из виджета — подсказка пользователя (user_category), не истина.
+    category: card.category ?? null,
+    autocontext: {
+      url: clip(ac.url, 500),
+      buildVersion: clip(ac.buildVersion, 100),
+      userAgent: clip(ac.userAgent, 300),
+      timestamp: clip(ac.timestamp, 60),
+      jsErrors,
+      lastFailedApiRequestId: clip(ac.lastFailedApiRequestId, 200),
+    },
+    screenshotUrl: clip(card.screenshotUrl, 500),
+  };
+}
+
 // Собрать компактный контекст задачи для промта роли.
 async function buildRoleContext(c, claimed, { engine = null } = {}) {
   const ev = await c.query(
@@ -3600,7 +3656,8 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
   // INTAKE-INTEGRATIONS-001: LEFT JOIN — беспроектное обращение из интеграций
   // (project_id IS NULL) не должно давать пустую строку (INNER JOIN скрыл бы её).
   const meta = await c.query(
-    `SELECT p.id AS project_id, p.code AS project, p.root_path, p.docs_path, s.service_code AS service
+    `SELECT p.id AS project_id, p.code AS project, p.root_path, p.docs_path, s.service_code AS service,
+            t.intake_integration_id, t.data_card
        FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
        LEFT JOIN services s ON s.id = t.service_id WHERE t.id = $1`,
     [claimed.id],
@@ -3679,6 +3736,14 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
     }));
   }
 
+  // INTAKE-INTEGRATIONS-001 / INTAKE-CATEGORY-VALIDATION-001: поля обращения из
+  // канала интеграций (reporterService/reporterForm/autocontext/screenshotUrl/
+  // category) в контекст Приёмщика. Только для задач-обращений и только Приёмщику.
+  const intakeReport = buildIntakeReportContext(meta.rows[0]?.data_card, {
+    roleCode: claimed.role_code,
+    isIntakeTask: Boolean(meta.rows[0]?.intake_integration_id),
+  });
+
   return {
     taskId: claimed.id,
     title: claimed.title,
@@ -3694,6 +3759,8 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
     projectMaps,
     // Каталог всех проектов для беспроектного обращения из интеграций (иначе null).
     projectCatalog,
+    // Поля обращения из канала интеграций (только у задач-обращений под Приёмщиком).
+    intakeReport,
     projectServices: svc.rows.map((r) => r.service_code),
     // Для задачи-на-сервис берём агрегат результатов подзадач; иначе — как раньше.
     programmerResult: hasChildren

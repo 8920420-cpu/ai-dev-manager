@@ -6,7 +6,7 @@ import {
   redactIntegration,
   normalizeIntegrationInput,
 } from '../src/intakeIntegrations.js';
-import { normalizeIntakeReport } from '../src/db.js';
+import { normalizeIntakeReport, buildIntakeReportContext } from '../src/db.js';
 
 // --- hashToken --------------------------------------------------------------
 test('hashToken: стабильный SHA-256 hex, пустой вход → ""', () => {
@@ -127,4 +127,86 @@ test('normalizeIntakeReport: битый текст сообщения → 422 co
     () => normalizeIntakeReport({ token: 't', externalId: 'e', message: '?????? ?????? ?????', user: 'u' }),
     (e) => { assert.equal(e.statusCode, 422); assert.equal(e.message, 'corrupted_encoding'); return true; },
   );
+});
+
+// --- normalizeIntakeReport: category (INTAKE-CATEGORY-VALIDATION-001) --------
+const baseReport = { token: 't', externalId: 'e', message: 'достаточно длинное сообщение', user: 'u' };
+
+for (const category of ['bug', 'idea', 'feature', 'question']) {
+  test(`normalizeIntakeReport: валидная category=${category} сохраняется`, () => {
+    const out = normalizeIntakeReport({ ...baseReport, category });
+    assert.equal(out.category, category);
+  });
+}
+
+test('normalizeIntakeReport: category нормализуется (регистр/пробелы)', () => {
+  assert.equal(normalizeIntakeReport({ ...baseReport, category: '  BUG  ' }).category, 'bug');
+});
+
+test('normalizeIntakeReport: невалидная category → null (приём не роняет)', () => {
+  assert.equal(normalizeIntakeReport({ ...baseReport, category: 'urgent' }).category, null);
+  assert.equal(normalizeIntakeReport({ ...baseReport, category: 123 }).category, null);
+});
+
+test('normalizeIntakeReport: пустая/отсутствующая category → null', () => {
+  assert.equal(normalizeIntakeReport({ ...baseReport, category: '   ' }).category, null);
+  assert.equal(normalizeIntakeReport(baseReport).category, null);
+});
+
+// --- buildIntakeReportContext (INTAKE-INTEGRATIONS-001) ---------------------
+const sampleCard = {
+  reportNumber: 42,
+  integration: 'PS-чат',
+  reporterUser: 'ivan',
+  reporterService: 'ps-chat',
+  reporterForm: 'OrderForm',
+  category: 'bug',
+  autocontext: {
+    url: 'https://app/order', buildVersion: '1.2.3', userAgent: 'UA',
+    timestamp: '2026-07-03T00:00:00Z', jsErrors: ['E1', 'E2'], lastFailedApiRequestId: 'req-9',
+  },
+  screenshotUrl: 'minio://bucket/shot.png',
+};
+
+test('buildIntakeReportContext: блок собирается для задачи-обращения под Приёмщиком', () => {
+  const r = buildIntakeReportContext(sampleCard, { roleCode: 'TASK_INTAKE_OFFICER', isIntakeTask: true });
+  assert.ok(r);
+  assert.equal(r.reportNumber, 42);
+  assert.equal(r.reporterService, 'ps-chat');
+  assert.equal(r.reporterForm, 'OrderForm');
+  assert.equal(r.category, 'bug');
+  assert.equal(r.autocontext.url, 'https://app/order');
+  assert.equal(r.autocontext.lastFailedApiRequestId, 'req-9');
+  assert.deepEqual(r.autocontext.jsErrors, ['E1', 'E2']);
+  assert.equal(r.screenshotUrl, 'minio://bucket/shot.png');
+});
+
+test('buildIntakeReportContext: null для не-Приёмщика', () => {
+  assert.equal(buildIntakeReportContext(sampleCard, { roleCode: 'ARCHITECT', isIntakeTask: true }), null);
+});
+
+test('buildIntakeReportContext: null для НЕ задачи-обращения', () => {
+  assert.equal(buildIntakeReportContext(sampleCard, { roleCode: 'TASK_INTAKE_OFFICER', isIntakeTask: false }), null);
+});
+
+test('buildIntakeReportContext: jsErrors капятся первыми 10 строками, каждая по длине', () => {
+  const jsErrors = Array.from({ length: 25 }, (_, i) => `err-${i}`);
+  jsErrors[0] = 'x'.repeat(1000);
+  const r = buildIntakeReportContext(
+    { autocontext: { jsErrors } },
+    { roleCode: 'TASK_INTAKE_OFFICER', isIntakeTask: true },
+  );
+  assert.equal(r.autocontext.jsErrors.length, 10);           // не больше 10 строк
+  assert.ok(r.autocontext.jsErrors[0].length <= 300);        // каждая строка капнута
+  assert.ok(r.autocontext.jsErrors[0].endsWith('…'));        // длинная строка обрезана
+  assert.equal(r.autocontext.jsErrors[1], 'err-1');
+});
+
+test('buildIntakeReportContext: пустой/битый data_card не роняет (поля → null/[])', () => {
+  const r = buildIntakeReportContext(null, { roleCode: 'TASK_INTAKE_OFFICER', isIntakeTask: true });
+  assert.ok(r);
+  assert.equal(r.reportNumber, null);
+  assert.equal(r.category, null);
+  assert.equal(r.autocontext.url, null);
+  assert.deepEqual(r.autocontext.jsErrors, []);
 });
