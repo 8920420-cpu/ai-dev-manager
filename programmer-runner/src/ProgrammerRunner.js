@@ -16,7 +16,8 @@ export class ProgrammerRunner {
    * @param {{claim:Function, complete:Function, release:Function}} deps.http
    *   claim()        → Promise<{ task?:Object }>  (распакованный data оркестратора)
    *   complete(body) → Promise<any>
-   *   release(taskId)→ Promise<any>
+   *   release(taskId, opts?) → Promise<any>  opts.reason/opts.meta прокидываются
+   *     оркестратору (outcome/error_text прогона, KPI-событие лимита ходов)
    * @param {(task:Object, ctx:{signal:AbortSignal}) => Promise<{ok:boolean, changedFiles?:string[], result?:any, error?:string}>} deps.runAgent
    * @param {number} [deps.taskTimeoutMs]  жёсткий таймаут на задачу; ДОЛЖЕН быть
    *   меньше орфан-таймаута оркестратора (CLAUDE_ASSIGN_TIMEOUT_MS≈30 мин), иначе
@@ -74,7 +75,9 @@ export class ProgrammerRunner {
       clearTimeout(timer);
       const reason = ac.signal.aborted ? 'agent_timeout' : error.message;
       this.log.error?.('programmer agent threw', { taskId: task.id, reason });
-      await this.safeRelease(task.id);
+      // Прокидываем причину: без неё в agent_runs остаётся outcome='released' и
+      // источник петли захват→провал→release установить нельзя (инцидент 03.07.2026).
+      await this.safeRelease(task.id, { reason });
       return { taskId: task.id, released: true, reason };
     }
     clearTimeout(timer);
@@ -92,7 +95,8 @@ export class ProgrammerRunner {
         return { taskId: task.id, released: true, reason, limitHit: true, meta: agentResult.meta };
       }
       this.log.warn?.('programmer agent did not succeed', { taskId: task.id, reason });
-      await this.safeRelease(task.id);
+      // meta прокидываем, если исполнитель его вернул (например turns) — иначе только reason.
+      await this.safeRelease(task.id, agentResult?.meta ? { reason, meta: agentResult.meta } : { reason });
       return { taskId: task.id, released: true, reason };
     }
 
@@ -107,9 +111,10 @@ export class ProgrammerRunner {
       return { taskId: task.id, success: true, complete: res };
     } catch (error) {
       // Сдача не прошла (сеть/5xx) — освобождаем захват, чтобы не зависнуть в CODING.
+      const reason = `complete_failed: ${error.message}`;
       this.log.error?.('programmer complete failed', { taskId: task.id, error: error.message });
-      await this.safeRelease(task.id);
-      return { taskId: task.id, released: true, reason: `complete_failed: ${error.message}` };
+      await this.safeRelease(task.id, { reason });
+      return { taskId: task.id, released: true, reason };
     }
   }
 

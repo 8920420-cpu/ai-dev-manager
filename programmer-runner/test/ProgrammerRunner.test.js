@@ -79,6 +79,19 @@ test('провал-вердикт: runAgent ok=false → release, без complet
   assert.equal(out.reason, 'не смог');
   assert.equal(http.calls.complete.length, 0);
   assert.deepEqual(http.calls.release, ['T1']);
+  // Причина обязана уйти оркестратору (иначе в agent_runs остаётся 'released').
+  assert.deepEqual(http.calls.releaseArgs[0].opts, { reason: 'не смог' });
+});
+
+test('провал-вердикт с meta: reason и meta прокидываются в release', async () => {
+  const http = fakeHttp({ claimReturn: () => ({ task: sampleTask() }) });
+  const runAgent = async () => ({ ok: false, error: 'build failed', meta: { numTurns: 7 } });
+  const runner = new ProgrammerRunner({ http, runAgent, log: silent });
+
+  const out = await runner.tick();
+  assert.equal(out.released, true);
+  assert.equal(out.reason, 'build failed');
+  assert.deepEqual(http.calls.releaseArgs[0].opts, { reason: 'build failed', meta: { numTurns: 7 } });
 });
 
 test('лимит ходов: limitHit → release с reason+meta для KPI', async () => {
@@ -109,6 +122,7 @@ test('исключение исполнителя → release', async () => {
   assert.equal(out.released, true);
   assert.equal(out.reason, 'crash');
   assert.deepEqual(http.calls.release, ['T1']);
+  assert.deepEqual(http.calls.releaseArgs[0].opts, { reason: 'crash' });
 });
 
 test('таймаут: signal abort → release с reason agent_timeout', async () => {
@@ -123,6 +137,7 @@ test('таймаут: signal abort → release с reason agent_timeout', async (
   assert.equal(out.released, true);
   assert.equal(out.reason, 'agent_timeout');
   assert.deepEqual(http.calls.release, ['T1']);
+  assert.deepEqual(http.calls.releaseArgs[0].opts, { reason: 'agent_timeout' });
 });
 
 test('complete упал → release, чтобы не зависнуть в CODING', async () => {
@@ -134,6 +149,7 @@ test('complete упал → release, чтобы не зависнуть в CODIN
   assert.equal(out.released, true);
   assert.match(out.reason, /complete_failed/);
   assert.deepEqual(http.calls.release, ['T1']);
+  assert.match(http.calls.releaseArgs[0].opts.reason, /complete_failed/);
 });
 
 test('реэнтерабельность: пока busy, второй tick не захватывает', async () => {
@@ -183,6 +199,7 @@ test('integrate_conflict: ok=false → release (re-queue)', async () => {
   assert.match(out.reason, /integrate_conflict/);
   assert.deepEqual(http.calls.release, ['T1']);
   assert.equal(http.calls.complete.length, 0);
+  assert.match(http.calls.releaseArgs[0].opts.reason, /integrate_conflict/);
 });
 
 test('buildCompletionBody: фолбэк на поля задачи, changedFiles нормализуется', () => {

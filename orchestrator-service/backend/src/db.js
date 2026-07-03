@@ -1546,10 +1546,26 @@ export async function claimNextClaudeTask(s) {
  * Откат захвата: вернуть задачу в пул, если фидер не смог записать файл.
  * Снимаем назначение агента только с задачи, всё ещё ожидающей кодинга.
  */
+// PROGRAMMER-RELEASE-REASON-001: предел длины outcome/error_text при освобождении
+// захвата. Единая точка записи → защищает agent_runs от раздувания независимо от
+// источника reason (длинный error.message, петля захват→провал→release). 500
+// символов достаточно для диагностики причины.
+const RELEASE_TEXT_MAX = 500;
+function clipReleaseText(v) {
+  const str = String(v ?? '');
+  return str.length > RELEASE_TEXT_MAX ? str.slice(0, RELEASE_TEXT_MAX) : str;
+}
+
+// Публичная обёртка над Tx: открывает соединение и делегирует транзакционной части
+// (её же дёргают юнит-тесты с поддельным клиентом, как advanceTaskTx/moveTaskTx).
 export async function releaseClaudeTask(s, taskId, opts = {}) {
+  return withClient(clientConfig(s), (c) => releaseClaudeTaskTx(c, taskId, opts));
+}
+
+export async function releaseClaudeTaskTx(c, taskId, opts = {}) {
   const id = String(taskId ?? '').trim();
   if (!id) throw scannerError(422, 'taskId_required');
-  return withClient(clientConfig(s), async (c) => {
+  {
     const r = await c.query(
       `UPDATE tasks SET assigned_agent_id = NULL
         WHERE id = $1 AND status = 'CODING'
@@ -1585,7 +1601,10 @@ export async function releaseClaudeTask(s, taskId, opts = {}) {
     if (released) {
       const reason = String(opts.reason ?? '').trim();
       const runStatus = reason === 'agent_timeout' ? 'TIMEOUT' : 'FAILED';
-      const outcome = reason || 'released';
+      // Обрезаем и outcome, и error_text до предела: reason приходит извне (может
+      // быть длинным error.message), а петля release множит такие записи.
+      const outcome = clipReleaseText(reason || 'released');
+      const errorText = clipReleaseText(`programmer_released: ${outcome}`);
       const turns = Number.isFinite(Number(opts.meta?.numTurns))
         ? Math.trunc(Number(opts.meta.numTurns)) : null;
       await c.query(
@@ -1597,11 +1616,11 @@ export async function releaseClaudeTask(s, taskId, opts = {}) {
              WHERE task_id = $1 AND role_id = $6 AND status = 'RUNNING'
              ORDER BY started_at DESC LIMIT 1
           )`,
-        [id, runStatus, turns, outcome, `programmer_released: ${outcome}`, r.rows[0].current_role_id],
+        [id, runStatus, turns, outcome, errorText, r.rows[0].current_role_id],
       );
     }
     return { released, taskId: id };
-  });
+  }
 }
 
 // --- Host-мост для ролей действия (PIPELINE_SERVICE, GIT_INTEGRATOR) ---------
@@ -2184,6 +2203,23 @@ const ROLE_TIMEOUT_MS = roleTimeoutCfg.value;
 const claudeAssignCfg = resolveDuration('RUNNER_CLAUDE_TIMEOUT_MS', ROLE_TIMEOUT_MS, { min: 30_000, max: 2 * 60 * 60_000 });
 const CLAUDE_ASSIGN_TIMEOUT_MS = claudeAssignCfg.value;
 
+// HOST-ORPHAN-TIMEOUT-001: host-роли (PIPELINE_SERVICE из TESTING, GIT_INTEGRATOR
+// из COMMIT) при claim через /api/runner/next-host-task создают agent_run RUNNING
+// (claimNextHostTask). Если host-runner умирает посреди работы (docker compose build
+// в PIPELINE_SERVICE, коммит в GIT_INTEGRATOR), release-host-task не приходит и прогон
+// висит RUNNING, держа слот роли и назначение (AGENT_ASSIGNED) навсегда. Формально их
+// реапят resetStaleClaims/reapOrphanRunningRuns, но по ОБЩЕМУ ROLE_TIMEOUT_MS (10 мин),
+// который короче длинной docker-сборки → живой прогон срезался бы посреди build (тот же
+// класс инцидента, что 10-минутный срез PROGRAMMER). Даём host-ролям ОТДЕЛЬНЫЙ больший
+// таймаут: дефолт 40 мин — с запасом над самой долгой ожидаемой сборкой, но не
+// бесконечность. КОНТРАКТ (CONFIG-AUDIT-001): дефолт совпадает в db.js/compose/.env и
+// БОЛЬШЕ ROLE_TIMEOUT_MS. См. CONFIG_AUDIT.md.
+const DEFAULT_HOST_TIMEOUT_MS = 40 * 60 * 1000;
+const hostTimeoutCfg = resolveDuration('RUNNER_HOST_TIMEOUT_MS', DEFAULT_HOST_TIMEOUT_MS, { min: 60_000, max: 4 * 60 * 60_000 });
+const HOST_TIMEOUT_MS = hostTimeoutCfg.value;
+// Коды host-ролей для ветвления таймаута/события в жнецах (из единого HOST_ROLES).
+const HOST_ROLE_CODES = Object.keys(HOST_ROLES);
+
 // DOC-BRANCH-LIVENESS-001: максимальный возраст «зависания» документационной
 // fork-ветви, после которого она принудительно продвигается к join (чтобы не
 // держать родителя, даже если движок документации вообще не создаёт прогонов —
@@ -2194,7 +2230,7 @@ const DOC_BRANCH_MAX_AGE_MS = docBranchAgeCfg.value;
 
 // CONFIG-AUDIT-001: стартовый лог эффективных орфан-таймаутов с атрибуцией
 // источника (env|default) — чтобы по логу было видно, что реально применилось.
-logEffectiveConfig('orchestrator timeouts', [roleTimeoutCfg, claudeAssignCfg]);
+logEffectiveConfig('orchestrator timeouts', [roleTimeoutCfg, claudeAssignCfg, hostTimeoutCfg]);
 
 // --- Динамический маршрут проекта (PIPELINE-DYNAMIC-ROUTE-001) ---------------
 
@@ -2927,16 +2963,22 @@ async function resetStaleClaims(c) {
   await reconcileClockSkew(c, { log: (m) => console.log(m) });
   await c.query(
     `WITH stale AS (
-       SELECT ar.id, ar.task_id, ar.role_id, t.status::text AS task_status
+       SELECT ar.id, ar.task_id, ar.role_id, r.code AS role_code, t.status::text AS task_status,
+              round(extract(epoch from (now() - ar.started_at)) * 1000)::bigint AS hung_ms
          FROM agent_runs ar
          JOIN tasks t ON t.id = ar.task_id
          LEFT JOIN roles r ON r.id = ar.role_id
-        WHERE ar.status = 'RUNNING' AND ar.started_at < now() - ($1::bigint * interval '1 millisecond')
+        WHERE ar.status = 'RUNNING'
           -- PROGRAMMER-UNIFY-001: у программиста более длинная сессия и свой
           -- (обычно больший) таймаут CLAUDE_ASSIGN_TIMEOUT_MS — его осиротевшие
           -- прогоны закрывает releaseStaleClaudeClaims, чтобы общий ROLE_TIMEOUT_MS
           -- не убивал реально идущую долгую сессию программиста раньше времени.
           AND COALESCE(r.code, '') <> 'PROGRAMMER'
+          -- HOST-ORPHAN-TIMEOUT-001: host-роли (docker-сборка/коммит) реапятся по
+          -- своему БОЛЬШЕМУ таймауту, иначе живой прогон срежется посреди build;
+          -- остальные роли — по общему ROLE_TIMEOUT_MS.
+          AND ar.started_at < now() - ((CASE WHEN COALESCE(r.code, '') = ANY($3::text[])
+                                        THEN $2 ELSE $1 END)::bigint * interval '1 millisecond')
      ), done AS (
        UPDATE agent_runs
           SET status = 'TIMEOUT',
@@ -2952,10 +2994,16 @@ async function resetStaleClaims(c) {
      )
      INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
      SELECT s.task_id, 'STATUS_CHANGED', s.task_status::task_status, s.task_status::task_status, s.role_id,
-            jsonb_build_object('runner', true, 'reason', 'role_timeout', 'runStatus', 'TIMEOUT')
+            -- HOST-ORPHAN-TIMEOUT-001: для host-ролей — диагностируемое событие
+            -- (кто=roleCode, почему=host_orphan_timeout, сколько висела=hungMs).
+            CASE WHEN COALESCE(s.role_code, '') = ANY($3::text[])
+                 THEN jsonb_build_object('runner', true, 'reason', 'host_orphan_timeout',
+                        'runStatus', 'TIMEOUT', 'roleCode', s.role_code, 'hungMs', s.hung_ms)
+                 ELSE jsonb_build_object('runner', true, 'reason', 'role_timeout', 'runStatus', 'TIMEOUT')
+            END
        FROM stale s
        JOIN freed f ON f.id = s.task_id`,
-    [ROLE_TIMEOUT_MS],
+    [ROLE_TIMEOUT_MS, HOST_TIMEOUT_MS, HOST_ROLE_CODES],
   );
   await releaseStaleClaudeClaims(c);
 }
@@ -3035,18 +3083,31 @@ export async function reapOrphanRunningRuns(c, { ageCheck = false } = {}) {
   }
   const params = [errText, reason];
   let agePredicate = '';
+  // Стартовый reconcile (ageCheck=false) гасит ЛЮБОЙ RUNNING безусловно — причина
+  // «рестарт», а не «зависание по таймауту», поэтому payload остаётся общим.
+  let eventPayload = `jsonb_build_object('runner', true, 'reason', $2::text, 'runStatus', 'TIMEOUT')`;
   if (ageCheck) {
-    // PROGRAMMER-UNIFY-001: сессия программиста легально дольше общего ROLE_TIMEOUT_MS
-    // (кодинг идёт 10-25 мин, см. RUNNER_CLAUDE_TIMEOUT_MS) — его RUNNING-прогон
-    // сравниваем с бОльшим таймаутом, синхронно с releaseStaleClaudeClaims. Иначе
-    // тикающий жнец гасит живую сессию ровно на 10-й минуте и освобождает захват.
-    params.push(ROLE_TIMEOUT_MS, CLAUDE_ASSIGN_TIMEOUT_MS);
-    agePredicate = `AND ar.started_at < now() - ((CASE WHEN COALESCE(r.code, '') = 'PROGRAMMER'
-                      THEN $${params.length} ELSE $${params.length - 1} END)::bigint * interval '1 millisecond')`;
+    // PROGRAMMER-UNIFY-001 + HOST-ORPHAN-TIMEOUT-001: ветвим возраст CASE'ом по роли —
+    // у программиста легально бОльшая сессия (CLAUDE_ASSIGN_TIMEOUT_MS), у host-ролей
+    // свой больший таймаут (HOST_TIMEOUT_MS: docker-сборка/коммит идут дольше общего
+    // ROLE_TIMEOUT_MS), остальные роли — по общему. Иначе тикающий жнец гасит живой
+    // прогон раньше времени и освобождает захват (инцидент 10-минутного среза).
+    params.push(ROLE_TIMEOUT_MS, CLAUDE_ASSIGN_TIMEOUT_MS, HOST_TIMEOUT_MS, HOST_ROLE_CODES);
+    // $3 общий (ROLE_TIMEOUT_MS), $4 программист, $5 host, $6 коды host-ролей.
+    agePredicate = `AND ar.started_at < now() - ((CASE WHEN COALESCE(r.code, '') = 'PROGRAMMER' THEN $4
+                      WHEN COALESCE(r.code, '') = ANY($6::text[]) THEN $5
+                      ELSE $3 END)::bigint * interval '1 millisecond')`;
+    // Для осиротевшей host-роли — диагностируемое событие host_orphan_timeout
+    // (кто=roleCode, почему, сколько висела=hungMs).
+    eventPayload = `CASE WHEN COALESCE(s.role_code, '') = ANY($6::text[])
+                      THEN jsonb_build_object('runner', true, 'reason', 'host_orphan_timeout',
+                             'runStatus', 'TIMEOUT', 'roleCode', s.role_code, 'hungMs', s.hung_ms)
+                      ELSE jsonb_build_object('runner', true, 'reason', $2::text, 'runStatus', 'TIMEOUT') END`;
   }
   const r = await c.query(
     `WITH stale AS (
-       SELECT ar.id, ar.task_id, ar.role_id, t.status::text AS task_status
+       SELECT ar.id, ar.task_id, ar.role_id, r.code AS role_code, t.status::text AS task_status,
+              round(extract(epoch from (now() - ar.started_at)) * 1000)::bigint AS hung_ms
          FROM agent_runs ar
          JOIN tasks t ON t.id = ar.task_id
          LEFT JOIN roles r ON r.id = ar.role_id
@@ -3066,7 +3127,7 @@ export async function reapOrphanRunningRuns(c, { ageCheck = false } = {}) {
      )
      INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
      SELECT s.task_id, 'STATUS_CHANGED', s.task_status::task_status, s.task_status::task_status, s.role_id,
-            jsonb_build_object('runner', true, 'reason', $2::text, 'runStatus', 'TIMEOUT')
+            ${eventPayload}
        FROM stale s
        JOIN freed f ON f.id = s.task_id`,
     params,
@@ -3365,12 +3426,28 @@ async function claimLlmRoleTask(c, roleCode = null) {
 // Прошлые успешные выводы ролей по задаче (для проброса по цепочке) + последнее
 // ревью. Позволяет DECOMPOSER видеть решение ARCHITECT, FAILURE_ANALYST — ревью,
 // Programmer — проект и разбивку. Общий источник для роли и для Claude-моста.
-async function fetchPriorOutputs(c, taskId) {
+export async function fetchPriorOutputs(c, taskId) {
+  // PIPELINE-PRIOR-DEDUP-001: при Dynamic Workflow (REWORK/BRANCH к Failure
+  // Analyst/RESTART/доработка через moveTask) задача проходит роли многократно,
+  // и каждый SUCCESS-прогон копится в agent_runs. Следующей роли по маршруту
+  // нужен только ПОСЛЕДНИЙ вывод каждой предшественницы, а не вся портянка её
+  // попыток (замер по живой БД: до 182 SUCCESS-прогонов одной роли → ~106K
+  // символов, ~25-30K токенов в каждом вызове модели). DISTINCT ON (r.code) с
+  // ORDER BY r.code, started_at DESC оставляет последний прогон каждой роли;
+  // внешний ORDER BY по started_at восстанавливает хронологию ролей (читаемость
+  // промпта). Ср. programmer-runner/src/promptBuilder.js ("Keep the latest output
+  // per role"). История agent_runs/prompt_exchanges НЕ трогается — это только
+  // выборка контекста; форма строк и контракт summarizePriorRuns(runs.rows) те же.
   const runs = await c.query(
-    `SELECT r.code AS role_code, ar.status::text AS status, ar.output_json
-       FROM agent_runs ar JOIN roles r ON r.id = ar.role_id
-      WHERE ar.task_id = $1 AND ar.status = 'SUCCESS' AND ar.output_json IS NOT NULL
-      ORDER BY ar.started_at`,
+    `SELECT latest.role_code, latest.status, latest.output_json
+       FROM (
+         SELECT DISTINCT ON (r.code)
+                r.code AS role_code, ar.status::text AS status, ar.output_json, ar.started_at
+           FROM agent_runs ar JOIN roles r ON r.id = ar.role_id
+          WHERE ar.task_id = $1 AND ar.status = 'SUCCESS' AND ar.output_json IS NOT NULL
+          ORDER BY r.code, ar.started_at DESC
+       ) latest
+      ORDER BY latest.started_at`,
     [taskId],
   );
   const review = await c.query(
