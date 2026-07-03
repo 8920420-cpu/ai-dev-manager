@@ -29,7 +29,11 @@ import {
 } from '../../types/settings';
 import type { Integration } from '../../types/integration';
 import { RoleFieldsModal } from './RoleFieldsModal';
+import { IntakeIntegrationsPanel } from './IntakeIntegrationsPanel';
 import styles from './RoleCardModal.module.css';
+
+/** Код роли Приёмщика задач — у неё есть раздел «Интеграции обращений». */
+const INTAKE_ROLE_CODE = 'TASK_INTAKE_OFFICER';
 
 interface RoleCardModalProps {
   open: boolean;
@@ -375,6 +379,11 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
                 нужен запущенный хостовый раннер (вход выполнен на машине).
               </Callout>
             )}
+
+            {/* INTAKE-INTEGRATIONS-001: раздел «Интеграции обращений» — только у
+                Приёмщика задач; отдельно от «Движка» (движок — чем роль думает,
+                интеграции — откуда приходят обращения из приложений). */}
+            {role.code === INTAKE_ROLE_CODE && <IntakeIntegrationsPanel />}
 
             <Textarea
               label="Рабочий промт"

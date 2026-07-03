@@ -15,6 +15,7 @@ import {
   getAppliedMigrations,
   acceptScannerCompletion,
   acceptScannerIntake,
+  acceptIntakeReport,
   listUnassignedTasks,
   assignTaskProject,
   advanceTask,
@@ -40,6 +41,15 @@ import {
   listExchanges,
   invokeConnector,
 } from './connectors.js';
+import {
+  listIntegrations as listIntakeIntegrations,
+  getIntegration as getIntakeIntegration,
+  createIntegration as createIntakeIntegration,
+  updateIntegration as updateIntakeIntegration,
+  rotateIntegrationToken as rotateIntakeIntegrationToken,
+  deleteIntegration as deleteIntakeIntegration,
+  getIntakeStats,
+} from './intakeIntegrations.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
 import { getPerformanceMetrics, getVersionMetrics, getDailyModelStats, getKpiMarkers, createKpiMarker } from './performance.js';
@@ -318,6 +328,18 @@ function matchServerRoute(pathname) {
   return { kind: 'actions', id: decodeURIComponent(m[1]) };
 }
 
+// INTAKE-INTEGRATIONS-001: разбор путей /api/intake-integrations[/(stats|:id[/rotate-token])].
+// Отдельный префикс от /api/integrations (коннекторы-движки) — это разные сущности.
+function matchIntakeIntegrationRoute(pathname) {
+  if (pathname === '/api/intake-integrations') return { kind: 'collection' };
+  if (pathname === '/api/intake-integrations/stats') return { kind: 'stats' };
+  const m = pathname.match(/^\/api\/intake-integrations\/([^/]+)(?:\/(rotate-token))?$/);
+  if (!m) return null;
+  const id = decodeURIComponent(m[1]);
+  if (m[2] === 'rotate-token') return { kind: 'rotate', id };
+  return { kind: 'item', id };
+}
+
 export function createApp() {
   return createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -350,6 +372,20 @@ export function createApp() {
             version: SERVICE_VERSION,
             migrations,
           });
+        }
+
+        // INTAKE-INTEGRATIONS-001: приём обращения о проблеме из приложения-источника.
+        // Открыт МИМО orchestrator API-токена — авторизация по ТОКЕНУ ИНТЕГРАЦИИ,
+        // который приложение шлёт в Authorization: Bearer <token> либо X-Intake-Token.
+        // acceptIntakeReport сам валидирует токен, анти-спам и идемпотентность.
+        if (req.method === 'POST' && p === '/api/intake/report') {
+          const body = await readBody(req);
+          const auth = req.headers['authorization'];
+          const token = (auth && auth.startsWith('Bearer ') ? auth.slice(7) : '')
+            || req.headers['x-intake-token'] || body.token || '';
+          const result = await acceptIntakeReport(await loadSettings(), { ...body, token });
+          publishTaskChange('intake_report_received', { taskId: result?.taskId ?? null });
+          return sendJson(res, 200, result);
         }
 
         // /health и /api/version открыты для healthcheck; всё остальное под /api
@@ -880,6 +916,32 @@ export function createApp() {
           } else if (intg.kind === 'invoke') {
             if (req.method === 'POST')
               return sendJson(res, 200, await invokeConnector(intg.id, await readBody(req)));
+          }
+          return sendJson(res, 405, { error: 'method_not_allowed' });
+        }
+
+        // --- INTAKE-INTEGRATIONS-001: реестр интеграций-источников обращений ---
+        // (раздел «Интеграции обращений» в карточке роли Task Intake Officer).
+        // Управление под orchestrator API-токеном; сам приём обращений — отдельный
+        // открытый endpoint /api/intake/report (авторизация по токену интеграции).
+        const intake = matchIntakeIntegrationRoute(p);
+        if (intake) {
+          if (intake.kind === 'collection') {
+            if (req.method === 'GET')
+              return sendJson(res, 200, { integrations: await listIntakeIntegrations() });
+            if (req.method === 'POST')
+              return sendJson(res, 201, await createIntakeIntegration(await readBody(req)));
+          } else if (intake.kind === 'stats') {
+            if (req.method === 'GET') return sendJson(res, 200, await getIntakeStats());
+          } else if (intake.kind === 'item') {
+            if (req.method === 'GET') return sendJson(res, 200, await getIntakeIntegration(intake.id));
+            if (req.method === 'PUT')
+              return sendJson(res, 200, await updateIntakeIntegration(intake.id, await readBody(req)));
+            if (req.method === 'DELETE')
+              return sendJson(res, 200, await deleteIntakeIntegration(intake.id));
+          } else if (intake.kind === 'rotate') {
+            if (req.method === 'POST')
+              return sendJson(res, 200, await rotateIntakeIntegrationToken(intake.id));
           }
           return sendJson(res, 405, { error: 'method_not_allowed' });
         }

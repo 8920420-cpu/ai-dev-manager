@@ -13,6 +13,7 @@ import { reconcileClockSkew } from './clockGuard.js';
 import { isDbConnectionError, noteDbConnectionFailure, claimGraceActive } from './bootClaimGuard.js';
 import { resolveDuration, logEffectiveConfig } from './envConfig.js';
 import { isDriverProvider } from './connectors.js';
+import { hashToken } from './intakeIntegrations.js';
 
 const { Client } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -581,6 +582,178 @@ export async function acceptScannerIntake(s, input) {
             taskId: again.rows[0].id, externalId: payload.externalId,
           };
         }
+      }
+      throw error;
+    }
+  });
+}
+
+// INTAKE-INTEGRATIONS-001 — короткий заголовок обращения из первой строки текста
+// (Приёмщик позже заменит его на short_title). Ограничиваем длину для карточки.
+function intakeReportTitle(message) {
+  const firstLine = String(message ?? '').split(/\r?\n/)[0].trim();
+  const base = firstLine || 'Обращение пользователя';
+  return base.length > 120 ? `${base.slice(0, 117)}…` : base;
+}
+
+/**
+ * INTAKE-INTEGRATIONS-001 — нормализация обращения из канала «интеграции в
+ * приложения» (POST /api/intake/report). Чистая функция (без БД): проверяет
+ * обязательные поля и собирает автоконтекст. token приходит из заголовка запроса
+ * (Authorization: Bearer / X-Intake-Token) — сервер кладёт его в input.token.
+ */
+export function normalizeIntakeReport(input) {
+  const str = (v) => String(v ?? '').trim();
+  const token = str(input?.token);
+  if (!token) throw scannerError(401, 'token_required');
+  const externalId = str(input?.externalId);
+  if (!externalId) throw scannerError(422, 'external_id_required');
+  const message = str(input?.message);
+  if (!message) throw scannerError(422, 'message_required');
+  const user = str(input?.user);
+  if (!user) throw scannerError(422, 'user_required');
+  // Битую кодировку отклоняем на входе (как в scanner-интейке): по такому тексту
+  // обращение не восстановить.
+  if (looksCorruptedText(message)) throw scannerError(422, 'corrupted_encoding');
+
+  const ac = input?.autocontext && typeof input.autocontext === 'object' && !Array.isArray(input.autocontext)
+    ? input.autocontext : {};
+  const autocontext = {
+    url: str(ac.url) || null,
+    buildVersion: str(ac.buildVersion) || null,
+    userAgent: str(ac.userAgent) || null,
+    timestamp: str(ac.timestamp) || null,
+    jsErrors: Array.isArray(ac.jsErrors) ? ac.jsErrors.map((e) => str(e)).filter(Boolean).slice(0, 50) : [],
+    lastFailedApiRequestId: str(ac.lastFailedApiRequestId) || null,
+  };
+  return {
+    token,
+    externalId,
+    message,
+    user,
+    service: str(input?.service),      // микросервис-источник
+    form: str(input?.form),            // форма/экран, с которого написано сообщение
+    autocontext,
+    // Ссылка на объект-скриншот в MinIO (грузит бэкенд приложения-источника).
+    screenshotUrl: str(input?.screenshotUrl) || null,
+  };
+}
+
+/**
+ * INTAKE-INTEGRATIONS-001 — приём обращения о проблеме от зарегистрированного
+ * приложения-источника (третий канал приёма Task Intake Officer). Авторизация по
+ * токену интеграции; анти-спам (rate-limit по интеграции и по пользователю +
+ * минимальная длина сообщения); идемпотентность по (intake_integration_id,
+ * external_id). Обращение создаётся БЕЗ проекта, но СРАЗУ в статусе BACKLOG под
+ * Приёмщиком (не BLOCKED) — чтобы не зависать в «Неразобранных»; проект определит
+ * сам Приёмщик по каталогу проектов. Ответ содержит человекочитаемый номер
+ * обращения (reportNumber) — приложение показывает его пользователю.
+ */
+export async function acceptIntakeReport(s, input) {
+  const payload = normalizeIntakeReport(input);
+  const tokenHash = hashToken(payload.token);
+  return withClient(clientConfig(s), async (c) => {
+    // 1. Авторизация по токену интеграции.
+    const integ = await c.query(
+      `SELECT id, name, enabled, rate_limit_per_min, user_rate_limit_per_min, min_message_length
+         FROM intake_integrations WHERE token_hash = $1 AND token_hash <> ''`,
+      [tokenHash],
+    );
+    if (!integ.rowCount) throw scannerError(401, 'invalid_intake_token');
+    const integration = integ.rows[0];
+    if (!integration.enabled) throw scannerError(403, 'integration_disabled');
+
+    // 2. Анти-спам: слишком короткое сообщение отклоняем.
+    if (payload.message.length < integration.min_message_length) {
+      throw scannerError(422, 'message_too_short');
+    }
+
+    // Идемпотентность: обращение с тем же external_id уже принято → тот же номер.
+    const findDup = () => c.query(
+      'SELECT id, data_card FROM tasks WHERE intake_integration_id = $1 AND external_id = $2',
+      [integration.id, payload.externalId],
+    );
+    const dupResult = (row) => ({
+      accepted: true, duplicate: true, imported: false,
+      taskId: row.id, reportNumber: row.data_card?.reportNumber ?? null,
+      externalId: payload.externalId,
+    });
+    const dup0 = await findDup();
+    if (dup0.rowCount) return dupResult(dup0.rows[0]);
+
+    // 3. Анти-спам: rate-limit по интеграции и по пользователю. Окно — 1 минута по
+    // created_at (устойчиво к рестарту одного инстанса; горизонтального
+    // масштабирования оркестратора нет — счётчик держим в БД, не в памяти).
+    const perInt = await c.query(
+      `SELECT count(*)::int AS n FROM tasks
+        WHERE intake_integration_id = $1 AND created_at > now() - interval '1 minute'`,
+      [integration.id],
+    );
+    if (perInt.rows[0].n >= integration.rate_limit_per_min) throw scannerError(429, 'rate_limited');
+    const perUser = await c.query(
+      `SELECT count(*)::int AS n FROM tasks
+        WHERE intake_integration_id = $1 AND created_at > now() - interval '1 minute'
+          AND data_card->>'reporterUser' = $2`,
+      [integration.id, payload.user],
+    );
+    if (perUser.rows[0].n >= integration.user_rate_limit_per_min) throw scannerError(429, 'user_rate_limited');
+
+    // 4. Создание обращения: беспроектная задача СРАЗУ в BACKLOG под Приёмщиком.
+    const role = await entryRole(c);
+    await c.query('BEGIN');
+    try {
+      // Повторная проверка дубля под транзакцией (гонка параллельной доставки).
+      const dup = await findDup();
+      if (dup.rowCount) {
+        await c.query('COMMIT');
+        return dupResult(dup.rows[0]);
+      }
+      const seq = await c.query("SELECT nextval('intake_report_seq')::bigint AS n");
+      const reportNumber = Number(seq.rows[0].n);
+      const dataCard = {
+        source: 'intake-integration',
+        integration: integration.name,
+        reportNumber,
+        externalId: payload.externalId,
+        reporterUser: payload.user,
+        reporterService: payload.service || null,
+        reporterForm: payload.form || null,
+        autocontext: payload.autocontext,
+        // Ссылка на скриншот в MinIO — сохраняется в карточке и доступна ролям.
+        screenshotUrl: payload.screenshotUrl,
+      };
+      const ins = await c.query(
+        `INSERT INTO tasks
+           (project_id, service_id, external_id, intake_integration_id, title, description,
+            status, current_role_id, current_stage_key, created_by, data_card)
+         VALUES (NULL, NULL, $1, $2, $3, $4, 'BACKLOG'::task_status, $5, NULL, 'intake-integration', $6::jsonb)
+         RETURNING id`,
+        [payload.externalId, integration.id, intakeReportTitle(payload.message), payload.message,
+         role.id, JSON.stringify(dataCard)],
+      );
+      const taskId = ins.rows[0].id;
+      await c.query(
+        `INSERT INTO task_events (task_id, event_type, to_status, role_id, payload_json)
+         VALUES ($1, 'TASK_CREATED', 'BACKLOG'::task_status, $2, $3::jsonb)`,
+        [taskId, role.id, JSON.stringify({
+          source: 'intake-integration', integration: integration.name, integrationId: integration.id,
+          reportNumber, externalId: payload.externalId, reporterUser: payload.user,
+          reporterService: payload.service || null, reporterForm: payload.form || null,
+          hasScreenshot: Boolean(payload.screenshotUrl),
+        })],
+      );
+      await c.query('COMMIT');
+      return {
+        accepted: true, duplicate: false, imported: true,
+        taskId, reportNumber, externalId: payload.externalId,
+        nextRole: role.code, toStatus: 'BACKLOG',
+      };
+    } catch (error) {
+      await c.query('ROLLBACK');
+      // Гонка: тот же external_id принят параллельно — это не ошибка.
+      if (error.code === '23505') {
+        const again = await findDup();
+        if (again.rowCount) return dupResult(again.rows[0]);
       }
       throw error;
     }
@@ -3058,30 +3231,36 @@ async function claimLlmRoleTask(c, roleCode = null) {
               t.data_card, t.current_stage_key, t.parent_task_id, r.code AS role_code, r.id AS role_id
          FROM tasks t
          JOIN roles r ON r.id = t.current_role_id
-         JOIN projects p ON p.id = t.project_id
+         LEFT JOIN projects p ON p.id = t.project_id
         WHERE t.assigned_agent_id IS NULL
           AND r.hidden = false
-          AND p.status <> 'paused'
+          AND (p.id IS NULL OR p.status <> 'paused')
           AND r.code = ANY($1::text[])
           ${roleFilter}
           AND (
-            EXISTS (
-              SELECT 1 FROM project_stages ps
-                JOIN project_stage_roles psr ON psr.stage_id = ps.id
-               WHERE ps.project_id = t.project_id AND ps.enabled = true
-                 AND psr.role_id = r.id AND ps.task_status::text = t.status::text
-            )
-            OR (
-              NOT EXISTS (
-                SELECT 1 FROM project_stages ps2
-                 WHERE ps2.project_id = t.project_id AND ps2.enabled = true AND ps2.task_status IS NOT NULL
+            (t.project_id IS NOT NULL AND (
+              EXISTS (
+                SELECT 1 FROM project_stages ps
+                  JOIN project_stage_roles psr ON psr.stage_id = ps.id
+                 WHERE ps.project_id = t.project_id AND ps.enabled = true
+                   AND psr.role_id = r.id AND ps.task_status::text = t.status::text
               )
-              AND (r.code, t.status::text) IN (VALUES ${valuesSql})
-            )
-            -- TASK-RESTART-001: перезапущенные задачи Приёмщик забирает БЕЗУСЛОВНО,
-            -- даже если у проекта нет этапа с маппингом на этот статус (иначе после
-            -- ручного перезапуска они бы снова зависли, как BACKLOG при входе READY).
-            OR (r.code = 'TASK_INTAKE_OFFICER' AND t.status::text = 'RESTART')
+              OR (
+                NOT EXISTS (
+                  SELECT 1 FROM project_stages ps2
+                   WHERE ps2.project_id = t.project_id AND ps2.enabled = true AND ps2.task_status IS NOT NULL
+                )
+                AND (r.code, t.status::text) IN (VALUES ${valuesSql})
+              )
+              -- TASK-RESTART-001: перезапущенные задачи Приёмщик забирает БЕЗУСЛОВНО,
+              -- даже если у проекта нет этапа с маппингом на этот статус (иначе после
+              -- ручного перезапуска они бы снова зависли, как BACKLOG при входе READY).
+              OR (r.code = 'TASK_INTAKE_OFFICER' AND t.status::text = 'RESTART')
+            ))
+            -- INTAKE-INTEGRATIONS-001: беспроектное обращение из канала «интеграции в
+            -- приложения» — Приёмщик забирает его СРАЗУ в BACKLOG. Без этой ветки
+            -- INNER JOIN projects скрывал бы задачу без проекта, и обращение зависло бы.
+            OR (t.project_id IS NULL AND r.code = 'TASK_INTAKE_OFFICER' AND t.status::text = 'BACKLOG')
           )
         ORDER BY t.priority DESC, t.created_at
         FOR UPDATE OF t SKIP LOCKED
@@ -3160,9 +3339,11 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
     [claimed.id],
   );
   const scan = ev.rows.find((r) => r.payload_json && (r.payload_json.changedFiles || r.payload_json.result));
+  // INTAKE-INTEGRATIONS-001: LEFT JOIN — беспроектное обращение из интеграций
+  // (project_id IS NULL) не должно давать пустую строку (INNER JOIN скрыл бы её).
   const meta = await c.query(
     `SELECT p.id AS project_id, p.code AS project, p.root_path, p.docs_path, s.service_code AS service
-       FROM tasks t JOIN projects p ON p.id = t.project_id
+       FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
        LEFT JOIN services s ON s.id = t.service_id WHERE t.id = $1`,
     [claimed.id],
   );
@@ -3216,6 +3397,30 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
     }).catch(() => null);
   }
 
+  // INTAKE-INTEGRATIONS-001: беспроектное обращение из интеграций — подаём Приёмщику
+  // каталог ВСЕХ зарегистрированных проектов (код/имя/папки/сервисы), чтобы он
+  // определил проект по подсказкам обращения (микросервис-источник и форма). Для
+  // задач с проектом — null (проект уже известен).
+  let projectCatalog = null;
+  if (!projectId && claimed.role_code === 'TASK_INTAKE_OFFICER') {
+    const cat = await c.query(
+      `SELECT p.code, p.name, p.root_path, p.docs_path,
+              COALESCE(
+                array_agg(s.service_code ORDER BY s.service_code)
+                  FILTER (WHERE s.service_code IS NOT NULL), '{}'
+              ) AS services
+         FROM projects p
+         LEFT JOIN services s ON s.project_id = p.id
+        WHERE p.status <> 'paused'
+        GROUP BY p.id, p.code, p.name, p.root_path, p.docs_path
+        ORDER BY p.code`,
+    );
+    projectCatalog = cat.rows.map((r) => ({
+      code: r.code, name: r.name, rootPath: r.root_path, docsPath: r.docs_path,
+      services: Array.isArray(r.services) ? r.services : [],
+    }));
+  }
+
   return {
     taskId: claimed.id,
     title: claimed.title,
@@ -3229,6 +3434,8 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
     docsPath: meta.rows[0]?.docs_path ?? '',
     // Карта проекта/сервиса инлайн (только для исследующих ролей; иначе null).
     projectMaps,
+    // Каталог всех проектов для беспроектного обращения из интеграций (иначе null).
+    projectCatalog,
     projectServices: svc.rows.map((r) => r.service_code),
     // Для задачи-на-сервис берём агрегат результатов подзадач; иначе — как раньше.
     programmerResult: hasChildren
@@ -3410,6 +3617,13 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
   if (missingOut.length && decision.outcome !== 'BLOCK') {
     decision = { outcome: 'REWORK', agentRunStatus: 'SUCCESS', reason: `missing_outputs:${missingOut.join(',')}` };
   }
+  // INTAKE-INTEGRATIONS-001: беспроектное обращение из канала «интеграции в
+  // приложения». Приёмщик определил проект (verdict.fields.project) по каталогу
+  // проектов — резолвим его, проставляем project_id (+ service) и входим в Architect.
+  // Проект не разрешился → BLOCKED с диагностикой (обращение не теряется).
+  if (claimed.role_code === 'TASK_INTAKE_OFFICER' && !claimed.project_id && decision.outcome === 'FORWARD') {
+    return routeIntakeToProject(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, kpi });
+  }
   // DECOMP-CONTRACT-001: успешный Декомпозитор не просто «forward» — он
   // МАТЕРИАЛИЗУЕТ из карточки задачи-на-сервис (L1) и подзадачи-на-файл (L2),
   // а сам эпик паркует в WAITING_FOR_CHILDREN. Только в линейном маршруте (в
@@ -3456,6 +3670,93 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
   return finalizeRole(c, claimed, {
     verdict, response, exchangeId, durationMs, decision, resolved, cardValues, kpi, setServiceId, setDescription, setTitle,
   });
+}
+
+// INTAKE-INTEGRATIONS-001 — маршрутизация беспроектного обращения после Приёмщика.
+// Приёмщик определил проект (verdict.fields.project) по каталогу проектов. Резолвим
+// его в зарегистрированный проект, проставляем project_id (+ service_id, если сервис
+// назван и существует) и входим в Architect (ARCHITECTURE), кладём карточку интейка,
+// развёрнутое описание и человекочитаемое название. Проект не разрешился → BLOCKED с
+// диагностикой (обращение остаётся под Приёмщиком, видно причину — не теряется).
+async function routeIntakeToProject(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, kpi = null }) {
+  const pick = (...vals) => {
+    for (const v of vals) {
+      const t = typeof v === 'string' ? v.trim() : '';
+      if (t && !/^unknown$/i.test(t)) return t;
+    }
+    return '';
+  };
+  const projectRef = pick(verdict.fields?.project, cardValues?.project);
+  const project = projectRef ? await findProject(c, projectRef) : null;
+  if (!project) {
+    return blockClaimedReason(c, claimed, `intake_project_unresolved:${projectRef || 'empty'}`,
+      { verdict, cardValues, kpi, event: 'intake_project_unresolved' });
+  }
+
+  // Вход в Architect (или безопасный откат к штатному входу, если этапа Architect нет).
+  const entry = await computeEntry(c, project.id, 'ARCHITECT');
+
+  // Сервис — опционально: если Приёмщик назвал зарегистрированный сервис проекта.
+  let serviceId = null;
+  const svcRef = pick(verdict.fields?.service, cardValues?.service);
+  if (svcRef) {
+    const svc = await c.query(
+      'SELECT id FROM services WHERE project_id = $1 AND lower(service_code) = lower($2) LIMIT 1',
+      [project.id, svcRef],
+    );
+    serviceId = svc.rows[0]?.id ?? null;
+  }
+
+  // Развёрнутое описание/название от Приёмщика — как в обычном форварде Приёмщика.
+  const dd = verdict.fields?.structured_description ?? cardValues?.structured_description;
+  const setDescription = typeof dd === 'string' && dd.trim() ? dd.trim().slice(0, 20000) : null;
+  const tt = verdict.fields?.short_title ?? cardValues?.short_title
+    ?? verdict.fields?.task_title ?? cardValues?.task_title;
+  const setTitle = typeof tt === 'string' && tt.trim() ? tt.trim().slice(0, 300) : null;
+
+  await c.query('BEGIN');
+  try {
+    const cur = await c.query('SELECT status::text AS status FROM tasks WHERE id = $1 FOR UPDATE', [claimed.id]);
+    if (!cur.rowCount) { await c.query('ROLLBACK'); return null; }
+
+    const mergedCard = { ...(cardValues || {}), project: project.code, projectPath: project.root_path };
+    const sets = [
+      'project_id = $2', 'status = $3::task_status', 'current_role_id = $4',
+      'current_stage_key = $5::uuid', 'assigned_agent_id = NULL', 'data_card = data_card || $6::jsonb',
+    ];
+    const params = [claimed.id, project.id, entry.status, entry.role.id, entry.entryStageKey ?? null,
+      JSON.stringify(mergedCard)];
+    if (serviceId) { params.push(serviceId); sets.push(`service_id = $${params.length}::uuid`); }
+    if (setDescription) { params.push(setDescription); sets.push(`description = $${params.length}`); }
+    if (setTitle) { params.push(setTitle); sets.push(`title = $${params.length}`); }
+    await c.query(`UPDATE tasks SET ${sets.join(', ')} WHERE id = $1`, params);
+
+    const kpiSet = runKpiSet(kpi, 2);
+    await c.query(
+      `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet.sql} WHERE id = $1`,
+      [claimed.agentRunId, JSON.stringify({
+        status: verdict.status, summary: verdict.summary, outcome: 'FORWARD',
+        reason: 'intake_project_resolved', project: project.code, fields: cardValues,
+      }), ...kpiSet.params],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'STATUS_CHANGED', $2::task_status, $3::task_status, $4, $5::jsonb)`,
+      [claimed.id, claimed.status, entry.status, claimed.role_id, JSON.stringify({
+        runner: true, ai: true, role: claimed.role_code, source: 'intake-integration',
+        project: project.code, nextRole: entry.role.code, outcome: 'FORWARD', exchangeId,
+      })],
+    );
+    await c.query('COMMIT');
+    return {
+      taskId: claimed.id, fromRole: claimed.role_code, fromStatus: claimed.status,
+      toStatus: entry.status, nextRole: entry.role.code, project: project.code,
+      verdict: verdict.status, durationMs,
+    };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
 }
 
 // DECOMPOSER-REMOVE-001 — гарантировать service_id у задачи Архитектора перед CODING.

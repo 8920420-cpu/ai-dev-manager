@@ -9,7 +9,7 @@
 - **Назначение:** единый источник истины оркестрации ИИ-агентов.
 - **Подключение из Docker:** `postgresql://postgres:postgres@pgbouncer:6432/orchestrator_db`
 
-### Таблицы (19)
+### Таблицы (20)
 
 | Таблица | Назначение |
 |---------|-----------|
@@ -32,6 +32,7 @@
 | `knowledge_documents` | карты проекта (этот каталог `docs/`) |
 | `context_snapshots` | неизменяемые снимки контекста агента |
 | `scanner_dispatches` | идемпотентный журнал завершений из task document |
+| `intake_integrations` | внешние приложения-источники обращений (3-й канал Приёмщика) |
 
 ### Ключевые связи
 
@@ -55,6 +56,12 @@ agent_runs.id    → context_snapshots.agent_run_id
 `agent_runs(agent_id)`, `pipeline_runs(task_id)`, `service_locks(service_id)`,
 `task_events(task_id)`. Полный список — в DATA_MODEL.md §5.
 
+Идемпотентность обращений (INTAKE-INTEGRATIONS-001): частичный уникальный
+`uniq_tasks_integration_external (intake_integration_id, external_id)` WHERE обе
+не NULL; старый `uniq_tasks_unassigned_external` сужен до
+`WHERE project_id IS NULL AND external_id IS NOT NULL AND intake_integration_id IS NULL`
+(scanner-задачи). Последовательность `intake_report_seq` — номер обращения.
+
 ### Гарантии целостности
 
 - Уникальный активный лок на сервис: `uq_service_locks_active` (WHERE `released_at IS NULL`).
@@ -62,6 +69,10 @@ agent_runs.id    → context_snapshots.agent_run_id
 - Append-only: триггеры на `task_events`, `context_snapshots`.
 - Конкурентный захват задач: `FOR UPDATE SKIP LOCKED`.
 - Одна доставка Scanner на задачу/completion: UNIQUE `(task_id, completion_key)`.
+- Идемпотентность приёма обращений: UNIQUE `(intake_integration_id, external_id)`
+  (`uniq_tasks_integration_external`). Токен интеграции уникален среди выпущенных
+  (`intake_integrations_token_hash_unique`, partial `WHERE token_hash <> ''`);
+  имя интеграции уникально без учёта регистра (`lower(name)`).
 
 ---
 

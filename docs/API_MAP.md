@@ -57,6 +57,54 @@ Scanner вызывает endpoint после появления завершён
 
 ---
 
+## Приём обращений из приложений (INTAKE-INTEGRATIONS-001)
+
+Третий канал приёма роли Task Intake Officer: конечные пользователи продуктов
+сообщают о проблемах изнутри приложений. Обращение попадает беспроектной задачей
+сразу в `BACKLOG` под Приёмщиком (не «Неразобранные»), проект определяет сам
+Приёмщик по каталогу проектов.
+
+### `POST /api/intake/report`
+
+Открытый endpoint (мимо `ORCHESTRATOR_API_TOKEN`) — авторизация по **токену
+интеграции**: заголовок `Authorization: Bearer <token>`, либо `X-Intake-Token`,
+либо поле `token` в теле. Приём валидирует токен, анти-спам и идемпотентность.
+
+Поля тела: `message` (текст обращения), `user`, `service` (микросервис-источник),
+`form` (экран/форма), `externalId` (идемпотентность источника), `autocontext`
+(URL, версия сборки, user-agent, timestamp, последние JS-ошибки, id упавшего
+запроса), `screenshotUrl` (ссылка на объект в MinIO — сохраняется в карточке
+задачи и доступна следующим ролям).
+
+- **Успех:** `{"accepted":true,"duplicate":false,"imported":true,"taskId":"...",
+  "reportNumber":42,"externalId":"...","nextRole":"TASK_INTAKE_OFFICER",
+  "toStatus":"BACKLOG"}`. `reportNumber` — человекочитаемый номер обращения
+  (последовательность `intake_report_seq`); приложение показывает «Заявка №X принята».
+- **Идемпотентность:** повторная доставка того же `externalId` возвращает
+  `{"accepted":true,"duplicate":true,"imported":false,"taskId":"...",
+  "reportNumber":42,...}` и не создаёт дубль.
+- **Ошибки:** `401 invalid_intake_token`, `403 integration_disabled`,
+  `422 message_too_short`, `429 rate_limited` (по интеграции) /
+  `429 user_rate_limited` (по пользователю).
+
+### Реестр интеграций (под `ORCHESTRATOR_API_TOKEN`)
+
+Раздел «Интеграции обращений» в карточке роли Task Intake Officer. Не путать с
+«Движком» роли (`/api/integrations` — коннекторы-движки): это разные сущности.
+Токен интеграции хранится только как SHA-256; наружу отдаётся флаг `has_token`.
+
+- **`GET /api/intake-integrations`** — список: `{"integrations":[...]}`.
+- **`POST /api/intake-integrations`** — создание (`201`).
+- **`GET /api/intake-integrations/stats`** — статистика принятых обращений по
+  интеграциям-источникам.
+- **`GET /api/intake-integrations/:id`** — одна интеграция.
+- **`PUT /api/intake-integrations/:id`** — обновление (включена/выключена,
+  rate-limit, min-длина).
+- **`DELETE /api/intake-integrations/:id`** — удаление.
+- **`POST /api/intake-integrations/:id/rotate-token`** — перевыпуск токена.
+
+---
+
 ## tester-service (HTTP, по умолчанию :4187)
 
 ### `GET /health`

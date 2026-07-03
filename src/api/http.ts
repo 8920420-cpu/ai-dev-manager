@@ -72,6 +72,14 @@ const ERROR_MESSAGES: Record<string, string> = {
   connector_invoke_failed: 'Не удалось выполнить запрос к интеграции.',
   prompt_required: 'Введите текст запроса (prompt).',
   no_enabled_connector: 'Нет включённого AI-коннектора для этой роли.',
+  // Интеграции обращений (третий канал приёма Task Intake Officer)
+  intake_integration_not_found: 'Интеграция обращений не найдена.',
+  intake_integration_name_exists: 'Интеграция обращений с таким названием уже существует.',
+  invalid_intake_token: 'Неверный токен интеграции обращений.',
+  integration_disabled: 'Интеграция обращений выключена.',
+  message_too_short: 'Сообщение обращения слишком короткое.',
+  rate_limited: 'Превышен лимит обращений по интеграции. Повторите позже.',
+  user_rate_limited: 'Превышен лимит обращений по пользователю. Повторите позже.',
   // Роли
   role_not_found: 'Роль не найдена.',
   role_code_required: 'Не указан код роли.',
