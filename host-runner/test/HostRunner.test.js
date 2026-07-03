@@ -14,11 +14,18 @@ function fakeHttp(overrides = {}) {
   };
 }
 
+// tick() теперь fire-and-forget: возвращает статусы синхронно, а результат роли
+// доступен через entry.promise. Хелпер дожидается результата по роли.
+async function resultFor(out, role) {
+  const entry = out.find((o) => o.role === role);
+  return entry?.promise ? entry.promise : entry;
+}
+
 test('idle: нет задачи => нет complete/release', async () => {
   const http = fakeHttp();
   const runner = new HostRunner({ http, executors: { PIPELINE_SERVICE: async () => ({ success: true }) }, roles: ['PIPELINE_SERVICE'], log: silent });
-  const out = await runner.tick();
-  assert.deepEqual(out, [{ role: 'PIPELINE_SERVICE', idle: true }]);
+  const res = await resultFor(runner.tick(), 'PIPELINE_SERVICE');
+  assert.deepEqual(res, { role: 'PIPELINE_SERVICE', idle: true });
   assert.equal(http.calls.complete.length, 0);
 });
 
@@ -30,8 +37,8 @@ test('успех: claim -> execute -> complete(success=true) с output', async (
     roles: ['PIPELINE_SERVICE'],
     log: silent,
   });
-  const out = await runner.tick();
-  assert.deepEqual(out, [{ role: 'PIPELINE_SERVICE', taskId: 't1', success: true }]);
+  const res = await resultFor(runner.tick(), 'PIPELINE_SERVICE');
+  assert.deepEqual(res, { role: 'PIPELINE_SERVICE', taskId: 't1', success: true });
   assert.equal(http.calls.complete.length, 1);
   assert.deepEqual(http.calls.complete[0], { taskId: 't1', role: 'PIPELINE_SERVICE', success: true, output: { runId: 'r1' } });
   assert.equal(http.calls.release.length, 0);
@@ -45,7 +52,7 @@ test('вердикт-провал: complete(success=false), без release', asy
     roles: ['PIPELINE_SERVICE'],
     log: silent,
   });
-  await runner.tick();
+  await resultFor(runner.tick(), 'PIPELINE_SERVICE');
   assert.equal(http.calls.complete[0].success, false);
   assert.equal(http.calls.release.length, 0);
 });
@@ -58,8 +65,8 @@ test('сбой исполнителя (throw): release задачи, без comp
     roles: ['GIT_INTEGRATOR'],
     log: silent,
   });
-  const out = await runner.tick();
-  assert.equal(out[0].error, 'git boom');
+  const res = await resultFor(runner.tick(), 'GIT_INTEGRATOR');
+  assert.equal(res.error, 'git boom');
   assert.equal(http.calls.complete.length, 0);
   assert.deepEqual(http.calls.release, ['t3']);
 });
@@ -72,17 +79,60 @@ test('обе роли опрашиваются за тик', async () => {
     executors: { PIPELINE_SERVICE: async () => ({ success: true }), GIT_INTEGRATOR: async () => ({ success: true }) },
     log: silent,
   });
-  await runner.tick();
-  assert.deepEqual(seen, ['PIPELINE_SERVICE', 'GIT_INTEGRATOR']);
+  const out = runner.tick();
+  await Promise.all(out.map((o) => o.promise));
+  // При параллельном опросе порядок недетерминирован — проверяем членство, не порядок.
+  assert.deepEqual(new Set(seen), new Set(['PIPELINE_SERVICE', 'GIT_INTEGRATOR']));
 });
 
-test('tick не реэнтерабелен', async () => {
+test('per-role: повторный тик не входит в уже занятую роль (реэнтерабельность)', async () => {
   let active = 0;
   let maxActive = 0;
   const http = fakeHttp({
     claim: async () => { active += 1; maxActive = Math.max(maxActive, active); await new Promise((r) => setTimeout(r, 15)); active -= 1; return { task: null }; },
   });
   const runner = new HostRunner({ http, executors: { PIPELINE_SERVICE: async () => ({ success: true }) }, roles: ['PIPELINE_SERVICE'], log: silent });
-  await Promise.all([runner.tick(), runner.tick(), runner.tick()]);
+  const first = runner.tick();
+  // Пока действие роли в полёте — повторные тики должны её пропускать.
+  assert.deepEqual(runner.tick().map((o) => ({ role: o.role, skipped: o.skipped })), [{ role: 'PIPELINE_SERVICE', skipped: 'busy' }]);
+  assert.deepEqual(runner.tick().map((o) => ({ role: o.role, skipped: o.skipped })), [{ role: 'PIPELINE_SERVICE', skipped: 'busy' }]);
+  await Promise.all(first.map((o) => o.promise));
   assert.equal(maxActive, 1);
+});
+
+test('приёмка: зависший PIPELINE_SERVICE не мешает GIT_INTEGRATOR пройти claim->execute->complete', async () => {
+  let releasePipeline;
+  const pipelineHang = new Promise((r) => { releasePipeline = r; });
+  const http = fakeHttp({
+    claim: async (role) => {
+      if (role === 'PIPELINE_SERVICE') return { task: { id: 'p1', role } };
+      if (role === 'GIT_INTEGRATOR') return { task: { id: 'g1', role } };
+      return { task: null };
+    },
+  });
+  const runner = new HostRunner({
+    http,
+    executors: {
+      // Долгое действие: висит на незавершённом промисе (эмуляция docker build/up).
+      PIPELINE_SERVICE: async () => { await pipelineHang; return { success: true, output: {} }; },
+      GIT_INTEGRATOR: async () => ({ success: true, output: { merged: 'abc' } }),
+    },
+    log: silent,
+  });
+
+  const out = runner.tick();
+
+  // GIT_INTEGRATOR завершается, пока PIPELINE_SERVICE ещё висит.
+  const gitRes = await resultFor(out, 'GIT_INTEGRATOR');
+  assert.deepEqual(gitRes, { role: 'GIT_INTEGRATOR', taskId: 'g1', success: true });
+  assert.equal(http.calls.complete.length, 1);
+  assert.deepEqual(http.calls.complete[0], { taskId: 'g1', role: 'GIT_INTEGRATOR', success: true, output: { merged: 'abc' } });
+
+  // PIPELINE_SERVICE всё ещё в полёте: complete по нему не вызван, guard занят.
+  assert.equal(runner.inFlight.has('PIPELINE_SERVICE'), true);
+
+  // Отпускаем зависший pipeline и дожидаемся его завершения (чистка).
+  releasePipeline();
+  await resultFor(out, 'PIPELINE_SERVICE');
+  assert.equal(http.calls.complete.length, 2);
 });

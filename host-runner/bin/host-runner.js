@@ -72,7 +72,8 @@ const http = {
 };
 
 const executors = {
-  PIPELINE_SERVICE: (task) => runPipelineAction(task, { repoRoot: REPO_ROOT }),
+  // Пути pipeline берутся из контракта claim (task.pipeline), не из REPO_ROOT.
+  PIPELINE_SERVICE: (task) => runPipelineAction(task),
   GIT_INTEGRATOR: (task) => runGitAction(task, { repoRoot: REPO_ROOT }),
 };
 
@@ -146,9 +147,12 @@ let stopping = false;
 async function loop() {
   while (!stopping) {
     try {
-      const out = await runner.tick();
-      const acted = out.filter((o) => o && o.taskId);
-      if (acted.length) console.log('host-runner tick:', JSON.stringify(acted));
+      // Fire-and-forget: роли опрашиваются независимо, tick не ждёт долгих
+      // действий. Логирование завершений — в асинхронном пути pollRole
+      // (log.info 'host task completed'); тут только фиксируем старт/skip.
+      const out = runner.tick();
+      const started = out.filter((o) => o && o.started).map((o) => o.role);
+      if (started.length) console.log('host-runner tick started:', JSON.stringify(started));
     } catch (e) {
       console.error('host-runner tick error:', e.message);
     }

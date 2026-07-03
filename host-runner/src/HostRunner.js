@@ -17,23 +17,33 @@ export class HostRunner {
     this.executors = executors;
     this.roles = roles;
     this.log = log;
-    this.busy = false;
+    // Пер-ролевой guard реэнтерабельности: role -> Promise выполняемого действия.
+    // Роли развязаны — busy одной роли не блокирует опрос другой.
+    this.inFlight = new Map();
   }
 
-  // Один проход по всем host-ролям. Реэнтерабельность гасим флагом, чтобы
-  // длинный pipeline/commit не наступал на следующий тик.
-  async tick() {
-    if (this.busy) return [];
-    this.busy = true;
-    try {
-      const out = [];
-      for (const role of this.roles) {
-        out.push(await this.pollRole(role));
+  // Один проход по всем host-ролям. Роли опрашиваются независимо: pollRole для
+  // каждой свободной роли запускается fire-and-forget, а tick сразу возвращает
+  // статусы и НЕ ждёт долгих действий (docker build/up, git). Так длинный
+  // PIPELINE_SERVICE не мешает GIT_INTEGRATOR забирать задачи между тиками.
+  // Повторный опрос той же роли пропускается, пока её действие в полёте —
+  // реэнтерабельность сохраняется на уровне роли (одна роль = одно действие).
+  tick() {
+    const out = [];
+    for (const role of this.roles) {
+      if (this.inFlight.has(role)) {
+        out.push({ role, skipped: 'busy' });
+        continue;
       }
-      return out;
-    } finally {
-      this.busy = false;
+      // pollRole обрабатывает claim/throw/вердикт внутри и не бросает, но на
+      // всякий случай ловим, чтобы отказ роли не оставил guard навсегда занятым.
+      const promise = this.pollRole(role)
+        .catch((error) => ({ role, error: error?.message ?? String(error) }))
+        .finally(() => this.inFlight.delete(role));
+      this.inFlight.set(role, promise);
+      out.push({ role, started: true, promise });
     }
+    return out;
   }
 
   async pollRole(role) {
