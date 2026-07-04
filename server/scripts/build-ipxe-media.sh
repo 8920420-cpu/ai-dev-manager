@@ -22,7 +22,7 @@ mkdir -p "$OUT_DIR"
 docker run --rm -v "$OUT_DIR":/out debian:bookworm-slim sh -c "
   set -eu
   apt-get update -qq
-  apt-get install -y -qq git make gcc binutils perl liblzma-dev mtools genisoimage >/dev/null
+  apt-get install -y -qq git make gcc binutils perl liblzma-dev mtools genisoimage isolinux syslinux-common >/dev/null
   git clone -q --depth 1 https://github.com/ipxe/ipxe /ipxe
   cd /ipxe/src
   printf '#!ipxe\ndhcp\nchain http://$PXE_SERVER_IP:$PXE_HTTP_PORT/boot.ipxe\n' > embed.ipxe
