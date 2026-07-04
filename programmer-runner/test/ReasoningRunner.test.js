@@ -33,6 +33,22 @@ const okResult = (extra = {}) => ({
   tokensIn: 1500, tokensOut: 300, costUsd: 0.042, durationMs: 61000, ...extra,
 });
 
+// ROLE-TIMEOUT-001: персональный бюджет прогона по коду роли (Архитектору мега-эпика
+// общих 9 мин не хватало — обрыв на середине и перезапуск по кругу).
+test('roleTimeoutsMs: таймаут роли из карты, остальным — общий; мусор отбрасывается', () => {
+  const runner = new ReasoningRunner({
+    http: fakeHttp(), runAgent: async () => okResult(), log: silent,
+    taskTimeoutMs: 540000,
+    roleTimeoutsMs: { architect: 1200000, DECOMPOSER: 'мусор', TASK_REVIEWER: -5 },
+  });
+  assert.equal(runner.resolveTaskTimeoutMs('ARCHITECT'), 1200000, 'код роли нормализуется в верхний регистр');
+  assert.equal(runner.resolveTaskTimeoutMs('architect'), 1200000, 'роль задачи тоже нормализуется');
+  assert.equal(runner.resolveTaskTimeoutMs('DECOMPOSER'), 540000, 'нечисловое значение отброшено → общий');
+  assert.equal(runner.resolveTaskTimeoutMs('TASK_REVIEWER'), 540000, 'неположительное значение отброшено → общий');
+  assert.equal(runner.resolveTaskTimeoutMs(''), 540000, 'без роли — общий таймаут');
+  assert.equal(runner.resolveTaskTimeoutMs(null), 540000);
+});
+
 test('idle: нет задачи → ни complete, ни release', async () => {
   const http = fakeHttp();
   const runner = new ReasoningRunner({ http, runAgent: async () => okResult(), log: silent });

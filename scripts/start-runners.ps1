@@ -100,9 +100,15 @@ if (-not $env:ORCHESTRATOR_URL) { $env:ORCHESTRATOR_URL = 'http://localhost:4186
 # (напр. неожиданные 150000ms = унаследованный env, а не дефолт 540000).
 $codexTimeoutSrc  = if ($env:CODEX_TASK_TIMEOUT_MS) { 'env(inherited)' } else { 'default' }
 $claudeTimeoutSrc = if ($env:CLAUDE_REASONING_TASK_TIMEOUT_MS) { 'env(inherited)' } else { 'default' }
+$architectTimeoutSrc = if ($env:ARCHITECT_TASK_TIMEOUT_MS) { 'env(inherited)' } else { 'default' }
 if (-not $env:CODEX_TASK_TIMEOUT_MS)            { $env:CODEX_TASK_TIMEOUT_MS = '540000' }
 if (-not $env:CLAUDE_REASONING_TASK_TIMEOUT_MS) { $env:CLAUDE_REASONING_TASK_TIMEOUT_MS = '540000' }
-Write-Host "CONFIG: CODEX_TASK_TIMEOUT_MS=$($env:CODEX_TASK_TIMEOUT_MS) ($codexTimeoutSrc), CLAUDE_REASONING_TASK_TIMEOUT_MS=$($env:CLAUDE_REASONING_TASK_TIMEOUT_MS) ($claudeTimeoutSrc)"
+# ROLE-TIMEOUT-001 (2026-07-04): персональный бюджет Архитектора 20 мин. Пакетный
+# эпик виджета ПС (4 сервиса, пофайловые work_items) реально работал все 540с
+# (400-580k токенов входа за прогон) и обрывался на середине — 9 прогонов по кругу.
+# КОНТРАКТ: < RUNNER_ROLE_TIMEOUT_MS (орфан оркестратора, поднят до 1500000 в .env).
+if (-not $env:ARCHITECT_TASK_TIMEOUT_MS)        { $env:ARCHITECT_TASK_TIMEOUT_MS = '1200000' }
+Write-Host "CONFIG: CODEX_TASK_TIMEOUT_MS=$($env:CODEX_TASK_TIMEOUT_MS) ($codexTimeoutSrc), CLAUDE_REASONING_TASK_TIMEOUT_MS=$($env:CLAUDE_REASONING_TASK_TIMEOUT_MS) ($claudeTimeoutSrc), ARCHITECT_TASK_TIMEOUT_MS=$($env:ARCHITECT_TASK_TIMEOUT_MS) ($architectTimeoutSrc)"
 
 # CLAUDE-POOL-001 (2026-07-03): единый пул Claude-агентов на все рассуждающие роли —
 # минимум 3 одновременных агента (решение пользователя), дефолт 4. Значение обычно

@@ -19,14 +19,19 @@ const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
 // ставит 540000 (9 мин). effectiveConfig в логе показывает source/raw.
 const intervalCfg = resolveDuration('CODEX_INTERVAL_MS', 5000, { min: 200, max: 5 * 60_000 });
 const taskTimeoutCfg = resolveDuration('CODEX_TASK_TIMEOUT_MS', 10 * 60_000, { min: 30_000, max: 60 * 60_000 });
+// ROLE-TIMEOUT-001: персональный бюджет Архитектора. Пакетный эпик (4–5 сервисов с
+// пофайловыми work_items) не укладывается в общие 9 мин — прогон обрывался на
+// середине и перезапускался по кругу. КОНТРАКТ: < RUNNER_ROLE_TIMEOUT_MS (орфан).
+const architectTimeoutCfg = resolveDuration('ARCHITECT_TASK_TIMEOUT_MS', 20 * 60_000, { min: 30_000, max: 60 * 60_000 });
 const concurrencyCfg = resolveInt('CODEX_CONCURRENCY', 2, { min: 1, max: 8 });
 // PROVIDER-LIMIT-COOLDOWN-002: пауза при превышении лимита подписки/квоты/троттлинге
 // (дефолт 1 час — настройка). По истечении раннер сначала ПРОВЕРЯЕТ движок (probe),
 // и только если проверка прошла — снова берёт задачи (см. ReasoningRunner).
 const providerCooldownCfg = resolveDuration('CODEX_PROVIDER_COOLDOWN_MS', 60 * 60_000, { min: 60_000, max: 6 * 60 * 60_000 });
-logEffectiveConfig('codex-runner', [intervalCfg, taskTimeoutCfg, concurrencyCfg, providerCooldownCfg]);
+logEffectiveConfig('codex-runner', [intervalCfg, taskTimeoutCfg, architectTimeoutCfg, concurrencyCfg, providerCooldownCfg]);
 const INTERVAL_MS = intervalCfg.value;
 const TASK_TIMEOUT_MS = taskTimeoutCfg.value;
+const ARCHITECT_TIMEOUT_MS = architectTimeoutCfg.value;
 const CONCURRENCY = concurrencyCfg.value;
 const PROVIDER_COOLDOWN_MS = providerCooldownCfg.value;
 // Если задан CODEX_ROLE — раннер опрашивает только эту роль (полезно разнести
@@ -69,6 +74,8 @@ const http = {
 const runAgent = makeCodexRunAgent();
 const runner = new ReasoningRunner({
   http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY, providerCooldownMs: PROVIDER_COOLDOWN_MS,
+  // ROLE-TIMEOUT-001: Архитектору — расширенный бюджет прогона (см. контракт выше).
+  roleTimeoutsMs: { ARCHITECT: ARCHITECT_TIMEOUT_MS },
 });
 
 // Видимость песочницы в логе: bypass снимает per-command sandbox-spawn (главный

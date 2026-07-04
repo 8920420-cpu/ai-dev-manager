@@ -2193,7 +2193,10 @@ export async function claimNextReasoningTask(s, engineParam = null, roleParam = 
     const roleSystem = await composeRoleSystemPrompt(c, claimed.role_code);
     // ARCHITECT-TURN-CAP-001: персональный кап ходов роли (рунавей-гард). Драйвер
     // claude_code применит его вместо своего дефолта; codex maxTurns игнорирует.
-    const roleMaxTurns = resolveRoleMaxTurns(claimed.role_code);
+    // ARCHITECT-BUDGET-SCALE-001: для Архитектора кап масштабируется размером эпика
+    // (число сервисов/фронтов в описании + длина описания) — мега-эпику одного
+    // фиксированного капа не хватает продумать разбивку за один прогон.
+    const roleMaxTurns = resolveRoleMaxTurns(claimed.role_code, { description: claimed.description });
     // PROMPT-CACHE-001: для claude_code выносим СТАТИЧНУЮ часть (промт роли + карта) в
     // system-префикс — драйвер держит его в кэше (SYSTEM_PROMPT_DYNAMIC_BOUNDARY, 5-мин
     // ephemeral), и повторные claim'ы того же проекта/роли не переоплачивают карту. У
@@ -2449,7 +2452,22 @@ const PROGRAMMER_RELEASE_BACKOFF_MS = parseBackoffScheduleMs(
 );
 const programmerLoopMaxCfg = resolveInt('PROGRAMMER_RELEASE_LOOP_MAX', 5, { min: 1, max: 1000 });
 const PROGRAMMER_RELEASE_LOOP_MAX = programmerLoopMaxCfg.value;
+// ARCHITECT-BUDGET-LOOP-001: сколько подряд CANCELLED/TIMEOUT-прогонов Архитектора
+// (мега-эпик не влезает в бюджет одного прогона) уводят задачу в BLOCKED С ПРИЧИНОЙ.
+// Дефолт 3 — по инциденту («три CANCELLED подряд по таймауту»). Настройка.
+const architectBudgetLoopMaxCfg = resolveInt('ARCHITECT_BUDGET_LOOP_MAX', 3, { min: 1, max: 100 });
+const ARCHITECT_BUDGET_LOOP_MAX = architectBudgetLoopMaxCfg.value;
+// Человекочитаемая причина блока (кладём и в карточку задачи, и в событие).
+const ARCHITECT_BUDGET_BLOCK_REASON = 'Архитектор не уложился в бюджет: несколько прогонов подряд отменены по таймауту рассуждения — задача слишком крупная. Разбейте эпик на пакеты по 4–5 сервисов/фронтов и верните в ARCHITECTURE, либо увеличьте бюджет ходов/времени Архитектора.';
+// TASK-RUN-LOOP-CAP-001: общий предохранитель для ЛЮБОЙ роли — K подряд
+// CANCELLED/TIMEOUT-прогонов этапа → BLOCKED с причиной («пуск руками»). Порог выше
+// архитекторского (узкие жнецы срабатывают раньше со своим диагнозом). Настройка.
+const taskRunLoopMaxCfg = resolveInt('TASK_RUN_LOOP_MAX', 5, { min: 1, max: 1000 });
+const TASK_RUN_LOOP_MAX = taskRunLoopMaxCfg.value;
+const TASK_RUN_LOOP_BLOCK_REASON = 'Автоматика остановлена: несколько прогонов этапа подряд оборваны без результата (таймаут/отмена) — задача перезапускалась по кругу и жгла токены. Разберите причину (лог прогонов этапа, бюджет времени роли) и запустите вручную: переместите задачу на нужный этап.';
 logEffectiveConfig('programmer release loop', [programmerLoopMaxCfg]);
+logEffectiveConfig('architect budget loop', [architectBudgetLoopMaxCfg]);
+logEffectiveConfig('task run loop cap', [taskRunLoopMaxCfg]);
 console.log(`programmer release backoff schedule (ms)=${JSON.stringify(PROGRAMMER_RELEASE_BACKOFF_MS)}`);
 
 // --- Динамический маршрут проекта (PIPELINE-DYNAMIC-ROUTE-001) ---------------
@@ -2677,6 +2695,15 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // claimNextClaudeTask лишь тормозит захват, а этот свипер разрывает петлю, чтобы
     // задача не молотила часами и не держала единственный слот программиста.
     await escalateProgrammerReleaseLoop(c);
+    // ARCHITECT-BUDGET-LOOP-001: Архитектор, K раз подряд отменённый/просроченный по
+    // reasoning-таймауту на мега-эпике, уводится в BLOCKED С ВНЯТНОЙ ПРИЧИНОЙ (в
+    // карточке и событии), а не молча — чтобы человек видел «задача слишком крупная,
+    // разбейте на пакеты или увеличьте бюджет», а не пустой блок без диагноза.
+    await escalateArchitectBudgetLoop(c);
+    // TASK-RUN-LOOP-CAP-001: общий предохранитель — ЛЮБАЯ роль, K раз подряд
+    // оборванная без вердикта (CANCELLED/TIMEOUT), останавливается в BLOCKED с
+    // причиной в карточке; дальше пуск руками (move на этап после разбора).
+    await escalateRunawayRoleLoops(c);
     // DOC-BRANCH-LIVENESS-001: документационная fork-ветвь не должна заклинивать
     // родителя на join. Мёртвую ветку документации (BLOCKED/FAILED/исчерпание попыток)
     // продвигаем на узел вперёд к join ДО снятия join-барьера, чтобы родитель поехал.
@@ -2959,10 +2986,14 @@ async function advanceSkippedStageRoles(c) {
 }
 
 /**
- * FORK-JOIN-001 (Phase 4) — расщепление в узле fork. Родитель (parent_task_id IS
- * NULL), доехавший до узла kind='fork' (current_stage_key), порождает по подзадаче
- * на каждую исходящую ветку и паркуется на парном join в WAITING_FOR_CHILDREN.
- * Идемпотентно: расщепляем только если детей ещё нет. Один txn на родителя.
+ * FORK-JOIN-001 (Phase 4) — расщепление в узле fork. Задача, доехавшая до узла
+ * kind='fork' (current_stage_key), порождает по подзадаче на каждую исходящую
+ * ветку и паркуется на парном join в WAITING_FOR_CHILDREN.
+ * FORK-CHILD-001: расщепляется и ДОЧЕРНЯЯ задача (сервисная подзадача эпика) —
+ * раньше `parent_task_id IS NULL` навсегда заклинивал детей на fork-узле (Git
+ * Integrator не запускался, деливеребл не коммитился). Идемпотентно: расщепляем,
+ * только если НЕЗАВЕРШЁННЫХ детей нет (терминальные дети прошлого прохода fork не
+ * блокируют повторный проход после REWORK). Один txn на задачу.
  */
 export async function advanceForkNodes(c) {
   const parents = await c.query(
@@ -2973,9 +3004,9 @@ export async function advanceForkNodes(c) {
        JOIN project_stages ps
          ON ps.project_id = t.project_id AND ps.stage_key = t.current_stage_key AND ps.kind = 'fork'
       WHERE t.assigned_agent_id IS NULL
-        AND t.parent_task_id IS NULL
         AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
-        AND NOT EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id)
+        AND NOT EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id
+                          AND ch.status NOT IN ('DONE','CANCELLED','FAILED'))
       FOR UPDATE OF t SKIP LOCKED`,
   );
   let forked = 0;
@@ -3041,7 +3072,9 @@ export async function advanceForkNodes(c) {
  */
 export async function advanceJoinNodes(c) {
   let advanced = 0;
-  // (1) Дети на join → DONE.
+  // (1) Дети на join → DONE. FORK-CHILD-001: WAITING_FOR_CHILDREN исключён — это
+  // ребёнок, сам ставший fork-родителем и припаркованный на join; его завершает
+  // шаг (2), когда его собственные ветки станут терминальными.
   const kids = await c.query(
     `SELECT t.id, t.status::text AS status, t.current_role_id
        FROM tasks t
@@ -3049,7 +3082,7 @@ export async function advanceJoinNodes(c) {
          ON ps.project_id = t.project_id AND ps.stage_key = t.current_stage_key AND ps.kind = 'join'
       WHERE t.parent_task_id IS NOT NULL
         AND t.assigned_agent_id IS NULL
-        AND t.status NOT IN ('DONE','CANCELLED','FAILED')
+        AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
       FOR UPDATE OF t SKIP LOCKED`,
   );
   for (const k of kids.rows) {
@@ -3075,14 +3108,15 @@ export async function advanceJoinNodes(c) {
     }
   }
 
-  // (2) Родители на join со всеми терминальными детьми → снять барьер.
+  // (2) Fork-родители на join со всеми терминальными детьми → снять барьер.
+  // FORK-CHILD-001: без фильтра parent_task_id — припаркованный на join может быть
+  // и сервисным ребёнком эпика, ставшим fork-родителем своих веток.
   const parents = await c.query(
     `SELECT t.id, t.project_id, t.status::text AS status, t.current_role_id, t.current_stage_key, t.data_card
        FROM tasks t
        JOIN project_stages ps
          ON ps.project_id = t.project_id AND ps.stage_key = t.current_stage_key AND ps.kind = 'join'
-      WHERE t.parent_task_id IS NULL
-        AND t.status = 'WAITING_FOR_CHILDREN'
+      WHERE t.status = 'WAITING_FOR_CHILDREN'
         AND t.assigned_agent_id IS NULL
         AND EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id)
         AND NOT EXISTS (
@@ -3501,6 +3535,111 @@ export async function escalateProgrammerReleaseLoop(c, maxFails = PROGRAMMER_REL
             jsonb_build_object('runner', true, 'reason', 'programmer_release_loop', 'failedRuns', b.n_fail)
        FROM blocked b`,
     [Math.max(1, Number(maxFails) || 1)],
+  );
+  return r.rowCount;
+}
+
+// ARCHITECT-BUDGET-LOOP-001 — диагностика мега-эпика, который Архитектор НЕ успевает
+// продумать за один прогон. Мега-эпик (раскатка на N сервисов/фронтов с пофайловыми
+// инструкциями) упирается в reasoning-таймаут раннера БЕЗ вердикта: прогон отменяется
+// (CANCELLED через release-reasoning-task) либо гасится жнецом (TIMEOUT), задача
+// переигрывается — и так по кругу, а без диагноза уходит в молчаливый BLOCKED. Здесь:
+// после K = maxCancels ПОДРЯД отменённых/просроченных прогонов Архитектора (после
+// последнего SUCCESS) уводим ARCHITECTURE-задачу в BLOCKED, но С ВНЯТНОЙ ПРИЧИНОЙ —
+// кладём её и в data_card задачи (видно в карточке), и в TASK_BLOCKED-событие. Причина
+// подсказывает действие: разбить эпик на пакеты 4–5 сервисов или увеличить бюджет.
+// Успешный прогон обнуляет счётчик (окно считается после последнего SUCCESS), поэтому
+// на здоровом пути порог не достигается. Один свипер в преамбуле advanceAutomatedTasks
+// рядом с escalateProgrammerReleaseLoop — независимо от раннера/движка.
+export async function escalateArchitectBudgetLoop(c, maxCancels = ARCHITECT_BUDGET_LOOP_MAX, reason = ARCHITECT_BUDGET_BLOCK_REASON) {
+  const r = await c.query(
+    `WITH loop_tasks AS (
+       SELECT t.id, t.status::text AS status, t.current_role_id, cd.n_cancel
+         FROM tasks t
+         JOIN roles r ON r.id = t.current_role_id
+         CROSS JOIN LATERAL (
+           SELECT count(*) AS n_cancel
+             FROM agent_runs ar
+            WHERE ar.task_id = t.id
+              AND ar.role_id = t.current_role_id
+              AND ar.status IN ('CANCELLED','TIMEOUT')
+              AND ar.finished_at IS NOT NULL
+              AND ar.finished_at > COALESCE((
+                    SELECT max(ok.finished_at) FROM agent_runs ok
+                     WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
+                       AND ok.status = 'SUCCESS'), '-infinity'::timestamptz)
+         ) cd
+        WHERE t.status = 'ARCHITECTURE'
+          AND t.assigned_agent_id IS NULL
+          AND r.code = 'ARCHITECT'
+          AND cd.n_cancel >= $1
+     ), blocked AS (
+       UPDATE tasks t
+          SET status = 'BLOCKED', assigned_agent_id = NULL,
+              data_card = COALESCE(t.data_card, '{}'::jsonb) || jsonb_build_object(
+                'architect_budget_block',
+                jsonb_build_object('reason', $2::text, 'cancelledRuns', lt.n_cancel))
+         FROM loop_tasks lt
+        WHERE t.id = lt.id AND t.status = 'ARCHITECTURE'
+        RETURNING t.id, lt.status AS from_status, lt.current_role_id AS from_role, lt.n_cancel
+     )
+     INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     SELECT b.id, 'TASK_BLOCKED', b.from_status::task_status, 'BLOCKED', b.from_role,
+            jsonb_build_object('runner', true, 'reason', 'architect_budget_exhausted',
+              'cancelledRuns', b.n_cancel, 'detail', $2::text)
+       FROM blocked b`,
+    [Math.max(1, Number(maxCancels) || 1), reason],
+  );
+  return r.rowCount;
+}
+
+// TASK-RUN-LOOP-CAP-001 — общий предохранитель от бесконечных перезапусков ЛЮБОГО
+// этапа. Прогон, оборванный без вердикта (CANCELLED через release, TIMEOUT от
+// жнеца), возвращает задачу в очередь — и без порога она перезапускается по кругу,
+// жжёт токены, а в UI этап выглядит как «не оставил структурированного результата».
+// После K = maxCancels ПОДРЯД безрезультатных прогонов текущей роли (окно — после
+// последнего SUCCESS этой роли) задача уводится в BLOCKED с внятной причиной в
+// data_card (auto_run_limit — видно в карточке) и TASK_BLOCKED-событии: дальше —
+// пуск руками (разобраться и переместить задачу на этап через move). Узкие жнецы
+// (Архитектор — ARCHITECT_BUDGET_LOOP_MAX=3, аналитик, программист) срабатывают
+// раньше со своими порогами/диагнозами; этот — страховка для всех остальных ролей.
+export async function escalateRunawayRoleLoops(c, maxCancels = TASK_RUN_LOOP_MAX, reason = TASK_RUN_LOOP_BLOCK_REASON) {
+  const r = await c.query(
+    `WITH loop_tasks AS (
+       SELECT t.id, t.status::text AS status, t.current_role_id, r.code AS role_code, cd.n_cancel
+         FROM tasks t
+         JOIN roles r ON r.id = t.current_role_id
+         CROSS JOIN LATERAL (
+           SELECT count(*) AS n_cancel
+             FROM agent_runs ar
+            WHERE ar.task_id = t.id
+              AND ar.role_id = t.current_role_id
+              AND ar.status IN ('CANCELLED','TIMEOUT')
+              AND ar.finished_at IS NOT NULL
+              AND ar.finished_at > COALESCE((
+                    SELECT max(ok.finished_at) FROM agent_runs ok
+                     WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
+                       AND ok.status = 'SUCCESS'), '-infinity'::timestamptz)
+         ) cd
+        WHERE t.status NOT IN ('DONE','CANCELLED','FAILED','BLOCKED','WAITING_FOR_CHILDREN')
+          AND t.assigned_agent_id IS NULL
+          AND cd.n_cancel >= $1
+     ), blocked AS (
+       UPDATE tasks t
+          SET status = 'BLOCKED', assigned_agent_id = NULL,
+              data_card = COALESCE(t.data_card, '{}'::jsonb) || jsonb_build_object(
+                'auto_run_limit',
+                jsonb_build_object('reason', $2::text, 'cancelledRuns', lt.n_cancel, 'role', lt.role_code))
+         FROM loop_tasks lt
+        WHERE t.id = lt.id AND t.status NOT IN ('DONE','CANCELLED','FAILED','BLOCKED')
+        RETURNING t.id, lt.status AS from_status, lt.current_role_id AS from_role, lt.role_code, lt.n_cancel
+     )
+     INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     SELECT b.id, 'TASK_BLOCKED', b.from_status::task_status, 'BLOCKED', b.from_role,
+            jsonb_build_object('runner', true, 'reason', 'run_budget_exhausted',
+              'role', b.role_code, 'cancelledRuns', b.n_cancel, 'detail', $2::text)
+       FROM blocked b`,
+    [Math.max(1, Number(maxCancels) || 1), reason],
   );
   return r.rowCount;
 }

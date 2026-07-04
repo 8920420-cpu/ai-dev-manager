@@ -522,16 +522,73 @@ export const MAP_ROLES = new Set([...RESEARCH_ROLES, 'TASK_INTAKE_OFFICER']);
 // файлов. null → драйвер использует свой дефолт.
 export const ROLE_MAX_TURNS_DEFAULTS = { ARCHITECT: 24 };
 
-export function resolveRoleMaxTurns(roleCode) {
+// ARCHITECT-BUDGET-SCALE-001 — размер эпика масштабирует кап ходов Архитектора.
+// Мега-эпик (раскатка на N сервисов/фронтов с пофайловыми инструкциями на каждый)
+// не укладывается в фиксированный кап 24 хода за один прогон. Сигнал размера на
+// КЛЕЙМЕ доступен только из описания задачи (work_items ещё не созданы — их
+// ПРОИЗВОДИТ Архитектор): берём (а) явное число сервисов/фронтов, названное в
+// описании («раскатка на 14 фронтов»), и (б) длину описания как прокси объёма.
+// Кап растёт линейно от базового, но жёстко ограничен потолком (рунавей-гард
+// сохраняется). Значения — настройка (ARCHITECT_TURN_SCALE_* можно переопределить
+// в будущем; сейчас — консервативные дефолты).
+export const ARCHITECT_TURN_SCALE = {
+  perService: 3,   // +ходов на каждый сервис/фронт сверх базовых двух
+  perKChars: 2,    // +ходов на каждую 1000 знаков описания сверх baseChars
+  baseServices: 2, // до 2 сервисов надбавки нет (одиночная/парная задача)
+  baseChars: 2000, // до 2000 знаков описания надбавки нет
+  max: 60,         // жёсткий потолок ходов Архитектора
+};
+
+// Оценить размер эпика по описанию: максимум явно НАЗВАННОГО числа сервисов/фронтов
+// (например «14 фронтов», «на 14 сервисов», «14-сервисном эпике»). 0 — если в
+// описании нет такого явного числа. Регистронезависимо, допускает дефис-разделитель.
+export function estimateEpicServiceCount(text) {
+  const s = String(text ?? '');
+  if (!s) return 0;
+  const re = /(\d{1,3})[\s-]*(?:фронт|сервис|микросервис|services|service|fronts|front)/giu;
+  let max = 0;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return max;
+}
+
+// Масштабировать базовый кап ходов Архитектора по размеру эпика (из описания).
+// Берём СИЛЬНЕЙШИЙ из двух сигналов (число сервисов ИЛИ длина описания), надбавку
+// ограничиваем потолком. Явно заданный env-кап ВЫШЕ потолка не понижаем.
+function scaleArchitectMaxTurns(base, sizeCtx) {
+  const cfg = ARCHITECT_TURN_SCALE;
+  const desc = typeof sizeCtx === 'string' ? sizeCtx : String(sizeCtx?.description ?? '');
+  if (!desc) return base;
+  const services = estimateEpicServiceCount(desc);
+  const extraServices = Math.max(0, services - cfg.baseServices) * cfg.perService;
+  const extraChars = Math.floor(Math.max(0, desc.length - cfg.baseChars) / 1000) * cfg.perKChars;
+  const extra = Math.max(0, extraServices, extraChars);
+  const scaled = base + extra;
+  return scaled <= cfg.max ? scaled : Math.max(base, cfg.max);
+}
+
+// resolveRoleMaxTurns(roleCode, sizeCtx?) — кап ходов роли. Без sizeCtx (совместимость)
+// возвращает прежнее фиксированное значение. С sizeCtx (объект { description } или
+// строка описания) ARCHITECT-BUDGET-SCALE-001 масштабирует ТОЛЬКО кап Архитектора по
+// размеру эпика; прочие роли не масштабируются.
+export function resolveRoleMaxTurns(roleCode, sizeCtx = null) {
   const code = String(roleCode ?? '').trim();
   if (!code) return null;
   const raw = process.env[`${code}_MAX_TURNS`];
   const envN = Number(raw);
+  let base;
   if (raw != null && String(raw).trim() !== '' && Number.isFinite(envN) && envN > 0) {
-    return Math.trunc(envN);
+    base = Math.trunc(envN);
+  } else {
+    const def = ROLE_MAX_TURNS_DEFAULTS[code];
+    base = Number.isFinite(def) && def > 0 ? Math.trunc(def) : null;
   }
-  const def = ROLE_MAX_TURNS_DEFAULTS[code];
-  return Number.isFinite(def) && def > 0 ? Math.trunc(def) : null;
+  if (base == null) return null;
+  if (code !== 'ARCHITECT' || !sizeCtx) return base;
+  return scaleArchitectMaxTurns(base, sizeCtx);
 }
 
 // RESEARCH-BUDGET-001 — жёсткий бюджет разведки для исследующих ролей. Дописывается

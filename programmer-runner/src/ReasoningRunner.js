@@ -21,10 +21,14 @@ export class ReasoningRunner {
    * @param {number} [deps.taskTimeoutMs]  жёсткий таймаут на задачу; ДОЛЖЕН быть
    *   меньше орфан-таймаута оркестратора (RUNNER_ROLE_TIMEOUT_MS≈15 мин), иначе
    *   реапер освободит захват раньше нас и мы сдадим его «вхолостую».
+   * @param {Object<string,number>} [deps.roleTimeoutsMs]  ROLE-TIMEOUT-001:
+   *   персональные таймауты по коду роли (ключ — ROLE_CODE). Архитектору мега-эпика
+   *   общего reasoning-бюджета не хватает (обрыв на середине → перезапуск по кругу).
+   *   Контракт «< орфан-таймаута» обязателен для КАЖДОГО значения карты.
    * @param {number} [deps.concurrency]
    * @param {Console} [deps.log]
    */
-  constructor({ http, runAgent, taskTimeoutMs = 10 * 60 * 1000, concurrency = 2,
+  constructor({ http, runAgent, taskTimeoutMs = 10 * 60 * 1000, roleTimeoutsMs = {}, concurrency = 2,
                 providerCooldownMs = 60 * 60 * 1000, probeTask = null,
                 now = () => Date.now(), log = console } = {}) {
     if (!http) throw new Error('ReasoningRunner: http required');
@@ -32,6 +36,13 @@ export class ReasoningRunner {
     this.http = http;
     this.runAgent = runAgent;
     this.taskTimeoutMs = taskTimeoutMs;
+    // Нормализуем карту ролевых таймаутов: код роли — верхним регистром, значение —
+    // конечное положительное число; мусор отбрасываем (падать из-за конфига нельзя).
+    this.roleTimeoutsMs = {};
+    for (const [role, ms] of Object.entries(roleTimeoutsMs || {})) {
+      const n = Number(ms);
+      if (Number.isFinite(n) && n > 0) this.roleTimeoutsMs[String(role).trim().toUpperCase()] = n;
+    }
     this.concurrency = Math.max(1, Number(concurrency) || 1);
     // PROVIDER-LIMIT-COOLDOWN-002: при «мягком» отказе движка (превышение лимита
     // подписки/квоты/троттлинг/перегрузка) останавливаем приём задач на
@@ -50,6 +61,12 @@ export class ReasoningRunner {
 
   get availableSlots() {
     return Math.max(0, this.concurrency - this.inFlight);
+  }
+
+  // ROLE-TIMEOUT-001: жёсткий таймаут прогона для конкретной роли — из карты
+  // roleTimeoutsMs, иначе общий taskTimeoutMs.
+  resolveTaskTimeoutMs(role) {
+    return this.roleTimeoutsMs[String(role || '').trim().toUpperCase()] ?? this.taskTimeoutMs;
   }
 
   // «Мягкий» отказ провайдера — лимит подписки/квоты/троттлинг/перегрузка. Долбить
@@ -141,7 +158,7 @@ export class ReasoningRunner {
     if (!task) return { idle: true };
 
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), this.taskTimeoutMs);
+    const timer = setTimeout(() => ac.abort(), this.resolveTaskTimeoutMs(task.role));
     let agentResult;
     try {
       agentResult = await this.runAgent(task, { signal: ac.signal });

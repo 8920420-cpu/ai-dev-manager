@@ -22,14 +22,19 @@ const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
 // унаследованного окружения, а не из дефолта (см. CONFIG_AUDIT.md).
 const intervalCfg = resolveDuration('CLAUDE_REASONING_INTERVAL_MS', 5000, { min: 200, max: 5 * 60_000 });
 const taskTimeoutCfg = resolveDuration('CLAUDE_REASONING_TASK_TIMEOUT_MS', 10 * 60_000, { min: 30_000, max: 60 * 60_000 });
+// ROLE-TIMEOUT-001: персональный бюджет Архитектора. Пакетный эпик (4–5 сервисов с
+// пофайловыми work_items) не укладывается в общие 9 мин — прогон обрывался на
+// середине и перезапускался по кругу. КОНТРАКТ: < RUNNER_ROLE_TIMEOUT_MS (орфан).
+const architectTimeoutCfg = resolveDuration('ARCHITECT_TASK_TIMEOUT_MS', 20 * 60_000, { min: 30_000, max: 60 * 60_000 });
 const concurrencyCfg = resolveInt('CLAUDE_REASONING_CONCURRENCY', 2, { min: 1, max: 8 });
 // PROVIDER-LIMIT-COOLDOWN-002: пауза при превышении лимита подписки Claude/квоты/
 // перегрузке (дефолт 1 час — настройка). По истечении раннер сначала ПРОВЕРЯЕТ движок
 // (probe) и только при успехе снова берёт задачи (см. ReasoningRunner).
 const providerCooldownCfg = resolveDuration('CLAUDE_REASONING_PROVIDER_COOLDOWN_MS', 60 * 60_000, { min: 60_000, max: 6 * 60 * 60_000 });
-logEffectiveConfig('claude-reasoning-runner', [intervalCfg, taskTimeoutCfg, concurrencyCfg, providerCooldownCfg]);
+logEffectiveConfig('claude-reasoning-runner', [intervalCfg, taskTimeoutCfg, architectTimeoutCfg, concurrencyCfg, providerCooldownCfg]);
 const INTERVAL_MS = intervalCfg.value;
 const TASK_TIMEOUT_MS = taskTimeoutCfg.value;
+const ARCHITECT_TIMEOUT_MS = architectTimeoutCfg.value;
 const CONCURRENCY = concurrencyCfg.value;
 const PROVIDER_COOLDOWN_MS = providerCooldownCfg.value;
 // Если задан CLAUDE_REASONING_ROLE — опрашиваем только её, иначе любую роль,
@@ -79,6 +84,8 @@ const http = {
 const runAgent = makeClaudeReasoningRunAgent();
 const runner = new ReasoningRunner({
   http, runAgent, taskTimeoutMs: TASK_TIMEOUT_MS, concurrency: CONCURRENCY, providerCooldownMs: PROVIDER_COOLDOWN_MS,
+  // ROLE-TIMEOUT-001: Архитектору — расширенный бюджет прогона (см. контракт выше).
+  roleTimeoutsMs: { ARCHITECT: ARCHITECT_TIMEOUT_MS },
 });
 
 console.log(`claude-reasoning-runner: orchestrator=${ORCH}, рассуждающие роли через Claude Code, role=${ROLE || 'любая делегированная'}`);

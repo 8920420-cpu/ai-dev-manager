@@ -18,6 +18,8 @@ import {
   promptHash,
   recordPromptVersion,
   resolveRoleMaxTurns,
+  estimateEpicServiceCount,
+  ARCHITECT_TURN_SCALE,
 } from '../src/roles.js';
 import { readFile } from 'node:fs/promises';
 
@@ -46,6 +48,91 @@ test('resolveRoleMaxTurns: env ${ROLE}_MAX_TURNS переопределяет д
     assert.equal(resolveRoleMaxTurns('ARCHITECT'), 24);
     process.env.ARCHITECT_MAX_TURNS = 'abc'; // мусор → дефолт
     assert.equal(resolveRoleMaxTurns('ARCHITECT'), 24);
+  } finally {
+    if (prev === undefined) delete process.env.ARCHITECT_MAX_TURNS;
+    else process.env.ARCHITECT_MAX_TURNS = prev;
+  }
+});
+
+// --- ARCHITECT-BUDGET-SCALE-001: масштабирование капа ходов по размеру эпика --
+
+test('estimateEpicServiceCount: явное число сервисов/фронтов из описания', () => {
+  assert.equal(estimateEpicServiceCount('раскатка виджета на 14 фронтов ПС'), 14);
+  assert.equal(estimateEpicServiceCount('эпик на 14 сервисов'), 14);
+  assert.equal(estimateEpicServiceCount('на 14-сервисном эпике'), 14);
+  assert.equal(estimateEpicServiceCount('rollout across 8 services'), 8);
+  // Берём МАКСИМУМ из нескольких упоминаний.
+  assert.equal(estimateEpicServiceCount('2 фронта сейчас, потом ещё 12 сервисов'), 12);
+  // Нет явного числа — 0.
+  assert.equal(estimateEpicServiceCount('обычная правка одного файла'), 0);
+  assert.equal(estimateEpicServiceCount(''), 0);
+  assert.equal(estimateEpicServiceCount(null), 0);
+});
+
+test('resolveRoleMaxTurns: без sizeCtx — прежнее фиксированное значение (совместимость)', () => {
+  const prev = process.env.ARCHITECT_MAX_TURNS;
+  delete process.env.ARCHITECT_MAX_TURNS;
+  try {
+    assert.equal(resolveRoleMaxTurns('ARCHITECT'), 24);
+    // Пустой/бессодержательный sizeCtx не меняет базу.
+    assert.equal(resolveRoleMaxTurns('ARCHITECT', { description: '' }), 24);
+    assert.equal(resolveRoleMaxTurns('ARCHITECT', 'мелкая правка'), 24);
+  } finally {
+    if (prev === undefined) delete process.env.ARCHITECT_MAX_TURNS;
+    else process.env.ARCHITECT_MAX_TURNS = prev;
+  }
+});
+
+test('resolveRoleMaxTurns: мега-эпик на 14 фронтов масштабирует кап (до потолка)', () => {
+  const prev = process.env.ARCHITECT_MAX_TURNS;
+  delete process.env.ARCHITECT_MAX_TURNS;
+  try {
+    const turns = resolveRoleMaxTurns('ARCHITECT', { description: 'раскатка виджета на 14 фронтов ПС' });
+    // База 24 + (14-2)*3 = 60 → упирается в потолок.
+    assert.equal(turns, ARCHITECT_TURN_SCALE.max);
+    assert.ok(turns > 24, 'кап вырос относительно базового 24');
+    // Строка-описание принимается напрямую.
+    assert.equal(resolveRoleMaxTurns('ARCHITECT', 'на 14 сервисов'), ARCHITECT_TURN_SCALE.max);
+  } finally {
+    if (prev === undefined) delete process.env.ARCHITECT_MAX_TURNS;
+    else process.env.ARCHITECT_MAX_TURNS = prev;
+  }
+});
+
+test('resolveRoleMaxTurns: эпик среднего размера растёт линейно и не превышает потолок', () => {
+  const prev = process.env.ARCHITECT_MAX_TURNS;
+  delete process.env.ARCHITECT_MAX_TURNS;
+  try {
+    // 5 сервисов: 24 + (5-2)*3 = 33.
+    assert.equal(resolveRoleMaxTurns('ARCHITECT', { description: 'работа на 5 сервисов' }), 33);
+    // Длинное описание (прокси объёма): 6000 знаков → 24 + floor((6000-2000)/1000)*2 = 32.
+    assert.equal(resolveRoleMaxTurns('ARCHITECT', { description: 'x'.repeat(6000) }), 32);
+    // Никогда не выше потолка.
+    assert.ok(resolveRoleMaxTurns('ARCHITECT', { description: 'на 99 сервисов' }) <= ARCHITECT_TURN_SCALE.max);
+  } finally {
+    if (prev === undefined) delete process.env.ARCHITECT_MAX_TURNS;
+    else process.env.ARCHITECT_MAX_TURNS = prev;
+  }
+});
+
+test('resolveRoleMaxTurns: масштабируется только ARCHITECT, прочие роли — без изменений', () => {
+  // Для НЕ-Архитектора sizeCtx не влияет: результат такой же, как без sizeCtx
+  // (робастно к ambient-env вроде PROGRAMMER_MAX_TURNS). У ролей без env/дефолта — null.
+  const bigEpic = { description: 'на 14 сервисов' };
+  for (const role of ['TASK_REVIEWER', 'PROGRAMMER', 'DECOMPOSER']) {
+    assert.equal(
+      resolveRoleMaxTurns(role, bigEpic),
+      resolveRoleMaxTurns(role),
+      `${role}: sizeCtx не меняет кап (масштабируется только ARCHITECT)`,
+    );
+  }
+});
+
+test('resolveRoleMaxTurns: явный env-кап выше потолка не понижается масштабированием', () => {
+  const prev = process.env.ARCHITECT_MAX_TURNS;
+  try {
+    process.env.ARCHITECT_MAX_TURNS = '100'; // оператор задал большой кап явно
+    assert.equal(resolveRoleMaxTurns('ARCHITECT', { description: 'на 14 сервисов' }), 100);
   } finally {
     if (prev === undefined) delete process.env.ARCHITECT_MAX_TURNS;
     else process.env.ARCHITECT_MAX_TURNS = prev;
