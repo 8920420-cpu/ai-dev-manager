@@ -49,12 +49,18 @@ export class FakeExecutor {
   async run(command, opts = {}) {
     this.calls.push({ command, opts });
     const preset = this.table[command] ?? {};
+    const stdout = preset.stdout ?? '';
+    const stderr = preset.stderr ?? '';
+    // Транслируем заготовленный вывод через колбэки, как реальный CommandExecutor,
+    // чтобы StageRunner мог собрать безопасный «хвост» (commands[].logFragment).
+    if (stdout && typeof opts.onStdout === 'function') opts.onStdout(stdout);
+    if (stderr && typeof opts.onStderr === 'function') opts.onStderr(stderr);
     return {
       command,
       exitCode: preset.exitCode ?? 0,
       signal: null,
-      stdout: preset.stdout ?? '',
-      stderr: preset.stderr ?? '',
+      stdout,
+      stderr,
       timedOut: preset.timedOut ?? false,
       error: preset.error ?? null,
       durationSeconds: preset.durationSeconds ?? 0.01,

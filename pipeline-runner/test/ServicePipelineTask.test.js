@@ -10,6 +10,7 @@ import {
   PipelineTaskError,
   isServiceRelPathSafe,
   isInsideRoot,
+  SAFE_LOG_FRAGMENT_LIMIT,
 } from '../src/ServicePipelineTask.js';
 import { PipelineRunner } from '../src/PipelineRunner.js';
 import { FakeExecutor, NullLogger, tmpDir, stageMap } from './helpers.js';
@@ -194,6 +195,78 @@ test('падение команды → success=false, failedStage, перехо
   assert.ok(!executor.calls.find((c) => c.command === 'never'));
   const failedAction = result.output.summary.actions.find((a) => a.status === 'failed');
   assert.equal(failedAction.exitCode, 1);
+});
+
+test('провал команды: summary.error.logTail содержит хвост лога ИМЕННО упавшей команды', async (t) => {
+  const root = tmpDir(t);
+  writeService(root, 'PS', 'services/catalog', {
+    name: 'Catalog_Service',
+    stages: { test: ['ok'], build: ['boom'] },
+  });
+
+  const executor = new FakeExecutor({
+    ok: { stdout: 'tests passed\n' },
+    boom: { exitCode: 1, stderr: 'FATAL: build failed at module X\n' },
+  });
+  const task = new ServicePipelineTask({ projectsRoot: root, createRunner: fakeRunnerFactory(executor) });
+  const result = await task.run(claim({ serviceRel: 'services/catalog', serviceId: 'svc-A' }));
+
+  assert.equal(result.success, false);
+  assert.equal(result.output.failedStage, 'build');
+
+  // Верхнеуровневая причина провала присутствует и указывает на упавшую стадию.
+  const error = result.output.summary.error;
+  assert.ok(error, 'output.summary.error должен присутствовать при провале');
+  assert.equal(error.code, 'pipeline_stage_failed');
+  assert.match(error.message, /build/);
+
+  // Хвост лога — именно упавшей команды boom, а не успешной ok.
+  assert.match(error.logTail, /FATAL: build failed at module X/);
+  assert.doesNotMatch(error.logTail, /tests passed/);
+
+  // logPath (путь на хосте) остаётся, но причина уже дублирована текстом.
+  assert.ok('logPath' in result.output);
+});
+
+test('провал команды: неограниченный секретоподобный вывод усечён в summary.error.logTail', async (t) => {
+  const root = tmpDir(t);
+  writeService(root, 'PS', 'services/catalog', {
+    name: 'Catalog_Service',
+    stages: { build: ['boom'] },
+  });
+
+  // Вывод многократно больше лимита — целиком попасть в результат не должен.
+  const secret = 'SECRET_TOKEN_ABCDEF_'.repeat(5000);
+  const executor = new FakeExecutor({ boom: { exitCode: 1, stderr: secret } });
+  const task = new ServicePipelineTask({ projectsRoot: root, createRunner: fakeRunnerFactory(executor) });
+  const result = await task.run(claim({ serviceRel: 'services/catalog', serviceId: 'svc-A' }));
+
+  assert.equal(result.success, false);
+  const logTail = result.output.summary.error.logTail;
+  // Усечение работает на обоих уровнях (StageRunner LOG_TAIL_LIMIT + safeLogFragment):
+  // весь секрет целиком не попадает, длина ограничена лимитом.
+  assert.ok(logTail.length < secret.length, 'хвост не должен содержать весь вывод');
+  assert.ok(logTail.length <= SAFE_LOG_FRAGMENT_LIMIT, 'хвост усечён до безопасного лимита');
+});
+
+test('провал по таймауту без вывода: error есть, logTail пустой, без падения', async (t) => {
+  const root = tmpDir(t);
+  writeService(root, 'PS', 'services/catalog', {
+    name: 'Catalog_Service',
+    timeoutMinutes: 5,
+    stages: { build: ['slow'] },
+  });
+
+  // Команда упала по таймауту и ничего не вывела — logFragment у неё отсутствует.
+  const executor = new FakeExecutor({ slow: { timedOut: true, exitCode: null } });
+  const task = new ServicePipelineTask({ projectsRoot: root, createRunner: fakeRunnerFactory(executor) });
+  const result = await task.run(claim({ serviceRel: 'services/catalog', serviceId: 'svc-A' }));
+
+  assert.equal(result.success, false);
+  const error = result.output.summary.error;
+  assert.ok(error, 'output.summary.error должен присутствовать');
+  assert.equal(error.code, 'pipeline_stage_timeout');
+  assert.equal(error.logTail, ''); // хвоста нет — пустая строка, без исключения
 });
 
 test('выбор сервиса по serviceId: запускается A, скрипты B не трогаются', async (t) => {

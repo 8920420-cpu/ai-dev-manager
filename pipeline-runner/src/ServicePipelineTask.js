@@ -213,6 +213,54 @@ function stageToActions(stageSummary) {
 }
 
 /**
+ * Собрать верхнеуровневую причину провала (code/message/logTail) из summary
+ * упавшей стадии для output.summary.error. Ключевое — logTail: безопасный хвост
+ * вывода ИМЕННО упавшей команды. Берётся из уже собранного StageRunner-ом
+ * commands[].logFragment (файлы с хоста не читаются) и усекается через
+ * safeLogFragment(SAFE_LOG_FRAGMENT_LIMIT). Если хвоста нет (таймаут до запуска
+ * команды или команда без вывода) — logTail пустой, а причина отражена в
+ * message (reason / exit code), без падения.
+ *
+ * @param {Object|null} summaryDoc summary из PipelineRunner (result.summary)
+ * @param {string|null} failedStage имя упавшей стадии (result.failedStage)
+ * @returns {{ code: string, message: string, logTail: string }}
+ */
+function failureErrorFromSummary(summaryDoc, failedStage) {
+  const stages = summaryDoc && Array.isArray(summaryDoc.stages) ? summaryDoc.stages : [];
+  const stage =
+    stages.find((s) => s.name === failedStage) ??
+    stages.find((s) => s.status !== 'success' && s.status !== 'SKIPPED') ??
+    null;
+  if (!stage) {
+    return { code: 'pipeline_failed', message: 'Pipeline провалился', logTail: '' };
+  }
+
+  const commands = Array.isArray(stage.commands) ? stage.commands : [];
+  // Упавшая команда: по failedCommand, иначе первая с не-success статусом.
+  const failed =
+    commands.find((c) => c.command === stage.failedCommand) ??
+    commands.find((c) => c.status !== 'success') ??
+    null;
+
+  const timedOut = failed?.timedOut === true || stage.reason === 'timeout';
+  const exitCode = stage.exitCode ?? failed?.exitCode ?? null;
+  const cmdText = failed?.command ?? stage.failedCommand ?? null;
+
+  const parts = [`Стадия "${stage.name}" провалилась`];
+  if (cmdText) parts.push(`команда: ${safeLogFragment(cmdText, 200)}`);
+  if (timedOut) parts.push('причина: timeout');
+  else if (exitCode !== null && exitCode !== undefined) parts.push(`exit=${exitCode}`);
+  if (failed?.error) parts.push(`error=${safeLogFragment(String(failed.error), 200)}`);
+
+  return {
+    code: timedOut ? 'pipeline_stage_timeout' : 'pipeline_stage_failed',
+    message: safeLogFragment(parts.join(', '), 1000),
+    // Хвост берём из уже возвращённого logFragment упавшей команды и усекаем ещё раз.
+    logTail: failed?.logFragment ? safeLogFragment(failed.logFragment) : '',
+  };
+}
+
+/**
  * ServicePipelineTask — исполнение этапа PIPELINE_SERVICE для одного claim.
  */
 export class ServicePipelineTask {
@@ -327,6 +375,13 @@ export class ServicePipelineTask {
         status: result.success ? 'success' : 'failed',
         runId: result.runId ?? null,
         actions,
+        // При провале дублируем причину на верхний уровень: усечённый хвост лога
+        // ИМЕННО упавшей команды (без чтения файлов с хоста), чтобы Failure
+        // Analyst/UI видели фактическую причину, не разбирая actions[] и не
+        // читая logPath (путь на хосте им недоступен).
+        ...(result.success
+          ? {}
+          : { error: failureErrorFromSummary(summaryDoc, result.failedStage ?? null) }),
       },
       failedStage: result.failedStage ?? null,
       startedAt: startedAt.toISOString(),
