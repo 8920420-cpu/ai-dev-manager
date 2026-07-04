@@ -27,6 +27,31 @@ function git(cwd, args, opts = {}) {
   });
 }
 
+// Применить патч (дельту задачи) к рабочему дереву repoCwd. Бросает при неудаче;
+// git apply атомарен — на ошибке дерево остаётся нетронутым.
+function applyPatch(repoCwd, patch) {
+  execFileSync('git', ['-C', repoCwd, 'apply', '--binary', '--whitespace=nowarn', '-'], {
+    input: patch, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
+  });
+}
+
+// Ляжет ли патч на дерево repoCwd начисто (без модификации дерева, git apply --check).
+// reverse=true проверяет ОБРАТИМОСТЬ: патч уже применён и содержимое совпадает
+// (тогда прямой apply дал бы 'already exists', а обратный проходит начисто).
+function applyChecks(repoCwd, patch, { reverse = false } = {}) {
+  const args = ['-C', repoCwd, 'apply', '--binary', '--whitespace=nowarn', '--check'];
+  if (reverse) args.push('--reverse');
+  args.push('-');
+  try {
+    execFileSync('git', args, {
+      input: patch, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // Глобальная сериализация шага «применить дельту в main»: два сервиса не должны
 // накатывать патч в основное дерево одновременно (гонка индекса/рабочей копии).
 let mainLock = Promise.resolve();
@@ -132,15 +157,75 @@ export class WorktreeManager {
       .split('\n').map((s) => s.trim()).filter(Boolean);
 
     return withMainLock(() => {
+      // Быстрый путь (обычная, не REWORK, сдача): весь патч ложится одним apply.
       try {
-        execFileSync('git', ['-C', repoCwd, 'apply', '--binary', '--whitespace=nowarn', '-'], {
-          input: patch, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
-        });
+        applyPatch(repoCwd, patch);
         return { ok: true, changedFiles, result: agentOut.result };
-      } catch (e) {
-        this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, error: e.message });
-        return { ok: false, conflict: true, error: `integrate_conflict: ${e.message}`, changedFiles };
+      } catch (firstErr) {
+        // Патч не лёг целиком. Ожидаемо при REWORK-заходе: файлы прошлого прогона
+        // уже лежат в основном дереве (untracked ?? packages/), и creation-hunks
+        // падают 'already exists in working directory'. Делаем интеграцию
+        // идемпотентной: разбираем дельту по файлам и классифицируем каждый —
+        //   • ложится начисто          → применить;
+        //   • уже донесён (то же содержимое, reverse-check проходит) → пропустить;
+        //   • содержимое расходится     → честный конфликт.
+        let classes;
+        try {
+          classes = this._classifyPatchFiles(wt, repoCwd, changedFiles);
+        } catch (e) {
+          // Не смогли разобрать по файлам — отдаём исходную ошибку apply как есть.
+          this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, error: firstErr.message });
+          return { ok: false, conflict: true, error: `integrate_conflict: ${firstErr.message}`, changedFiles };
+        }
+        const conflicts = classes.filter((c) => c.state === 'conflict').map((c) => c.file);
+        if (conflicts.length) {
+          // Реальный конфликт: содержимое в основном дереве отличается от патча.
+          // Дерево НЕ трогаем (git apply атомарен, ничего не применяли) — внятное
+          // сообщение вместо сырого stderr git apply.
+          const msg = `integrate_conflict: содержимое в основном дереве расходится с патчем ветки ${handle.branch}`
+            + ` — файлы: ${conflicts.join(', ')}`;
+          this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, conflicts });
+          return { ok: false, conflict: true, error: msg, changedFiles, conflictingFiles: conflicts };
+        }
+        // Конфликтов нет: применяем недостающие файлы, уже донесённые пропускаем.
+        const toApply = classes.filter((c) => c.state === 'apply');
+        try {
+          for (const c of toApply) applyPatch(repoCwd, c.patch);
+        } catch (e) {
+          this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, error: e.message });
+          return { ok: false, conflict: true, error: `integrate_conflict: ${e.message}`, changedFiles };
+        }
+        const skipped = classes.filter((c) => c.state === 'applied').map((c) => c.file);
+        if (skipped.length) {
+          // changedFiles всё равно отдаём целиком: незакоммиченные артефакты
+          // (?? packages/) должен подобрать Git Integrator после разблокировки.
+          this.log.info?.('integrate: файлы уже в основном дереве, пропущены (идемпотентно)',
+            { branch: handle.branch, skipped });
+        }
+        return {
+          ok: true,
+          changedFiles,
+          result: agentOut.result,
+          alreadyApplied: toApply.length === 0,
+        };
       }
+    });
+  }
+
+  // Классифицировать файлы дельты относительно текущего состояния основного дерева.
+  // Для каждого файла берём его персональный кусок патча (git diff HEAD~1 HEAD -- file)
+  // и проверяем применимость без модификации дерева:
+  //   'apply'    — ложится начисто (файла нет / содержимое совпадает с «до»);
+  //   'applied'  — уже донесён прошлым прогоном (reverse-check проходит начисто);
+  //   'conflict' — содержимое расходится (ни прямой, ни обратный check не проходят);
+  //   'noop'     — пустой diff (на всякий случай, не влияет на исход).
+  _classifyPatchFiles(wt, repoCwd, files) {
+    return files.map((file) => {
+      const patch = git(wt, ['diff', '--binary', 'HEAD~1', 'HEAD', '--', file]);
+      if (!patch.trim()) return { file, state: 'noop', patch };
+      if (applyChecks(repoCwd, patch)) return { file, state: 'apply', patch };
+      if (applyChecks(repoCwd, patch, { reverse: true })) return { file, state: 'applied', patch };
+      return { file, state: 'conflict', patch };
     });
   }
 
