@@ -6,9 +6,14 @@
 чистое железо ──PXE──> Ubuntu autoinstall ──firstboot──> регистрация в Albia
 Albia (ssh-ключ) ──provision-k3s.sh──> HA-кластер k3s из 3 нод (embedded etcd)
 локальный registry (:5000) ──> образы прод-версий сервисов ──> кластер
-Cloudflare ──> белые IP нод ──> nginx на каждой ноде (ingress-nginx) ──> сервисы
-LAN ──> etcd, flannel, репликация Postgres (наружу не выходит)
+Cloudflare ──> белые IP площадок ──> nginx на каждой ноде (ingress) ──> сервисы
+WG-сеть площадок ──> etcd, flannel (wireguard-native), репликация Postgres
 ```
+
+Топология: 3 сервера на разных площадках, каждая со своим белым IP; площадки
+связаны site-to-site WireGuard на роутерах в одну внутреннюю сеть. Машина
+211 — управление (оркестратор, registry, сервер установки, albia,
+kubeconfig/kubectl); в кластер она не входит.
 
 Сервисы compose:
 
@@ -163,15 +168,19 @@ docker exec albia provision-k3s.sh 192.168.1.51 192.168.1.52 192.168.1.53
 каждой ноде (ingress-nginx DaemonSet, hostPort 80/443), ставится манифестом
 `deploy/k8s/10-ingress-nginx.yaml`.
 
-Важно: передавайте **LAN-адреса** — `--node-ip` фиксирует etcd/flannel и весь
-межнодовый трафик (включая репликацию Postgres) в локальной сети. Белые IP в
+Важно: передавайте **внутренние адреса** серверов (адрес в сети своей
+площадки; между площадками их маршрутизирует site-to-site WireGuard).
+`--flannel-backend=wireguard-native` — flannel строит собственный шифрованный
+mesh и сам подбирает MTU (путь между площадками идёт через туннели с MTU
+~1420, обычный vxlan упирался бы во фрагментацию). Белые IP площадок в
 кластерный трафик не попадают. Доп. SAN для API-сертификата:
 `docker exec -e K3S_TLS_SAN_EXTRA=203.0.113.10,203.0.113.11 albia provision-k3s.sh ...`.
 
-## Внешний трафик: Cloudflare → белые IP
+## Внешний трафик: Cloudflare → белые IP площадок
 
-У каждой ноды свой белый IP; балансировщик — Cloudflare:
+У каждой площадки свой белый IP; балансировщик — Cloudflare:
 
+- На роутере каждой площадки пробрасываются порты **80 и 443** на её сервер.
 - На каждой ноде свой nginx (ingress-nginx DaemonSet, hostPort 80/443) —
   маршрутизирует запросы по микросервисам согласно Ingress-правилам
   (`deploy/k8s/50-ingress.yaml`).

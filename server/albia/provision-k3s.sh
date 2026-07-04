@@ -4,9 +4,13 @@
 #   docker exec albia provision-k3s.sh              # ноды из registry/nodes.jsonl
 #   docker exec albia provision-k3s.sh 192.168.2.51 192.168.2.52 192.168.2.53
 #
-# Важно: передавайте LAN-адреса нод. Кластерный трафик (etcd, flannel,
-# репликация Postgres) ходит только по локальной сети (--node-ip);
-# белые IP используются только для входящего трафика от Cloudflare.
+# Важно: передавайте внутренние адреса нод (адрес сервера в сети его
+# площадки; площадки связаны site-to-site WireGuard на роутерах).
+# Кластерный трафик (etcd, репликация Postgres) ходит по этим адресам через
+# туннели; белые IP площадок используются только для входа от Cloudflare.
+# flannel-backend=wireguard-native: flannel строит собственный шифрованный
+# mesh между нодами и сам подбирает MTU — критично, т.к. путь между
+# площадками идёт через WG-туннели (MTU ~1420, vxlan бы фрагментировался).
 set -eu
 
 : "${ALBIA_REGISTRY_DIR:=/opt/albia/registry}"
@@ -85,6 +89,7 @@ else
   run "$first" "curl -sfL $K3S_INSTALL_URL | sudo sh -s - server --cluster-init \
     --node-ip $first --advertise-address $first $tls_san \
     --disable traefik \
+    --flannel-backend=wireguard-native \
     --write-kubeconfig-mode 640"
 fi
 
@@ -103,7 +108,8 @@ for ip in "$@"; do
   fi
   run "$ip" "curl -sfL $K3S_INSTALL_URL | sudo K3S_TOKEN='$token' sh -s - server \
     --server https://$first:6443 --node-ip $ip $tls_san \
-    --disable traefik"
+    --disable traefik \
+    --flannel-backend=wireguard-native"
 done
 
 echo "== fetch kubeconfig =="
