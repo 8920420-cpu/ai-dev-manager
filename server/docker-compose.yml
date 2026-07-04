@@ -80,6 +80,25 @@ services:
       retries: 3
       start_period: 5s
 
+  # TFTP standalone (для сценария «роутер раздаёт DHCP-опции 66/67, dnsmasq
+  # не нужен»). ВНИМАНИЕ: на Windows/Docker Desktop проброс 69/udp НЕ работает
+  # (проверено: листенер не поднимается, TFTP-ответ с эфемерного порта режется
+  # прокси) — профиль включать только на Linux-хосте. На Windows сетевая
+  # загрузка без флешки — через UEFI HTTP Boot (см. runbook).
+  tftpd:
+    build:
+      context: ./tftpd
+      dockerfile: Dockerfile
+    image: server-tftpd:latest
+    container_name: server-tftpd
+    profiles:
+      - tftp
+    ports:
+      - "${PXE_TFTP_BIND:-0.0.0.0}:69:69/udp"
+    volumes:
+      - ${SERVER_DATA_ROOT:-.}/tftp:/srv/tftp:ro
+    restart: unless-stopped
+
   registry:
     image: registry:2
     container_name: server-registry

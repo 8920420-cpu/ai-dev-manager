@@ -9,8 +9,9 @@
 #     sh server/scripts/build-ipxe-media.sh
 #
 # Результат в OUT_DIR:
-#   ipxe.iso  — BIOS/legacy: записать на CD или флешку (Rufus, режим DD)
-#   ipxe.efi  — UEFI: положить на FAT32-флешку как EFI/BOOT/BOOTX64.EFI
+#   ipxe.iso       — BIOS/legacy: записать на CD или флешку (Rufus, режим DD)
+#   ipxe.efi       — UEFI: флешка EFI/BOOT/BOOTX64.EFI, TFTP (DHCP opt 67) или UEFI HTTP Boot
+#   undionly.kpxe  — BIOS/legacy по TFTP (DHCP opt 67)
 set -eu
 
 : "${PXE_SERVER_IP:?Set PXE_SERVER_IP}"
@@ -28,7 +29,7 @@ docker run --rm -v "$OUT_DIR":/out debian:bookworm-slim sh -c "
   git clone -q --depth 1 https://github.com/ipxe/ipxe /ipxe
   cd /ipxe/src
   printf '#!ipxe\ndhcp\nchain http://$PXE_SERVER_IP:$PXE_HTTP_PORT/boot.ipxe\n' > embed.ipxe
-  make -j\$(nproc) bin/ipxe.iso bin-x86_64-efi/ipxe.efi EMBED=embed.ipxe >/dev/null
-  cp bin/ipxe.iso bin-x86_64-efi/ipxe.efi /out/
-  echo 'built: ipxe.iso (BIOS), ipxe.efi (UEFI -> EFI/BOOT/BOOTX64.EFI)'
+  make -j\$(nproc) bin/ipxe.iso bin/undionly.kpxe bin-x86_64-efi/ipxe.efi EMBED=embed.ipxe >/dev/null
+  cp bin/ipxe.iso bin/undionly.kpxe bin-x86_64-efi/ipxe.efi /out/
+  echo 'built: ipxe.iso (BIOS media), undionly.kpxe (BIOS tftp), ipxe.efi (UEFI media/tftp/http)'
 "
