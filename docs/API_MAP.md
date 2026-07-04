@@ -41,9 +41,28 @@ Scanner вызывает endpoint после появления завершён
   "result": "Исправлено",
   "changedFiles": ["src/chat.js"],
   "sourceDocument": "/workspace/<service>.md",
-  "nextRole": "TASK_REVIEWER"
+  "nextRole": "TASK_REVIEWER",
+  "numTurns": 42,
+  "codeVersion": "abc1234",
+  "model": "claude-...",
+  "tokensIn": 120000,
+  "tokensOut": 8000,
+  "tokensCacheRead": 90000,
+  "tokensCacheCreation": 15000,
+  "costUsd": 0.37,
+  "coldStartMs": 2100
 }
 ```
+
+Поля `tokensIn`, `tokensOut`, `tokensCacheRead`, `tokensCacheCreation`,
+`costUsd`, `coldStartMs` — **опциональные** метрики прогона агента (usage,
+стоимость, холодный старт), которые шлёт programmer-runner. Обратная
+совместимость: если раннер их не прислал (старый формат), обработчик пишет в
+`agent_runs` нули/`NULL`, как раньше, без падения. Ключи фиксированы (контракт
+раннера с оркестратором); при маппинге в `agent_runs`: `tokensIn→token_input`,
+`tokensOut→token_output`, `tokensCacheRead→token_cache_read`,
+`tokensCacheCreation→token_cache_creation`, `costUsd→cost`,
+`coldStartMs→cold_start_ms`.
 
 Успех: `{"accepted":true,"duplicate":false,"nextRole":"TASK_REVIEWER"}`.
 Повторная доставка возвращает `duplicate:true` и не создаёт второй переход.
