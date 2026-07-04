@@ -126,9 +126,22 @@ node scanner-service/bin/scanner-service.js
      "title": "<заголовок задачи>",
      "sourceDocument": "<метка источника, напр. claude-programmer/...>",
      "result": "<отчёт Programmer: что и как сделано>",
-     "changedFiles": ["path/one.js", "path/two.md"]
+     "changedFiles": ["path/one.js", "path/two.md"],
+     "numTurns": 42,
+     "tokensIn": 12345,
+     "tokensOut": 6789,
+     "tokensCacheRead": 100000,
+     "tokensCacheCreation": 2000,
+     "costUsd": 0.1234,
+     "coldStartMs": 850
    }
    ```
+   Поля `tokensIn`, `tokensOut`, `tokensCacheRead`, `tokensCacheCreation`,
+   `costUsd`, `coldStartMs` — **опциональные** KPI-поля сдачи, которые
+   `programmer-runner` шлёт рядом с `numTurns`. Оркестратор маппит их в
+   `agent_runs` (`token_input`, `token_output`, `token_cache_read`,
+   `token_cache_creation`, `cost`, `cold_start_ms`) через COALESCE: старый
+   раннер без этих полей не затирает данные (обратная совместимость).
    → `{ accepted: true, nextRole: "TASK_REVIEWER" }`. Задача уходит на ревью.
    Ревьюер отклоняет, если нет `result` и `changedFiles` — отчёт обязателен.
 
