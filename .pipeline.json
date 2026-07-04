@@ -7,7 +7,9 @@
       "enabled": true,
       "commands": [
         "npm --prefix pipeline-runner test",
-        "npm --prefix host-runner test"
+        "npm --prefix host-runner test",
+        "npm --prefix orchestrator-service/backend test",
+        "npm test"
       ]
     },
     "build": {
