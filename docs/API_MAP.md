@@ -248,6 +248,17 @@ const result = await runPipeline({ configPath: '.pipeline.json' });
 заменяются, новые добавляются). Изоляция прежняя: `workingDirectory`, найденный
 compose и команды не выходят за `projectRoot` (`resolveServicePaths`).
 
+Валидация каталога сервиса на claim (SERVICE-REPO-PATH-001): контракт claim
+PIPELINE_SERVICE предварительно резолвит `services.repository_path`
+(`resolveServiceRepoPath`). Валидный существующий каталог оставляется; пустой/
+устаревший путь лениво бэкфиллится по коду сервиса (точное совпадение каталога на
+глубине ≤3). Если каталог не задан и не найден — конвейер НЕ строится от корня, а
+возвращается диагностируемая ошибка `service_path_unresolved` (HTTP `422`,
+сообщение «сервис X: repository_path не задан/не найден, укажите каталог
+сервиса») ДО построения стадий. Поэтому `pipeline_compose_not_found` теперь
+возможен только при разрешённом каталоге сервиса без compose в подсистеме, а не
+из-за пустого `repository_path`.
+
 Примечание: это отдельный путь от `POST /test` tester-service и CLI
 `pipeline-runner --config` — там `.pipeline.json`/`pipelineConfigPath` по-прежнему
 обязателен (иначе `pipeline_config_not_found`), конвенционного построения нет.

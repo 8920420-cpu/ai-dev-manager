@@ -86,7 +86,12 @@ PostgreSQL (`orchestrator_db`).
 > - **build** — ближайший вверх `docker-compose.yml`/`compose.yml` (граница
 >   подсистемы, не выходя за корень проекта) → `docker compose -f <compose> build`;
 > - **deploy** — тот же compose → `docker compose -f <compose> up -d`; если compose
->   не найден — диагностируемая ошибка стадии deploy (`pipeline_compose_not_found`);
+>   не найден — диагностируемая ошибка стадии deploy (`pipeline_compose_not_found`).
+>   После SERVICE-REPO-PATH-001 (ADR-014) этот исход достижим только когда каталог
+>   сервиса РАЗРЕШЁН (`repository_path` указывает на существующий каталог), но
+>   compose в подсистеме не найден; пустой/устаревший `repository_path` больше не
+>   проходит как «сборка от корня» — он перехватывается раньше, на claim
+>   PIPELINE_SERVICE, провалом `service_path_unresolved`;
 > - **smoke** — если в compose объявлен healthcheck → `docker compose -f <compose>
 >   up -d --wait`; иначе стадия SKIPPED (`no_healthcheck_in_compose`).
 >
@@ -280,3 +285,37 @@ TASK_REVIEWER).
 kind='service' со `status='CODING'` и `service_id` клеймятся (фильтр
 `task_kind <> 'epic'`), сериализация «один активный CODING на сервис»
 (NOT EXISTS + advisory lock) сохраняется.
+
+---
+
+## ADR-014 — Резолвинг каталога сервиса (services.repository_path) для сервисного пайплайна — SERVICE-REPO-PATH-001
+
+**Дата:** 2026-07-04
+**Решение:** `services.repository_path` (каталог сервиса относительно корня
+проекта) заполняется автоматически и валидируется до запуска сервисного
+конвейера. Логика вынесена в `orchestrator-service/backend/src/serviceRepoPath.js`:
+- **Авторегистрация сервиса.** При авторегистрации `services.repository_path`
+  выводится из общего каталогового префикса путей `files`/`changedFiles`
+  work_item (`deriveServicePathFromFiles`) и пишется в `INSERT services`
+  (`orchestrator-service/backend/src/db.js` ~1256; вызов подготовки пути ~563–564).
+- **Валидация и ленивый бэкфилл на claim PIPELINE_SERVICE.** На выдаче задачи
+  роли `PIPELINE_SERVICE` путь резолвится `resolveServiceRepoPath(rootPath,
+  serviceCode, repository_path)` (`db.js` ~1911–1925): (1) текущий
+  `repository_path` валиден и каталог существует в корне проекта → оставить как
+  есть; (2) иначе — бэкфилл по коду сервиса (`findServiceDirByCode` — точное
+  совпадение имени каталога на глубине ≤3; найден ровно один — записать в
+  `services.repository_path` через `UPDATE`); (3) иначе — НЕ запускать конвейер
+  от корня, а вернуть диагностируемый провал `service_path_unresolved`
+  (`scannerError(422)`, сообщение «сервис X: repository_path не задан/не найден,
+  укажите каталог сервиса») ДО построения стадий и запуска команд.
+**Причина:** у сервисов, авторегистрируемых по work_items, `repository_path` был
+`NULL` → `workingDirectory` = корень проекта → конвенция искала
+`docker-compose.yml` от корня монорепо, где его нет (компоузы лежат в
+подсистемах), и каждый прогон PIPELINE_SERVICE мгновенно падал
+`pipeline_compose_not_found`. У части сервисов путь был заполнен, но устарел
+(каталога уже нет в репозитории).
+**Последствия:** задача по сервису с известным каталогом проходит с реальным
+build/deploy подсистемы; сервис без разрешимого каталога даёт понятный провал
+`service_path_unresolved` с текстом причины (вместо `pipeline_compose_not_found`
+от корня). `pipeline_compose_not_found` (ADR-007a) теперь достижим только когда
+каталог сервиса разрешён, но compose в подсистеме не найден.
