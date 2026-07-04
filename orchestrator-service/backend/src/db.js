@@ -3068,6 +3068,26 @@ export async function advanceJoinNodes(c) {
       for (const ch of childRows.rows) {
         if (ch.data_card && typeof ch.data_card === 'object') merged = { ...merged, ...ch.data_card };
       }
+      // DOC-COMMIT-ON-JOIN-001: агрегируем changedFiles детей (правки Doc Keeper лежат
+      // на СОСЕДНЕЙ ветке — их нет в цепочке предков родителя, поэтому
+      // resolveHostTaskContext их не видит) в ОБЪЕДИНЕНИЕ с дедупом и выносим их
+      // ВЕРХНИМ уровнем в событие продвижения родителя. resolveHostTaskContext берёт
+      // непустые changedFiles по событиям цепочки → пост-join Git Integrator (роль
+      // узла ЗА join, работает на РОДИТЕЛЕ) увидит doc-пути и закоммитит их отдельным
+      // коммитом. Пустой список (Doc Auditor→NO_CHANGES: доки не редактировались) →
+      // поля в событии нет → пост-join Git Integrator упрётся в уже закоммиченный код
+      // (nothing_to_stage), второго коммита не будет — поведение как сейчас.
+      const childChanged = [];
+      const seenChanged = new Set();
+      for (const ch of childRows.rows) {
+        const files = ch.data_card && Array.isArray(ch.data_card.changedFiles) ? ch.data_card.changedFiles : [];
+        for (const f of files) {
+          const key = String(f);
+          if (!key || seenChanged.has(key)) continue;
+          seenChanged.add(key);
+          childChanged.push(f);
+        }
+      }
       // Продвинуть родителя за join по рёбрам графа.
       const loaded = await loadProjectGraph(c, p.project_id);
       const nextKey = loaded ? nextNodeKey(loaded.graph, p.current_stage_key, { outcome: 'FORWARD' }) : null;
@@ -3081,11 +3101,13 @@ export async function advanceJoinNodes(c) {
                 data_card = data_card || $5::jsonb WHERE id = $1`,
         [p.id, toStatus, nextRoleId, nextKey, JSON.stringify(merged)],
       );
+      const joinPayload = { runner: true, reason: 'join_completed', nextStageKey: nextKey };
+      if (childChanged.length) joinPayload.changedFiles = childChanged;
       await c.query(
         `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
          VALUES ($1, $2, 'WAITING_FOR_CHILDREN', $3::task_status, $4, $5::jsonb)`,
         [p.id, done ? 'TASK_DONE' : 'STATUS_CHANGED', toStatus, p.current_role_id,
-         JSON.stringify({ runner: true, reason: 'join_completed', nextStageKey: nextKey })],
+         JSON.stringify(joinPayload)],
       );
       await c.query('COMMIT');
       advanced += 1;

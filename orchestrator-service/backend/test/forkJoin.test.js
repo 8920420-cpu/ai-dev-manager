@@ -117,3 +117,106 @@ test('JOIN: упавшая ветка → родитель BLOCKED (полити
   assert.match(ev.sql, /'BLOCKED'/, 'событие перехода в BLOCKED');
   assert.match(ev.params[2], /join_child_failed/, 'причина — упавшая ветка');
 });
+
+// DOC-COMMIT-ON-JOIN-001: граф с узлом Git Integrator ПОСЛЕ join: J (join) → G
+// (Git Integrator, COMMIT). Правки Doc Keeper лежат в data_card док-ребёнка —
+// advanceJoinNodes агрегирует их и выносит верхним уровнем в событие продвижения
+// родителя, чтобы resolveHostTaskContext отдал их пост-join Git Integrator'у.
+const POSTJOIN_NODES = [
+  { id: 'sJ', stage_key: 'J', kind: 'join',  join_key: null, name: 'Слияние', enabled: true, task_status: null },
+  { id: 'sG', stage_key: 'G', kind: 'stage', join_key: null, name: 'Git Integrator (документация)', enabled: true, task_status: 'COMMIT' },
+];
+const POSTJOIN_ROLES = [
+  { stage_id: 'sG', role_id: 'rGI', code: 'GIT_INTEGRATOR', position: 0 },
+];
+const POSTJOIN_EDGES = [
+  { from_key: 'J', to_key: 'G', condition: null, position: 0 },
+];
+
+test('JOIN: правки Doc Keeper (changedFiles детей) выносятся в событие продвижения к пост-join Git Integrator', async () => {
+  const c = fakeClient([
+    { re: /FROM tasks t\s+JOIN project_stages ps[\s\S]*kind = 'join'[\s\S]*parent_task_id IS NOT NULL/, reply: { rowCount: 0, rows: [] } },
+    { re: /FROM tasks t\s+JOIN project_stages ps[\s\S]*kind = 'join'[\s\S]*parent_task_id IS NULL/, reply: {
+      rowCount: 1,
+      rows: [{ id: PARENT, project_id: PROJ, status: 'WAITING_FOR_CHILDREN', current_role_id: 'rJoin', current_stage_key: 'J', data_card: {} }],
+    } },
+    { re: /SELECT status::text AS status, data_card FROM tasks WHERE parent_task_id/, reply: {
+      rowCount: 2, rows: [
+        // док-ветка: Doc Keeper сдал список отредактированных доков.
+        { status: 'DONE', data_card: { changedFiles: ['docs/API_MAP.md', 'docs/ARCHITECTURE.md'] } },
+        // git-ветка: код уже закоммичен, changedFiles в карточке нет.
+        { status: 'DONE', data_card: {} },
+      ],
+    } },
+    { re: /FROM project_stage_edges WHERE project_id/, reply: { rowCount: POSTJOIN_EDGES.length, rows: POSTJOIN_EDGES } },
+    { re: /FROM project_stages WHERE project_id = \$1 ORDER BY position/, reply: { rowCount: POSTJOIN_NODES.length, rows: POSTJOIN_NODES } },
+    { re: /FROM project_stage_roles psr JOIN roles/, reply: { rowCount: POSTJOIN_ROLES.length, rows: POSTJOIN_ROLES } },
+  ]);
+
+  const n = await advanceJoinNodes(c);
+  assert.equal(n, 1, 'барьер снят');
+
+  const upd = c.calls.find((q) => /UPDATE tasks SET status = \$2::task_status/.test(q.sql));
+  assert.ok(upd, 'родитель продвинут');
+  assert.equal(upd.params[1], 'COMMIT', 'родитель едет на узел Git Integrator (COMMIT), не DONE');
+  assert.equal(upd.params[2], 'rGI', 'роль узла — Git Integrator');
+  assert.equal(upd.params[3], 'G', 'current_stage_key → пост-join узел');
+
+  const ev = c.calls.find((q) => /INSERT INTO task_events/.test(q.sql));
+  assert.equal(ev.params[1], 'STATUS_CHANGED', 'не DONE — впереди ещё узел');
+  const payload = JSON.parse(ev.params[4]);
+  assert.deepEqual(payload.changedFiles, ['docs/API_MAP.md', 'docs/ARCHITECTURE.md'],
+    'changedFiles детей вынесены верхним уровнем — их подберёт resolveHostTaskContext');
+});
+
+test('JOIN: NO_CHANGES доков (пустые changedFiles детей) → в событии нет changedFiles (второго коммита не будет)', async () => {
+  const c = fakeClient([
+    { re: /FROM tasks t\s+JOIN project_stages ps[\s\S]*kind = 'join'[\s\S]*parent_task_id IS NOT NULL/, reply: { rowCount: 0, rows: [] } },
+    { re: /FROM tasks t\s+JOIN project_stages ps[\s\S]*kind = 'join'[\s\S]*parent_task_id IS NULL/, reply: {
+      rowCount: 1,
+      rows: [{ id: PARENT, project_id: PROJ, status: 'WAITING_FOR_CHILDREN', current_role_id: 'rJoin', current_stage_key: 'J', data_card: {} }],
+    } },
+    { re: /SELECT status::text AS status, data_card FROM tasks WHERE parent_task_id/, reply: {
+      rowCount: 2, rows: [{ status: 'DONE', data_card: {} }, { status: 'DONE', data_card: {} }],
+    } },
+    { re: /FROM project_stage_edges WHERE project_id/, reply: { rowCount: POSTJOIN_EDGES.length, rows: POSTJOIN_EDGES } },
+    { re: /FROM project_stages WHERE project_id = \$1 ORDER BY position/, reply: { rowCount: POSTJOIN_NODES.length, rows: POSTJOIN_NODES } },
+    { re: /FROM project_stage_roles psr JOIN roles/, reply: { rowCount: POSTJOIN_ROLES.length, rows: POSTJOIN_ROLES } },
+  ]);
+
+  const n = await advanceJoinNodes(c);
+  assert.equal(n, 1);
+
+  const upd = c.calls.find((q) => /UPDATE tasks SET status = \$2::task_status/.test(q.sql));
+  assert.equal(upd.params[3], 'G', 'родитель всё равно проходит через пост-join узел');
+
+  const ev = c.calls.find((q) => /INSERT INTO task_events/.test(q.sql));
+  const payload = JSON.parse(ev.params[4]);
+  assert.equal(payload.changedFiles, undefined, 'без правок доков changedFiles в событии нет');
+});
+
+test('JOIN: changedFiles детей объединяются с дедупом (несколько веток с правками)', async () => {
+  const c = fakeClient([
+    { re: /FROM tasks t\s+JOIN project_stages ps[\s\S]*kind = 'join'[\s\S]*parent_task_id IS NOT NULL/, reply: { rowCount: 0, rows: [] } },
+    { re: /FROM tasks t\s+JOIN project_stages ps[\s\S]*kind = 'join'[\s\S]*parent_task_id IS NULL/, reply: {
+      rowCount: 1,
+      rows: [{ id: PARENT, project_id: PROJ, status: 'WAITING_FOR_CHILDREN', current_role_id: 'rJoin', current_stage_key: 'J', data_card: {} }],
+    } },
+    { re: /SELECT status::text AS status, data_card FROM tasks WHERE parent_task_id/, reply: {
+      rowCount: 2, rows: [
+        { status: 'DONE', data_card: { changedFiles: ['docs/API_MAP.md', 'docs/PROJECT_MAP.md'] } },
+        { status: 'DONE', data_card: { changedFiles: ['docs/PROJECT_MAP.md', 'docs/ARCHITECTURE.md'] } },
+      ],
+    } },
+    { re: /FROM project_stage_edges WHERE project_id/, reply: { rowCount: POSTJOIN_EDGES.length, rows: POSTJOIN_EDGES } },
+    { re: /FROM project_stages WHERE project_id = \$1 ORDER BY position/, reply: { rowCount: POSTJOIN_NODES.length, rows: POSTJOIN_NODES } },
+    { re: /FROM project_stage_roles psr JOIN roles/, reply: { rowCount: POSTJOIN_ROLES.length, rows: POSTJOIN_ROLES } },
+  ]);
+
+  await advanceJoinNodes(c);
+  const ev = c.calls.find((q) => /INSERT INTO task_events/.test(q.sql));
+  const payload = JSON.parse(ev.params[4]);
+  assert.deepEqual(payload.changedFiles,
+    ['docs/API_MAP.md', 'docs/PROJECT_MAP.md', 'docs/ARCHITECTURE.md'],
+    'объединение по порядку первого вхождения, PROJECT_MAP.md один раз');
+});
