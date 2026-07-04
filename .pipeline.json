@@ -3,6 +3,13 @@
   "workingDirectory": ".",
   "timeoutMinutes": 15,
   "stages": {
+    "unit-tests": {
+      "enabled": true,
+      "commands": [
+        "npm --prefix pipeline-runner test",
+        "npm --prefix host-runner test"
+      ]
+    },
     "build": {
       "enabled": true,
       "commands": [

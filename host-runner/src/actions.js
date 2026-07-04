@@ -2,48 +2,47 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
-import { ConfigLoader, PipelineRunner } from '../../pipeline-runner/src/index.js';
+import { runServicePipeline } from '../../pipeline-runner/src/index.js';
 
 const pexec = promisify(execFile);
 
 /**
- * PIPELINE_SERVICE: реальный прогон pipeline через pipeline-runner.
- * По умолчанию — безопасный прогон юнит-тестов pipeline-runner (реальный
- * pass/fail, без docker). Можно указать настоящий .pipeline.json через
- * HOST_PIPELINE_CONFIG (тогда выполняются его стадии, в т.ч. docker build/up).
+ * PIPELINE_SERVICE: реальный прогон pipeline сервиса задачи через pipeline-runner.
+ *
+ * Контракт claim (`task.pipeline`) обязателен: оркестратор строит его при выдаче
+ * задачи (buildPipelineClaimContract) либо отклоняет claim с 422 ещё до выдачи.
+ * Выполняется pipeline ИМЕННО сервиса задачи (юнит-тесты → docker compose build →
+ * docker compose up -d → smoke) сервисным слоем pipeline-runner. Провал любой
+ * стадии → success=false с failedStage → штатный маршрут в Failure Analyst.
+ * Отсутствующий/невалидный контракт → диагностируемый провал ДО запуска команд
+ * (summary.error.code = pipeline_contract_missing и т.п.), НЕ ложный успех.
+ *
+ * Реконсиляция путей контракта выполняется здесь, не ломая оркестратор и
+ * pipeline-runner: оркестратор кладёт в claim `projectRoot` как АБСОЛЮТНЫЙ
+ * root_path проекта, а resolveServicePaths ждёт ОТНОСИТЕЛЬНЫЙ projectRoot внутри
+ * абсолютного projectsRoot и отвергает абсолютный. Согласуем: projectsRoot =
+ * абсолютный корень проекта (root_path), projectRoot → '.' (сам корень).
+ * repositoryPath (относительный путь сервиса) остаётся как есть — по нему
+ * резолвится рабочая директория сервиса внутри корня.
  */
 export async function runPipelineAction(task, opts = {}) {
-  const repoRoot = opts.repoRoot ?? process.cwd();
-  const configPath = opts.configPath ?? process.env.HOST_PIPELINE_CONFIG ?? '';
-  const loader = new ConfigLoader();
+  const pipeline = task?.pipeline && typeof task.pipeline === 'object' ? task.pipeline : null;
+  const serviceTask = pipeline ? { ...task, pipeline: { ...pipeline, projectRoot: '.' } } : task;
+  const projectsRoot = opts.projectsRoot ?? String(pipeline?.projectRoot ?? '').trim();
 
-  let config;
-  if (configPath) {
-    config = await loader.load(configPath);
-  } else {
-    // Безопасный дефолт: гоняем тесты pipeline-runner — реальный прогон без docker.
-    const dir = opts.pipelineDir ?? process.env.HOST_PIPELINE_DIR ?? path.join(repoRoot, 'pipeline-runner');
-    const cmd = opts.pipelineCmd ?? process.env.HOST_PIPELINE_CMD ?? 'node --test';
-    config = loader.validate(
-      {
-        name: task.service || 'host-pipeline',
-        workingDirectory: dir,
-        timeoutMinutes: 15,
-        stages: { 'unit-tests': { commands: [cmd], enabled: true } },
-      },
-      path.join(dir, '.pipeline.json'),
-    );
-  }
+  const servicePipelineOpts = { projectsRoot };
+  if (opts.configFilename) servicePipelineOpts.configFilename = opts.configFilename;
+  if (opts.createRunner) servicePipelineOpts.createRunner = opts.createRunner;
+  if (opts.runnerDeps) servicePipelineOpts.runnerDeps = opts.runnerDeps;
 
-  const result = await new PipelineRunner({ config }).execute();
+  const result = await runServicePipeline(serviceTask, servicePipelineOpts);
+
+  // Результат сервисного слоя уже совместим с host-task-completed
+  // (output.summary/failedStage/startedAt/logPath). Дополнительно поднимаем runId
+  // на верхний уровень output для обратной совместимости прежнего контракта.
   return {
     success: result.success === true,
-    output: {
-      runId: result.runId,
-      failedStage: result.failedStage ?? null,
-      logPath: result.reportPath ?? null,
-      summary: { success: result.success, failedStage: result.failedStage ?? null, runId: result.runId },
-    },
+    output: { ...result.output, runId: result.output?.summary?.runId ?? null },
   };
 }
 
@@ -155,8 +154,3 @@ export async function runGitAction(task, opts = {}) {
     },
   };
 }
-
-export const EXECUTORS = {
-  PIPELINE_SERVICE: runPipelineAction,
-  GIT_INTEGRATOR: runGitAction,
-};
