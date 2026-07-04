@@ -242,6 +242,15 @@ async function finalizeProgrammerRunOnCompletion(c, { taskId, roleId, payload })
   );
 }
 
+// STALE-COMPLETION-ROLE-GUARD-001 — вывести роль-источник сдачи из completionKey.
+// Ключ сдачи программиста имеет вид `programmer-${taskRowId}-${agentAssignedEventId}`
+// (см. claimNextClaudeTask), поэтому префикс кодирует роль-исполнителя, сделавшую
+// сдачу. Неизвестный формат → null: ожидание роли не задаётся и guard не срабатывает
+// (обратная совместимость с ключами без префикса роли).
+function roleFromCompletionKey(key) {
+  return String(key ?? '').startsWith('programmer-') ? 'PROGRAMMER' : null;
+}
+
 /**
  * Принять завершение от файлового Scanner bridge и передать задачу Task Reviewer.
  * scanner_dispatches и транзакция обеспечивают exactly-once переход на стороне БД.
@@ -277,6 +286,26 @@ export async function acceptScannerCompletionTx(c, payload) {
       if (!inserted.rowCount) {
         await c.query('COMMIT');
         return { accepted: true, duplicate: true, autoCreated: created, taskId: payload.taskId, nextRole: 'TASK_REVIEWER' };
+      }
+
+      // STALE-COMPLETION-ROLE-GUARD-001: сдача, чей completionKey кодирует роль
+      // PROGRAMMER (префикс `programmer-`), НЕ может закрывать этап, чей текущий
+      // исполнитель — другая роль (задача уже ушла с CODING, напр. держится
+      // PIPELINE_SERVICE на TESTING). Иначе fromRole берётся из
+      // task.current_role_code и resolveTransition(FORWARD) закрывает ЧУЖОЙ этап
+      // именем программиста — так дубль/опоздавшая сдача программиста закрыла TESTING
+      // в COMMIT и затёрла changedFiles реальной сдачи (инцидент f43a9f6c). Дедуп по
+      // (task_id, completion_key) это не ловит, если у сдачи новый ключ. Маршрут не
+      // продвигаем; dispatch уже зафиксирован как «увиден и проигнорирован» —
+      // фиксируем транзакцию и возвращаем сдачу как stale-дубль.
+      const expectedRole = roleFromCompletionKey(payload.completionKey);
+      if (expectedRole && task.current_role_code && task.current_role_code !== expectedRole) {
+        await c.query('COMMIT');
+        return {
+          accepted: true, duplicate: true, stale: true, autoCreated: created,
+          taskId: payload.taskId, currentRole: task.current_role_code,
+          expectedRole, nextRole: null,
+        };
       }
 
       // Завершение Programmer → продвижение по маршруту проекта
@@ -1702,9 +1731,17 @@ const HOST_ROLES = {
  * родителе/корне. Раньше scan смотрел только события самой задачи: у ребёнка их
  * нет → Git Integrator получал пустой changedFiles и завершался
  * note='no_changed_files', код оставался не закоммиченным. Ищем по всей цепочке
- * предков; берём ПОСЛЕДНЕЕ событие с непустым changedFiles или непустым result —
- * пустые ([]/'') не считаются, иначе TASK_CREATED с changedFiles:[] перекрывает
- * реальную сдачу. rootTask — корень цепочки (карточка Приёмщика для коммита).
+ * предков; пустые ([]/'') не считаются сдачей (иначе TASK_CREATED с changedFiles:[]
+ * перекрыл бы реальную сдачу).
+ *
+ * STALE-COMPLETION-ROLE-GUARD-001: changedFiles АГРЕГИРУЕМ по всей цепочке событий
+ * сдачи с дедупом (объединение непустых списков, порядок первого вхождения), а не
+ * берём одно последнее событие. Иначе поздний дубль сдачи с changedFiles:[] (но
+ * непустым result) выигрывал по created_at DESC и перекрывал реальный список файлов
+ * из более ранней валидной сдачи (инцидент f43a9f6c: пустой список затёр 5 файлов →
+ * Git Integrator получил no_changed_files, код не был закоммичен). result берём из
+ * последней сдачи с непустым result. rootTask — корень цепочки (карточка Приёмщика
+ * для коммита).
  */
 export async function resolveHostTaskContext(c, taskId) {
   const chain = await c.query(
@@ -1729,10 +1766,28 @@ export async function resolveHostTaskContext(c, taskId) {
             AND jsonb_array_length(payload_json->'changedFiles') > 0)
           OR COALESCE(payload_json->>'result', '') <> ''
         )
-      ORDER BY created_at DESC LIMIT 1`,
+      ORDER BY created_at DESC`,
     [chainIds],
   );
-  return { chainIds, rootTask, scan: ev.rows[0] ?? null };
+  if (!ev.rows.length) return { chainIds, rootTask, scan: null };
+  // Агрегируем changedFiles по всем событиям сдачи цепочки с дедупом; пустой список
+  // одного события не перекрывает непустой из другого (см. docblock).
+  const seen = new Set();
+  const changedFiles = [];
+  for (const row of ev.rows) {
+    const files = row.payload_json?.changedFiles;
+    if (!Array.isArray(files)) continue;
+    for (const f of files) {
+      const key = String(f);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      changedFiles.push(f);
+    }
+  }
+  // result — последняя сдача с непустым результатом (события отсортированы DESC).
+  const withResult = ev.rows.find((row) => String(row.payload_json?.result ?? '') !== '');
+  const result = withResult ? withResult.payload_json.result : '';
+  return { chainIds, rootTask, scan: { payload_json: { changedFiles, result } } };
 }
 
 /**

@@ -200,6 +200,53 @@ test('дубль сдачи программиста не трогает agent_r
   assert.equal(c.calls.some((q) => /UPDATE agent_runs/.test(q.sql)), false, 'прогон повторно не финализируется');
 });
 
+// STALE-COMPLETION-ROLE-GUARD-001: дубль/опоздавшая сдача программиста, пришедшая
+// когда задача уже ушла в TESTING под PIPELINE_SERVICE (pipeline ещё бежит), НЕ
+// должна закрывать этап. completionKey кодирует роль сдачи (префикс `programmer-`);
+// если текущая роль задачи — не PROGRAMMER, сдача помечается stale и маршрут не
+// продвигается, agent_run PIPELINE_SERVICE не затирается. Этап TESTING закрывает
+// только сдача host pipeline (completeHostTaskTx с roleCode=PIPELINE_SERVICE).
+test('дубль сдачи программиста в TESTING (под PIPELINE_SERVICE) → игнор, этап не закрывается', async () => {
+  __resetRoleFieldsCacheForTests();
+  const rules = scannerBaseRules();
+  rules[1] = {
+    re: /FROM tasks t[\s\S]*FOR UPDATE OF t/,
+    reply: { rowCount: 1, rows: [{
+      id: TASK, status: 'TESTING', project_id: 'proj-1', project_code: 'PS',
+      service_code: 'Catalog_Service', reviewer_role_id: 'rev-1',
+      current_role_id: 'role-pipe', current_role_code: 'PIPELINE_SERVICE',
+    }] },
+  };
+  const c = fakeClient(rules);
+  const res = await acceptScannerCompletionTx(c, scannerPayload({
+    completionKey: `programmer-${TASK}-assigned-1`, fields: { diff: 'x' }, numTurns: 28,
+  }));
+
+  assert.equal(res.accepted, true);
+  assert.equal(res.stale, true, 'опоздавшая сдача программиста помечена stale');
+  assert.equal(res.duplicate, true);
+  assert.equal(res.nextRole, null, 'маршрут НЕ продвигается чужой сдачей');
+  assert.equal(res.currentRole, 'PIPELINE_SERVICE');
+  assert.equal(c.calls.some((q) => /UPDATE tasks/.test(q.sql)), false, 'статус задачи не меняется');
+  assert.equal(c.calls.some((q) => /INSERT INTO task_events/.test(q.sql)), false, 'событие перехода не пишется');
+  assert.equal(c.calls.some((q) => /UPDATE agent_runs/.test(q.sql)), false, 'прогон PIPELINE_SERVICE не затирается сдачей программиста');
+  assert.equal(c.calls.some((q) => /COMMIT/.test(q.sql)), true, 'dispatch зафиксирован (сдача увидена и проигнорирована)');
+});
+
+// Контроль: та же сдача программиста, когда задача РЕАЛЬНО в CODING под PROGRAMMER,
+// проходит штатно (guard не ложно-срабатывает на легитимной сдаче).
+test('сдача программиста в CODING под PROGRAMMER (ключ programmer-…) → принята, не stale', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(scannerBaseRules());
+  const res = await acceptScannerCompletionTx(c, scannerPayload({
+    completionKey: `programmer-${TASK}-assigned-1`, fields: { diff: 'patch' },
+  }));
+  assert.equal(res.accepted, true);
+  assert.notEqual(res.stale, true, 'легитимная сдача не помечается stale');
+  assert.equal(res.nextRole, 'TASK_REVIEWER');
+  assert.ok(c.calls.find((q) => /UPDATE tasks/.test(q.sql)), 'задача продвинута');
+});
+
 test('контракт без обязательных полей → требований нет, сдача проходит', async () => {
   __resetRoleFieldsCacheForTests();
   const rules = scannerBaseRules();
