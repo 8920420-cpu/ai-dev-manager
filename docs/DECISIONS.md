@@ -319,3 +319,53 @@ build/deploy подсистемы; сервис без разрешимого к
 `service_path_unresolved` с текстом причины (вместо `pipeline_compose_not_found`
 от корня). `pipeline_compose_not_found` (ADR-007a) теперь достижим только когда
 каталог сервиса разрешён, но compose в подсистеме не найден.
+
+## ADR-015 — Бюджет и диагностика Архитектора на мега-эпиках; общий кап перезапусков этапа — ARCHITECT-BUDGET-SCALE-001 / ARCHITECT-BUDGET-LOOP-001 / TASK-RUN-LOOP-CAP-001 / ROLE-TIMEOUT-001
+
+**Дата:** 2026-07-04
+**Коммит:** b56c936
+**Решение:** четыре связанных механизма оркестрации против «молчаливого BLOCKED»,
+когда Архитектор не укладывается в бюджет одного прогона на крупном эпике.
+
+- **ROLE-TIMEOUT-001 — персональный таймаут прогона по роли.** Reasoning-раннеры
+  (`codex-runner/src/ReasoningRunner.js`, `programmer-runner/src/ReasoningRunner.js`)
+  получили карту `roleTimeoutsMs`; `resolveTaskTimeoutMs(role)` берёт таймаут роли
+  из карты, иначе общий `taskTimeoutMs`. `scripts/start-runners.ps1` задаёт
+  Архитектору `ARCHITECT_TASK_TIMEOUT_MS` (дефолт `1200000` = 20 мин) вместо общих
+  540 с. Орфан-таймаут рассуждающей роли поднят: `RUNNER_ROLE_TIMEOUT_MS=1500000`
+  (25 мин, было 600000/10 мин) в `.env.example`. Контракт цепочки: орфан (25 мин) >
+  бюджет Архитектора (20 мин) > общий hard-timeout рассуждающих раннеров (9 мин).
+- **ARCHITECT-BUDGET-SCALE-001 — масштабирование капа ходов по размеру эпика.**
+  `resolveRoleMaxTurns(roleCode, sizeCtx)` (`orchestrator-service/backend/src/roles.js`)
+  для роли `ARCHITECT` масштабирует базовый кап (`ROLE_MAX_TURNS_DEFAULTS.ARCHITECT=24`)
+  по описанию задачи. Сигнал размера доступен на claim только из описания (work_items
+  ещё не созданы — их производит Архитектор): `estimateEpicServiceCount` парсит явно
+  названное число сервисов/фронтов («14 фронтов»), плюс длина описания как прокси
+  объёма. Параметры `ARCHITECT_TURN_SCALE`: `perService:3`, `perKChars:2`,
+  `baseServices:2`, `baseChars:2000`, потолок `max:60`. Масштабируется ТОЛЬКО
+  Архитектор; вызов на claim — `db.js` `claimNextReasoningTask` с `{ description }`.
+- **ARCHITECT-BUDGET-LOOP-001 — диагностируемый блок мега-эпика.**
+  `escalateArchitectBudgetLoop` (`db.js`, свипер в `advanceAutomatedTasks`): после
+  `K = ARCHITECT_BUDGET_LOOP_MAX` (дефолт 3) подряд `CANCELLED`/`TIMEOUT`-прогонов
+  Архитектора (окно — после последнего `SUCCESS`) `ARCHITECTURE`-задача уходит в
+  `BLOCKED` С ПРИЧИНОЙ: в `data_card.architect_budget_block` (`{reason, cancelledRuns}`)
+  и в событии `TASK_BLOCKED` (`reason='architect_budget_exhausted'`). Текст причины
+  подсказывает действие: разбить эпик на пакеты по 4–5 сервисов/фронтов и вернуть в
+  ARCHITECTURE, либо увеличить бюджет.
+- **TASK-RUN-LOOP-CAP-001 — общий предохранитель для любой роли.**
+  `escalateRunawayRoleLoops` (`db.js`, свипер в `advanceAutomatedTasks`): после
+  `K = TASK_RUN_LOOP_MAX` (дефолт 5) подряд оборванных без вердикта
+  (`CANCELLED`/`TIMEOUT`) прогонов текущей роли задача уходит в `BLOCKED` с причиной в
+  `data_card.auto_run_limit` (`{reason, cancelledRuns, role}`) и событии `TASK_BLOCKED`
+  (`reason='run_budget_exhausted'`). Порог выше архитекторского — узкие жнецы
+  (Архитектор `ARCHITECT_BUDGET_LOOP_MAX=3`) срабатывают раньше со своим диагнозом;
+  этот — страховка для остальных ролей. Дальше — пуск руками (move на этап).
+**Причина:** мега-эпик (раскатка на N сервисов/фронтов с пофайловыми инструкциями)
+упирался в reasoning-таймаут 540 с БЕЗ вердикта, прогон отменялся/гасился жнецом,
+задача переигрывалась по кругу и без диагноза уходила в молчаливый `BLOCKED` (инцидент
+2026-07-04: PS-FEEDBACK-WIDGET-ROLLOUT-001 — три `CANCELLED` подряд по ~547 с).
+**Последствия:** Архитектор получает больший бюджет времени/ходов на крупных эпиках;
+при реальном неуложении задача блокируется С ВНЯТНОЙ ПРИЧИНОЙ в карточке (не молча) и
+требует ручного перезапуска; пороги/таймауты настраиваются через env
+(`ARCHITECT_TASK_TIMEOUT_MS`, `RUNNER_ROLE_TIMEOUT_MS`, `ARCHITECT_BUDGET_LOOP_MAX`,
+`TASK_RUN_LOOP_MAX`, `ARCHITECT_MAX_TURNS`).

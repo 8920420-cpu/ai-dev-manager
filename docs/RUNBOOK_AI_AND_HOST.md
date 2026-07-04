@@ -33,6 +33,25 @@
 (нет в `LLM_ROLE_CODES`, нет в `HOST_ROLES`). Если завести этап с ролью `TESTER`, задачи
 на нём встанут намертво. Для прогона тестов используйте `PIPELINE_SERVICE`, а не `TESTER`.
 
+**Важно (новый класс «задача сама ушла в BLOCKED с причиной», b56c936):** оркестратор
+уводит задачу в `BLOCKED` С ВНЯТНОЙ ПРИЧИНОЙ, когда этап несколько прогонов подряд
+обрывается без вердикта (`CANCELLED`/`TIMEOUT`), — вместо молчаливого блока и петли
+перезапусков, жгущей токены. Это НЕ чинится автоматом — нужен **ручной перезапуск**.
+- `ARCHITECT-BUDGET-LOOP-001`: `K = ARCHITECT_BUDGET_LOOP_MAX` (дефолт 3) подряд
+  оборванных прогонов Архитектора на `ARCHITECTURE` → `BLOCKED`; причина в
+  `data_card.architect_budget_block` и событии `TASK_BLOCKED`
+  (`reason='architect_budget_exhausted'`). Обычно означает «эпик слишком крупный».
+  Действие: разбить эпик на пакеты по 4–5 сервисов/фронтов и вернуть в ARCHITECTURE,
+  либо увеличить бюджет Архитектора (`ARCHITECT_TASK_TIMEOUT_MS`, `ARCHITECT_MAX_TURNS`).
+- `TASK-RUN-LOOP-CAP-001`: `K = TASK_RUN_LOOP_MAX` (дефолт 5) подряд оборванных
+  прогонов ЛЮБОЙ роли → `BLOCKED`; причина в `data_card.auto_run_limit` и событии
+  `TASK_BLOCKED` (`reason='run_budget_exhausted'`). Действие: разобрать причину (лог
+  прогонов этапа, бюджет времени роли) и запустить вручную — переместить задачу на
+  нужный этап (`POST /api/tasks/:id/move`).
+Найти такие задачи: `SELECT id,title,data_card->'auto_run_limit' AS run_cap,
+data_card->'architect_budget_block' AS arch_budget FROM tasks WHERE status='BLOCKED'
+AND (data_card ? 'auto_run_limit' OR data_card ? 'architect_budget_block');`
+
 ---
 
 ## 2. Запуск оркестратора (БД-сервис)
