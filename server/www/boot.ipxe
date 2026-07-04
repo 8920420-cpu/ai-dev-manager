@@ -8,6 +8,8 @@ set ubuntu-path ${base-url}/ubuntu/${ubuntu-version}
 set seed-url ${base-url}/autoinstall/
 
 dhcp
-kernel ${ubuntu-path}/casper/vmlinuz ip=dhcp url=${ubuntu-path}/ubuntu-live-server.iso autoinstall ds=nocloud-net;s=${seed-url} ---
+# cloud-config-url=/dev/null: иначе cloud-init трактует url= (ISO для casper) как
+# cloud-config и качает 3.4 ГБ в /run (tmpfs) — OOM и падение cloud-init-local.service.
+kernel ${ubuntu-path}/casper/vmlinuz ip=dhcp url=${ubuntu-path}/ubuntu-live-server.iso cloud-config-url=/dev/null autoinstall ds=nocloud-net;s=${seed-url} ---
 initrd ${ubuntu-path}/casper/initrd
 boot
