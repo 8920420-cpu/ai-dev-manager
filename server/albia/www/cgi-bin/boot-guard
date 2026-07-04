@@ -1,0 +1,26 @@
+#!/bin/sh
+# iPXE-гард против переустановки по кругу: boot.ipxe спрашивает по MAC, ставилась
+# ли нода. Если MAC (или hostname node-<mac6>) уже в nodes.jsonl — возвращаем
+# node-installed=1 и boot.ipxe уходит на локальный диск вместо установки.
+set -eu
+
+: "${ALBIA_REGISTRY_DIR:=/opt/albia/registry}"
+reg="$ALBIA_REGISTRY_DIR/nodes.jsonl"
+
+mac="$(printf '%s' "${QUERY_STRING:-}" \
+  | sed -n 's/.*mac=\([^&]*\).*/\1/p' \
+  | sed 's/%3[Aa]/:/g' \
+  | tr 'A-F' 'a-f')"
+mac6="$(printf '%s' "$mac" | tr -d ':' | tail -c 6)"
+
+installed=0
+if [ -n "$mac" ] && [ -s "$reg" ]; then
+  if grep -qi "\"mac\":\"$mac\"" "$reg" 2>/dev/null; then
+    installed=1
+  elif [ -n "$mac6" ] && grep -qi "node-$mac6" "$reg" 2>/dev/null; then
+    installed=1
+  fi
+fi
+
+printf 'Content-Type: text/plain\r\n\r\n'
+printf '#!ipxe\nset node-installed %s\n' "$installed"

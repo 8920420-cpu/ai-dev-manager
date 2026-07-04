@@ -25,6 +25,17 @@ if [ "$content_length" -gt 0 ] 2>/dev/null; then
   body="$(dd bs=1 count="$content_length" 2>/dev/null || true)"
 fi
 
+# iPXE-гард: boot.ipxe спрашивает по MAC, ставилась ли нода (см. www/cgi-bin/boot-guard).
+case "$method $path" in
+  "GET /cgi-bin/boot-guard"*)
+    query=""
+    case "$path" in *\?*) query="${path#*\?}" ;; esac
+    printf 'HTTP/1.1 200 OK\r\nConnection: close\r\n'
+    QUERY_STRING="$query" ALBIA_REGISTRY_DIR="$ALBIA_REGISTRY_DIR" /opt/albia/www/cgi-bin/boot-guard
+    exit 0
+    ;;
+esac
+
 if [ "$method" != "POST" ] || [ "$path" != "/cgi-bin/register" ]; then
   printf 'HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"ok":false,"error":"not_found"}\n'
   exit 0

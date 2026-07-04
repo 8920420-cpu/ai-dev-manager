@@ -90,8 +90,23 @@ docker compose --env-file .env -f server/docker-compose.yml --profile registry u
 
 Поток загрузки чистого сервера: iPXE (с носителя или по PXE) → HTTP
 `/boot.ipxe` → Ubuntu autoinstall → первый бут запускает `albia-firstboot`,
-нода регистрируется в Albia (`nodes.jsonl`: hostname, primaryIp, allIps,
+нода регистрируется в Albia (`nodes.jsonl`: hostname, mac, primaryIp, allIps,
 serial и т.д.).
+
+**Гард от переустановки по кругу.** Перед установкой `boot.ipxe` спрашивает
+Albia (`GET /cgi-bin/boot-guard?mac=<MAC>`): если нода с этим MAC (или
+hostname `node-<mac6>`) уже есть в `nodes.jsonl` — грузится локальный диск
+(`sanboot`, на UEFI — `exit` в следующее устройство загрузки), т.е. забытый
+носитель/PXE-приоритет не сотрёт рабочую ноду. Если Albia недоступна —
+установка идёт как обычно (свежая нода не блокируется). Гард срабатывает
+только ПОСЛЕ первой успешной регистрации: до неё вынимать носитель /
+менять порядок загрузки всё ещё обязательно, иначе установка зациклится.
+Снести ноду заново: удалить её строку из `nodes.jsonl` (или временно
+остановить albia) и перезагрузить с носителя.
+
+В строке ядра обязателен `cloud-config-url=/dev/null`: без него cloud-init
+считает `url=` (ISO для casper) своим конфигом и скачивает 3.4 ГБ второй раз
+в `/run` (tmpfs) — OOM и падение `cloud-init-local.service`.
 
 ## Загрузка с iPXE-носителя (основной путь на Windows-хосте)
 

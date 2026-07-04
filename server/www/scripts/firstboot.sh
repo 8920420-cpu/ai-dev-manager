@@ -14,6 +14,8 @@ fi
 
 hostname="$(hostname)"
 machine_id="$(cat /etc/machine-id 2>/dev/null || true)"
+primary_if="$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | head -n 1)"
+mac="$(cat "/sys/class/net/$primary_if/address" 2>/dev/null || true)"
 primary_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
 all_ips="$(hostname -I 2>/dev/null | tr ' ' ',' | sed 's/,*$//')"
 serial="$(cat /sys/class/dmi/id/product_serial 2>/dev/null || true)"
@@ -24,7 +26,7 @@ registered_at="$(date -Iseconds 2>/dev/null || date)"
 node_id="${machine_id:-$hostname}"
 
 payload="$(cat <<EOF
-{"nodeId":"$node_id","hostname":"$hostname","primaryIp":"$primary_ip","allIps":"$all_ips","sshUser":"admin","machineId":"$machine_id","serial":"$serial","manufacturer":"$manufacturer","productName":"$product_name","registeredAt":"$registered_at"}
+{"nodeId":"$node_id","hostname":"$hostname","mac":"$mac","primaryIp":"$primary_ip","allIps":"$all_ips","sshUser":"admin","machineId":"$machine_id","serial":"$serial","manufacturer":"$manufacturer","productName":"$product_name","registeredAt":"$registered_at"}
 EOF
 )"
 
