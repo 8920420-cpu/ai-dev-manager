@@ -71,7 +71,10 @@ Scanner вызывает endpoint после появления завершён
 либо поле `token` в теле. Приём валидирует токен, анти-спам и идемпотентность.
 
 Поля тела: `message` (текст обращения), `user`, `service` (микросервис-источник),
-`form` (экран/форма), `externalId` (идемпотентность источника), `autocontext`
+`form` (экран/форма), `externalId` (идемпотентность источника), `category`
+(необязательно; `bug|idea|feature|question` — невалидное/пустое → `null`, приём не
+роняет; сохраняется в `data_card.category` и в payload события `TASK_CREATED` как
+подсказка пользователя, которую Приёмщик перепроверяет), `autocontext`
 (URL, версия сборки, user-agent, timestamp, последние JS-ошибки, id упавшего
 запроса), `screenshotUrl` (ссылка на объект в MinIO — сохраняется в карточке
 задачи и доступна следующим ролям).
@@ -102,6 +105,35 @@ Scanner вызывает endpoint после появления завершён
   rate-limit, min-длина).
 - **`DELETE /api/intake-integrations/:id`** — удаление.
 - **`POST /api/intake-integrations/:id/rotate-token`** — перевыпуск токена.
+
+### Виджет «Обратная связь» оркестратора (frontend, ORCH-FEEDBACK-WIDGET-001)
+
+Same-origin контракт, который **потребляет** SPA-виджет «Обратная связь»
+(`src/api/feedbackApi.ts`, `src/types/feedback.ts`; коммит `8cbc0aa`). Виджет не
+шлёт токен интеграции из браузера — замысел в том, чтобы backend оркестратора
+серверно подставил токен предзарегистрированной интеграции «orchestrator-ui» и
+переиспользовал приём `POST /api/intake/report` (`acceptIntakeReport`), создавая
+задачу сразу в `BACKLOG` под Приёмщиком.
+
+> ⚠️ **Зависимость от бэкенда (на 2026-07-03 не реализована).** Endpoint'ы
+> `/api/feedback` и `/api/feedback/screenshot` найдены только в коде frontend —
+> в `orchestrator-service/backend/` их пока нет. Ниже задокументирован контракт
+> со стороны UI-потребителя; факт серверной реализации требует отдельного
+> подтверждения.
+
+- **`POST /api/feedback`** — приём обращения same-origin. Тело
+  (`FeedbackPayload`): `externalId` (uuid, генерирует виджет), `message`, `user`
+  (имя из localStorage, дефолт `orchestrator-ui`), `category`
+  (`bug|idea|feature|question`), `service` (всегда `orchestrator-ui`), `form`
+  (текущий маршрут SPA), `autocontext` (`url`, `buildVersion`, `userAgent`,
+  `timestamp`, `jsErrors[]`, `lastFailedApiRequestId`), `screenshotUrl?`. Ответ
+  (`FeedbackResult`, переиспользует контракт `acceptIntakeReport`):
+  `{ reportNumber, accepted?, duplicate?, taskId?, externalId? }`; виджет
+  показывает «Заявка №N принята».
+- **`POST /api/feedback/screenshot`** — загрузка скриншота. Тело `{ image }`
+  (JPEG data URL, снимается `html2canvas` ленивым импортом). Ответ
+  (`ScreenshotUploadResult`): `{ url, id? }` — `url` кладётся в `screenshotUrl`
+  обращения. Хранение выбирает backend; секрет интеграции в бандл не зашивается.
 
 ---
 
@@ -191,6 +223,29 @@ const result = await runPipeline({ configPath: '.pipeline.json' });
 ```
 Порядок ключей `stages` = порядок выполнения. Первая упавшая команда
 останавливает весь pipeline.
+
+### Сервисный режим по конвенции (`runServicePipeline`)
+Исполнитель этапа PIPELINE_SERVICE (`runServicePipeline`/`ServicePipelineTask`,
+вызывается host-runner по claim `task.pipeline`) НЕ требует `.pipeline.json` на
+диске. Если у выбранного сервиса нет локального `.pipeline.json`, стадии строит
+`ConventionConfigBuilder` по пути сервиса и корню проекта:
+- **test** — `go.mod` → `go test ./...`; `package.json` с непустым скриптом
+  `test` → `npm test`; иначе стадия SKIPPED (`no_tests_detected`);
+- **build** — ближайший вверх `docker-compose.yml`/`compose.yml` (в пределах
+  `projectRoot`) → `docker compose -f <compose> build`;
+- **deploy** — тот же compose → `docker compose -f <compose> up -d`; если compose
+  не найден — ошибка стадии `deploy` (`pipeline_compose_not_found`);
+- **smoke** — есть healthcheck в compose → `docker compose -f <compose> up -d
+  --wait`; иначе стадия SKIPPED (`no_healthcheck_in_compose`).
+
+Локальный `.pipeline.json` при наличии ПЕРЕОПРЕДЕЛЯЕТ конвенцию: целиком (по
+умолчанию) либо постадийно при `"extendsConvention": true` (одноимённые стадии
+заменяются, новые добавляются). Изоляция прежняя: `workingDirectory`, найденный
+compose и команды не выходят за `projectRoot` (`resolveServicePaths`).
+
+Примечание: это отдельный путь от `POST /test` tester-service и CLI
+`pipeline-runner --config` — там `.pipeline.json`/`pipelineConfigPath` по-прежнему
+обязателен (иначе `pipeline_config_not_found`), конвенционного построения нет.
 
 ---
 

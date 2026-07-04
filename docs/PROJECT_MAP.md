@@ -54,8 +54,14 @@ ai-dev-manager/
 ## Микросервисы и компоненты
 
 ### pipeline-runner
-- **Назначение:** запуск этапов CI/CD (test/lint/build/deploy/smoke), управляемых
-  только `.pipeline.json`. Не содержит проектной логики, не зависит от языка.
+- **Назначение:** запуск этапов CI/CD (test/lint/build/deploy/smoke). Стадии
+  задаются `.pipeline.json` ЛИБО конвенцией по пути сервиса. В сервисном режиме
+  (`runServicePipeline`) при отсутствии `.pipeline.json` движок сам строит стадии
+  по конвенции монорепо (`ConventionConfigBuilder`): детект стека (go.mod →
+  `go test ./...`; package.json со скриптом test → `npm test`; иначе test SKIPPED)
+  и подсистемы (ближайший вверх `docker-compose.yml` → build/deploy `docker compose
+  build`/`up -d`; smoke по healthcheck compose). Локальный `.pipeline.json` —
+  необязательный override (целиком или постадийно через `extendsConvention`).
 - **Технологии:** Node.js ≥ 18.
 - **Путь:** `pipeline-runner/`
 - **Зависимости:** нет (используется tester-service как `file:../pipeline-runner`).
@@ -70,10 +76,21 @@ ai-dev-manager/
 - **Точка входа:** `bin/tester-service.js` (HTTP на `$TESTER_PORT`, по умолчанию 4187).
 
 ### ai-dev-manager (web)
-- **Назначение:** фронтенд/панель оркестратора.
+- **Назначение:** фронтенд/панель оркестратора (Vite+React SPA, `src/` → `dist/`).
 - **Технологии:** статика за nginx, Docker.
 - **Путь:** корень + `dist/`, `nginx.conf`.
 - **Точка входа:** контейнер `ai-dev-manager`, порт 4186.
+- **Виджет «Обратная связь»** (ORCH-FEEDBACK-WIDGET-001, коммит `8cbc0aa`):
+  плавающая кнопка на всех страницах SPA — `src/App.tsx` подключает
+  `src/features/feedback/FeedbackWidget.tsx` (диалог: категория → текст +
+  чекбокс скриншота → проверка → отправка → номер заявки). Буфер JS-ошибок
+  (`window.onerror`/`unhandledrejection`) — `src/features/feedback/jsErrorBuffer.ts`;
+  скриншот через `html2canvas` ленивым импортом —
+  `src/features/feedback/captureScreenshot.ts`; типы — `src/types/feedback.ts`;
+  same-origin клиент — `src/api/feedbackApi.ts` (см. API_MAP.md, зависит от
+  бэкенд-эндпоинтов `/api/feedback` и `/api/feedback/screenshot`, пока не
+  реализованных в `orchestrator-service/backend/`). Новая npm-зависимость —
+  `html2canvas` (`package.json`).
 
 ### orchestrator-db
 - **Назначение:** единый источник истины оркестрации (задачи, статусы, роли,

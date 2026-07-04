@@ -76,6 +76,37 @@ PostgreSQL (`orchestrator_db`).
 **Причина:** единый запускатель для разных стеков, изоляция запусков.
 **Последствия:** каждый проверяемый проект обязан иметь `.pipeline.json`.
 
+> **Обновление (2026-07-03, ADR-007a — конвенционный режим).** В сервисном
+> режиме исполнения (`runServicePipeline`/`ServicePipelineTask`) `.pipeline.json`
+> стал НЕОБЯЗАТЕЛЬНЫМ. Если у сервиса нет локального `.pipeline.json`, движок сам
+> строит стадии по конвенции монорепо, зная только путь сервиса и корень проекта
+> (`ConventionConfigBuilder`):
+> - **test** — `go.mod` → `go test ./...`; `package.json` с непустым скриптом
+>   `test` → `npm test`; иначе стадия SKIPPED (`no_tests_detected`);
+> - **build** — ближайший вверх `docker-compose.yml`/`compose.yml` (граница
+>   подсистемы, не выходя за корень проекта) → `docker compose -f <compose> build`;
+> - **deploy** — тот же compose → `docker compose -f <compose> up -d`; если compose
+>   не найден — диагностируемая ошибка стадии deploy (`pipeline_compose_not_found`);
+> - **smoke** — если в compose объявлен healthcheck → `docker compose -f <compose>
+>   up -d --wait`; иначе стадия SKIPPED (`no_healthcheck_in_compose`).
+>
+> Локальный `.pipeline.json` остаётся необязательным ПЕРЕОПРЕДЕЛЕНИЕМ конвенции:
+> целиком (по умолчанию) либо постадийно (`extendsConvention: true` — одноимённые
+> стадии переопределяются, новые добавляются). Compose-файл не парсится (без
+> YAML-зависимости): подсистема = ближайший compose целиком, healthcheck
+> детектируется текстовым поиском. Логика дефолтов централизована в
+> `ConventionConfigBuilder` — правка применяется сразу ко всем сервисам, копии
+> `.pipeline.json` по репозиториям не заводятся. Тезисы «каждый проект обязан
+> иметь `.pipeline.json`» и «не содержит проектной логики / не зависит от языка»
+> действуют только для прямого запуска по конфигу; сервисный режим детектит стек
+> (go/node) и подсистему (compose).
+>
+> Тогда же удалён легаси-фолбэк host-runner (заглушка «самотесты
+> pipeline-runner» + env `HOST_PIPELINE_CONFIG/DIR/CMD`): контракт claim
+> (`task.pipeline`) обязателен — оркестратор строит его при выдаче задачи или
+> отклоняет claim с 422; задача без контракта теперь падает диагностируемо
+> (`pipeline_contract_missing`), а не завершается ложным успехом за секунды.
+
 ---
 
 ## ADR-008 — Документация как источник контекста
@@ -148,6 +179,16 @@ AI-API — их нельзя вызывать как обычный HTTP LLM end
   отклонение коротких сообщений (`min_message_length`).
 - Ссылка на скриншот (объект MinIO) сохраняется в карточке задачи и доступна
   следующим ролям.
+- Поля обращения (`reporterService`, `reporterForm`, `autocontext`,
+  `screenshotUrl`, `category`) прокидываются в контекст роли только для
+  задач-обращений (`tasks.intake_integration_id IS NOT NULL`) и только Приёмщику —
+  функция `buildIntakeReportContext` (`orchestrator-service/backend/src/db.js`);
+  объём капится (напр. `jsErrors` — первые 10 строк с обрезкой длины).
+- Категория из виджета (`category`, `bug|idea|feature|question`) — подсказка
+  пользователя (`user_category`), не истина: Приёмщик перепроверяет соответствие
+  тексту сообщения и фиксирует `resolved_category` (при переопределении — с
+  коротким обоснованием). Маппинг `resolved_category` → `task_type` карточки:
+  `bug→bug`, `idea→improvement/idea`, `feature→feature`, `question→question`.
 **Причина:** конечные пользователи продуктов должны сообщать о проблемах
 изнутри приложений, а обращения — попадать штатным потоком приёма без ручного
 назначения проекта.
@@ -157,3 +198,85 @@ AI-API — их нельзя вызывать как обычный HTTP LLM end
 Task Intake Officer (`/api/intake-integrations`). Вне объёма v1: личный список
 «мои заявки», дедуп похожих обращений, расширенная аналитика в Мониторе,
 подключение приложений вне ПС.
+
+---
+
+## ADR-012 — Вердикты reasoning-ролей: fenced YAML/JSON и авто-ретрай вместо FAILED — VERDICT-RETRY-001
+
+**Дата:** 2026-07-03
+**Коммит:** ed57314
+**Решение:** Обработка вердиктов reasoning-ролей усилена в двух местах:
+- `parseVerdict` (`orchestrator-service/backend/src/roleEngine.js`) теперь
+  распознаёт вердикт не только «голым» JSON, но и внутри код-фенсов
+  ```` ```json ```` и ```` ```yaml ````: YAML-блок парсится и приводится к тому
+  же объекту вердикта, что и JSON. Ранее распознавался только чистый JSON
+  (доработка VERDICT-PARSE-ROBUST-001).
+- Исход `verdict_unparsed` больше НЕ роняет задачу сразу в терминальный
+  `FAILED`. Прогон роли авто-повторяется до лимита `RUNNER_MAX_VERDICT_RETRY`
+  (env, `resolveInt`, default `1`, min `0`, max `10`; `0` = прежнее поведение
+  без ретраев). Только после исчерпания лимита возвращается прежнее поведение —
+  терминальный `FAILED` со `STATUS_CHANGED → FAILED`, `reason=verdict_unparsed`
+  (`orchestrator-service/backend/src/db.js`). Сырой ответ модели остаётся в
+  `prompt_exchanges`, диагностика — в `agent_runs.error_text` + `output_json`.
+**Причина:** движок `claude_code` (Claude Agent SDK, см. ADR-010) не умеет
+навязать JSON-схему вердикта на уровне CLI — в отличие от codex с
+`--output-schema`, — поэтому TASK_REVIEWER периодически возвращает содержательно
+корректный вердикт (например `status: APPROVED`) в код-фенсе ```` ```yaml ````,
+что давало `verdict_unparsed` и немедленный ручной разбор (за 24 ч ~10% прогонов
+TASK_REVIEWER).
+**Последствия:** содержательно корректные вердикты в fenced YAML/JSON более не
+теряются; единичный сбой парсинга гасится авто-повтором, а не терминальным
+падением. Семантика вердиктов и маршруты ролей не изменены. Регулировка числа
+повторов — через env `RUNNER_MAX_VERDICT_RETRY`.
+
+---
+
+## ADR-013 — Архитектор расщепляет мультисервисную задачу на независимые задачи-по-сервисам — ARCH-SERVICE-SPLIT-001
+
+**Дата:** 2026-07-03
+**Решение:** При вердикте роли `ARCHITECT` с `outcome=FORWARD` в
+`applyReasoningVerdict` (`orchestrator-service/backend/src/db.js`) разбивка
+берётся через `normalizeWorkItems(data_card + verdict.fields + cardValues)`;
+сервисы резолвятся по `services` проекта регистронезависимо. Если резолвится
+**≥2 разных зарегистрированных сервиса** — вместо `ensureArchitectService`
+вызывается `materializeArchitectSplit` (по образцу `materializeDecomposition`,
+один txn):
+- на каждый сервис создаётся **независимая дочерняя задача** `task_kind='service'`,
+  `parent_task_id`=исходная задача, тот же `project_id`, свой `service_id`,
+  `title = work_items[i].title`, `description` = описание исходной задачи +
+  раздел «Задание для сервиса `<serviceCode>`» с `files`/`what` только этого
+  сервиса, `data_card` = карточка родителя (+ поля вердикта Архитектора) с
+  **отфильтрованными по сервису** `work_items`/`affected_files`,
+  `created_by='architect'`;
+- дети входят в маршрут переходом `FORWARD` Архитектора: в граф-режиме (у
+  исходной задачи есть `current_stage_key`) — целевой узел Programmer через
+  `resolveGraphTransition`, детям проставляется `current_stage_key` целевого
+  этапа; в линейном — `resolveTransition` (обычно `CODING`/`PROGRAMMER`). Дети
+  не зависят друг от друга и идут по конвейеру независимо
+  (`CODING → REVIEW → TESTING → COMMIT …`);
+- исходная задача становится эпиком: `task_kind='epic'`,
+  `status='WAITING_FOR_CHILDREN'`, `assigned_agent_id=NULL`; пишется событие
+  `STATUS_CHANGED` (role `ARCHITECT`, `reason='architect_service_split'`, в
+  payload — список созданных задач `{id, serviceCode}` и `unresolved`-сервисы);
+  `agent_run` Архитектора завершается `SUCCESS` с outcome и статистикой.
+- **Идемпотентность:** если у задачи уже есть дети (`SELECT 1 FROM tasks WHERE
+  parent_task_id = …`) — повторно задачи не создаются, прогон финализируется
+  `reason='already_decomposed'`.
+- **0 или 1 сервис** — поведение не меняется (`ensureArchitectService`: одна
+  задача; 0 сервисов → `BLOCKED architect_no_service`). Нерезолвленные
+  `serviceCode` при расщеплении попадают в `unresolved` в payload события, задач
+  по ним не создаётся.
+- **Роллап:** `rollupDecompositionEpics` закрывает эпики с детьми
+  `task_kind='service'` (все дети терминальны → `DONE`; есть `BLOCKED`/`FAILED`
+  → `BLOCKED`).
+**Причина:** ранее при `FORWARD` `ensureArchitectService` резолвил ПЕРВЫЙ
+зарегистрированный сервис, и вся работа уходила Programmer одной задачей, даже
+если затронуты 2+ сервисов. Промт Архитектора (`arch-service-split-v1`) всегда
+заполняет `work_items` — ровно один элемент на затронутый сервис.
+**Последствия:** задача Архитектора, затрагивающая сервисы A и B, после его
+вердикта превращается в две независимые задачи (по одной на сервис), каждая
+проходит конвейер отдельно, а родитель-эпик закрывается роллапом после
+завершения детей. Claim программиста (`claimNextClaudeTask`) не затронут: дети
+kind='service' со `status='CODING'` и `service_id` клеймятся (фильтр
+`task_kind <> 'epic'`), сериализация «один активный CODING на сервис»
+(NOT EXISTS + advisory lock) сохраняется.
