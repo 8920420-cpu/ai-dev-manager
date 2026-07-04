@@ -252,6 +252,24 @@ export function summarizePriorRuns(rows = []) {
     });
 }
 
+// FA-MISSING-ARTIFACT-001 — распознать вердикт Аналитика сбоя вида «в контексте
+// нет артефакта провала» (нет упавшей команды/кода возврата/строк лога → диагноз
+// невозможен, вердикт «до предоставления реального лога»). Чистая функция по тексту
+// вердикта (summary + findings): требуем СОВПАДЕНИЯ и слова-отрицания (нет/
+// отсутствует/не предоставлен), и слова-артефакта (артефакт/лог/упавшая команда/код
+// возврата/данные о сбое). Двойное условие бьёт по конкретной жалобе «нечего
+// диагностировать», а не по обычному диагнозу, упоминающему лог/команду. Используется
+// анти-петлёй decideOutcome (эскалация в BLOCKED при повторе той же жалобы).
+export function isMissingArtifactComplaint(verdict) {
+  const parts = [verdict?.summary];
+  if (Array.isArray(verdict?.findings)) parts.push(...verdict.findings);
+  const text = parts.filter((s) => typeof s === 'string').join(' ').toLowerCase();
+  if (!text) return false;
+  const negation = /(отсутств\w*|\bнет\b|не\s+предоставл\w*|не\s+хватает|не\s+приложен\w*|не\s+содержит|\bmissing\b|\bno\b)/;
+  const artifact = /(артефакт\w*|\bлог\b|\bлога\b|\bлогах\b|\bлоги\b|строк\w*\s+лог\w*|хвост\w*\s+лог\w*|упавш\w*\s+команд\w*|кода?\s+возврат\w*|exit\s*code|данн\w*\s+о\s+(сбое|провале|падени\w*)|artifact|traceback)/;
+  return negation.test(text) && artifact.test(text);
+}
+
 // Единый JSON-контракт вердикта, дописывается к промту роли. Коннектор уже в
 // JSON-режиме, но просим явный обязательный JSON, иначе DeepSeek может отдать
 // прозу. Поля совпадают с YAML-форматами промтов, плюс ok-нормализация.
@@ -575,7 +593,7 @@ export function normalizeVerdict(roleCode, parsed) {
  *   'rework' (провал гейта без аналитика → на доработку) | 'forward' (необяз.).
  * reworkCount — сколько раз задача возвращалась в доработку (защита от цикла).
  */
-export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = MAX_REWORK } = {}) {
+export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = MAX_REWORK, priorMissingArtifact = false } = {}) {
   const forward = { outcome: 'FORWARD', agentRunStatus: 'SUCCESS', reason: 'ok' };
   // DOC-BRANCH-LIVENESS-001: мягкое движение вперёд с сохранением причины —
   // прогон НЕ считается упавшим (SUCCESS), но reason фиксирует, что документация
@@ -600,6 +618,14 @@ export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = 
     case 'FAILURE_ANALYST':
       if (verdict.ok === false && ['INCONCLUSIVE', 'INFRASTRUCTURE_BLOCKED'].includes(verdict.status)) {
         return block(verdict.status.toLowerCase());
+      }
+      // FA-MISSING-ARTIFACT-001 (анти-петля): Аналитик снова жалуется на отсутствие
+      // артефакта провала, а прошлый его раунд — та же жалоба. Значит, диагностировать
+      // нечем, и ещё круг Programmer→Reviewer→Pipeline ничего не добавит (инцидент:
+      // 4 раунда «нет лога» подряд → max_rework_exceeded, десятки прогонов впустую).
+      // Эскалируем в BLOCKED сразу с пометкой missing_artifact — на вмешательство.
+      if (priorMissingArtifact && isMissingArtifactComplaint(verdict)) {
+        return block('missing_artifact');
       }
       if (reworkCount >= maxRework) return block('max_rework_exceeded');
       return rework('diagnosed');

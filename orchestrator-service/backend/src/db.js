@@ -4,7 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ROLE_FLOW, fastForwardHiddenRoles } from './rolePipeline.js';
-import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict, renderProjectMaps } from './roleEngine.js';
+import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict, renderProjectMaps, isMissingArtifactComplaint } from './roleEngine.js';
 import { buildRoute, resolveTransition, forwardFrom, routeIsUsable, TERMINAL_STATUSES } from './projectRoute.js';
 import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey, reworkNodeKey } from './graphRoute.js';
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
@@ -208,6 +208,20 @@ export async function getAppliedMigrations(s) {
   });
 }
 
+// COMPLETION-SUMMARY-TEXT-001 — текстовый summary сдачи из поля result. Раннер
+// программиста шлёт result ОБЪЕКТОМ ({ summary, outcome, agent, ... }); наивный
+// String(object) давал «[object Object]» в task_events, в output_json прогона и в
+// priorRoleOutputs следующих ролей (теряя читаемую сдачу). Строка → как есть;
+// объект → .summary (иначе JSON); null/undefined → ''.
+function resultSummaryText(result) {
+  if (typeof result === 'string') return result;
+  if (result && typeof result === 'object') {
+    if (typeof result.summary === 'string' && result.summary.trim()) return result.summary;
+    try { return JSON.stringify(result); } catch { return ''; }
+  }
+  return result == null ? '' : String(result);
+}
+
 // PROGRAMMER-UNIFY-001 — финализировать RUNNING-прогон программиста при успешной
 // сдаче. Захват создал ровно один agent_run RUNNING на эту задачу под ролью
 // PROGRAMMER; переводим его в SUCCESS с KPI (turns=passes, model, code_version) —
@@ -223,22 +237,28 @@ export async function getAppliedMigrations(s) {
 // TIMEOUT, поэтому переписываем именно осиротевший прогон этой сдачи.
 async function finalizeProgrammerRunOnCompletion(c, { taskId, roleId, payload }) {
   if (roleId == null) return;
-  const turns = Number.isFinite(Number(payload?.numTurns)) ? Math.trunc(Number(payload.numTurns)) : null;
-  const summary = typeof payload?.result === 'string'
-    ? payload.result.slice(0, 2000)
-    : (payload?.result?.summary ?? payload?.title ?? 'completed');
+  // Читаемый summary (не «[object Object]») в output_json прогона — его же тянет
+  // priorRoleOutputs в контекст следующих ролей.
+  const summary = (resultSummaryText(payload?.result) || payload?.title || 'completed').slice(0, 2000);
+  // OBSERVABILITY-PROGRAMMER-KPI-001 — usage/cost/cold start сдачи программиста в
+  // agent_runs через те же хелперы, что и рассуждающие роли. Контракт с раннером:
+  // tokensIn/tokensOut/tokensCacheRead/tokensCacheCreation/costUsd/coldStartMs +
+  // numTurns (→ turns). token_input/output/cache/cost идут через COALESCE в
+  // runKpiSet, поэтому СТАРЫЙ раннер без этих полей не затирает данные (остаются
+  // нули/прежние значения) — обратная совместимость. Исход сдачи — всегда success.
+  const kpi = normalizeRunKpi({ ...payload, turns: payload?.numTurns, outcome: 'success' });
+  const outputJson = JSON.stringify({ status: 'DONE', summary, changedFiles: payload?.changedFiles ?? [] });
+  const kpiSet = runKpiSet(kpi, 2);
+  const roleIdx = 2 + kpiSet.params.length + 1;
   await c.query(
     `UPDATE agent_runs
-        SET status = 'SUCCESS', finished_at = now(), turns = $2, outcome = 'success',
-            model = COALESCE($3, model), code_version = COALESCE($4, code_version),
-            output_json = $5::jsonb
+        SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet.sql}
       WHERE id = (
         SELECT id FROM agent_runs
-         WHERE task_id = $1 AND role_id = $6 AND status IN ('RUNNING','TIMEOUT')
+         WHERE task_id = $1 AND role_id = $${roleIdx} AND status IN ('RUNNING','TIMEOUT')
          ORDER BY started_at DESC LIMIT 1
       )`,
-    [taskId, turns, payload?.model ?? null, payload?.codeVersion ?? null,
-      JSON.stringify({ status: 'DONE', summary, changedFiles: payload?.changedFiles ?? [] }), roleId],
+    [taskId, outputJson, ...kpiSet.params, roleId],
   );
 }
 
@@ -358,7 +378,7 @@ export async function acceptScannerCompletionTx(c, payload) {
            VALUES ($1, 'TASK_DONE', $2::task_status, 'DONE', $3, $4::jsonb)`,
           [payload.taskId, task.status, task.current_role_id, JSON.stringify({
             source: 'scanner', completionKey: payload.completionKey, service: payload.service,
-            result: payload.result, changedFiles: payload.changedFiles, fields: progCardValues,
+            result: resultSummaryText(payload.result), changedFiles: payload.changedFiles, fields: progCardValues,
             parentTaskId: task.parent_task_id, kind: 'subtask', passes: payload.numTurns,
             codeVersion: payload.codeVersion, model: payload.model,
           })],
@@ -418,7 +438,7 @@ export async function acceptScannerCompletionTx(c, payload) {
           source: 'scanner',
           completionKey: payload.completionKey,
           service: payload.service,
-          result: payload.result,
+          result: resultSummaryText(payload.result),
           changedFiles: payload.changedFiles,
           nextRole: nextRoleCode,
           fields: progCardValues,
@@ -1785,8 +1805,11 @@ export async function resolveHostTaskContext(c, taskId) {
     }
   }
   // result — последняя сдача с непустым результатом (события отсортированы DESC).
-  const withResult = ev.rows.find((row) => String(row.payload_json?.result ?? '') !== '');
-  const result = withResult ? withResult.payload_json.result : '';
+  // COMPLETION-SUMMARY-TEXT-001: извлекаем текстовый summary (result мог быть записан
+  // объектом), а НЕ приводим объект через String() → иначе «[object Object]» уходит в
+  // приоры следующих ролей.
+  const withResult = ev.rows.find((row) => resultSummaryText(row.payload_json?.result) !== '');
+  const result = withResult ? resultSummaryText(withResult.payload_json.result) : '';
   return { chainIds, rootTask, scan: { payload_json: { changedFiles, result } } };
 }
 
@@ -3753,6 +3776,104 @@ export async function fetchPriorOutputs(c, taskId) {
   };
 }
 
+// FA-MISSING-ARTIFACT-001 — сжать output_json ПРОВАЛЬНОГО прогона host-роли
+// (PIPELINE_SERVICE/GIT_INTEGRATOR) в компактный артефакт для контекста Аналитика
+// сбоя. Без этого артефакта FA «не видит» причину падения (нет упавшей команды,
+// кода возврата, строк лога) и раунд за раундом просит «реальный лог», хотя причина
+// уже лежит в БД (инцидент 1c3967ab/1ff73c5a: pipeline_compose_not_found).
+// Чистая функция (форма output известна из pipeline-runner/host-runner). Толерантна
+// к форме `error`: объект {code,message,logTail} ЛИБО строка (GIT_INTEGRATOR:
+// output.error='commit failed: …'); и к месту `error`: верхний уровень (инцидент)
+// ЛИБО summary.error (pipeline-runner). Ошибка ДО запуска команд (compose-not-found)
+// → error.message несёт причину, logTail/failedCommand пустые (это норма, не потеря).
+export function summarizeFailureArtifact(roleCode, output) {
+  const clip = (v, max) => {
+    if (v == null) return null;
+    const s = String(v);
+    return s.length > max ? `${s.slice(0, max - 1)}…` : s;
+  };
+  const o = output && typeof output === 'object' && !Array.isArray(output) ? output : {};
+  const summary = o.summary && typeof o.summary === 'object' && !Array.isArray(o.summary) ? o.summary : {};
+  const rawErr = o.error ?? summary.error ?? null;
+  let errorCode = null;
+  let errorMessage = null;
+  let logTail = '';
+  if (rawErr && typeof rawErr === 'object' && !Array.isArray(rawErr)) {
+    errorCode = clip(rawErr.code, 200);
+    errorMessage = clip(rawErr.message, 2000);
+    if (typeof rawErr.logTail === 'string') logTail = rawErr.logTail;
+  } else if (typeof rawErr === 'string') {
+    errorMessage = clip(rawErr, 2000);
+  }
+  const failedStage = o.failedStage ?? summary.failedStage ?? null;
+  // Упавшая команда с exit code — из summary.actions (если команды вообще стартовали).
+  const actions = Array.isArray(summary.actions) ? summary.actions : [];
+  const failedAction = actions.find((a) => a && typeof a === 'object'
+    && a.status && a.status !== 'success' && a.status !== 'SKIPPED') ?? null;
+  const failedCommand = failedAction && failedAction.command
+    ? { command: clip(failedAction.command, 500), exitCode: failedAction.exitCode ?? null }
+    : null;
+  // Хвост лога: из error.logTail (уже усечён pipeline-runner), иначе — из logFragment
+  // упавшей команды. При ошибке ДО команд остаётся пустым (причина — в errorMessage).
+  if (!logTail && failedAction && typeof failedAction.logFragment === 'string') {
+    logTail = failedAction.logFragment;
+  }
+  const note = typeof o.note === 'string' ? o.note
+    : (typeof summary.note === 'string' ? summary.note : null);
+  return {
+    role: roleCode,
+    status: 'FAILED',
+    failedStage: failedStage ?? null,
+    errorCode,
+    errorMessage,
+    failedCommand,
+    logTail: clip(logTail, 4000) ?? '',
+    logPath: o.logPath ?? summary.logPath ?? null,
+    runId: summary.runId ?? o.runId ?? null,
+    // GIT_INTEGRATOR и пр.: пометка исхода (no_changed_files/nothing_to_stage).
+    note: note != null ? clip(note, 500) : null,
+  };
+}
+
+// FA-MISSING-ARTIFACT-001 — артефакт ПОСЛЕДНЕГО провального прогона host-роли задачи
+// для контекста Аналитика сбоя. Источник — agent_runs.output_json упавшего прогона
+// (status='FAILED'), который completeHostTaskTx уже пишет целиком; тот же output
+// лежит и в payload события STATUS_CHANGED→FAILURE_ANALYSIS — берём из agent_runs как
+// единственной строки на прогон. Возвращает null, если провальных прогонов нет.
+export async function fetchFailureArtifact(c, taskId) {
+  const r = await c.query(
+    `SELECT r.code AS role_code, ar.output_json
+       FROM agent_runs ar JOIN roles r ON r.id = ar.role_id
+      WHERE ar.task_id = $1 AND ar.status = 'FAILED'
+        AND r.code IN ('PIPELINE_SERVICE', 'GIT_INTEGRATOR')
+        AND ar.output_json IS NOT NULL
+      ORDER BY ar.started_at DESC LIMIT 1`,
+    [taskId],
+  );
+  const row = r.rows[0];
+  if (!row) return null;
+  return summarizeFailureArtifact(row.role_code, row.output_json);
+}
+
+// FA-MISSING-ARTIFACT-001 — жаловался ли ПРЕДЫДУЩИЙ прогон Аналитика сбоя на
+// отсутствие артефакта провала? Читаем output_json последнего завершённого прогона
+// FAILURE_ANALYST (кроме текущего, ещё RUNNING) и прогоняем через
+// isMissingArtifactComplaint. Нужен анти-петле decideOutcome: две жалобы подряд по
+// одному провалу → BLOCKED сразу (missing_artifact), а не ещё круг вхолостую.
+async function priorFailureAnalystMissedArtifact(c, taskId, excludeRunId) {
+  const r = await c.query(
+    `SELECT ar.output_json
+       FROM agent_runs ar JOIN roles r ON r.id = ar.role_id
+      WHERE ar.task_id = $1 AND r.code = 'FAILURE_ANALYST'
+        AND ar.output_json IS NOT NULL AND ($2::uuid IS NULL OR ar.id <> $2)
+      ORDER BY ar.started_at DESC LIMIT 1`,
+    [taskId, excludeRunId ?? null],
+  );
+  const o = r.rows[0]?.output_json;
+  if (!o || typeof o !== 'object') return false;
+  return isMissingArtifactComplaint({ summary: o.summary, findings: o.findings });
+}
+
 // INTAKE-INTEGRATIONS-001 / INTAKE-CATEGORY-VALIDATION-001 — собрать компактный блок
 // обращения (intakeReport) для контекста роли. Чистая функция (без БД). Блок
 // формируется ТОЛЬКО для задач-обращений (isIntakeTask, т.е. intake_integration_id
@@ -3816,6 +3937,15 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
     ? await c.query('SELECT service_code FROM services WHERE project_id = $1 ORDER BY service_code', [projectId])
     : { rows: [] };
   const prior = await fetchPriorOutputs(c, claimed.id);
+
+  // FA-MISSING-ARTIFACT-001: Аналитику сбоя подаём артефакт последнего провального
+  // прогона host-роли (PIPELINE_SERVICE/GIT_INTEGRATOR) — error.code/message,
+  // failedStage, упавшая команда с exit code и хвост лога. Без него FA не видит
+  // причину (fetchPriorOutputs берёт только SUCCESS-прогоны) и просит «реальный лог»
+  // раунд за раундом. Только для FA — прочим ролям артефакт провала не нужен (null).
+  const failureArtifact = claimed.role_code === 'FAILURE_ANALYST'
+    ? await fetchFailureArtifact(c, claimed.id)
+    : null;
 
   // DECOMP-CONTRACT-001: если это задача-на-сервис (kind='service' с подзадачами),
   // её реальные результаты лежат на детях-подзадачах. Соберём их, чтобы Task
@@ -3917,6 +4047,8 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
     subtaskResults,
     priorRoleOutputs: prior.priorRoleOutputs,
     lastReview: prior.lastReview,
+    // FA-MISSING-ARTIFACT-001: артефакт последнего провала host-роли (только для FA).
+    failureArtifact,
     recentEvents: ev.rows.slice(0, 8).map((r) => ({ type: r.event_type, from: r.from_status, to: r.to_status })),
   };
 }
@@ -4082,9 +4214,18 @@ function runKpiSet(kpi, base) {
 
 async function applyReasoningVerdict(c, claimed, { route, contract, verdict, response, exchangeId, durationMs, kpi = null }) {
   const { values: cardValues, missingRequired: missingOut } = extractOutputs(verdict.fields, contract.outputs);
+  // FA-MISSING-ARTIFACT-001 (анти-петля): если Аналитик сбоя СНОВА жалуется на
+  // отсутствие артефакта провала — проверяем, была ли та же жалоба в его прошлом
+  // прогоне. Две подряд по одному провалу → decideOutcome эскалирует в BLOCKED
+  // (missing_artifact), не гоняя Programmer/Reviewer/Pipeline ещё круг вхолостую.
+  // Запрос делаем ТОЛЬКО когда текущий вердикт — жалоба (короткое замыкание &&).
+  const priorMissingArtifact = claimed.role_code === 'FAILURE_ANALYST'
+    && isMissingArtifactComplaint(verdict)
+    && await priorFailureAnalystMissedArtifact(c, claimed.id, claimed.agentRunId);
   let decision = decideOutcome(claimed.role_code, verdict, {
     reworkCount: claimed.reworkCount,
     maxRework: MAX_REWORK,
+    priorMissingArtifact,
   });
   if (missingOut.length && decision.outcome !== 'BLOCK') {
     decision = { outcome: 'REWORK', agentRunStatus: 'SUCCESS', reason: `missing_outputs:${missingOut.join(',')}` };
@@ -4851,10 +4992,21 @@ export function normalizeScannerCompletion(input) {
     service: required('service'),
     title: required('title'),
     status: 'completed',
-    result: String(input?.result ?? ''),
+    // COMPLETION-SUMMARY-TEXT-001: раннер программиста шлёт result ОБЪЕКТОМ
+    // ({ summary, ... }); извлекаем текстовый summary вместо String(object) —
+    // иначе «[object Object]» в task_events, output_json прогона и приорах.
+    result: resultSummaryText(input?.result),
     changedFiles: Array.isArray(input?.changedFiles) ? input.changedFiles.map(String) : [],
+    // usage/cost/cold start сдачи программиста (контракт с programmer-runner). В
+    // теле идут как есть; finalizeProgrammerRunOnCompletion читает их через
+    // normalizeRunKpi/runKpiSet. Числа/строки; отсутствуют (старый раннер) → null.
+    tokensIn: input?.tokensIn ?? null,
+    tokensOut: input?.tokensOut ?? null,
+    tokensCacheRead: input?.tokensCacheRead ?? null,
+    tokensCacheCreation: input?.tokensCacheCreation ?? null,
+    costUsd: input?.costUsd ?? null,
+    coldStartMs: input?.coldStartMs ?? null,
     // Число проходов (ходов агента) до завершения — скалярная метрика для Монитора.
-    // result сериализуется в строку выше, поэтому проходы храним отдельным числом.
     numTurns: Number.isFinite(Number(input?.numTurns)) ? Math.trunc(Number(input.numTurns)) : null,
     // VERSION-KPI-TRACKING-001: версия кода раннера и модель — у программиста промт
     // в коде, поэтому code_version версионирует и логику, и промт. Метки идут в
