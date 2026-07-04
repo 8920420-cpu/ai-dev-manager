@@ -161,6 +161,22 @@ test('resolveServiceRepoPath: неоднозначный код → service_path
   assert.equal(r.code, 'service_path_unresolved');
 });
 
+// CONTAINER-FS-DEGRADE-001: root_path — путь ХОСТА, оркестратор в контейнере его
+// не видит; безопасный сохранённый путь доверяем, пустой — по-прежнему провал.
+test('resolveServiceRepoPath: корень не виден процессу → безопасный сохранённый путь доверяем', () => {
+  const r = resolveServiceRepoPath('K:\\no\\such\\host\\root', 'Chat_Service', 'CRM/Chat_Service');
+  assert.deepEqual(r, { ok: true, repositoryPath: 'CRM/Chat_Service', changed: false });
+});
+
+test('resolveServiceRepoPath: корень не виден, путь пуст/небезопасен → service_path_unresolved', () => {
+  const empty = resolveServiceRepoPath('K:\\no\\such\\host\\root', 'Svc', null);
+  assert.equal(empty.ok, false);
+  assert.equal(empty.code, 'service_path_unresolved');
+  const unsafe = resolveServiceRepoPath('K:\\no\\such\\host\\root', 'Svc', '../escape');
+  assert.equal(unsafe.ok, false);
+  assert.equal(unsafe.code, 'service_path_unresolved');
+});
+
 // --- getOrCreateService: авторегистрация пишет repository_path ----------------
 
 test('getOrCreateService: новый сервис — repository_path попадает в INSERT', async () => {

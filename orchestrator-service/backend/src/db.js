@@ -1837,7 +1837,8 @@ export async function claimNextHostTask(s, roleCode) {
     await c.query('BEGIN');
     try {
       const picked = await c.query(
-        `SELECT t.id, t.title, t.description, t.current_role_id, t.project_id, t.service_id
+        `SELECT t.id, t.title, t.description, t.current_role_id, t.project_id, t.service_id,
+                t.status::text AS status
            FROM tasks t
            JOIN roles r ON r.id = t.current_role_id
            JOIN projects p ON p.id = t.project_id
@@ -1908,6 +1909,31 @@ export async function claimNextHostTask(s, roleCode) {
       // ДО запуска команд (транзакция откатывается, задача не выдаётся).
       let pipeline = null;
       if (roleCode === 'PIPELINE_SERVICE') {
+        // PIPELINE-CLAIM-UNWEDGE-001: нерезолвящийся сервис раньше ронял claim
+        // HTTP 422 — раннер получал отказ по кругу, а «кривая» задача (голова
+        // выборки) заклинивала ВСЕ pipeline-задачи проекта. Теперь стопорим САМУ
+        // задачу: прогон закрываем FAILED с ошибкой (видно в истории этапа),
+        // задачу — в BLOCKED с причиной в карточке (пуск руками после заполнения
+        // пути сервиса), COMMIT. Следующий тик claim берёт следующего кандидата.
+        const blockPipelineTask = async (code, message) => {
+          await c.query(
+            `UPDATE agent_runs SET status = 'FAILED', finished_at = now(),
+                    output_json = $2::jsonb, error_text = $3 WHERE id = $1`,
+            [run.rows[0].id, JSON.stringify({ error: { code, message } }), message],
+          );
+          await c.query(
+            `UPDATE tasks SET status = 'BLOCKED', assigned_agent_id = NULL,
+                    data_card = COALESCE(data_card, '{}'::jsonb) || $2::jsonb WHERE id = $1`,
+            [t.id, JSON.stringify({ pipeline_claim_block: { code, reason: message, service: m.service ?? null } })],
+          );
+          await c.query(
+            `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+             VALUES ($1, 'TASK_BLOCKED', $2::task_status, 'BLOCKED', $3, $4::jsonb)`,
+            [t.id, t.status, t.current_role_id,
+             JSON.stringify({ runner: true, reason: code, detail: message, service: m.service ?? null })],
+          );
+          await c.query('COMMIT');
+        };
         // SERVICE-REPO-PATH-001: репозиторный путь сервиса ОБЯЗАН указывать на
         // существующий каталог. Пустой/устаревший путь раньше проходил как
         // «сборка от корня» → pipeline_compose_not_found. Теперь: валидный путь
@@ -1915,9 +1941,8 @@ export async function claimNextHostTask(s, roleCode) {
         // диагностируемый провал service_path_unresolved ДО запуска стадий.
         const resolvedPath = resolveServiceRepoPath(m.root_path, m.service, m.repository_path);
         if (!resolvedPath.ok) {
-          const e = scannerError(422, resolvedPath.message);
-          e.code = resolvedPath.code; // service_path_unresolved
-          throw e;
+          await blockPipelineTask(resolvedPath.code, resolvedPath.message);
+          return { task: null, blocked: { taskId: t.id, code: resolvedPath.code } };
         }
         if (resolvedPath.changed) {
           await c.query('UPDATE services SET repository_path = $2 WHERE id = $1', [m.service_id, resolvedPath.repositoryPath]);
@@ -1934,9 +1959,8 @@ export async function claimNextHostTask(s, roleCode) {
             repositoryPath: resolvedPath.repositoryPath,
           });
         } catch (err) {
-          const e = scannerError(422, err.message || 'pipeline_contract_invalid');
-          e.code = err.code || 'pipeline_contract_invalid';
-          throw e;
+          await blockPipelineTask(err.code || 'pipeline_contract_invalid', err.message || 'pipeline_contract_invalid');
+          return { task: null, blocked: { taskId: t.id, code: err.code || 'pipeline_contract_invalid' } };
         }
       }
 

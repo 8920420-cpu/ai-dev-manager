@@ -118,11 +118,26 @@ export function findServiceDirByCode(rootPath, serviceCode, { maxDepth = 3 } = {
   return isServicePathSafe(only) ? only : null;
 }
 
+// CONTAINER-FS-DEGRADE-001: виден ли корень проекта ИЗ ТЕКУЩЕГО процесса.
+// root_path в БД — путь ХОСТА (Windows), а оркестратор работает в контейнере без
+// маунта проектов: statSync там всегда падает, и любая fs-валидация невозможна в
+// принципе (инцидент: каждый claim PIPELINE_SERVICE → 422, очередь стояла).
+function rootAccessible(rootPath) {
+  try {
+    return fs.statSync(String(rootPath ?? '').trim()).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Резолв каталога сервиса для claim PIPELINE_SERVICE.
  *  1) текущий repository_path валиден и каталог существует → оставить как есть;
- *  2) иначе — бэкфилл по коду (findServiceDirByCode); нашли один → отдать его;
- *  3) иначе — диагностируемый провал service_path_unresolved (НЕ запускать
+ *  2) корень проекта не виден процессу (оркестратор в контейнере) — валидировать
+ *     и бэкфиллить нечем: синтаксически безопасный сохранённый путь ДОВЕРЯЕМ
+ *     (реальную проверку сделает host-runner на хосте), пустой — провал;
+ *  3) иначе — бэкфилл по коду (findServiceDirByCode); нашли один → отдать его;
+ *  4) иначе — диагностируемый провал service_path_unresolved (НЕ запускать
  *     конвейер от корня).
  *
  * Возвращает { ok: true, repositoryPath, changed } или
@@ -130,11 +145,17 @@ export function findServiceDirByCode(rootPath, serviceCode, { maxDepth = 3 } = {
  */
 export function resolveServiceRepoPath(rootPath, serviceCode, repositoryPath, opts = {}) {
   const current = toPosix(repositoryPath).trim().replace(/^\.\//, '').replace(/\/+$/, '');
-  if (current && isServicePathSafe(current) && serviceDirExists(rootPath, current)) {
+  const currentSafe = Boolean(current) && isServicePathSafe(current);
+  if (currentSafe && serviceDirExists(rootPath, current)) {
     return { ok: true, repositoryPath: current, changed: false };
   }
-  const found = findServiceDirByCode(rootPath, serviceCode, opts);
-  if (found) return { ok: true, repositoryPath: found, changed: found !== current };
+  if (!rootAccessible(rootPath)) {
+    // CONTAINER-FS-DEGRADE-001 (см. rootAccessible): доверяем безопасному пути.
+    if (currentSafe) return { ok: true, repositoryPath: current, changed: false };
+  } else {
+    const found = findServiceDirByCode(rootPath, serviceCode, opts);
+    if (found) return { ok: true, repositoryPath: found, changed: found !== current };
+  }
   const code = String(serviceCode ?? '').trim() || '(без кода)';
   return {
     ok: false,
