@@ -29,7 +29,8 @@ docker run --rm -v "$OUT_DIR":/out debian:bookworm-slim sh -c "
   git clone -q --depth 1 https://github.com/ipxe/ipxe /ipxe
   cd /ipxe/src
   printf '#!ipxe\ndhcp\nchain http://$PXE_SERVER_IP:$PXE_HTTP_PORT/boot.ipxe\n' > embed.ipxe
-  make -j\$(nproc) bin/ipxe.iso bin/undionly.kpxe bin-x86_64-efi/ipxe.efi EMBED=embed.ipxe >/dev/null
+  make -j\$(nproc) bin/ipxe.iso bin/undionly.kpxe bin-x86_64-efi/ipxe.efi bin-x86_64-efi/ipxe.iso EMBED=embed.ipxe >/dev/null
   cp bin/ipxe.iso bin/undionly.kpxe bin-x86_64-efi/ipxe.efi /out/
-  echo 'built: ipxe.iso (BIOS media), undionly.kpxe (BIOS tftp), ipxe.efi (UEFI media/tftp/http)'
+  cp bin-x86_64-efi/ipxe.iso /out/ipxe-efi.iso
+  echo 'built: ipxe.iso (BIOS media), ipxe-efi.iso (UEFI media), undionly.kpxe (BIOS tftp), ipxe.efi (UEFI media/tftp/http)'
 "
