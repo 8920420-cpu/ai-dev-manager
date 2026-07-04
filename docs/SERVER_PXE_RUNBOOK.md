@@ -32,10 +32,10 @@ LAN ──> etcd, flannel, репликация Postgres (наружу не вы
 
 ```env
 SERVER_DATA_ROOT=K:\Роботы\Golang\git\server   # обязательно ВНЕ репозитория
-PXE_SERVER_IP=192.168.2.200                    # LAN IP докер-хоста
-PXE_ROUTER=192.168.2.1
-PXE_DNS=192.168.2.1
-PXE_DHCP_RANGE=192.168.2.201,192.168.2.240,12h
+PXE_SERVER_IP=192.168.1.211                    # LAN IP докер-хоста
+PXE_ROUTER=192.168.1.1
+PXE_DNS=192.168.1.1
+PXE_DHCP_RANGE=192.168.1.221,192.168.1.240,12h
 PXE_HTTP_PORT=8087
 ALBIA_PORT=8092
 # REGISTRY_PORT=5000
@@ -98,7 +98,7 @@ HTTP как обычно. Носитель нужен только на врем
 Сборка (готовые файлы кладутся в `$SERVER_DATA_ROOT/boot-media/`):
 
 ```bash
-PXE_SERVER_IP=192.168.2.200 PXE_HTTP_PORT=8087 \
+PXE_SERVER_IP=192.168.1.211 PXE_HTTP_PORT=8087 \
   OUT_DIR="K:/Роботы/Golang/git/server/boot-media" \
   sh server/scripts/build-ipxe-media.sh
 ```
@@ -124,10 +124,10 @@ localhost:5000/albia:latest` и т.д.). Одновременно оба не п
 
 ```powershell
 docker exec albia provision-k3s.sh                    # ноды из nodes.jsonl
-docker exec albia provision-k3s.sh 192.168.2.51 192.168.2.52 192.168.2.53
+docker exec albia provision-k3s.sh 192.168.1.51 192.168.1.52 192.168.1.53
 ```
 
-Скрипт по ssh (ключ `ssh/admin_ed25519`):
+Скрипт по ssh (ключ `ssh/albia_provision_ed25519`):
 
 1. пишет `/etc/rancher/k3s/registries.yaml` — доверие к
    `http://$PXE_SERVER_IP:5000` (локальный registry);

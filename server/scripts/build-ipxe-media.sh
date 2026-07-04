@@ -21,8 +21,10 @@ mkdir -p "$OUT_DIR"
 
 docker run --rm -v "$OUT_DIR":/out debian:bookworm-slim sh -c "
   set -eu
-  apt-get update -qq
-  apt-get install -y -qq git make gcc binutils perl liblzma-dev mtools genisoimage isolinux syslinux-common >/dev/null
+  # Check-Date=false: часы WSL2-VM Docker Desktop могут отставать (clock skew),
+  # из-за чего apt считает Release-файлы «ещё не валидными».
+  apt-get -o Acquire::Check-Date=false update -qq
+  apt-get -o Acquire::Check-Date=false install -y -qq git make gcc binutils perl liblzma-dev mtools genisoimage isolinux syslinux-common >/dev/null
   git clone -q --depth 1 https://github.com/ipxe/ipxe /ipxe
   cd /ipxe/src
   printf '#!ipxe\ndhcp\nchain http://$PXE_SERVER_IP:$PXE_HTTP_PORT/boot.ipxe\n' > embed.ipxe
