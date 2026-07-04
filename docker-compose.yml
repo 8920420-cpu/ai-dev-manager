@@ -43,6 +43,12 @@ services:
       # рассуждающих ролей: CODING идёт 10–20 мин, поэтому НЕ наследует короткий
       # RUNNER_ROLE_TIMEOUT_MS (иначе claude-захват реапится посреди написания кода).
       RUNNER_CLAUDE_TIMEOUT_MS: "${RUNNER_CLAUDE_TIMEOUT_MS:-1500000}"
+      # Орфан-таймаут HOST-ролей (PIPELINE_SERVICE/GIT_INTEGRATOR) — отдельно от
+      # рассуждающих: docker compose build / коммит идут дольше ROLE_TIMEOUT_MS, и
+      # если host-runner умер посреди сборки, release-host-task не приходит. КОНТРАКТ:
+      # дефолт совпадает с db.js/.env (2400000 ≈ 40 мин) и БОЛЬШЕ RUNNER_ROLE_TIMEOUT_MS,
+      # иначе живой прогон срежется посреди build. См. CONFIG_AUDIT.md.
+      RUNNER_HOST_TIMEOUT_MS: "${RUNNER_HOST_TIMEOUT_MS:-2400000}"
       # Задайте токен, чтобы закрыть /api/* при сетевом доступе (пусто = выключено).
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
       # Микросервис инструментов (builtin-чтение проекта + MCP для Claude Code).

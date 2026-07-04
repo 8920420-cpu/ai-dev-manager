@@ -102,3 +102,66 @@ test('reap: нет осиротевших прогонов → freed = 0', async
   const freed = await reapOrphanRunningRuns(c, { ageCheck: true });
   assert.equal(freed, 0);
 });
+
+// HOST-ORPHAN-TIMEOUT-001: убитый посреди прогона host-runner (PIPELINE_SERVICE во
+// время docker compose build, GIT_INTEGRATOR во время коммита) не зовёт
+// release-host-task → прогон висит RUNNING. Рантайм-жнец возвращает его в пул, но
+// сравнивает возраст с ОТДЕЛЬНЫМ бОльшим таймаутом host-ролей (иначе живой прогон
+// срежется посреди сборки), и пишет диагностируемое событие host_orphan_timeout.
+test('reap (runtime): host-роли реапятся по своему бОльшему таймауту через CASE по кодам ролей', async () => {
+  __resetClockGuard();
+  const c = fakeClient([
+    { re: /EXTRACT\(EPOCH/, reply: { rows: [{ ms: 1_000_000 }], rowCount: 1 } },
+    { re: REAP_RE, reply: { rowCount: 1, rows: [] } },
+  ]);
+
+  await reapOrphanRunningRuns(c, { ageCheck: true });
+  const main = c.calls.find((q) => REAP_RE.test(q.sql));
+  assert.ok(main, 'основной запрос вызван');
+
+  // Возраст host-роли ветвится через ANY(...::text[]) по кодам host-ролей.
+  assert.ok(/= ANY\(\$6::text\[\]\)/.test(main.sql), 'host-ветка возраста через ANY по кодам ролей');
+  // Программистская ветка сохранена (не сломали PROGRAMMER-UNIFY-001).
+  assert.ok(/CASE[\s\S]*WHEN COALESCE\(r\.code, ''\) = 'PROGRAMMER'/.test(main.sql), 'ветка PROGRAMMER сохранена');
+
+  // Переданы коды host-ролей и отдельный host-таймаут.
+  const hostCodes = main.params[5];
+  assert.ok(Array.isArray(hostCodes), 'коды host-ролей переданы массивом');
+  assert.ok(hostCodes.includes('PIPELINE_SERVICE'), 'PIPELINE_SERVICE в кодах host-ролей');
+  assert.ok(hostCodes.includes('GIT_INTEGRATOR'), 'GIT_INTEGRATOR в кодах host-ролей');
+
+  const roleTimeout = main.params[2];
+  const hostTimeout = main.params[4];
+  assert.equal(typeof hostTimeout, 'number', 'host-таймаут передан числом');
+  assert.ok(hostTimeout > roleTimeout, 'host-таймаут БОЛЬШЕ общего (живой docker-прогон не срезается посреди build)');
+
+  // Живой прогон в пределах host-таймаута не трогается, зависший — возвращается:
+  // возраст сравнивается именно с host-таймаутом, а он с запасом над сборкой.
+  const alive = roleTimeout + 60_000;   // старше общего, но host-прогон ещё живой
+  const hung = hostTimeout + 60_000;    // перешагнул host-таймаут → орфан
+  assert.ok(alive < hostTimeout, 'прогон возрастом чуть больше общего таймаута ещё в пределах host-таймаута → не реапится');
+  assert.ok(hung > hostTimeout, 'прогон старше host-таймаута → реапится');
+
+  // Возврат в пул: freed CTE снимает assigned_agent_id.
+  assert.ok(/freed AS \([\s\S]*assigned_agent_id = NULL/.test(main.sql), 'freed CTE освобождает слот (возврат в пул)');
+
+  // Диагностируемое событие для host-роли: кто (roleCode), почему, сколько висела (hungMs).
+  assert.ok(/'reason', 'host_orphan_timeout'/.test(main.sql), "событие reason=host_orphan_timeout");
+  assert.ok(/'hungMs', s\.hung_ms/.test(main.sql), 'в событии длительность зависания hungMs');
+  assert.ok(/'roleCode', s\.role_code/.test(main.sql), 'в событии код роли roleCode');
+  // stale CTE экспонирует роль и длительность для события.
+  assert.ok(/r\.code AS role_code/.test(main.sql), 'stale CTE отдаёт код роли');
+  assert.ok(/AS hung_ms/.test(main.sql), 'stale CTE считает длительность зависания');
+});
+
+// На стартовом reconcile (ageCheck=false) гасим ВСЕ RUNNING безусловно; причина —
+// «рестарт», а не «зависание по таймауту», поэтому host-ветки события НЕТ.
+test('reap (startup): host-ветки события host_orphan_timeout нет', async () => {
+  __resetClockGuard();
+  const c = fakeClient([{ re: REAP_RE, reply: { rowCount: 2, rows: [] } }]);
+  await reapOrphanRunningRuns(c);
+  const main = c.calls.find((q) => REAP_RE.test(q.sql));
+  assert.ok(main, 'основной запрос вызван');
+  assert.ok(!/host_orphan_timeout/.test(main.sql), 'на старте host-ветки события нет (общая причина рестарта)');
+  assert.equal(main.params.length, 2, 'на старте таймаут-параметры не передаются');
+});
