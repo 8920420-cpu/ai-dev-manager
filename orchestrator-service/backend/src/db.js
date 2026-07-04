@@ -2774,20 +2774,32 @@ export async function advanceAutomatedTasks(s, opts = {}) {
   for (const [roleCode, free] of slots) {
     for (let i = 0; i < free; i += 1) jobs.push(roleCode);
   }
+  // DB-FINALIZE-RETRY-001: конфиг БД пробрасываем в processClaimedRole, чтобы ретрай
+  // финализации мог открыть СВЕЖЕЕ соединение (withClient(cfg)), когда claim-соединение
+  // порвалось. Один снимок конфига на тик — read-only данные, безопасно шарить.
+  const cfg = clientConfig(s);
   const results = await Promise.all(
     jobs.map((roleCode) =>
-      withClient(clientConfig(s), async (c) => {
+      withClient(cfg, async (c) => {
         const claimed = await claimLlmRoleTask(c, roleCode);
         if (!claimed) return null;
-        return processClaimedRole(c, claimed);
+        return processClaimedRole(c, claimed, cfg);
       }).catch((error) => {
         // ORCH-BOOT-CLAIM-GRACE-001 (реактивная часть): обрыв СОЕДИНЕНИЯ именно в
         // claim/process — главный источник осиротевших RUNNING-прогонов (claim
         // создан, но финализация порвалась). Фиксируем шторм, чтобы ближайшие тики
         // придержали новые claim'ы, пока БД не стабилизируется, и не плодили новых
-        // сирот. Сама ошибка по-прежнему гасится (тик неуспешен по этому слоту, но
-        // остальные слоты и предшаги продолжают работать).
+        // сирот.
         if (isDbConnectionError(error)) noteDbConnectionFailure(opts.now);
+        // DB-FINALIZE-RETRY-001: НЕ глушим ошибку молча. Пост-LLM запись уже прошла
+        // ограниченный ретрай на свежем соединении (см. finalizeWithConnRetry); если
+        // и он исчерпан — логируем явно. Прогон остаётся RUNNING и будет подобран
+        // per-tick сбросом (reapOrphanRunningRuns/resetStaleClaims по таймауту роли).
+        // Возврат null не роняет тик — прочие слоты и предшаги продолжают работать.
+        console.error(
+          `[orchestrator-service] прогон роли ${roleCode}: claim/финализация не завершена `
+          + `(${error?.message ?? error}); прогон оставлен под per-tick сброс`,
+        );
         return null;
       }),
     ),
@@ -4290,7 +4302,78 @@ async function maybeSkipFailureAnalyst(c, claimed, route) {
   });
 }
 
-async function processClaimedRole(c, claimed) {
+// DB-FINALIZE-RETRY-001 — устойчивость финализации прогона к транзиентным обрывам БД.
+//
+// Проблема: финализация прогона рассуждающей роли (запись вердикта/перехода/agent_run
+// ПОСЛЕ LLM-вызова) выполняется отдельной транзакцией BEGIN..COMMIT на claim-соединении.
+// Если соединение рвётся в этот момент (короткий шторм «Connection terminated» при
+// рестарте/failover pgbouncer/Patroni), финализация падает, ошибка глохла в
+// advanceAutomatedTasks (.catch(()=>null)), а прогон оставался в RUNNING и держал слот
+// роли до таймаута — так копились сотни FAILED/TIMEOUT.
+//
+// Решение: ограниченный ретрай ТОЛЬКО пост-LLM записи результата. LLM НЕ повторяем —
+// повторяем лишь финализирующую транзакцию, причём на СВЕЖЕМ соединении из пула (claim
+// уже закоммичен отдельной транзакцией claimLlmRoleTask, поэтому финализацию безопасно
+// повторить на другом соединении — с claim-локом не конфликтует). Идемпотентность
+// повторной записи обеспечивается на уровне транзакции (isRunAlreadyFinalized): если
+// первая попытка уже закоммитила результат, но ack COMMIT потерялся из-за обрыва, ретрай
+// увидит agent_run уже не в RUNNING и выйдет без повторной вставки событий/переходов.
+const FINALIZE_RETRY_BACKOFF_MS = [100, 200, 400];
+
+function sleepMs(ms) {
+  return new Promise((res) => { setTimeout(res, ms); });
+}
+
+// Идемпотентный гейт финализации: блокируем строку agent_run (FOR UPDATE) и смотрим её
+// статус. Прогон уже не RUNNING → он финализирован (в т.ч. предыдущей попыткой, чей ack
+// COMMIT потерялся) → true: вызывающий обязан ROLLBACK и выйти без повторной записи.
+// Нет строки прогона → false (не мешаем прежнему поведению; напр. фейковый клиент в
+// тестах, где строки agent_runs нет). Вызывать ВНУТРИ транзакции финализации.
+async function isRunAlreadyFinalized(c, agentRunId) {
+  if (!agentRunId) return false;
+  const r = await c.query(
+    `SELECT status::text AS status FROM agent_runs WHERE id = $1 FOR UPDATE`,
+    [agentRunId],
+  );
+  if (!r.rowCount) return false;
+  return r.rows[0].status !== 'RUNNING';
+}
+
+// Выполнить пост-LLM запись результата прогона с ограниченным ретраем при ТРАНЗИЕНТНОМ
+// обрыве соединения. Первая попытка — на исходном claim-соединении `client`; повторы —
+// на СВЕЖЕМ соединении (withClient(cfg, ...)), с экспоненциальной задержкой backoff.
+// Небизнес-ошибки (не обрыв соединения — isDbConnectionError) пробрасываются сразу, без
+// ретраев. Если открывать свежее соединение некуда (cfg не передан и нет deps.withFresh)
+// — прежнее поведение: ошибка всплывает наверх. deps — инъекции для тестов.
+async function finalizeWithConnRetry(finalize, client, cfg, deps = {}) {
+  const withFresh = deps.withFresh ?? (cfg ? (fn) => withClient(cfg, fn) : null);
+  const sleep = deps.sleep ?? sleepMs;
+  const backoff = deps.backoff ?? FINALIZE_RETRY_BACKOFF_MS;
+  try {
+    return await finalize(client);
+  } catch (error) {
+    if (!withFresh || !isDbConnectionError(error)) throw error;
+    let lastError = error;
+    for (const delayMs of backoff) {
+      await sleep(delayMs);
+      try {
+        return await withFresh(finalize);
+      } catch (retryError) {
+        lastError = retryError;
+        if (!isDbConnectionError(retryError)) throw retryError;
+      }
+    }
+    throw lastError; // ретраи исчерпаны — ошибка всплывает наверх (не глушим молча)
+  }
+}
+
+// DB-FINALIZE-RETRY-001 (тестовый экспорт): доступ к чистым частям механизма ретрая/
+// идемпотентности без сетевого withClient (см. finalizeRetry.test.js).
+export const __finalizeRetryInternals = {
+  FINALIZE_RETRY_BACKOFF_MS, isRunAlreadyFinalized, finalizeWithConnRetry,
+};
+
+async function processClaimedRole(c, claimed, cfg) {
   const route = await loadProjectRoute(c, claimed.project_id);
   // TESTS-GREEN-SKIP-FA-001: аналитик сбоя на задаче с зелёными тестами — пропуск
   // вперёд без вызова модели (см. maybeSkipFailureAnalyst). Делаем это ДО гейта
@@ -4331,18 +4414,23 @@ async function processClaimedRole(c, claimed) {
       executeTool: runTool,
     });
   } catch (error) {
-    return failRoleRun(c, claimed, error);
+    // DB-FINALIZE-RETRY-001: LLM-вызов НЕ повторяем — но запись FAILED-исхода тоже
+    // должна пережить транзиентный обрыв соединения (иначе прогон завис бы в RUNNING).
+    return finalizeWithConnRetry((fc) => failRoleRun(fc, claimed, error), c, cfg);
   }
 
   // SILENT-FAIL-GUARD-001 (B): модель ответила, но без распознаваемого JSON-вердикта
   // (напр. DeepSeek прислал tool-call разметку вместо финального JSON, либо упёрся в
   // инструменты). НЕ считаем это успехом и НЕ продвигаем задачу вперёд — помечаем
   // «не выполнен» (FAILED) с логированием причины, чтобы быстро находить поломку.
+  // DB-FINALIZE-RETRY-001: запись исхода — под ретрай (LLM уже отработал, не повторяем).
   if (result.parsed === null) {
-    return failRoleUnparsed(c, claimed, result);
+    return finalizeWithConnRetry((fc) => failRoleUnparsed(fc, claimed, result), c, cfg);
   }
 
-  return applyReasoningVerdict(c, claimed, {
+  // DB-FINALIZE-RETRY-001: запись вердикта/перехода/agent_run — под ретрай на свежем
+  // соединении. LLM-результат (result) уже получен и в ретрае переиспользуется как есть.
+  return finalizeWithConnRetry((fc) => applyReasoningVerdict(fc, claimed, {
     route,
     contract,
     verdict: result.verdict,
@@ -4354,7 +4442,7 @@ async function processClaimedRole(c, claimed) {
       tokensIn: result.tokensIn, tokensOut: result.tokensOut,
       turns: result.turns, outcome: 'success',
     }),
-  });
+  }), c, cfg);
 }
 
 // Хвост рассуждающей роли: распознанный вердикт → выходной гейт полей → решение
@@ -4532,6 +4620,11 @@ async function routeIntakeToProject(c, claimed, { verdict, response, exchangeId,
   try {
     const cur = await c.query('SELECT status::text AS status FROM tasks WHERE id = $1 FOR UPDATE', [claimed.id]);
     if (!cur.rowCount) { await c.query('ROLLBACK'); return null; }
+    // DB-FINALIZE-RETRY-001: идемпотентность повторной финализации на свежем соединении.
+    if (await isRunAlreadyFinalized(c, claimed.agentRunId)) {
+      await c.query('ROLLBACK');
+      return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: cur.rows[0].status, alreadyFinalized: true };
+    }
 
     const mergedCard = { ...(cardValues || {}), project: project.code, projectPath: project.root_path };
     const sets = [
@@ -4639,6 +4732,11 @@ function filterCardForService(card, byCode, serviceId) {
 async function blockClaimedReason(c, claimed, reason, { verdict, cardValues, kpi = null, event = 'blocked' } = {}) {
   await c.query('BEGIN');
   try {
+    // DB-FINALIZE-RETRY-001: идемпотентность повторной финализации на свежем соединении.
+    if (await isRunAlreadyFinalized(c, claimed.agentRunId)) {
+      await c.query('ROLLBACK');
+      return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: 'BLOCKED', reason, alreadyFinalized: true };
+    }
     const kpiSet = runKpiSet(kpi, 2);
     await c.query(
       `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet.sql} WHERE id = $1`,
@@ -4723,6 +4821,12 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
 
   await c.query('BEGIN');
   try {
+    // DB-FINALIZE-RETRY-001: идемпотентность повторной финализации на свежем соединении
+    // (ack COMMIT предыдущей попытки мог потеряться при обрыве) — прогон уже не RUNNING.
+    if (await isRunAlreadyFinalized(c, claimed.agentRunId)) {
+      await c.query('ROLLBACK');
+      return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: claimed.status, reason: 'already_finalized', durationMs };
+    }
     // Идемпотентность: эпик уже расщеплён — финализируем прогон без дублей.
     const hasChildren = await c.query('SELECT 1 FROM tasks WHERE parent_task_id = $1 LIMIT 1', [claimed.id]);
     if (hasChildren.rowCount) {
@@ -4863,6 +4967,12 @@ export async function materializeArchitectSplit(c, claimed, { verdict, response,
 
   await c.query('BEGIN');
   try {
+    // DB-FINALIZE-RETRY-001: идемпотентность повторной финализации на свежем соединении
+    // (ack COMMIT предыдущей попытки мог потеряться при обрыве) — прогон уже не RUNNING.
+    if (await isRunAlreadyFinalized(c, claimed.agentRunId)) {
+      await c.query('ROLLBACK');
+      return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: claimed.status, reason: 'already_finalized', durationMs };
+    }
     // Идемпотентность: задача уже расщеплена — финализируем прогон без дублей.
     const hasChildren = await c.query('SELECT 1 FROM tasks WHERE parent_task_id = $1 LIMIT 1', [claimed.id]);
     if (hasChildren.rowCount) {
@@ -4965,6 +5075,14 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
     if (!cur.rowCount) {
       await c.query('ROLLBACK');
       return null;
+    }
+    // DB-FINALIZE-RETRY-001: идемпотентность повторной финализации. Если предыдущая
+    // попытка уже закоммитила результат (а ack COMMIT потерялся из-за обрыва соединения),
+    // прогон уже не RUNNING — выходим без повторной вставки события/перехода (иначе
+    // задвоили бы task_events и повторно перевели задачу).
+    if (await isRunAlreadyFinalized(c, claimed.agentRunId)) {
+      await c.query('ROLLBACK');
+      return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: cur.rows[0].status, alreadyFinalized: true };
     }
     const nextRoleId = resolved.done || !resolved.nextRole
       ? null
@@ -5075,6 +5193,11 @@ async function blockClaimedForFields(c, claimed, missingFields) {
 async function failRoleRun(c, claimed, err) {
   await c.query('BEGIN');
   try {
+    // DB-FINALIZE-RETRY-001: идемпотентность повторной финализации на свежем соединении.
+    if (await isRunAlreadyFinalized(c, claimed.agentRunId)) {
+      await c.query('ROLLBACK');
+      return null;
+    }
     await c.query(
       `UPDATE agent_runs SET status = 'FAILED', finished_at = now(), error_text = $2 WHERE id = $1`,
       [claimed.agentRunId, err.message],
@@ -5124,6 +5247,11 @@ async function failRoleUnparsed(c, claimed, result) {
     + `(ответ модели не распарсился; см. prompt_exchanges ${result?.exchangeId ?? ''})`;
   await c.query('BEGIN');
   try {
+    // DB-FINALIZE-RETRY-001: идемпотентность повторной финализации на свежем соединении.
+    if (await isRunAlreadyFinalized(c, claimed.agentRunId)) {
+      await c.query('ROLLBACK');
+      return null;
+    }
     await c.query(
       `UPDATE agent_runs SET status = 'FAILED', finished_at = now(), error_text = $2, output_json = $3::jsonb WHERE id = $1`,
       [claimed.agentRunId, errorText, JSON.stringify({ reason, exchangeId: result?.exchangeId ?? null, responseHead: head })],
