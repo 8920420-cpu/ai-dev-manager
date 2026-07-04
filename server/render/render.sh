@@ -39,6 +39,9 @@ envsubst "$VARS" < "$SRC/boot.ipxe" > "$DST/boot.ipxe"
 envsubst "$VARS" < "$SRC/autoinstall/user-data" > "$DST/autoinstall/user-data"
 envsubst "$VARS" < "$SRC/scripts/firstboot.sh" > "$DST/scripts/firstboot.sh"
 cp "$SRC/autoinstall/meta-data" "$DST/autoinstall/meta-data"
+# пустой vendor-data обязателен: без него cloud-init бракует весь NoCloud-сид
+# (10 ретраев 404 → datasource failed → установщик уходит в интерактив)
+cp "$SRC/autoinstall/vendor-data" "$DST/autoinstall/vendor-data"
 
 for f in "$DST/boot.ipxe" "$DST/autoinstall/user-data" "$DST/scripts/firstboot.sh"; do
   if grep -q 'PXE_SERVER_IP\|PXE_HTTP_PORT\|ALBIA_PORT\|ALBIA_SSH_PUBKEY' "$f"; then
