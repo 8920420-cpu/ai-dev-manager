@@ -1,7 +1,7 @@
 #!ipxe
 
-set server-ip ${next-server}
-set http-port 8087
+set server-ip ${PXE_SERVER_IP}
+set http-port ${PXE_HTTP_PORT}
 set base-url http://${server-ip}:${http-port}
 set ubuntu-version 24.04
 set ubuntu-path ${base-url}/ubuntu/${ubuntu-version}

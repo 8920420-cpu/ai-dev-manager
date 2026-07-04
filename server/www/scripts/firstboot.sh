@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-ALBIA_URL="${ALBIA_URL:-http://192.168.2.200:8092/cgi-bin/register}"
+ALBIA_URL="${ALBIA_URL:-http://${PXE_SERVER_IP}:${ALBIA_PORT}/cgi-bin/register}"
 STATE_DIR="/var/lib/albia"
 STATE_FILE="$STATE_DIR/registered"
 
@@ -15,6 +15,7 @@ fi
 hostname="$(hostname)"
 machine_id="$(cat /etc/machine-id 2>/dev/null || true)"
 primary_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+all_ips="$(hostname -I 2>/dev/null | tr ' ' ',' | sed 's/,*$//')"
 serial="$(cat /sys/class/dmi/id/product_serial 2>/dev/null || true)"
 product_name="$(cat /sys/class/dmi/id/product_name 2>/dev/null || true)"
 manufacturer="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null || true)"
@@ -23,7 +24,7 @@ registered_at="$(date -Iseconds 2>/dev/null || date)"
 node_id="${machine_id:-$hostname}"
 
 payload="$(cat <<EOF
-{"nodeId":"$node_id","hostname":"$hostname","primaryIp":"$primary_ip","sshUser":"admin","machineId":"$machine_id","serial":"$serial","manufacturer":"$manufacturer","productName":"$product_name","registeredAt":"$registered_at"}
+{"nodeId":"$node_id","hostname":"$hostname","primaryIp":"$primary_ip","allIps":"$all_ips","sshUser":"admin","machineId":"$machine_id","serial":"$serial","manufacturer":"$manufacturer","productName":"$product_name","registeredAt":"$registered_at"}
 EOF
 )"
 

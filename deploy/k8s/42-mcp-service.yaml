@@ -1,0 +1,69 @@
+# MCP-сервис (HTTP/SSE, /mcp). Мутации выключены; включать только вместе с
+# непустым ORCHESTRATOR_API_TOKEN. Ingress-правило для него закомментировано
+# в 50-ingress.yaml — открывать осознанно.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-service
+  namespace: ai-prod
+  labels:
+    app: mcp-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-service
+  template:
+    metadata:
+      labels:
+        app: mcp-service
+    spec:
+      containers:
+        - name: mcp-service
+          image: mcp-service:latest
+          ports:
+            - containerPort: 4190
+          env:
+            - name: MCP_SERVICE_PORT
+              value: "4190"
+            - name: PROJECT_ROOT
+              value: /app/ai-dev-manager
+            - name: ORCHESTRATOR_URL
+              value: http://orchestrator-service
+            - name: TOOLS_SERVICE_URL
+              value: http://tools-service:4188
+            - name: ORCHESTRATOR_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: orchestrator-secrets
+                  key: apiToken
+            - name: MCP_ENABLE_WRITE
+              value: "0"
+            - name: MCP_ENABLE_DELETE
+              value: "0"
+            - name: MCP_ENABLE_ORCHESTRATOR_MUTATIONS
+              value: "0"
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4190
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mcp-service
+  namespace: ai-prod
+spec:
+  selector:
+    app: mcp-service
+  ports:
+    - port: 4190
+      targetPort: 4190

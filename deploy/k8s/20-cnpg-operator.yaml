@@ -1,0 +1,13 @@
+# Оператор CloudNativePG — управляет кластером Postgres (шаг 6):
+# primary + streaming-реплики, автоматический failover. Весь трафик
+# репликации ходит по pod-сети flannel поверх LAN (--node-ip в provision-k3s.sh).
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: cloudnative-pg
+  namespace: kube-system
+spec:
+  repo: https://cloudnative-pg.github.io/charts
+  chart: cloudnative-pg
+  targetNamespace: cnpg-system
+  createNamespace: true

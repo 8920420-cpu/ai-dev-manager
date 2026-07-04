@@ -44,6 +44,17 @@ const MANAGED_SERVERS = [
     description: 'HTTP server for iPXE script, Ubuntu ISO/casper files, autoinstall seed and firstboot script.',
   },
   {
+    id: 'server-registry',
+    name: 'Server registry',
+    type: 'docker-compose',
+    composeFile: 'server/docker-compose.yml',
+    composeProfiles: ['registry'],
+    service: 'registry',
+    containerName: 'server-registry',
+    image: 'registry:2',
+    description: 'Локальный Docker registry :5000 для образов Albia и прод-деплоя в k3s.',
+  },
+  {
     id: 'server-netbootxyz',
     name: 'Server netboot.xyz',
     type: 'docker-compose',

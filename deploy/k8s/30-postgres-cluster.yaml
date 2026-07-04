@@ -1,0 +1,38 @@
+# Кластер Postgres (шаг 6): 3 инстанса — по одному на каждую ноду
+# (anti-affinity required). Primary принимает запись, две streaming-реплики
+# получают WAL по внутренней сети (flannel поверх LAN); failover автоматический.
+# CNPG сам создаёт Secret `pg-main-app` (логин/пароль владельца БД) и сервисы:
+#   pg-main-rw — всегда primary (запись), pg-main-ro — реплики (чтение).
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: pg-main
+  namespace: ai-prod
+spec:
+  instances: 3
+
+  bootstrap:
+    initdb:
+      database: orchestrator_db
+      owner: orchestrator
+
+  storage:
+    # local-path — штатный StorageClass k3s (диск ноды). Данные не переезжают
+    # между нодами — их консистентность обеспечивает репликация CNPG.
+    storageClass: local-path
+    size: 20Gi
+
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: required
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "512MB"
+    # Кворумная синхронная репликация (запись подтверждается хотя бы одной
+    # репликой). Если важнее скорость записи, чем нулевой RPO — убрать блок.
+    synchronous:
+      method: any
+      number: 1

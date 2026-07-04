@@ -37,8 +37,9 @@ hostname="$(printf '%s' "$body" | sed -n 's/.*"hostname"[[:space:]]*:[[:space:]]
 
 [ -n "$node_id" ] || node_id="node-$(date +%s)"
 [ -n "$hostname" ] || hostname="unknown"
+[ -n "$body" ] || body='{}'
 
 printf '{"registeredAt":"%s","remoteAddr":"%s","nodeId":"%s","hostname":"%s","payload":%s}\n' \
-  "$registered_at" "$remote_addr" "$node_id" "$hostname" "${body:-{}}" >> "$ALBIA_REGISTRY_DIR/nodes.jsonl"
+  "$registered_at" "$remote_addr" "$node_id" "$hostname" "$body" >> "$ALBIA_REGISTRY_DIR/nodes.jsonl"
 
 printf 'HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\n\r\n{"ok":true,"nodeId":"%s","hostname":"%s"}\n' "$node_id" "$hostname"

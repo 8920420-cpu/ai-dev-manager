@@ -17,9 +17,10 @@ hostname="$(printf '%s' "$body" | sed -n 's/.*"hostname"[[:space:]]*:[[:space:]]
 
 [ -n "$node_id" ] || node_id="node-$(date +%s)"
 [ -n "$hostname" ] || hostname="unknown"
+[ -n "$body" ] || body='{}'
 
 printf '{"registeredAt":"%s","remoteAddr":"%s","nodeId":"%s","hostname":"%s","payload":%s}\n' \
-  "$registered_at" "$remote_addr" "$node_id" "$hostname" "${body:-{}}" >> "$ALBIA_REGISTRY_DIR/nodes.jsonl"
+  "$registered_at" "$remote_addr" "$node_id" "$hostname" "$body" >> "$ALBIA_REGISTRY_DIR/nodes.jsonl"
 
 cat <<EOF
 Content-Type: application/json

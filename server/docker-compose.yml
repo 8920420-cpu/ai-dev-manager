@@ -12,7 +12,9 @@ services:
     environment:
       ALBIA_PORT: "${ALBIA_PORT:-8090}"
       ALBIA_PROVISION_USER: "${ALBIA_PROVISION_USER:-admin}"
-      ALBIA_PROVISION_SSH_KEY: "${ALBIA_PROVISION_SSH_KEY:-/opt/albia/ssh/admin_ed25519}"
+      # albia_provision_ed25519 — БЕЗ пассфразы (admin_ed25519 зашифрован и
+      # для неинтерактивного provisioning не годится).
+      ALBIA_PROVISION_SSH_KEY: "${ALBIA_PROVISION_SSH_KEY:-/opt/albia/ssh/albia_provision_ed25519}"
       ALBIA_PROVISION_PXE_SERVER_IP: "${PXE_SERVER_IP:-192.168.1.130}"
     ports:
       - "${ALBIA_BIND:-0.0.0.0}:${ALBIA_PORT:-8090}:${ALBIA_PORT:-8090}"
@@ -44,9 +46,27 @@ services:
       - ${SERVER_DATA_ROOT:-.}/tftp:/srv/tftp:ro
     restart: unless-stopped
 
+  render:
+    image: nginx:1.27-alpine
+    container_name: server-render
+    entrypoint: ["/bin/sh", "/render.sh"]
+    restart: "no"
+    environment:
+      PXE_SERVER_IP: "${PXE_SERVER_IP:?Set PXE_SERVER_IP to the LAN IP of this Docker host}"
+      PXE_HTTP_PORT: "${PXE_HTTP_PORT:-8088}"
+      ALBIA_PORT: "${ALBIA_PORT:-8090}"
+    volumes:
+      - ./render/render.sh:/render.sh:ro
+      - ./www:/render/src:ro
+      - ${SERVER_DATA_ROOT:-.}/www:/render/dst
+      - ${SERVER_DATA_ROOT:-.}/ssh:/render/ssh:ro
+
   nginx:
     image: nginx:1.27-alpine
     container_name: server-nginx
+    depends_on:
+      render:
+        condition: service_completed_successfully
     ports:
       - "${PXE_HTTP_BIND:-0.0.0.0}:${PXE_HTTP_PORT:-8088}:80"
     volumes:
@@ -59,6 +79,17 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+
+  registry:
+    image: registry:2
+    container_name: server-registry
+    profiles:
+      - registry
+    ports:
+      - "${REGISTRY_BIND:-0.0.0.0}:${REGISTRY_PORT:-5000}:5000"
+    volumes:
+      - ${SERVER_DATA_ROOT:-.}/registry:/var/lib/registry
+    restart: unless-stopped
 
   netbootxyz:
     image: lscr.io/linuxserver/netbootxyz:latest
