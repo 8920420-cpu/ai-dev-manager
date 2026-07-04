@@ -9,6 +9,7 @@ import { buildRoute, resolveTransition, forwardFrom, routeIsUsable, TERMINAL_STA
 import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey, reworkNodeKey } from './graphRoute.js';
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
 import { buildPipelineClaimContract } from './pipelineDispatch.js';
+import { deriveServicePathFromFiles, resolveServiceRepoPath } from './serviceRepoPath.js';
 import { reconcileClockSkew } from './clockGuard.js';
 import { isDbConnectionError, noteDbConnectionFailure, claimGraceActive } from './bootClaimGuard.js';
 import { resolveDuration, resolveInt, logEffectiveConfig, parseDurationMs } from './envConfig.js';
@@ -558,7 +559,12 @@ export async function acceptScannerIntake(s, input) {
     // Сопоставляем детерминированно. Не нашли → проект НЕ задан, задача станет
     // неразобранной (project_id IS NULL) и попадёт в корзину Приёмщика.
     const project = await findProject(c, payload.project);
-    const serviceId = project ? await getOrCreateService(c, project.id, payload.service) : null;
+    // SERVICE-REPO-PATH-001: каталог сервиса выводим из общего префикса путей
+    // сдачи — при авторегистрации сразу заполняем services.repository_path.
+    const servicePath = deriveServicePathFromFiles(payload.changedFiles);
+    const serviceId = project
+      ? await getOrCreateService(c, project.id, payload.service, null, servicePath)
+      : null;
     // Идемпотентный поиск дубля: для назначенной — в рамках проекта, для
     // неразобранной — среди задач без проекта (частичный uniq-индекс).
     const findDup = () => (project
@@ -1235,19 +1241,23 @@ export async function acceptTaskTx(c, taskId) {
 
 // Найти сервис по (project, code) или СОЗДАТЬ его (авто-регистрация при импорте).
 // Пустой код → null (задача без сервиса). service_name = code, если имени нет.
-async function getOrCreateService(c, projectId, serviceCode, serviceName) {
+export async function getOrCreateService(c, projectId, serviceCode, serviceName, repositoryPath) {
   const code = String(serviceCode ?? '').trim();
   if (!code) return null;
   const found = await c.query(
     'SELECT id FROM services WHERE project_id = $1 AND service_code = $2', [projectId, code],
   );
   if (found.rowCount) return found.rows[0].id;
+  // SERVICE-REPO-PATH-001: при авторегистрации сразу пишем каталог сервиса
+  // (выведенный из путей work_item/сдачи), чтобы PIPELINE_SERVICE не собирал от
+  // корня репозитория. Пустой путь → NULL (бэкфилл по коду произойдёт на claim).
+  const repoPath = String(repositoryPath ?? '').trim() || null;
   const ins = await c.query(
-    `INSERT INTO services (project_id, service_code, service_name)
-     VALUES ($1, $2, $3)
+    `INSERT INTO services (project_id, service_code, service_name, repository_path)
+     VALUES ($1, $2, $3, $4)
      ON CONFLICT (project_id, service_code) DO UPDATE SET service_code = EXCLUDED.service_code
      RETURNING id`,
-    [projectId, code, String(serviceName ?? '').trim() || code],
+    [projectId, code, String(serviceName ?? '').trim() || code, repoPath],
   );
   return ins.rows[0].id;
 }
@@ -1898,6 +1908,21 @@ export async function claimNextHostTask(s, roleCode) {
       // ДО запуска команд (транзакция откатывается, задача не выдаётся).
       let pipeline = null;
       if (roleCode === 'PIPELINE_SERVICE') {
+        // SERVICE-REPO-PATH-001: репозиторный путь сервиса ОБЯЗАН указывать на
+        // существующий каталог. Пустой/устаревший путь раньше проходил как
+        // «сборка от корня» → pipeline_compose_not_found. Теперь: валидный путь
+        // оставляем, иначе бэкфилл по коду (ленивое обновление), иначе —
+        // диагностируемый провал service_path_unresolved ДО запуска стадий.
+        const resolvedPath = resolveServiceRepoPath(m.root_path, m.service, m.repository_path);
+        if (!resolvedPath.ok) {
+          const e = scannerError(422, resolvedPath.message);
+          e.code = resolvedPath.code; // service_path_unresolved
+          throw e;
+        }
+        if (resolvedPath.changed) {
+          await c.query('UPDATE services SET repository_path = $2 WHERE id = $1', [m.service_id, resolvedPath.repositoryPath]);
+          m.repository_path = resolvedPath.repositoryPath;
+        }
         try {
           pipeline = buildPipelineClaimContract({
             projectId: m.project_id,
@@ -1906,10 +1931,12 @@ export async function claimNextHostTask(s, roleCode) {
             serviceCode: m.service,
             serviceName: m.service_name,
             projectRoot: m.root_path,
-            repositoryPath: m.repository_path,
+            repositoryPath: resolvedPath.repositoryPath,
           });
         } catch (err) {
-          throw scannerError(422, err.code || 'pipeline_contract_invalid');
+          const e = scannerError(422, err.message || 'pipeline_contract_invalid');
+          e.code = err.code || 'pipeline_contract_invalid';
+          throw e;
         }
       }
 
