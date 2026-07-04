@@ -87,9 +87,11 @@ ai-dev-manager/
   (`window.onerror`/`unhandledrejection`) — `src/features/feedback/jsErrorBuffer.ts`;
   скриншот через `html2canvas` ленивым импортом —
   `src/features/feedback/captureScreenshot.ts`; типы — `src/types/feedback.ts`;
-  same-origin клиент — `src/api/feedbackApi.ts` (см. API_MAP.md, зависит от
-  бэкенд-эндпоинтов `/api/feedback` и `/api/feedback/screenshot`, пока не
-  реализованных в `orchestrator-service/backend/`). Новая npm-зависимость —
+  same-origin клиент — `src/api/feedbackApi.ts` (см. API_MAP.md). Бэкенд приёма
+  реализован (FEEDBACK-WIDGET-001): `orchestrator-service/backend/src/feedback.js`
+  обслуживает `POST /api/feedback`, `POST /api/feedback/screenshot` и
+  `GET /api/feedback/screenshot/:id` (роуты в `server.js`), переиспользуя
+  `acceptIntakeReport` через интеграцию `orchestrator-ui`. Новая npm-зависимость —
   `html2canvas` (`package.json`).
 
 ### orchestrator-db

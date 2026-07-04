@@ -124,7 +124,8 @@ Chat_Service ──REST──> Connector_Service
   его same-origin на общий backend оркестратора. Принцип: **все виджеты обратной
   связи проходят через общий backend оркестратора**, который серверно подставляет
   токен интеграции «orchestrator-ui» и переиспользует приём обращений
-  INTAKE-INTEGRATIONS-001 → задача сразу в `BACKLOG` под Приёмщиком. Контракт
-  UI-потребителя (`/api/feedback`, `/api/feedback/screenshot`) — в API_MAP.md;
-  соответствующие backend-эндпоинты в `orchestrator-service/backend/` на момент
-  правки не реализованы.
+  INTAKE-INTEGRATIONS-001 → задача сразу в `BACKLOG` под Приёмщиком. Backend
+  реализован (FEEDBACK-WIDGET-001) модулем
+  `orchestrator-service/backend/src/feedback.js` (`acceptFeedback` →
+  `acceptIntakeReport`) с роутами `/api/feedback`, `/api/feedback/screenshot` и
+  `GET /api/feedback/screenshot/:id` в `server.js`; контракт — в API_MAP.md.

@@ -50,6 +50,7 @@ import {
   deleteIntegration as deleteIntakeIntegration,
   getIntakeStats,
 } from './intakeIntegrations.js';
+import { acceptFeedback, saveScreenshot, readScreenshot } from './feedback.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
 import { getPerformanceMetrics, getVersionMetrics, getDailyModelStats, getRoleLoadTotals, getKpiMarkers, createKpiMarker } from './performance.js';
@@ -165,9 +166,15 @@ function sendJson(res, code, obj) {
   res.end(JSON.stringify(obj));
 }
 
-const BODY_LIMIT_BYTES = 1e6; // 1 МБ на тело запроса
+const BODY_LIMIT_BYTES = 1e6; // 1 МБ на тело запроса по умолчанию
 
-export function readBody(req) {
+// Скриншоты обращений («Обратная связь») приходят data-URL'ом (base64) и крупнее
+// глобального лимита readBody — для /api/feedback/screenshot нужен отдельный потолок.
+const FEEDBACK_SCREENSHOT_BODY_LIMIT = Number(process.env.FEEDBACK_SCREENSHOT_BODY_LIMIT) || 8e6;
+
+// maxBytes переопределяет BODY_LIMIT_BYTES для эндпоинтов с заведомо большим телом
+// (напр. загрузка скриншота). Прочие вызовы (readBody(req)) сохраняют лимит 1 МБ.
+export function readBody(req, { maxBytes = BODY_LIMIT_BYTES } = {}) {
   return new Promise((resolve, reject) => {
     // Собираем СЫРЫЕ буферы и декодируем UTF-8 один раз в конце. Нельзя делать
     // `data += chunk` (chunk.toString() на каждый чанк): многобайтовый символ
@@ -202,7 +209,7 @@ export function readBody(req) {
       if (settled) return;
       chunks.push(c);
       size += c.length;
-      if (size > BODY_LIMIT_BYTES) fail('payload too large', 'payload_too_large', 413);
+      if (size > maxBytes) fail('payload too large', 'payload_too_large', 413);
     });
     req.on('end', () => {
       if (settled) return;
@@ -340,6 +347,14 @@ function matchIntakeIntegrationRoute(pathname) {
   return { kind: 'item', id };
 }
 
+// FEEDBACK-WIDGET-001: разбор пути отдачи скриншота обращения
+// GET /api/feedback/screenshot/:id (id — hex[.ext], проверка формата в readScreenshot).
+function matchFeedbackScreenshotRoute(pathname) {
+  const m = pathname.match(/^\/api\/feedback\/screenshot\/([^/]+)$/);
+  if (!m) return null;
+  return { id: decodeURIComponent(m[1]) };
+}
+
 export function createApp() {
   return createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -386,6 +401,35 @@ export function createApp() {
           const result = await acceptIntakeReport(await loadSettings(), { ...body, token });
           publishTaskChange('intake_report_received', { taskId: result?.taskId ?? null });
           return sendJson(res, 200, result);
+        }
+
+        // FEEDBACK-WIDGET-001: приём обращений виджета «Обратная связь» UI оркестратора.
+        // Same-origin, МИМО orchestrator API-токена (как /api/intake/report): backend сам
+        // подставляет токен предзарегистрированной интеграции «orchestrator-ui» (секрет в
+        // бандл не попадает) и переиспользует acceptIntakeReport — задача сразу в BACKLOG
+        // под Приёмщиком, идемпотентность по externalId. Ответ — FeedbackResult.
+        if (req.method === 'POST' && p === '/api/feedback') {
+          const result = await acceptFeedback(await loadSettings(), await readBody(req));
+          publishTaskChange('intake_report_received', { taskId: result?.taskId ?? null });
+          return sendJson(res, 200, result);
+        }
+
+        // Загрузка скриншота обращения (data URL). Отдельный увеличенный лимит тела —
+        // base64-скриншот превышает глобальные 1 МБ readBody. Ответ { id, url }; url
+        // кладётся во screenshotUrl обращения и доступен GET-ом ниже.
+        if (req.method === 'POST' && p === '/api/feedback/screenshot') {
+          const body = await readBody(req, { maxBytes: FEEDBACK_SCREENSHOT_BODY_LIMIT });
+          return sendJson(res, 200, await saveScreenshot(body.image));
+        }
+
+        // Отдача сохранённого скриншота обращения (ссылка из карточки задачи / <img>).
+        // Открыт (same-origin запрос картинки не несёт API-токена).
+        const feedbackShot = matchFeedbackScreenshotRoute(p);
+        if (feedbackShot) {
+          if (req.method !== 'GET') return sendJson(res, 405, { error: 'method_not_allowed' });
+          const { buffer, mime } = await readScreenshot(feedbackShot.id);
+          res.writeHead(200, { 'Content-Type': mime, 'Cache-Control': 'private, max-age=86400' });
+          return res.end(buffer);
         }
 
         // /health и /api/version открыты для healthcheck; всё остальное под /api

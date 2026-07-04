@@ -108,18 +108,18 @@ Scanner вызывает endpoint после появления завершён
 
 ### Виджет «Обратная связь» оркестратора (frontend, ORCH-FEEDBACK-WIDGET-001)
 
-Same-origin контракт, который **потребляет** SPA-виджет «Обратная связь»
-(`src/api/feedbackApi.ts`, `src/types/feedback.ts`; коммит `8cbc0aa`). Виджет не
-шлёт токен интеграции из браузера — замысел в том, чтобы backend оркестратора
-серверно подставил токен предзарегистрированной интеграции «orchestrator-ui» и
-переиспользовал приём `POST /api/intake/report` (`acceptIntakeReport`), создавая
-задачу сразу в `BACKLOG` под Приёмщиком.
+Same-origin контракт SPA-виджета «Обратная связь» (`src/api/feedbackApi.ts`,
+`src/types/feedback.ts`). Виджет не шлёт токен интеграции из браузера — backend
+оркестратора серверно подставляет токен предзарегистрированной интеграции
+«orchestrator-ui» и переиспользует приём `acceptIntakeReport`, создавая задачу
+сразу в `BACKLOG` под Приёмщиком.
 
-> ⚠️ **Зависимость от бэкенда (на 2026-07-03 не реализована).** Endpoint'ы
-> `/api/feedback` и `/api/feedback/screenshot` найдены только в коде frontend —
-> в `orchestrator-service/backend/` их пока нет. Ниже задокументирован контракт
-> со стороны UI-потребителя; факт серверной реализации требует отдельного
-> подтверждения.
+Backend реализован (FEEDBACK-WIDGET-001):
+`orchestrator-service/backend/src/feedback.js` (`acceptFeedback`,
+`saveScreenshot`, `readScreenshot`) + роуты в `server.js` (`/api/feedback`,
+`matchFeedbackScreenshotRoute`). Имя интеграции — `orchestrator-ui`
+(`UI_INTEGRATION_NAME`), создаётся лениво при первом обращении (`enabled=true`);
+токен подставляет сервер (в бандл фронтенда не попадает).
 
 - **`POST /api/feedback`** — приём обращения same-origin. Тело
   (`FeedbackPayload`): `externalId` (uuid, генерирует виджет), `message`, `user`
@@ -131,9 +131,14 @@ Same-origin контракт, который **потребляет** SPA-вид
   `{ reportNumber, accepted?, duplicate?, taskId?, externalId? }`; виджет
   показывает «Заявка №N принята».
 - **`POST /api/feedback/screenshot`** — загрузка скриншота. Тело `{ image }`
-  (JPEG data URL, снимается `html2canvas` ленивым импортом). Ответ
-  (`ScreenshotUploadResult`): `{ url, id? }` — `url` кладётся в `screenshotUrl`
-  обращения. Хранение выбирает backend; секрет интеграции в бандл не зашивается.
+  (data URL растрового формата: png/jpeg/webp/gif; снимается `html2canvas`
+  ленивым импортом). Размер тела ограничен `FEEDBACK_SCREENSHOT_BODY_LIMIT`
+  (по умолчанию 8 МБ), декодированного изображения — `FEEDBACK_SCREENSHOT_MAX_BYTES`
+  (по умолчанию 5 МБ). Ответ: `{ id, url }`, где `url` =
+  `/api/feedback/screenshot/<id>.<ext>` — кладётся в `screenshotUrl` обращения.
+- **`GET /api/feedback/screenshot/:id`** — отдача сохранённого скриншота
+  (`id` — hex, опционально с расширением `<hex>.<ext>`); возвращает файл с
+  соответствующим `Content-Type`, при отсутствии — `404 { error: 'not_found' }`.
 
 ---
 

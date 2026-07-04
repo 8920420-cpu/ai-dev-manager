@@ -156,6 +156,31 @@ export async function createIntegration(input) {
   });
 }
 
+// FEEDBACK-WIDGET-001 — автопровижининг служебной интеграции по фиксированному
+// ИМЕНИ с server-side секретом (канал виджета «Обратная связь» UI оркестратора).
+// В отличие от createIntegration (сама генерирует токен и падает на дубле имени),
+// секрет здесь задаёт сервер (env/пер-процессный), а вызов идемпотентен:
+//   • записи нет   → создаём (enabled=true);
+//   • запись есть  → синхронизируем ТОЛЬКО token_hash; enabled НЕ трогаем, чтобы
+//     не переопределять ручное выключение интеграции администратором.
+export async function ensureIntegrationWithToken(name, token, { enabled = true } = {}) {
+  const nm = String(name ?? '').trim();
+  if (!nm) throw httpError(422, 'name_required');
+  const tokenHash = hashToken(token);
+  if (!tokenHash) throw httpError(422, 'token_required');
+  return withClient(async (c) => {
+    const r = await c.query(
+      `INSERT INTO intake_integrations (name, token_hash, enabled)
+            VALUES ($1, $2, $3)
+       ON CONFLICT (lower(name)) DO UPDATE
+            SET token_hash = EXCLUDED.token_hash, updated_at = now()
+         RETURNING ${COLUMNS}`,
+      [nm, tokenHash, enabled],
+    );
+    return redactIntegration(rowToIntegration(r.rows[0]));
+  });
+}
+
 export async function updateIntegration(id, input) {
   const v = normalizeIntegrationInput(input, { partial: true });
   return withClient(async (c) => {
