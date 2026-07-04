@@ -86,6 +86,15 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* ROLE-LOAD-TOTALS-FOOTER — строка «Итого» блока «Нагрузка по ролям»:
+   выделяем полужирным и отделяющей верхней границей от строк ролей. */
+.totalRow td {
+  font-weight: 600;
+  color: var(--text-primary);
+  border-top: 2px solid var(--border);
+  background: var(--surface-2);
+}
+
 .statusRow {
   display: flex;
   flex-wrap: wrap;
