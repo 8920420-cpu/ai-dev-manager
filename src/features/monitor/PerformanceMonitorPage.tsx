@@ -268,7 +268,7 @@ function RoleLoadSection({
                 : 'Запусков ролей ещё не было.'}
             </span>
           ) : (
-            <table className={styles.table}>
+            <div className={styles.tableScroll}><table className={styles.table}>
               <thead>
                 <tr>
                   <th>Роль</th>
@@ -387,7 +387,7 @@ function RoleLoadSection({
                   <td className={styles.num}>—</td>
                 </tr>
               </tfoot>
-            </table>
+            </table></div>
           )}
         </>
       ) : (
@@ -463,7 +463,7 @@ function RoleLoadTotalsTab() {
           {data.roles.length === 0 ? (
             <span className={styles.muted}>За выбранный период запусков ролей нет.</span>
           ) : (
-            <table className={styles.table}>
+            <div className={styles.tableScroll}><table className={styles.table}>
               <thead>
                 <tr>
                   <th>Роль</th>
@@ -510,7 +510,7 @@ function RoleLoadTotalsTab() {
                   <td className={styles.num}>{fmtCost(totals.cost)}</td>
                 </tr>
               </tfoot>
-            </table>
+            </table></div>
           )}
         </>
       )}
@@ -633,7 +633,7 @@ function VersionsSection({ roleCodes }: { roleCodes: { code: string; name: strin
           {versions.length === 0 ? (
             <span className={styles.muted}>За выбранное окно прогонов с метками версии нет.</span>
           ) : isProgrammer ? (
-            <table className={styles.table}>
+            <div className={styles.tableScroll}><table className={styles.table}>
               <thead>
                 <tr>
                   <th>Версия</th>
@@ -661,9 +661,9 @@ function VersionsSection({ roleCodes }: { roleCodes: { code: string; name: strin
                   </tr>
                 ))}
               </tbody>
-            </table>
+            </table></div>
           ) : (
-            <table className={styles.table}>
+            <div className={styles.tableScroll}><table className={styles.table}>
               <thead>
                 <tr>
                   <th>Версия</th>
@@ -713,7 +713,7 @@ function VersionsSection({ roleCodes }: { roleCodes: { code: string; name: strin
                   </tr>
                 ))}
               </tbody>
-            </table>
+            </table></div>
           )}
 
           {data.markers.length > 0 && (
@@ -932,7 +932,7 @@ export function PerformanceMonitorPage() {
             {Object.keys(data.connector).length === 0 ? (
               <span className={styles.muted}>Коннектор ещё не использовался — данных нет.</span>
             ) : (
-              <table className={styles.table}>
+              <div className={styles.tableScroll}><table className={styles.table}>
                 <thead>
                   <tr>
                     <th>Провайдер</th>
@@ -957,7 +957,7 @@ export function PerformanceMonitorPage() {
                     </tr>
                   ))}
                 </tbody>
-              </table>
+              </table></div>
             )}
           </Section>
         </>

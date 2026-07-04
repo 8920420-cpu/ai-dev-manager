@@ -27,7 +27,7 @@
   outline: none;
 }
 .container {
-  max-width: 1180px;
+  max-width: 1300px;
   margin: 0 auto;
   padding: var(--space-8) var(--space-8) var(--space-12);
 }
