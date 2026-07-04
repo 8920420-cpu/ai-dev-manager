@@ -215,6 +215,12 @@ export async function getAppliedMigrations(s) {
 // рассуждающими ролями. Толерантно: нет прогона (legacy/прямое создание задачи) —
 // 0 строк, сдача не падает. roleId — роль на момент ЗАХВАТА (PROGRAMMER), а не
 // после продвижения задачи.
+// BOOT-RECONCILE-GRACE-001: сопоставляем последний прогон в статусе RUNNING ЛИБО
+// TIMEOUT. Claude-агент переживает рестарт оркестратора и досдаёт результат; если
+// boot-жнец успел пометить прогон TIMEOUT, поздняя сдача переписывает исход на
+// фактический SUCCESS (иначе KPI роли навсегда считает реально успешный прогон
+// таймаутом). Свежий RUNNING имеет больший started_at и выбирается раньше старого
+// TIMEOUT, поэтому переписываем именно осиротевший прогон этой сдачи.
 async function finalizeProgrammerRunOnCompletion(c, { taskId, roleId, payload }) {
   if (roleId == null) return;
   const turns = Number.isFinite(Number(payload?.numTurns)) ? Math.trunc(Number(payload.numTurns)) : null;
@@ -228,7 +234,7 @@ async function finalizeProgrammerRunOnCompletion(c, { taskId, roleId, payload })
             output_json = $5::jsonb
       WHERE id = (
         SELECT id FROM agent_runs
-         WHERE task_id = $1 AND role_id = $6 AND status = 'RUNNING'
+         WHERE task_id = $1 AND role_id = $6 AND status IN ('RUNNING','TIMEOUT')
          ORDER BY started_at DESC LIMIT 1
       )`,
     [taskId, turns, payload?.model ?? null, payload?.codeVersion ?? null,
@@ -1960,13 +1966,21 @@ export async function completeHostTaskTx(c, input) {
                 data_card = data_card || $4::jsonb WHERE id = $1`,
         [taskId, toStatus, nextRoleId, JSON.stringify(hostCardValues || {})],
       );
-      if (t.assigned_agent_id) {
-        await c.query(
-          `UPDATE agent_runs SET status = $2::agent_run_status, finished_at = now(), output_json = $3::jsonb
-            WHERE task_id = $1 AND status = 'RUNNING'`,
-          [taskId, success ? 'SUCCESS' : 'FAILED', JSON.stringify(output)],
-        );
-      }
+      // BOOT-RECONCILE-GRACE-001: закрыть прогон host-роли по фактическому исходу.
+      // Берём последний прогон роли в статусе RUNNING ЛИБО TIMEOUT. Host-runner
+      // переживает рестарт оркестратора и досылает результат ПОСЛЕ boot-жнеца; тот
+      // уже снял assigned_agent_id и мог пометить прогон TIMEOUT — поэтому не гейтим
+      // по assigned_agent_id и переписываем TIMEOUT на фактический SUCCESS/FAILED,
+      // иначе KPI и «Нагрузка по ролям» навсегда считают такой прогон таймаутом.
+      await c.query(
+        `UPDATE agent_runs SET status = $2::agent_run_status, finished_at = now(), output_json = $3::jsonb
+          WHERE id = (
+            SELECT id FROM agent_runs
+             WHERE task_id = $1 AND role_id = $4 AND status IN ('RUNNING','TIMEOUT')
+             ORDER BY started_at DESC LIMIT 1
+          )`,
+        [taskId, success ? 'SUCCESS' : 'FAILED', JSON.stringify(output), t.current_role_id],
+      );
       const done = toStatus === 'DONE';
       await c.query(
         `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
@@ -3106,8 +3120,10 @@ async function resetStaleClaims(c) {
 // его не ловит. Снимаем assigned_agent_id (фидер переподаст задачу в свободный
 // слот) и пишем диагностическое событие. Re-feed безопасен: фидер пишет только
 // в пустой слот, а acceptScannerCompletion идемпотентен.
-// timeoutMs=0 (стартовая реконсиляция) освобождает назначение немедленно: при
-// перезапуске процесса активной сессии Разработчика в полёте уже нет.
+// BOOT-RECONCILE-GRACE-001: стартовая реконсиляция передаёт штатный
+// CLAUDE_ASSIGN_TIMEOUT_MS (а не 0), т.к. Claude-агент переживает рестарт и
+// досдаёт результат — освобождаем только назначения старше таймаута роли, иначе
+// каждый деплой-рестарт убивал бы живую сессию Разработчика.
 async function releaseStaleClaudeClaims(c, timeoutMs = CLAUDE_ASSIGN_TIMEOUT_MS, reason = 'claude_assignment_timeout') {
   const r = await c.query(
     `WITH stale AS (
@@ -3163,7 +3179,7 @@ async function releaseStaleClaudeClaims(c, timeoutMs = CLAUDE_ASSIGN_TIMEOUT_MS,
 //      resetStaleClaims), чтобы прогоны «в полёте» не получили ложный TIMEOUT.
 // В обоих случаях: agent_run → TIMEOUT, у нетерминальной задачи снимается
 // assigned_agent_id (слот свободен), задача переигрывается штатно.
-export async function reapOrphanRunningRuns(c, { ageCheck = false } = {}) {
+export async function reapOrphanRunningRuns(c, { ageCheck = false, boot = false, deployRef = null } = {}) {
   const reason = ageCheck ? 'orphan_run_timeout' : 'orchestrator_restart_reconcile';
   const errText = ageCheck
     ? 'RUNNING run exceeded role timeout without finishing (orphaned mid-run, e.g. DB connection drop); reaped as TIMEOUT'
@@ -3195,6 +3211,14 @@ export async function reapOrphanRunningRuns(c, { ageCheck = false } = {}) {
                       THEN jsonb_build_object('runner', true, 'reason', 'host_orphan_timeout',
                              'runStatus', 'TIMEOUT', 'roleCode', s.role_code, 'hungMs', s.hung_ms)
                       ELSE jsonb_build_object('runner', true, 'reason', $2::text, 'runStatus', 'TIMEOUT') END`;
+  }
+  // BOOT-RECONCILE-GRACE-001 (требование 3): при стартовом (boot) реапе аннотируем
+  // событие меткой bootReconcile + деплой-маркером (APP_CODE_VERSION). Рестарты от
+  // собственного деплоя pipeline (docker compose up -d) так отличимы в диагностике
+  // от рантайм-орфанов: || сливает объекты, добавляя поля к базовому payload.
+  if (boot) {
+    params.push(deployRef ?? null);
+    eventPayload = `(${eventPayload}) || jsonb_build_object('bootReconcile', true, 'deployRef', $${params.length}::text)`;
   }
   const r = await c.query(
     `WITH stale AS (
@@ -3452,19 +3476,33 @@ export async function advanceStuckDocumentationBranches(c, maxAttempts = MAX_REW
 
 /**
  * Стартовая реконсиляция (вызывается один раз при запуске оркестратора).
- * Полный перезапуск программы означает, что активных сессий (ни Разработчика,
- * ни рассуждающих ролей) в полёте нет, поэтому немедленно освобождаем:
- *   1) осиротевшие Programmer-назначения (releaseStaleClaudeClaims, timeoutMs=0);
- *   2) повисшие RUNNING agent_runs рассуждающих ролей (reapOrphanRunningRuns) —
- *      иначе они держат слоты «N на роль» до 15-минутного таймаута и очередь
- *      стоит после каждого рестарта.
+ *
+ * BOOT-RECONCILE-GRACE-001. Прежняя реализация исходила из того, что при полном
+ * перезапуске активных сессий в полёте нет, и гасила ВСЕ RUNNING безусловно
+ * (reapOrphanRunningRuns без ageCheck) + освобождала ВСЕ Programmer-назначения
+ * немедленно (timeoutMs=0). Но деплой-стадия pipeline сама пересоздаёт контейнер
+ * оркестратора (docker compose up -d), а живые host-runner'ы и Claude-агенты
+ * переживают рестарт и досдают результат — значит каждый прогон pipeline убивал
+ * чужие живые прогоны (ложный TIMEOUT, искажённый KPI роли).
+ *
+ * Теперь щадящий boot-reconcile: гасим ТОЛЬКО прогоны старше штатного таймаута
+ * своей роли (ageCheck=true → CASE по роли: PROGRAMMER/host свои таймауты). Более
+ * молодые RUNNING остаются «осиротевшими кандидатами» — их досдаст переживший
+ * рестарт исполнитель, либо добьёт штатный жнец на тике (reapOrphanRunningRuns
+ * ageCheck=true) / released-backoff по истечении таймаута (без задвоения — тот же
+ * возрастной предикат). boot=true метит событие деплой-маркером (требование 3).
+ * Programmer-назначения тоже освобождаем только по штатному таймауту
+ * (CLAUDE_ASSIGN_TIMEOUT_MS), а не немедленно.
+ *
  * Возвращает число освобождённых Programmer-задач.
  */
-export async function reconcileOnStartup(s) {
-  return withClient(clientConfig(s), async (c) => {
-    await reapOrphanRunningRuns(c);
-    return releaseStaleClaudeClaims(c, 0, 'orchestrator_restart_reconcile');
-  });
+export async function reconcileOnStartupTx(c, { deployRef = null } = {}) {
+  await reapOrphanRunningRuns(c, { ageCheck: true, boot: true, deployRef });
+  return releaseStaleClaudeClaims(c, CLAUDE_ASSIGN_TIMEOUT_MS, 'orchestrator_restart_reconcile');
+}
+
+export async function reconcileOnStartup(s, { deployRef = process.env.APP_CODE_VERSION ?? null } = {}) {
+  return withClient(clientConfig(s), (c) => reconcileOnStartupTx(c, { deployRef }));
 }
 
 // Захватить одну задачу под ИИ-ролью. Возвращает контекст захвата или null.

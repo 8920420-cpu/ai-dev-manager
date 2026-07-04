@@ -212,6 +212,44 @@ test('контракт без обязательных полей → требо
   assert.equal(c.calls.some((q) => /COMMIT/.test(q.sql)), true);
 });
 
+// BOOT-RECONCILE-GRACE-001 (требование 2): поздняя успешная сдача программиста
+// переписывает исход прогона, уже помеченного boot-жнецом TIMEOUT, на SUCCESS —
+// финализирующий запрос сопоставляет последний прогон в RUNNING ЛИБО TIMEOUT.
+test('поздняя сдача программиста переписывает TIMEOUT-прогон (RUNNING|TIMEOUT)', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(scannerBaseRules());
+  const res = await acceptScannerCompletionTx(c, scannerPayload({ fields: { diff: 'x' }, numTurns: 3 }));
+  assert.equal(res.accepted, true);
+  const run = c.calls.find((q) => /UPDATE agent_runs[\s\S]*status = 'SUCCESS'/.test(q.sql));
+  assert.ok(run, 'прогон программиста финализирован');
+  // Ключ фикса: матчим не только RUNNING, но и TIMEOUT (осиротевший boot-реапом).
+  assert.ok(/status IN \('RUNNING','TIMEOUT'\)/.test(run.sql), 'сопоставляется RUNNING ИЛИ TIMEOUT');
+  assert.ok(/ORDER BY started_at DESC LIMIT 1/.test(run.sql), 'берётся последний прогон (свежий RUNNING приоритетнее старого TIMEOUT)');
+});
+
+// BOOT-RECONCILE-GRACE-001 (требование 2): host-runner переживает рестарт и досылает
+// результат ПОСЛЕ boot-жнеца, который уже снял assigned_agent_id и пометил прогон
+// TIMEOUT. Поздняя сдача должна переписать прогон даже при assigned_agent_id = NULL.
+test('поздняя сдача host-роли переписывает TIMEOUT-прогон при assigned_agent_id = NULL', async () => {
+  const c = fakeClient([
+    {
+      re: lookup,
+      // assigned_agent_id = NULL — слот уже освобождён boot-реапом, но прогон в TIMEOUT.
+      reply: { rowCount: 1, rows: [{ id: TASK, status: 'TESTING', current_role_id: 'role-pipe', assigned_agent_id: null, role_code: 'PIPELINE_SERVICE' }] },
+    },
+    { re: /SELECT id FROM roles WHERE code = \$1/, reply: { rowCount: 1, rows: [{ id: 'role-da' }] } },
+  ]);
+  const res = await completeHostTaskTx(c, { taskId: TASK, roleCode: 'PIPELINE_SERVICE', success: true, output: { summary: { ok: true } } });
+  assert.equal(res.accepted, true);
+  assert.equal(res.toStatus, 'COMMIT');
+
+  const run = c.calls.find((q) => /UPDATE agent_runs SET status = \$2::agent_run_status/.test(q.sql));
+  assert.ok(run, 'прогон host-роли финализируется даже без assigned_agent_id (иначе KPI навсегда TIMEOUT)');
+  assert.ok(/status IN \('RUNNING','TIMEOUT'\)/.test(run.sql), 'сопоставляется RUNNING ИЛИ TIMEOUT');
+  assert.equal(run.params[1], 'SUCCESS', 'исход переписан на фактический SUCCESS');
+  assert.equal(run.params[3], 'role-pipe', 'по роли захвата прогона (current_role_id)');
+});
+
 test('PIPELINE_SERVICE success → pipeline_runs + переход COMMIT (не терминал)', async () => {
   const c = fakeClient([
     {
