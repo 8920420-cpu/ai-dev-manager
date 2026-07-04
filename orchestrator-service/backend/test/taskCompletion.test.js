@@ -1,6 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { completeHostTaskTx, acceptScannerCompletionTx, __resetRoleFieldsCacheForTests } from '../src/db.js';
+import {
+  completeHostTaskTx, acceptScannerCompletionTx, resolveHostTaskContext,
+  normalizeScannerCompletion, __resetRoleFieldsCacheForTests,
+} from '../src/db.js';
 
 // Мини-клиент pg: отвечает по первому подходящему правилу (regex по SQL).
 // reply может быть функцией (hits, params) → { rows, rowCount }.
@@ -178,14 +181,142 @@ test('сдача программиста → agent_run финализирует
   assert.equal(res.accepted, true);
   const run = c.calls.find((q) => /UPDATE agent_runs[\s\S]*status = 'SUCCESS'/.test(q.sql));
   assert.ok(run, 'RUNNING-прогон программиста финализирован в SUCCESS');
-  assert.equal(run.params[1], 4, 'turns = numTurns (число проходов)');
-  assert.equal(run.params[2], 'claude-opus-4-8', 'model из сдачи');
-  assert.equal(run.params[3], 'abc123', 'code_version из сдачи');
-  assert.equal(run.params[5], 'role-prog', 'финализируется прогон роли захвата (PROGRAMMER)');
+  // Раскладка параметров runKpiSet(kpi, 2): $1 taskId, $2 output_json, затем KPI
+  // $3..$12 (tokenInput, tokenOutput, cost, coldStartMs, turns, outcome, codeVersion,
+  // model, tokenCacheRead, tokenCacheCreation), $13 roleId.
+  assert.equal(run.params[6], 4, 'turns = numTurns (число проходов)');
+  assert.equal(run.params[9], 'claude-opus-4-8', 'model из сдачи');
+  assert.equal(run.params[8], 'abc123', 'code_version из сдачи');
+  assert.equal(run.params[12], 'role-prog', 'финализируется прогон роли захвата (PROGRAMMER)');
   // Прогон закрывается строго ВНУТРИ транзакции — до COMMIT.
   const runIdx = c.calls.findIndex((q) => /UPDATE agent_runs[\s\S]*status = 'SUCCESS'/.test(q.sql));
   const commitIdx = c.calls.findIndex((q) => /COMMIT/.test(q.sql));
   assert.ok(runIdx >= 0 && commitIdx > runIdx, 'финализация прогона до COMMIT');
+});
+
+// OBSERVABILITY-PROGRAMMER-KPI-001 (а): сдача с usage/cost/cold start → agent_run
+// программиста получает token_input/token_output/token_cache_read/token_cache_creation/
+// cost/cold_start_ms из тела сдачи (контракт tokensIn/…/coldStartMs), маппинг через
+// normalizeRunKpi/runKpiSet — так же, как у рассуждающих ролей.
+test('сдача программиста с usage/cost/coldStart → agent_run получает token/cost/cold_start', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(scannerBaseRules());
+  const res = await acceptScannerCompletionTx(c, scannerPayload({
+    fields: { diff: 'patch' }, numTurns: 30, model: 'claude-opus-4-8', codeVersion: 'v1',
+    tokensIn: 12000, tokensOut: 3400, tokensCacheRead: 8000, tokensCacheCreation: 1500,
+    costUsd: 0.4212, coldStartMs: 950,
+  }));
+  assert.equal(res.accepted, true);
+  const run = c.calls.find((q) => /UPDATE agent_runs[\s\S]*status = 'SUCCESS'/.test(q.sql));
+  assert.ok(run, 'прогон программиста финализирован');
+  // KPI-колонки присутствуют в SET (usage/cost/cold start больше не теряются).
+  assert.ok(/token_input = COALESCE/.test(run.sql), 'token_input в SET');
+  assert.ok(/token_output = COALESCE/.test(run.sql), 'token_output в SET');
+  assert.ok(/cost = COALESCE/.test(run.sql), 'cost в SET');
+  assert.ok(/cold_start_ms =/.test(run.sql), 'cold_start_ms в SET');
+  assert.ok(/token_cache_read = COALESCE/.test(run.sql), 'token_cache_read в SET');
+  assert.ok(/token_cache_creation = COALESCE/.test(run.sql), 'token_cache_creation в SET');
+  // Значения из тела сдачи (раскладка runKpiSet(kpi, 2): $3..$12 — см. тест выше).
+  assert.equal(run.params[2], 12000, 'token_input = tokensIn');
+  assert.equal(run.params[3], 3400, 'token_output = tokensOut');
+  assert.equal(run.params[4], 0.4212, 'cost = costUsd');
+  assert.equal(run.params[5], 950, 'cold_start_ms = coldStartMs');
+  assert.equal(run.params[10], 8000, 'token_cache_read = tokensCacheRead');
+  assert.equal(run.params[11], 1500, 'token_cache_creation = tokensCacheCreation');
+});
+
+// OBSERVABILITY-PROGRAMMER-KPI-001 (б): старый раннер без usage-полей → финализация
+// не падает, а COALESCE-колонки не затираются (передаются NULL → сохраняется прежнее
+// значение). Обратная совместимость обязательна.
+test('сдача программиста без usage (старый раннер) → без падения, KPI не обнуляются насильно', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(scannerBaseRules());
+  const res = await acceptScannerCompletionTx(c, scannerPayload({ fields: { diff: 'patch' }, numTurns: 12 }));
+  assert.equal(res.accepted, true);
+  const run = c.calls.find((q) => /UPDATE agent_runs[\s\S]*status = 'SUCCESS'/.test(q.sql));
+  assert.ok(run, 'прогон финализирован даже без usage-полей');
+  // token_input/output/cost/cache идут через COALESCE(NULL, col) → прежние значения
+  // не затираются.
+  assert.ok(/token_input = COALESCE\(\$\d+, token_input\)/.test(run.sql), 'token_input через COALESCE');
+  assert.ok(/cost = COALESCE\(\$\d+, cost\)/.test(run.sql), 'cost через COALESCE');
+  assert.equal(run.params[2], null, 'tokensIn отсутствует → NULL (COALESCE сохранит записанное)');
+  assert.equal(run.params[3], null, 'tokensOut отсутствует → NULL');
+  assert.equal(run.params[4], null, 'costUsd отсутствует → NULL');
+  assert.equal(run.params[10], null, 'tokensCacheRead отсутствует → NULL');
+  assert.equal(run.params[11], null, 'tokensCacheCreation отсутствует → NULL');
+  // turns есть у любого раннера (число проходов) — проставляется.
+  assert.equal(run.params[6], 12, 'turns = numTurns');
+});
+
+// COMPLETION-SUMMARY-TEXT-001 (в): result пришёл ОБЪЕКТОМ { summary, ... } — в
+// task_events и в output_json прогона кладём читаемый текст summary, а не
+// «[object Object]» (его же тянет priorRoleOutputs в контекст следующих ролей).
+test('result-объект → в task_events и output_json читаемый summary, не «[object Object]»', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(scannerBaseRules());
+  const readable = 'Добавил маппинг usage/cost/cold start в agent_runs';
+  const res = await acceptScannerCompletionTx(c, scannerPayload({
+    fields: { diff: 'patch' },
+    result: { summary: readable, outcome: 'DONE' },
+  }));
+  assert.equal(res.accepted, true);
+  const ev = c.calls.find((q) => /INSERT INTO task_events/.test(q.sql) && /STATUS_CHANGED/.test(q.sql));
+  assert.ok(ev, 'событие перехода записано');
+  const evPayload = JSON.parse(ev.params[3]);
+  assert.equal(evPayload.result, readable, 'в task_events читаемый текст summary');
+  assert.notEqual(evPayload.result, '[object Object]', 'объект не сериализован через String()');
+  // output_json прогона тоже с текстовым summary.
+  const run = c.calls.find((q) => /UPDATE agent_runs[\s\S]*status = 'SUCCESS'/.test(q.sql));
+  const out = JSON.parse(run.params[1]);
+  assert.equal(out.summary, readable, 'output_json прогона хранит текст, а не объект');
+});
+
+// COMPLETION-SUMMARY-TEXT-001 (в, приоры): resolveHostTaskContext извлекает текстовый
+// summary из события, где result записан объектом, — так следующая host-роль получает
+// читаемый programmerResult вместо «[object Object]».
+test('resolveHostTaskContext: result-объект события → приоры получают текст', async () => {
+  const c = fakeClient([
+    { re: /WITH RECURSIVE chain/, reply: { rowCount: 1, rows: [{ id: TASK, title: 'T', description: 'D', depth: 0 }] } },
+    {
+      re: /SELECT payload_json FROM task_events/,
+      reply: { rowCount: 1, rows: [{ payload_json: { changedFiles: ['a.js'], result: { summary: 'Сделал маппинг KPI' } } }] },
+    },
+  ]);
+  const ctx = await resolveHostTaskContext(c, TASK);
+  assert.equal(ctx.scan.payload_json.result, 'Сделал маппинг KPI', 'из объекта извлечён текст summary');
+  assert.notEqual(ctx.scan.payload_json.result, '[object Object]');
+  assert.deepEqual(ctx.scan.payload_json.changedFiles, ['a.js'], 'changedFiles сохранены');
+});
+
+// COMPLETION-SUMMARY-TEXT-001 + контракт usage: продакшн-путь нормализации тела сдачи
+// (POST /api/scanner/task-completed → normalizeScannerCompletion). result-объект →
+// текст summary; changedFiles и usage/cost/coldStart проброшены дальше в finalize.
+test('normalizeScannerCompletion: result-объект → текст; changedFiles и usage проброшены', () => {
+  const norm = normalizeScannerCompletion({
+    taskId: TASK, completionKey: 'k1', project: 'PS', service: 'Catalog_Service',
+    title: 'T', sourceDocument: 'doc.md',
+    result: { summary: 'Готово: маппинг KPI', outcome: 'DONE' },
+    changedFiles: ['a.js', 'b.js'],
+    tokensIn: 100, tokensOut: 50, tokensCacheRead: 20, tokensCacheCreation: 5,
+    costUsd: 0.01, coldStartMs: 300,
+  });
+  assert.equal(norm.result, 'Готово: маппинг KPI', 'result — текст summary, не «[object Object]»');
+  assert.deepEqual(norm.changedFiles, ['a.js', 'b.js'], 'changedFiles сохранены (нужны Git Integrator)');
+  assert.equal(norm.tokensIn, 100);
+  assert.equal(norm.tokensOut, 50);
+  assert.equal(norm.tokensCacheRead, 20);
+  assert.equal(norm.tokensCacheCreation, 5);
+  assert.equal(norm.costUsd, 0.01);
+  assert.equal(norm.coldStartMs, 300);
+  // Старый раннер без usage-полей → null (обратная совместимость, не падение).
+  const legacy = normalizeScannerCompletion({
+    taskId: TASK, completionKey: 'k2', project: 'PS', service: 'Catalog_Service',
+    title: 'T', sourceDocument: 'doc.md', result: 'plain text',
+  });
+  assert.equal(legacy.result, 'plain text', 'строковый result — как есть');
+  assert.equal(legacy.tokensIn, null);
+  assert.equal(legacy.costUsd, null);
+  assert.equal(legacy.coldStartMs, null);
 });
 
 // Дубль сдачи (уже принятый completionKey) НЕ финализирует прогон повторно: он уже

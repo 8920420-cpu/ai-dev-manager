@@ -27,6 +27,50 @@ function linkSignal(signal) {
   return ac;
 }
 
+function num(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// PROGRAMMER-USAGE-KPI-001: токены/стоимость из финального result-сообщения SDK.
+// Образец — extractUsage() в claudeReasoningAgent.js. ВАЖНО: result.usage —
+// контекст ПОСЛЕДНЕГО хода (не сумма за сессию), а у программиста прогон длинный
+// (30–60 ходов), поэтому для KPI берём result.modelUsage — КУМУЛЯТИВНЫЕ по моделям
+// итоги за всю сессию (сходятся с total_cost_usd). Фолбэк на usage — для старых
+// версий SDK без modelUsage.
+//   tokensInput — свежий (uncached) ввод; tokensCacheCreation — запись в prompt-кэш;
+//   tokensCacheRead — чтение из кэша (доминирует в tool-loop); tokensOut — вывод.
+//   tokensIn — ПОЛНАЯ сумма входа (контракт tokensIn с оркестратором).
+function extractUsage(final) {
+  const costUsd = num(final?.total_cost_usd);
+  const mu = final?.modelUsage;
+  if (mu && typeof mu === 'object') {
+    let tokensInput = 0;
+    let tokensCacheCreation = 0;
+    let tokensCacheRead = 0;
+    let tokensOut = 0;
+    for (const m of Object.values(mu)) {
+      tokensInput += num(m?.inputTokens);
+      tokensCacheCreation += num(m?.cacheCreationInputTokens);
+      tokensCacheRead += num(m?.cacheReadInputTokens);
+      tokensOut += num(m?.outputTokens);
+    }
+    return {
+      tokensIn: tokensInput + tokensCacheCreation + tokensCacheRead,
+      tokensInput, tokensCacheCreation, tokensCacheRead, tokensOut, costUsd,
+    };
+  }
+  const u = final?.usage || {};
+  const tokensInput = num(u.input_tokens);
+  const tokensCacheCreation = num(u.cache_creation_input_tokens);
+  const tokensCacheRead = num(u.cache_read_input_tokens);
+  const tokensOut = num(u.output_tokens);
+  return {
+    tokensIn: tokensInput + tokensCacheCreation + tokensCacheRead,
+    tokensInput, tokensCacheCreation, tokensCacheRead, tokensOut, costUsd,
+  };
+}
+
 /**
  * Один прогон SDK в заданном рабочем дереве. Возвращает нормализованный исход
  * БЕЗ вычисления changedFiles — список файлов считает вызывающий (по worktree-
@@ -37,6 +81,11 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
   const prompt = buildPrompt(task);
   const ac = linkSignal(signal);
 
+  // PROGRAMMER-USAGE-KPI-001: cold start — от вызова query() до первого system/init
+  // сообщения SDK (спавн нативного модуля + авторизация подписки + hooks). Образец —
+  // metrics() в claudeReasoningAgent.js.
+  const started = Date.now();
+  let initAt = null;
   let final = null;
   try {
     for await (const message of query({
@@ -51,6 +100,7 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
         env: { ...process.env, ...env },
       },
     })) {
+      if (message.type === 'system' && initAt == null) initAt = Date.now();
       if (message.type === 'result') final = message;
     }
   } catch (error) {
@@ -84,6 +134,11 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
     return { ok: false, error: reason };
   }
 
+  // PROGRAMMER-USAGE-KPI-001: усвоение токенов/стоимости/cold start прогона — рядом
+  // с numTurns в result.agent, чтобы buildCompletionBody прокинул их в тело сдачи
+  // (см. контракт tokensIn/... с оркестратором). parsed.summary не трогаем.
+  const usage = extractUsage(final);
+  const coldStartMs = initAt != null ? initAt - started : null;
   return {
     ok: true,
     model, // VERSION-KPI-TRACKING-001: модель прогона для атрибуции KPI.
@@ -94,6 +149,14 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
         numTurns: final.num_turns,
         totalCostUsd: final.total_cost_usd,
         terminalReason: final.terminal_reason,
+        // Токены/стоимость/cold start прогона для KPI (agent_runs).
+        tokensIn: usage.tokensIn,
+        tokensInput: usage.tokensInput,
+        tokensOut: usage.tokensOut,
+        tokensCacheRead: usage.tokensCacheRead,
+        tokensCacheCreation: usage.tokensCacheCreation,
+        costUsd: usage.costUsd,
+        coldStartMs,
       },
       selfReportedFiles: (parsed && (parsed.files_changed || parsed.changedFiles)) || undefined,
     },

@@ -133,11 +133,20 @@ export class ProgrammerRunner {
 // идемпотентность повторной сдачи).
 export function buildCompletionBody(task, agentResult) {
   const c = task.completion || {};
+  const agent = agentResult.result?.agent || {};
+  // Только конечные числа отправляем как отдельные поля; иначе поле не выставляем
+  // (undefined) — старый раннер без usage/cold start даёт валидное тело (оркестратор
+  // COALESCE-ит null → нули без падения). Обратная совместимость обязательна.
+  const numOrUndef = (v) => (Number.isFinite(v) ? v : undefined);
   // Число «проходов» (ходов агента) до завершения — скалярная метрика для Монитора
   // («за сколько проходов программист справляется»). result сериализуется в строку
   // на стороне оркестратора, поэтому numTurns отправляем отдельным числом, а не
   // прячем внутрь result.
-  const numTurns = agentResult.result?.agent?.numTurns;
+  const numTurns = agent.numTurns;
+  // PROGRAMMER-USAGE-KPI-001: usage/стоимость/cold start прогона — отдельными полями
+  // сдачи с ТОЧНО такими ключами (контракт с оркестратором, normalizeRunKpi). costUsd
+  // допускается из totalCostUsd (уже лежал в result.agent).
+  const costUsd = numOrUndef(agent.costUsd) ?? numOrUndef(agent.totalCostUsd);
   return {
     taskId: task.id,
     completionKey: c.completionKey,
@@ -147,7 +156,15 @@ export function buildCompletionBody(task, agentResult) {
     sourceDocument: c.sourceDocument,
     changedFiles: Array.isArray(agentResult.changedFiles) ? agentResult.changedFiles : [],
     result: agentResult.result ?? {},
-    numTurns: Number.isFinite(numTurns) ? numTurns : undefined,
+    numTurns: numOrUndef(numTurns),
+    // Токены/стоимость/cold start прогона → agent_runs (token_input/token_output/
+    // token_cache_read/token_cache_creation/cost/cold_start_ms).
+    tokensIn: numOrUndef(agent.tokensIn),
+    tokensOut: numOrUndef(agent.tokensOut),
+    tokensCacheRead: numOrUndef(agent.tokensCacheRead),
+    tokensCacheCreation: numOrUndef(agent.tokensCacheCreation),
+    costUsd,
+    coldStartMs: numOrUndef(agent.coldStartMs),
     // VERSION-KPI-TRACKING-001: версия кода раннера (промт программиста в коде → она
     // же версионирует промт) и использованная модель — оркестратор кладёт в payload
     // события сдачи (KPI программиста живут в task_events).

@@ -231,3 +231,55 @@ test('buildCompletionBody: содержит codeVersion и model (метки в�
   const body2 = buildCompletionBody(task, { result: {} });
   assert.equal(body2.model, null);
 });
+
+// PROGRAMMER-USAGE-KPI-001: usage/стоимость/cold start прогона уходят в тело сдачи
+// отдельными полями (контракт с оркестратором → agent_runs).
+test('buildCompletionBody: usage/cost/coldStart из result.agent → отдельные поля сдачи', () => {
+  const task = { id: 'X', completion: { completionKey: 'k' } };
+  const body = buildCompletionBody(task, {
+    result: {
+      summary: 'ok',
+      agent: {
+        numTurns: 37,
+        tokensIn: 120000,
+        tokensOut: 4500,
+        tokensCacheRead: 90000,
+        tokensCacheCreation: 15000,
+        costUsd: 1.23,
+        coldStartMs: 21000,
+      },
+    },
+  });
+  assert.equal(body.numTurns, 37);
+  assert.equal(body.tokensIn, 120000);
+  assert.equal(body.tokensOut, 4500);
+  assert.equal(body.tokensCacheRead, 90000);
+  assert.equal(body.tokensCacheCreation, 15000);
+  assert.equal(body.costUsd, 1.23);
+  assert.equal(body.coldStartMs, 21000);
+});
+
+// costUsd допускается из totalCostUsd (старое поле result.agent), если costUsd нет.
+test('buildCompletionBody: costUsd фолбэком из totalCostUsd', () => {
+  const task = { id: 'X', completion: { completionKey: 'k' } };
+  const body = buildCompletionBody(task, { result: { agent: { totalCostUsd: 0.77 } } });
+  assert.equal(body.costUsd, 0.77);
+});
+
+// Обратная совместимость: старый раннер без usage/cold start → поля не выставлены
+// (undefined), тело валидно, падения нет.
+test('buildCompletionBody: без usage → поля usage/cost/coldStart = undefined (без падения)', () => {
+  const task = { id: 'X', completion: { completionKey: 'k' } };
+  const body = buildCompletionBody(task, { result: { summary: 'ok' } });
+  assert.equal(body.tokensIn, undefined);
+  assert.equal(body.tokensOut, undefined);
+  assert.equal(body.tokensCacheRead, undefined);
+  assert.equal(body.tokensCacheCreation, undefined);
+  assert.equal(body.costUsd, undefined);
+  assert.equal(body.coldStartMs, undefined);
+  // JSON-сериализация выбрасывает undefined-поля → старый формат тела сохраняется.
+  const parsed = JSON.parse(JSON.stringify(body));
+  assert.ok(!('tokensIn' in parsed));
+  assert.ok(!('costUsd' in parsed));
+  assert.ok(!('coldStartMs' in parsed));
+});
