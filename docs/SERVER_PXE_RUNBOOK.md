@@ -192,6 +192,33 @@ mesh и сам подбирает MTU (путь между площадками 
 - На нодах ограничить 80/443 диапазонами Cloudflare (ufw), 6443/22 — только
   из LAN. Postgres наружу не публикуется вообще.
 
+## Rancher (управление кластером с 211)
+
+Профиль `rancher` в server-compose: `--profile rancher up -d rancher`.
+UI: `https://192.168.1.211:9443` (самоподписанный сертификат — предупреждение
+браузера ожидаемо). Пароль первого входа:
+
+```powershell
+docker logs server-rancher 2>&1 | Select-String "Bootstrap Password:"
+```
+
+Данные Rancher — в named volume `server_rancher-data` (не в SERVER_DATA_ROOT:
+внутри контейнера работает собственный k3s/etcd, который не живёт на
+Windows bind-mount).
+
+Подключение кластера (после provision-k3s.sh):
+
+1. UI → Cluster Management → **Import Existing** → Generic → имя кластера.
+2. Rancher покажет команду `kubectl apply -f https://192.168.1.211:9443/...`
+   — выполнить её с kubeconfig кластера:
+   ```powershell
+   $env:KUBECONFIG = "K:\Роботы\Golang\git\server\albia\registry\kubeconfig"
+   curl.exe -ksfL <URL из UI> | kubectl apply -f -
+   ```
+   (вариант с curl -k нужен из-за самоподписанного сертификата Rancher).
+3. Агент cattle с нод ходит к Rancher на `https://192.168.1.211:9443` через
+   WG-маршруты площадок — проверьте доступность порта с нод.
+
 ## Прод в кластере (шаги 5–6): deploy/k8s/
 
 Полный порядок — `deploy/k8s/README.md`:

@@ -110,6 +110,23 @@ services:
       - ${SERVER_DATA_ROOT:-.}/registry:/var/lib/registry
     restart: unless-stopped
 
+  # Rancher — управление k8s-кластерами с 211 (профиль rancher).
+  # UI: https://<host>:9443. Данные в named volume (НЕ в SERVER_DATA_ROOT:
+  # внутри Rancher свой k3s/etcd, который не живёт на Windows bind-mount).
+  # Пароль первого входа: docker logs server-rancher 2>&1 | grep "Bootstrap Password:"
+  rancher:
+    image: "${RANCHER_IMAGE:-rancher/rancher:latest}"
+    container_name: server-rancher
+    profiles:
+      - rancher
+    privileged: true
+    ports:
+      - "${RANCHER_HTTP_BIND:-0.0.0.0}:${RANCHER_HTTP_PORT:-9080}:80"
+      - "${RANCHER_HTTPS_BIND:-0.0.0.0}:${RANCHER_HTTPS_PORT:-9443}:443"
+    volumes:
+      - rancher-data:/var/lib/rancher
+    restart: unless-stopped
+
   netbootxyz:
     image: lscr.io/linuxserver/netbootxyz:latest
     container_name: server-netbootxyz
@@ -127,6 +144,9 @@ services:
       - ${SERVER_DATA_ROOT:-.}/data/netbootxyz/config:/config
       - ${SERVER_DATA_ROOT:-.}/data/netbootxyz/assets:/assets
     restart: unless-stopped
+
+volumes:
+  rancher-data:
 
 networks:
   shared-network:

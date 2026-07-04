@@ -55,6 +55,17 @@ const MANAGED_SERVERS = [
     description: 'Локальный Docker registry :5000 для образов Albia и прод-деплоя в k3s.',
   },
   {
+    id: 'server-rancher',
+    name: 'Rancher',
+    type: 'docker-compose',
+    composeFile: 'server/docker-compose.yml',
+    composeProfiles: ['rancher'],
+    service: 'rancher',
+    containerName: 'server-rancher',
+    image: process.env.RANCHER_IMAGE || 'rancher/rancher:latest',
+    description: 'Rancher — управление k8s-кластерами (UI https://<host>:9443, профиль rancher).',
+  },
+  {
     id: 'server-netbootxyz',
     name: 'Server netboot.xyz',
     type: 'docker-compose',
