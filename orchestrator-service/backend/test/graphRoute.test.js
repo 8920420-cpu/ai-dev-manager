@@ -6,6 +6,7 @@ import {
   forkBranchKeys,
   outcomeLabel,
   nodeByKey,
+  reworkNodeKey,
 } from '../src/graphRoute.js';
 import { roleKind } from '../src/rolePipeline.js';
 
@@ -80,4 +81,70 @@ test('outcomeLabel: FORWARD → success; BLOCK/REWORK/BRANCH → failure', () =>
 test('gate-роли классифицированы как gate (не analyst — иначе forward их пропустит)', () => {
   assert.equal(roleKind('FORK_GATE'), 'gate');
   assert.equal(roleKind('JOIN_GATE'), 'gate');
+});
+
+// FORWARD-NO-ANALYST-001 — маршрут проекта «Оркестратор»: Pipeline Service стоит
+// по позиции перед Failure Analyst и Fork (рёбра сгенерированы линейно, БЕЗ меток
+// условий). Успех Pipeline Service должен минуть аналитика и уйти в fork; провал —
+// привести к аналитику. FORWARD НИКОГДА не приземляется на узел разбора провала.
+function pipelineForkGraph() {
+  const nodes = [
+    { stageKey: 'PS', kind: 'stage', roleCode: 'PIPELINE_SERVICE', status: 'TESTING' },
+    { stageKey: 'FA', kind: 'stage', roleCode: 'FAILURE_ANALYST', status: 'FAILURE_ANALYSIS' },
+    { stageKey: 'FORK', kind: 'fork', roleCode: 'FORK_GATE', status: null, joinKey: 'JOIN' },
+    { stageKey: 'B', kind: 'stage', roleCode: 'DOCUMENTATION_AUDITOR', status: 'COMMIT' },
+    { stageKey: 'JOIN', kind: 'join', roleCode: 'JOIN_GATE', status: null },
+  ];
+  const edges = [
+    { fromKey: 'PS', toKey: 'FA', condition: null, position: 0 },
+    { fromKey: 'FA', toKey: 'FORK', condition: null, position: 0 },
+    { fromKey: 'FORK', toKey: 'B', condition: null, position: 0 },
+    { fromKey: 'B', toKey: 'JOIN', condition: null, position: 0 },
+  ];
+  return buildGraph(nodes, edges);
+}
+
+test('FORWARD успеха Pipeline Service минует аналитика и уходит в fork', () => {
+  const g = pipelineForkGraph();
+  assert.equal(nextNodeKey(g, 'PS', { outcome: 'FORWARD' }), 'FORK', 'зелёный путь → fork, не Failure Analyst');
+});
+
+test('провал Pipeline Service (BRANCH/BLOCK) ведёт к аналитику', () => {
+  const g = pipelineForkGraph();
+  assert.equal(nextNodeKey(g, 'PS', { outcome: 'BRANCH' }), 'FA', 'провал → Failure Analyst');
+  assert.equal(nextNodeKey(g, 'PS', { outcome: 'BLOCK' }), 'FA', 'блок → Failure Analyst');
+});
+
+test('nextNodeKey: узел-исполнитель с рёбрами-условиями ветвится по исходу (не kind=condition)', () => {
+  const nodes = [
+    { stageKey: 'PS', kind: 'stage', roleCode: 'PIPELINE_SERVICE', status: 'TESTING' },
+    { stageKey: 'FORK', kind: 'fork', roleCode: 'FORK_GATE', status: null },
+    { stageKey: 'FA', kind: 'stage', roleCode: 'FAILURE_ANALYST', status: 'FAILURE_ANALYSIS' },
+  ];
+  const edges = [
+    { fromKey: 'PS', toKey: 'FORK', condition: 'success', position: 0 },
+    { fromKey: 'PS', toKey: 'FA', condition: 'failure', position: 1 },
+  ];
+  const g = buildGraph(nodes, edges);
+  assert.equal(nextNodeKey(g, 'PS', { outcome: 'FORWARD' }), 'FORK', 'success-ребро → fork');
+  assert.equal(nextNodeKey(g, 'PS', { outcome: 'BRANCH' }), 'FA', 'failure-ребро → analyst');
+});
+
+test('reworkNodeKey: доработка от аналитика → назад к ближайшему исполнителю', () => {
+  const nodes = [
+    { stageKey: 'ARCH', kind: 'stage', roleCode: 'ARCHITECT', status: 'ARCHITECTURE' },
+    { stageKey: 'PROG', kind: 'stage', roleCode: 'PROGRAMMER', status: 'CODING' },
+    { stageKey: 'REV', kind: 'stage', roleCode: 'TASK_REVIEWER', status: 'REVIEW' },
+    { stageKey: 'PS', kind: 'stage', roleCode: 'PIPELINE_SERVICE', status: 'TESTING' },
+    { stageKey: 'FA', kind: 'stage', roleCode: 'FAILURE_ANALYST', status: 'FAILURE_ANALYSIS' },
+  ];
+  const edges = [
+    { fromKey: 'ARCH', toKey: 'PROG', condition: null, position: 0 },
+    { fromKey: 'PROG', toKey: 'REV', condition: null, position: 0 },
+    { fromKey: 'REV', toKey: 'PS', condition: null, position: 0 },
+    { fromKey: 'PS', toKey: 'FA', condition: null, position: 0 },
+  ];
+  const g = buildGraph(nodes, edges);
+  assert.equal(reworkNodeKey(g, 'FA'), 'PROG', 'ближайший предшествующий исполнитель — Программист');
+  assert.equal(reworkNodeKey(g, 'PROG'), 'ARCH', 'без исполнителя выше — проектная роль (design)');
 });

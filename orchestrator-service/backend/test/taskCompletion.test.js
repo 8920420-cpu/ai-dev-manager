@@ -316,3 +316,104 @@ test('PIPELINE_SERVICE success → pipeline_runs + переход COMMIT (не �
   assert.equal(ev.params[1], 'STATUS_CHANGED');
   assert.equal(ev.params[3], 'COMMIT');
 });
+
+// ───── FORK-JOIN-001: сдача host-роли в ГРАФ-режиме (current_stage_key задан) ─────
+// Маршрут проекта «Оркестратор»: … → Pipeline Service(TESTING) → Failure Analyst →
+// Fork → ветки(Doc Auditor/Git Integrator) → Join. Рёбра сгенерированы линейно, БЕЗ
+// меток условий (Failure Analyst стоит по позиции сразу за Pipeline Service).
+// Правила graph-режима: узлы/рёбра проекта + gate-роль fork.
+const orchestratorGraphRules = () => [
+  {
+    re: /FROM project_stages WHERE project_id/,
+    reply: {
+      rowCount: 5,
+      rows: [
+        { id: 'sPS', position: 5, enabled: true, task_status: 'TESTING', stage_key: 'PS', kind: 'stage', join_key: null, name: 'Pipeline Service' },
+        { id: 'sFA', position: 6, enabled: true, task_status: 'FAILURE_ANALYSIS', stage_key: 'FA', kind: 'stage', join_key: null, name: 'Failure Analyst' },
+        { id: 'sFORK', position: 7, enabled: true, task_status: null, stage_key: 'FORK', kind: 'fork', join_key: 'JOIN', name: 'Fork' },
+        { id: 'sB', position: 8, enabled: true, task_status: 'COMMIT', stage_key: 'B', kind: 'stage', join_key: null, name: 'Doc Auditor' },
+        { id: 'sJOIN', position: 11, enabled: true, task_status: null, stage_key: 'JOIN', kind: 'join', join_key: null, name: 'Join' },
+      ],
+    },
+  },
+  {
+    re: /FROM project_stage_roles psr JOIN roles/,
+    reply: {
+      rowCount: 5,
+      rows: [
+        { stage_id: 'sPS', role_id: 'rPS', code: 'PIPELINE_SERVICE', position: 0 },
+        { stage_id: 'sFA', role_id: 'rFA', code: 'FAILURE_ANALYST', position: 0 },
+        { stage_id: 'sFORK', role_id: 'rFORK', code: 'FORK_GATE', position: 0 },
+        { stage_id: 'sB', role_id: 'rB', code: 'DOCUMENTATION_AUDITOR', position: 0 },
+        { stage_id: 'sJOIN', role_id: 'rJOIN', code: 'JOIN_GATE', position: 0 },
+      ],
+    },
+  },
+  {
+    re: /FROM project_stage_edges WHERE project_id/,
+    reply: {
+      rowCount: 4,
+      rows: [
+        { from_key: 'PS', to_key: 'FA', condition: null, position: 0 },
+        { from_key: 'FA', to_key: 'FORK', condition: null, position: 0 },
+        { from_key: 'FORK', to_key: 'B', condition: null, position: 0 },
+        { from_key: 'B', to_key: 'JOIN', condition: null, position: 0 },
+      ],
+    },
+  },
+  { re: /SELECT id FROM roles WHERE code = \$1/, reply: { rowCount: 1, rows: [{ id: 'role-next' }] } },
+];
+
+// Требование 1+2: успех Pipeline Service в граф-режиме ведёт к узлу FORK (а НЕ
+// захардкоженный Documentation Auditor на родителе и НЕ Failure Analyst).
+test('PIPELINE_SERVICE success (граф) → узел fork, минуя Doc Auditor на родителе и Failure Analyst', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient([
+    {
+      re: lookup,
+      reply: { rowCount: 1, rows: [{
+        id: TASK, status: 'TESTING', current_role_id: 'role-pipe', assigned_agent_id: null,
+        project_id: 'proj-1', current_stage_key: 'PS', role_code: 'PIPELINE_SERVICE',
+      }] },
+    },
+    ...orchestratorGraphRules(),
+  ]);
+  const res = await completeHostTaskTx(c, { taskId: TASK, roleCode: 'PIPELINE_SERVICE', success: true, output: { summary: { ok: true } } });
+
+  assert.equal(res.nextRole, 'FORK_GATE', 'успех Pipeline Service → узел fork');
+  assert.notEqual(res.nextRole, 'DOCUMENTATION_AUDITOR', 'НЕ хардкод Documentation Auditor');
+  assert.notEqual(res.nextRole, 'FAILURE_ANALYST', 'зелёная задача НЕ уходит к Failure Analyst');
+
+  const upd = c.calls.find((q) => /UPDATE tasks SET status/.test(q.sql));
+  assert.equal(upd.params[4], 'FORK', 'current_stage_key перенесён на узел fork');
+  assert.ok(c.calls.find((q) => /INSERT INTO pipeline_runs/.test(q.sql)), 'записан прогон пайплайна');
+
+  const ev = c.calls.find((q) => /INSERT INTO task_events/.test(q.sql));
+  assert.equal(ev.params[1], 'STATUS_CHANGED');
+  assert.notEqual(ev.params[3], 'FAILURE_ANALYSIS', 'зелёная задача не заходит в разбор провалов');
+});
+
+// Требование: провал Pipeline Service ведёт к Failure Analyst (ветка failure графа).
+test('PIPELINE_SERVICE fail (граф) → Failure Analyst (FAILURE_ANALYSIS)', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient([
+    {
+      re: lookup,
+      reply: { rowCount: 1, rows: [{
+        id: TASK, status: 'TESTING', current_role_id: 'role-pipe', assigned_agent_id: null,
+        project_id: 'proj-1', current_stage_key: 'PS', role_code: 'PIPELINE_SERVICE',
+      }] },
+    },
+    ...orchestratorGraphRules(),
+  ]);
+  const res = await completeHostTaskTx(c, { taskId: TASK, roleCode: 'PIPELINE_SERVICE', success: false, output: { failedStage: 'unit', summary: { ok: false } } });
+
+  assert.equal(res.nextRole, 'FAILURE_ANALYST', 'провал → Failure Analyst');
+  assert.equal(res.toStatus, 'FAILURE_ANALYSIS');
+
+  const upd = c.calls.find((q) => /UPDATE tasks SET status/.test(q.sql));
+  assert.equal(upd.params[4], 'FA', 'current_stage_key перенесён на узел Failure Analyst');
+
+  const run = c.calls.find((q) => /INSERT INTO pipeline_runs/.test(q.sql));
+  assert.equal(run.params[1], 'FAILED', 'прогон пайплайна помечен FAILED');
+});

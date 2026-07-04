@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { ROLE_FLOW, fastForwardHiddenRoles } from './rolePipeline.js';
 import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict, renderProjectMaps } from './roleEngine.js';
 import { buildRoute, resolveTransition, forwardFrom, routeIsUsable, TERMINAL_STATUSES } from './projectRoute.js';
-import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey } from './graphRoute.js';
+import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey, reworkNodeKey } from './graphRoute.js';
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
 import { buildPipelineClaimContract } from './pipelineDispatch.js';
 import { reconcileClockSkew } from './clockGuard.js';
@@ -1931,8 +1931,10 @@ const TERMINAL_TASK_STATUSES = new Set(['DONE', 'CANCELLED', 'FAILED']);
 
 /**
  * Принять результат host-роли и сделать переход. Для PIPELINE_SERVICE пишет
- * pipeline_runs; success → COMMIT/DOCUMENTATION_AUDITOR, fail → FAILURE_ANALYSIS.
- * Для GIT_INTEGRATOR success → DONE, fail → BLOCKED.
+ * pipeline_runs. Переход считает МАРШРУТ ПРОЕКТА (граф при current_stage_key,
+ * иначе позиционный) — nextRole НЕ захардкожен: успех Pipeline Service ведёт в
+ * следующий узел графа (напр. fork), Failure Analyst достижим только по ветке
+ * провала. Для GIT_INTEGRATOR success → конец маршрута (DONE), fail → BLOCKED.
  */
 export async function completeHostTask(s, input) {
   return withClient(clientConfig(s), (c) => completeHostTaskTx(c, input));
@@ -1959,7 +1961,7 @@ export async function completeHostTaskTx(c, input) {
       // бы пустой результат и ложный 404 на повторном сигнале завершения.
       const found = await c.query(
         `SELECT t.id, t.status::text AS status, t.current_role_id, t.assigned_agent_id,
-                t.project_id, r.code AS role_code
+                t.project_id, t.current_stage_key, r.code AS role_code
            FROM tasks t LEFT JOIN roles r ON r.id = t.current_role_id
           WHERE t.id = $1 FOR UPDATE OF t`,
         [taskId],
@@ -1979,7 +1981,18 @@ export async function completeHostTaskTx(c, input) {
       if (t.role_code !== roleCode) throw scannerError(409, 'role_mismatch');
 
       // Целевой переход — по маршруту проекта (PIPELINE-DYNAMIC-ROUTE-001).
+      // FORK-JOIN-001: задача с current_stage_key идёт ПО РЁБРАМ графа (в т.ч.
+      // Pipeline Service при успехе → узел fork, а НЕ захардкоженный Documentation
+      // Auditor на родителе, минуя FORK_GATE). Без ключа — прежняя позиционная
+      // маршрутизация (линейные схемы не затронуты).
       const route = await loadProjectRoute(c, t.project_id);
+      const claimedLike = {
+        id: t.id, project_id: t.project_id, current_stage_key: t.current_stage_key,
+        role_code: roleCode, status: t.status,
+      };
+      const resolveHost = (decision) => (t.current_stage_key
+        ? resolveGraphTransition(c, claimedLike, decision)
+        : resolveTransition(route, roleCode, decision));
       let resolved;
       if (roleCode === 'PIPELINE_SERVICE') {
         await c.query(
@@ -1994,16 +2007,16 @@ export async function completeHostTaskTx(c, input) {
             output.logPath ?? null,
           ],
         );
-        resolved = success
-          ? resolveTransition(route, roleCode, { outcome: 'FORWARD' })
-          : resolveTransition(route, roleCode, {
-              outcome: 'BRANCH', branchKind: 'analyst', branchRole: 'FAILURE_ANALYST', branchFallback: 'rework',
-            });
+        // Успех → вперёд по маршруту (граф минует аналитика на зелёном пути);
+        // провал → к аналитику (ветка 'failure' графа / branch линейного маршрута).
+        resolved = await resolveHost(success
+          ? { outcome: 'FORWARD' }
+          : { outcome: 'BRANCH', branchKind: 'analyst', branchRole: 'FAILURE_ANALYST', branchFallback: 'rework' });
       } else {
         // GIT_INTEGRATOR: успех завершает маршрут, провал — стоп.
         resolved = success
-          ? resolveTransition(route, roleCode, { outcome: 'FORWARD' })
-          : { nextRole: null, toStatus: 'BLOCKED', done: false, blocked: true, via: 'route' };
+          ? await resolveHost({ outcome: 'FORWARD' })
+          : { nextRole: null, toStatus: 'BLOCKED', done: false, blocked: true, via: t.current_stage_key ? 'graph' : 'route' };
       }
       const toStatus = resolved.toStatus;
       const nextRole = resolved.nextRole;
@@ -2016,10 +2029,12 @@ export async function completeHostTaskTx(c, input) {
         ? null
         : (await c.query('SELECT id FROM roles WHERE code = $1', [nextRole])).rows[0]?.id ?? null;
 
+      // FORK-JOIN-001: в граф-режиме переносим текущий узел на следующий (напр. на
+      // узел fork после успеха Pipeline Service); в линейном режиме остаётся NULL.
       await c.query(
         `UPDATE tasks SET status = $2::task_status, current_role_id = $3, assigned_agent_id = NULL,
-                data_card = data_card || $4::jsonb WHERE id = $1`,
-        [taskId, toStatus, nextRoleId, JSON.stringify(hostCardValues || {})],
+                data_card = data_card || $4::jsonb, current_stage_key = $5::uuid WHERE id = $1`,
+        [taskId, toStatus, nextRoleId, JSON.stringify(hostCardValues || {}), resolved.nextStageKey ?? null],
       );
       // BOOT-RECONCILE-GRACE-001: закрыть прогон host-роли по фактическому исходу.
       // Берём последний прогон роли в статусе RUNNING ЛИБО TIMEOUT. Host-runner
@@ -2483,6 +2498,23 @@ async function resolveGraphTransition(c, claimed, decision) {
   const loaded = await loadProjectGraph(c, claimed.project_id);
   if (!loaded) {
     // Рёбра исчезли (схему переписали в линейную) — фолбэк на позиционный резолвер.
+    const route = await loadProjectRoute(c, claimed.project_id);
+    return { ...resolveTransition(route, claimed.role_code, decision), nextStageKey: null };
+  }
+  // FA-REWORK-ROUTE-001: доработка (напр. диагност сбоя вернул задачу) идёт НАЗАД к
+  // ближайшему исполнителю по рёбрам графа, а не вперёд по маршруту — иначе вердикт
+  // «на доработку» проглатывается следующим узлом (fork/join спавнит ветки как при
+  // успехе). Цели нет (нет исполнителя выше по графу) → фолбэк на линейный резолвер.
+  if (decision.outcome === 'REWORK') {
+    const backKey = reworkNodeKey(loaded.graph, claimed.current_stage_key);
+    if (backKey) {
+      const backNode = nodeByKey(loaded.graph, backKey);
+      return {
+        nextRole: backNode?.roleCode ?? null,
+        toStatus: backNode?.status || claimed.status,
+        done: false, blocked: false, via: 'graph', nextStageKey: backKey,
+      };
+    }
     const route = await loadProjectRoute(c, claimed.project_id);
     return { ...resolveTransition(route, claimed.role_code, decision), nextStageKey: null };
   }
