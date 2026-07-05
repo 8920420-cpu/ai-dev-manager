@@ -70,25 +70,37 @@ async function ensureRepo(repoRoot) {
   return { created: true };
 }
 
-/**
- * GIT_INTEGRATOR: добавить ТОЛЬКО файлы текущей задачи, сделать один локальный
- * коммит и запушить в origin (best-effort). Без reset, clean и --no-verify.
- * Название и описание коммита берутся из карточки Приёмщика задач: task.title —
- * короткое название (short_title), task.description — структурированное описание.
- * Всё чистым кодом, без ИИ.
- */
-export async function runGitAction(task, opts = {}) {
-  const repoRoot = opts.repoRoot ?? process.cwd();
-  const files = (task.changedFiles ?? []).filter(
-    (f) => typeof f === 'string' && f.trim() !== '' && !f.includes('..') && !path.isAbsolute(f),
+// Заголовок коммита = название от Приёмщика (task.title = short_title). Тело =
+// его же структурированное описание (task.description); если описания нет —
+// падаем на результат программиста, чтобы не оставлять тело пустым.
+function commitMessage(task) {
+  const body = String(task.description || task.programmerResult || '').trim();
+  return (
+    `${task.title} (task ${task.id})` +
+    (body ? `\n\n${body}` : '') +
+    '\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>'
   );
-  if (files.length === 0) {
-    return { success: true, output: { commit: null, files: [], note: 'no_changed_files' } };
+}
+
+// Пуш ТОЛЬКО в origin, best-effort: локальный коммит main уже сделан, поэтому
+// провал пуша (нет origin / нет сети / non-fast-forward) не роняет роль —
+// фиксируем pushed:false + pushError, задача всё равно считается выполненной.
+async function pushHead(repoRoot) {
+  const hasOrigin = await git(repoRoot, ['remote', 'get-url', 'origin']).then(() => true).catch(() => false);
+  if (!hasOrigin) return { pushed: false, pushError: 'no_origin' };
+  try {
+    await git(repoRoot, ['push', 'origin', 'HEAD']);
+    return { pushed: true, pushError: null };
+  } catch (error) {
+    return { pushed: false, pushError: String(error.stderr || error.message || 'push failed').trim().slice(0, 500) };
   }
+}
 
-  // Репозиторий может быть ещё не создан — инициализируем автоматически.
-  const repo = await ensureRepo(repoRoot);
-
+// Прежний путь (обратная совместимость со старым программистом без worktree):
+// стейджим ТОЛЬКО заявленные файлы задачи и делаем один локальный коммит.
+// Возвращает нормализованный результат: { integrated, note?, commit?, ... } —
+// политику «пустой итог» применяет вызывающая runGitAction.
+async function integrateChangedFiles(repoRoot, task, files) {
   // Стейджим только те пути задачи, которые git реально видит как изменение
   // (модификация / добавление / удаление). Путь, которого git не знает вовсе
   // (уже закоммичен ранее, либо никогда не существовал), роняет `git add`
@@ -96,60 +108,155 @@ export async function runGitAction(task, opts = {}) {
   // git add валится на ПЕРВОМ неизвестном пути, не доходя до остальных.
   const status = await git(repoRoot, ['status', '--porcelain', '--', ...files]);
   const dirty = files.filter((f) => status.stdout.includes(f));
-  if (dirty.length === 0) {
-    return { success: true, output: { commit: null, files: [], note: 'nothing_to_stage' } };
-  }
+  if (dirty.length === 0) return { integrated: false, note: 'nothing_to_stage' };
   // -A: зафиксировать в т.ч. УДАЛЕНИЯ перечисленных путей.
   await git(repoRoot, ['add', '-A', '--', ...dirty]);
   const staged = await git(repoRoot, ['diff', '--cached', '--name-only']);
   const stagedFiles = staged.stdout.split('\n').map((s) => s.trim()).filter(Boolean);
-  if (stagedFiles.length === 0) {
-    return { success: true, output: { commit: null, files: [], note: 'nothing_staged' } };
-  }
-
-  // Заголовок = название от Приёмщика (task.title = short_title). Тело = его же
-  // структурированное описание (task.description); если описания нет — падаем на
-  // результат программиста, чтобы не оставлять тело пустым.
-  const body = String(task.description || task.programmerResult || '').trim();
-  const message =
-    `${task.title} (task ${task.id})` +
-    (body ? `\n\n${body}` : '') +
-    '\n\nCo-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>';
+  if (stagedFiles.length === 0) return { integrated: false, note: 'nothing_staged' };
 
   try {
-    await git(repoRoot, ['commit', '-m', message]);
+    await git(repoRoot, ['commit', '-m', commitMessage(task)]);
   } catch (error) {
-    return { success: false, output: { error: `commit failed: ${error.stderr || error.message}`, files: stagedFiles } };
+    return { error: `commit failed: ${error.stderr || error.message}`, extra: { files: stagedFiles } };
   }
-
   const head = await git(repoRoot, ['rev-parse', 'HEAD']);
   const branch = await git(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => ({ stdout: '' }));
+  return { integrated: true, commit: head.stdout.trim(), branch: branch.stdout.trim(), files: stagedFiles };
+}
 
-  // Пуш ТОЛЬКО в origin, best-effort: локальный коммит уже сделан, поэтому провал
-  // пуша (нет origin / нет сети / non-fast-forward) не роняет роль — фиксируем
-  // pushed:false + pushError, задача всё равно считается выполненной (success).
-  let pushed = false;
-  let pushError = null;
-  const hasOrigin = await git(repoRoot, ['remote', 'get-url', 'origin']).then(() => true).catch(() => false);
-  if (!hasOrigin) {
-    pushError = 'no_origin';
-  } else {
-    try {
-      await git(repoRoot, ['push', 'origin', 'HEAD']);
-      pushed = true;
-    } catch (error) {
-      pushError = String(error.stderr || error.message || 'push failed').trim().slice(0, 500);
-    }
+// Новый путь: программист сдал дельту КОММИТОМ в ветке worktree
+// (programmer/<project>/<service>). Вливаем ИМЕННО дельту программиста в main
+// внутри repoRoot cherry-pick'ом коммита deliveredCommit (fallback — ветка).
+// cherry-pick применяет только дельту задачи поверх текущего main и устойчив к
+// расхождению истории (другие сервисы/док-коммиты уже влиты в main).
+async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredCommit }) {
+  const ref = deliveredCommit || worktreeBranch;
+  // Ветка/коммит программиста должны существовать в этом же репозитории (worktree
+  // — отдельное дерево ТОГО ЖЕ репо). Иначе интегрировать нечего — честный провал.
+  const resolved = await git(repoRoot, ['rev-parse', '--verify', `${ref}^{commit}`])
+    .then((r) => r.stdout.trim())
+    .catch(() => '');
+  if (!resolved) return { error: `worktree ref not found: ${ref}`, note: 'worktree_ref_missing' };
+
+  const before = await git(repoRoot, ['rev-parse', 'HEAD']).then((r) => r.stdout.trim()).catch(() => null);
+  // Дельта уже в main (коммит — предок HEAD)? Тогда доносить нечего.
+  if (before) {
+    const already = await git(repoRoot, ['merge-base', '--is-ancestor', resolved, 'HEAD'])
+      .then(() => true).catch(() => false);
+    if (already) return { integrated: false, note: 'already_integrated' };
   }
 
+  // Идентичность коммитера задаём флагами -c, чтобы не зависеть от глобального
+  // git-config хоста (cherry-pick сохраняет исходного АВТОРА, но требует коммитера).
+  const ident = [
+    '-c', `user.email=${process.env.GIT_AUTHOR_EMAIL || 'ai-dev-manager@local'}`,
+    '-c', `user.name=${process.env.GIT_AUTHOR_NAME || 'AI Dev Manager'}`,
+  ];
+  try {
+    // -x фиксирует исходный SHA в теле коммита — дельту в main можно проследить.
+    await git(repoRoot, [...ident, 'cherry-pick', '-x', resolved]);
+  } catch (error) {
+    // Конфликт/пустая дельта: cherry-pick атомарен, откатываем незавершённое
+    // состояние, чтобы не оставить дерево в mid-state.
+    await git(repoRoot, ['cherry-pick', '--abort']).catch(() => {});
+    const stderr = String(error.stderr || error.message || '').trim();
+    if (/empty/i.test(stderr)) return { integrated: false, note: 'empty_delta' };
+    return { error: `cherry-pick failed: ${stderr.slice(0, 500)}`, note: 'cherry_pick_failed' };
+  }
+
+  const head = await git(repoRoot, ['rev-parse', 'HEAD']).then((r) => r.stdout.trim());
+  if (before && head === before) return { integrated: false, note: 'empty_delta' };
+  const branch = await git(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => ({ stdout: '' }));
+  const changed = await git(repoRoot, ['diff', '--name-only', `${head}^`, head]).then((r) => r.stdout).catch(() => '');
+  return {
+    integrated: true,
+    commit: head,
+    branch: branch.stdout.trim(),
+    files: changed.split('\n').map((s) => s.trim()).filter(Boolean),
+    mergedFrom: worktreeBranch,
+    deliveredCommit: resolved,
+  };
+}
+
+/**
+ * GIT_INTEGRATOR: довести код задачи до main и запушить в origin (best-effort).
+ *
+ * Два режима сдачи:
+ *   (1) worktreeBranch задан — программист сдал дельту КОММИТОМ в ветке worktree
+ *       (programmer/<project>/<service>); вливаем эту дельту (deliveredCommit) в
+ *       main внутри repoRoot cherry-pick'ом. Коммит main существует локально даже
+ *       при провале пуша.
+ *   (2) worktreeBranch НЕ задан — прежний путь (обратная совместимость): стейдж
+ *       task.changedFiles и один локальный коммит.
+ *
+ * Пустой итог интеграции (нечего сливать), КОГДА изменения ЗАЯВЛЕНЫ (непустой
+ * changedFiles ИЛИ worktreeBranch с непустым deliveredCommit) — это ПРОВАЛ
+ * (success:false, note empty_deliverable_declared_changes): иначе конвейер
+ * «зелёный», а код не доехал до main. Пустой итог при реально пустой сдаче
+ * (нет ветки и пустой changedFiles) — прежний success:true note no_changed_files.
+ */
+export async function runGitAction(task, opts = {}) {
+  const repoRoot = opts.repoRoot ?? process.cwd();
+  const files = (task.changedFiles ?? []).filter(
+    (f) => typeof f === 'string' && f.trim() !== '' && !f.includes('..') && !path.isAbsolute(f),
+  );
+  const worktreeBranch =
+    typeof task.worktreeBranch === 'string' && task.worktreeBranch.trim() !== '' ? task.worktreeBranch.trim() : null;
+  const deliveredCommit =
+    typeof task.deliveredCommit === 'string' && task.deliveredCommit.trim() !== '' ? task.deliveredCommit.trim() : null;
+
+  // Изменения ЗАЯВЛЕНЫ, если программист сдал ветку worktree с коммитом-дельтой
+  // ЛИБО перечислил changedFiles. От этого зависит трактовка пустого итога.
+  const declaredChanges = files.length > 0 || (worktreeBranch !== null && deliveredCommit !== null);
+
+  // Реально пустая сдача (нет ветки и пустой changedFiles) — прежнее поведение.
+  if (!worktreeBranch && files.length === 0) {
+    return { success: true, output: { commit: null, files: [], note: 'no_changed_files' } };
+  }
+
+  // Репозиторий может быть ещё не создан — инициализируем автоматически.
+  const repo = await ensureRepo(repoRoot);
+
+  const res = worktreeBranch
+    ? await integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredCommit })
+    : await integrateChangedFiles(repoRoot, task, files);
+
+  // Явная ошибка интеграции (конфликт cherry-pick, сбой commit, нет ref) — провал.
+  if (res.error) {
+    return { success: false, output: { error: res.error, note: res.note ?? 'integration_failed', ...(res.extra ?? {}) } };
+  }
+
+  // Пустой итог: заявленные изменения не доехали — провал; иначе тихий success.
+  if (!res.integrated) {
+    const note = res.note ?? 'no_changed_files';
+    if (declaredChanges) {
+      return {
+        success: false,
+        output: {
+          commit: null,
+          files: [],
+          note: 'empty_deliverable_declared_changes',
+          reason: note,
+          worktreeBranch,
+          deliveredCommit,
+          declaredFiles: files,
+        },
+      };
+    }
+    return { success: true, output: { commit: null, files: [], note } };
+  }
+
+  const push = await pushHead(repoRoot);
   return {
     success: true,
     output: {
-      commit: head.stdout.trim(),
-      branch: branch.stdout.trim(),
-      files: stagedFiles,
-      pushed,
-      pushError,
+      commit: res.commit,
+      branch: res.branch,
+      files: res.files,
+      ...(res.mergedFrom ? { mergedFrom: res.mergedFrom, deliveredCommit: res.deliveredCommit } : {}),
+      pushed: push.pushed,
+      pushError: push.pushError,
       repoInitialized: repo.created,
     },
   };

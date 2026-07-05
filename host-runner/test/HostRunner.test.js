@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { HostRunner } from '../src/HostRunner.js';
+import { runGitAction } from '../src/actions.js';
 
 const silent = { info() {}, error() {}, warn() {} };
 
@@ -135,4 +140,73 @@ test('приёмка: зависший PIPELINE_SERVICE не мешает GIT_IN
   releasePipeline();
   await resultFor(out, 'PIPELINE_SERVICE');
   assert.equal(http.calls.complete.length, 2);
+});
+
+// ── runGitAction: интеграция дельты программиста в main ───────────────────────
+// Регресс к инциденту 05.07 (agent_runs): программист сдаёт код КОММИТОМ в ветку
+// worktree (programmer/<project>/<service>), а GIT_INTEGRATOR раньше её не видел и
+// закрывал задачу тихим SUCCESS с note no_changed_files/nothing_to_stage — код
+// оставался только в ветке. Проверяем реальными git-эффектами во временном репо.
+
+function git(cwd, args) {
+  return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+// Временный git-репозиторий с одним коммитом на ветке main и заданной identity.
+function initRepo(t) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'gi-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  git(dir, ['init', '--quiet']);
+  git(dir, ['config', 'user.email', 'test@local']);
+  git(dir, ['config', 'user.name', 'Test']);
+  git(dir, ['config', 'commit.gpgsign', 'false']);
+  writeFileSync(path.join(dir, 'README.md'), 'base\n');
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '--quiet', '-m', 'init']);
+  git(dir, ['branch', '-M', 'main']); // имя ветки по умолчанию не зависит от версии git
+  return dir;
+}
+
+test('runGitAction: сдача через worktree-ветку → дельта влита в main', async (t) => {
+  const dir = initRepo(t);
+  // Программист сдаёт дельту коммитом в отдельной ветке (эмуляция worktree).
+  git(dir, ['checkout', '--quiet', '-b', 'programmer/PROJECT_2/host-runner']);
+  writeFileSync(path.join(dir, 'feature.js'), 'export const x = 1;\n');
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '--quiet', '-m', 'programmer: task delta']);
+  const deliveredCommit = git(dir, ['rev-parse', 'HEAD']).trim();
+  git(dir, ['checkout', '--quiet', 'main']); // main пока БЕЗ feature.js
+
+  const res = await runGitAction(
+    {
+      id: 't-wt',
+      title: 'Widget feedback',
+      worktreeBranch: 'programmer/PROJECT_2/host-runner',
+      deliveredCommit,
+      changedFiles: ['feature.js'],
+    },
+    { repoRoot: dir },
+  );
+
+  assert.equal(res.success, true);
+  assert.ok(res.output.commit, 'должен быть коммит интеграции в main');
+  // Дельта реально в main: файл закоммичен в ветке main, а не только в ветке программиста.
+  assert.doesNotThrow(() => git(dir, ['cat-file', '-e', 'main:feature.js']));
+  assert.equal(git(dir, ['show', 'main:feature.js']), 'export const x = 1;\n');
+  assert.ok(git(dir, ['log', '--oneline', 'main']).includes('task delta'));
+});
+
+test('runGitAction: реально пустая сдача (нет ветки, пустой changedFiles) → success note no_changed_files', async (t) => {
+  const dir = initRepo(t);
+  const res = await runGitAction({ id: 't-empty', title: 'Nothing', changedFiles: [] }, { repoRoot: dir });
+  assert.deepEqual(res, { success: true, output: { commit: null, files: [], note: 'no_changed_files' } });
+});
+
+test('runGitAction: заявленные изменения без реальной интеграции → FAILED empty_deliverable_declared_changes', async (t) => {
+  const dir = initRepo(t);
+  // changedFiles заявлен, но README.md не менялся → git не видит изменений (nothing_to_stage).
+  const res = await runGitAction({ id: 't-decl', title: 'Declared', changedFiles: ['README.md'] }, { repoRoot: dir });
+  assert.equal(res.success, false);
+  assert.equal(res.output.note, 'empty_deliverable_declared_changes');
+  assert.equal(res.output.reason, 'nothing_to_stage');
 });
