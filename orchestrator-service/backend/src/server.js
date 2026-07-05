@@ -20,6 +20,7 @@ import {
   assignTaskProject,
   advanceTask,
   moveTask,
+  setTaskPriority,
   restartStuckTasks,
   getAcceptanceBoard,
   acceptTask,
@@ -738,6 +739,18 @@ export function createApp() {
           const taskId = decodeURIComponent(moveMatch[1]);
           const result = await moveTask(await loadSettings(), taskId, await readBody(req));
           publishTaskChange('task_moved', { taskId });
+          return sendJson(res, 200, result);
+        }
+
+        // TASK-PRIORITY-SCALE-001: смена приоритета задачи из карточки/UI. Валидация в
+        // db.js: 0 — только проект оркестратора; оркестраторную ниже 0 не понизить; без
+        // вытеснения RUNNING (меняем только число). Принимаем PATCH и POST (совместимость).
+        const priorityMatch = p.match(/^\/api\/tasks\/([^/]+)\/priority$/);
+        if (priorityMatch && (req.method === 'PATCH' || req.method === 'POST')) {
+          const taskId = decodeURIComponent(priorityMatch[1]);
+          const body = await readBody(req);
+          const result = await setTaskPriority(await loadSettings(), taskId, body.priority);
+          publishTaskChange('task_priority_changed', { taskId });
           return sendJson(res, 200, result);
         }
 

@@ -143,7 +143,8 @@ INSERT INTO tasks (project_id, service_id, title, description, priority, status,
 SELECT p.id, s.id,
        'Добавить печатную форму счёта',
        'Реализовать генерацию PDF счёта в Catalog_Service.',
-       'HIGH', 'READY',
+       -- TASK-PRIORITY-SCALE-001: priority теперь SMALLINT (1 = высокий; было ENUM 'HIGH').
+       1, 'READY',
        (SELECT id FROM roles WHERE code = 'ARCHITECT'),
        'orchestrator'
 FROM projects p

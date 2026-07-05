@@ -141,7 +141,7 @@ export async function getTaskHistory(s, taskId) {
   }
   return withClient(clientConfig(s), async (c) => {
     const taskRes = await c.query(
-      `SELECT t.id, t.title, t.status::text AS status, t.data_card,
+      `SELECT t.id, t.title, t.status::text AS status, t.priority::text AS priority, t.data_card,
               p.name AS project_name, p.code AS project_code
          FROM tasks t JOIN projects p ON p.id = t.project_id
         WHERE t.id = $1`,
@@ -201,6 +201,7 @@ export async function getTaskHistory(s, taskId) {
         id: t.id,
         title: t.title,
         status: t.status,
+        priority: t.priority,
         projectName: t.project_name,
         projectCode: t.project_code ?? null,
         dataCard: t.data_card ?? null,

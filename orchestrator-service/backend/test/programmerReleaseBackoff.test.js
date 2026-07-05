@@ -75,7 +75,7 @@ test('claimNextClaudeTaskTx: cooldown-предикат в CTE picked, задач
   assert.ok(/now\(\) < cd\.last_fail/.test(picked.sql), 'сравнение по времени БД (now vs last_fail + backoff)');
 
   // Существующие механизмы НЕ сломаны: приоритетная очередь и worktree-сериализация.
-  assert.ok(/ORDER BY t\.priority DESC, t\.created_at/.test(picked.sql), 'приоритетная очередь сохранена');
+  assert.ok(/ORDER BY t\.priority ASC, t\.created_at ASC/.test(picked.sql), 'приоритетная очередь: priority ASC (меньше = важнее), FIFO по created_at');
   assert.ok(/t2\.assigned_agent_id IS NOT NULL/.test(picked.sql), 'worktree-per-service предикат сохранён');
   assert.ok(/FOR UPDATE OF t SKIP LOCKED/.test(picked.sql), 'FOR UPDATE SKIP LOCKED сохранён');
 
