@@ -24,6 +24,7 @@ import {
 } from '../../components/ui';
 import { cn } from '../../lib/cn';
 import { taskStatusLabel } from '../../data/taskStatuses';
+import { taskPriorityLabel, taskPriorityTone } from '../../data/taskPriorities';
 import {
   subscribeTaskChanges,
   tasksApi,
@@ -359,6 +360,7 @@ function TaskNode({
         </span>
         {hasSubs && <span className={styles.count}>{task.subtasks.length}</span>}
         <Badge tone={statusTone(task.status)}>{taskStatusLabel(task.status)}</Badge>
+        <Badge tone={taskPriorityTone(task.priority)}>{taskPriorityLabel(task.priority)}</Badge>
         <TaskRowActions
           taskId={task.id}
           title={task.title}
@@ -388,6 +390,7 @@ function SubtaskNode({ subtask, actions }: { subtask: TaskTreeSubtask; actions: 
           {subtask.title}
         </span>
         <Badge tone={statusTone(subtask.status)}>{taskStatusLabel(subtask.status)}</Badge>
+        <Badge tone={taskPriorityTone(subtask.priority)}>{taskPriorityLabel(subtask.priority)}</Badge>
         <TaskRowActions
           taskId={subtask.id}
           title={subtask.title}

@@ -21,6 +21,12 @@ import {
 import { projectsApi } from '../../api/projectsApi';
 import type { Project, Stage } from '../../types/project';
 import { taskStatusLabel } from '../../data/taskStatuses';
+import {
+  SELECTABLE_PRIORITIES,
+  isOrchestratorPriority,
+  taskPriorityLabel,
+  taskPriorityTone,
+} from '../../data/taskPriorities';
 import styles from './AcceptanceBoardPage.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
@@ -94,6 +100,17 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
     await load();
   }, [load]);
 
+  // Тихое обновление доски (без индикатора загрузки и без закрытия карточки) —
+  // после смены приоритета из карточки, чтобы бейдж в таблице совпал с карточкой.
+  const refreshBoard = useCallback(async () => {
+    try {
+      const data = await tasksApi.acceptanceBoard();
+      setBoard(data.tasks);
+    } catch {
+      /* фоновое обновление: молча игнорируем сбой */
+    }
+  }, []);
+
   const title = mode === 'review' ? 'Проверка' : 'Выполнено';
   const description =
     mode === 'review'
@@ -155,6 +172,7 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
                   <th>Проект</th>
                   <th>Сервис</th>
                   <th>Название</th>
+                  <th>Приоритет</th>
                   {mode === 'done' && <th>Принята</th>}
                 </tr>
               </thead>
@@ -183,6 +201,11 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
                     <td className={styles.titleCell} title={task.title}>
                       {task.title}
                     </td>
+                    <td>
+                      <Badge tone={taskPriorityTone(task.priority)}>
+                        {taskPriorityLabel(task.priority)}
+                      </Badge>
+                    </td>
                     {mode === 'done' && (
                       <td className={styles.muted}>{formatDate(task.acceptedAt)}</td>
                     )}
@@ -200,6 +223,7 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
         project={selected ? projectById.get(selected.projectId) ?? null : null}
         onClose={() => setSelected(null)}
         onDone={handleAccepted}
+        onRefresh={refreshBoard}
       />
     </div>
   );
@@ -317,18 +341,48 @@ function TaskAcceptanceModal({
   project,
   onClose,
   onDone,
+  onRefresh,
 }: {
   mode: AcceptanceMode;
   task: AcceptanceTask | null;
   project: Project | null;
   onClose: () => void;
   onDone: () => Promise<void> | void;
+  /** Тихо обновить доску после смены приоритета (карточку не закрывает). */
+  onRefresh?: () => Promise<void> | void;
 }) {
   const toast = useToast();
   const [history, setHistory] = useState<TaskHistory | null>(null);
   const [historyState, setHistoryState] = useState<LoadState>('loading');
   const [accepting, setAccepting] = useState(false);
   const [reworkOpen, setReworkOpen] = useState(false);
+  // Локальное значение приоритета: карточка сразу отражает смену, не дожидаясь доски.
+  const [priority, setPriority] = useState('2');
+  const [savingPriority, setSavingPriority] = useState(false);
+
+  // Синхронизируем приоритет с выбранной задачей при открытии/смене задачи.
+  useEffect(() => {
+    setPriority(task?.priority ?? '2');
+  }, [task]);
+
+  const handlePriorityChange = async (next: string) => {
+    if (!task || next === priority) return;
+    const prev = priority;
+    setPriority(next); // оптимистично
+    setSavingPriority(true);
+    try {
+      const res = await tasksApi.setPriority(task.id, Number(next));
+      // Сервер может нормализовать значение (напр. форс 0 для оркестратора).
+      setPriority(res.priority ?? next);
+      toast.success('Приоритет обновлён');
+      await onRefresh?.();
+    } catch (e) {
+      setPriority(prev); // откат при ошибке
+      toast.error(e instanceof Error ? e.message : 'Не удалось изменить приоритет');
+    } finally {
+      setSavingPriority(false);
+    }
+  };
 
   // Загрузка структуры и хронологии выбранной задачи.
   useEffect(() => {
@@ -418,6 +472,29 @@ function TaskAcceptanceModal({
         }
       >
         <div className={styles.detail}>
+          <section className={styles.block}>
+            <h3 className={styles.blockTitle}>Приоритет</h3>
+            {isOrchestratorPriority(priority) ? (
+              <p className={styles.muted}>
+                <Badge tone={taskPriorityTone(priority)}>{taskPriorityLabel(priority)}</Badge> —
+                приоритет задач проекта оркестратора выставляется сервером и не меняется вручную.
+              </p>
+            ) : (
+              <Select
+                label="Приоритет"
+                value={priority}
+                onChange={(e) => void handlePriorityChange(e.target.value)}
+                disabled={savingPriority}
+              >
+                {SELECTABLE_PRIORITIES.map((p) => (
+                  <option key={p} value={p}>
+                    {taskPriorityLabel(p)}
+                  </option>
+                ))}
+              </Select>
+            )}
+          </section>
+
           {historyState === 'loading' && <LoadingBlock label="Загрузка задачи…" />}
           {historyState === 'error' && (
             <Callout tone="error" title="Не удалось загрузить детали задачи" />

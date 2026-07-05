@@ -118,6 +118,8 @@ export interface TaskHistoryTask {
   id: string;
   title: string;
   status: string;
+  /** Приоритет задачи: '0' — оркестратор, '1' — высокий, '2' — обычный, '3' — низкий. */
+  priority: string;
   projectName: string;
   projectCode: string | null;
   dataCard: Record<string, unknown> | null;
@@ -176,6 +178,12 @@ export interface MoveTaskResult {
 /** Ответ `POST /api/tasks/restart-stuck` — массовый перезапуск зависших задач. */
 export interface RestartStuckResult {
   restarted: number;
+}
+
+/** Ответ `PATCH /api/tasks/:id/priority` — новый приоритет задачи (строка '0'..'3'). */
+export interface SetTaskPriorityResult {
+  taskId: string;
+  priority: string;
 }
 
 /** Завершённая конвейером задача (status=DONE) на доске приёмки. */
@@ -244,6 +252,20 @@ export const tasksApi = {
    */
   async move(taskId: string, input: { toStageId: string; reason: string }): Promise<MoveTaskResult> {
     return http.post<MoveTaskResult>(`/api/tasks/${encodeURIComponent(taskId)}/move`, input);
+  },
+
+  /**
+   * `PATCH /api/tasks/:id/priority` — сменить приоритет задачи через механизм
+   * обновления карточки. Шкала: 1 — высокий, 2 — обычный, 3 — низкий. Значение 0
+   * зарезервировано за проектом оркестратора и форсится сервером: клиент не может
+   * ни задать 0 чужой задаче, ни понизить оркестраторную ниже 0 (та же серверная
+   * валидация, что и на прочих путях обновления карточки).
+   */
+  async setPriority(taskId: string, priority: number): Promise<SetTaskPriorityResult> {
+    return http.patch<SetTaskPriorityResult>(
+      `/api/tasks/${encodeURIComponent(taskId)}/priority`,
+      { priority },
+    );
   },
 
   /**

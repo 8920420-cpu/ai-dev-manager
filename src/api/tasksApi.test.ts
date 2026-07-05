@@ -27,6 +27,7 @@ import { ApiError } from './http';
 beforeEach(() => {
   get.mockReset();
   post.mockReset();
+  patch.mockReset();
 });
 
 describe('tasksApi.advance', () => {
@@ -62,6 +63,27 @@ describe('tasksApi.move', () => {
     post.mockResolvedValue({ moved: true });
     await tasksApi.move('a/b', { toStageId: 's2', reason: 'r' });
     expect(post).toHaveBeenCalledWith('/api/tasks/a%2Fb/move', { toStageId: 's2', reason: 'r' });
+  });
+});
+
+describe('tasksApi.setPriority', () => {
+  it('PATCH /api/tasks/:id/priority с телом { priority } и возвращает результат', async () => {
+    patch.mockResolvedValue({ taskId: 't1', priority: '1' });
+    const res = await tasksApi.setPriority('t1', 1);
+    expect(patch).toHaveBeenCalledWith('/api/tasks/t1/priority', { priority: 1 });
+    expect(res.priority).toBe('1');
+  });
+
+  it('кодирует taskId в пути', async () => {
+    patch.mockResolvedValue({ taskId: 'a/b', priority: '3' });
+    await tasksApi.setPriority('a/b', 3);
+    expect(patch).toHaveBeenCalledWith('/api/tasks/a%2Fb/priority', { priority: 3 });
+  });
+
+  it('пробрасывает ApiError при отклонении сервером (напр. 0 для чужой задачи)', async () => {
+    const err = new ApiError('Недопустимый приоритет', 400, { error: 'invalid_priority' });
+    patch.mockRejectedValue(err);
+    await expect(tasksApi.setPriority('t1', 0)).rejects.toBe(err);
   });
 });
 
