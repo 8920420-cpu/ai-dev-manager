@@ -3248,7 +3248,7 @@ export async function advanceJoinNodes(c) {
  */
 export async function advanceDecompositionParents(c) {
   const parents = await c.query(
-    `SELECT t.id, t.status::text AS status, t.current_role_id
+    `SELECT t.id, t.status::text AS status, t.current_role_id, t.data_card
        FROM tasks t
       WHERE t.task_kind = 'epic'
         AND t.status = 'WAITING_FOR_CHILDREN'
@@ -3269,7 +3269,29 @@ export async function advanceDecompositionParents(c) {
           WHERE parent_task_id = $1 AND task_kind = 'service' AND status IN ('BLOCKED','FAILED')`,
         [p.id],
       );
-      const toStatus = bad.rows[0].n > 0 ? 'BLOCKED' : 'DONE';
+      // JOIN-PLANNED-COVERAGE-001: сверяем ФАКТИЧЕСКИХ детей с целевым списком
+      // сервисов Архитектора (data_card.planned_services). Когда капы/таймауты урезают
+      // work_items, дети создаются не на все заявленные сервисы (B1: заявлены
+      // WEBSTORE/Smeta/IAM/FastTable, дети только на WEBSTORE+IAM) — и DONE по одним лишь
+      // имеющимся детям скрыл бы, что половина фронтов не сделана. Сервис считается
+      // покрытым, если у него есть хотя бы один НЕ отменённый ребёнок task_kind='service'
+      // (сверяем по коду сервиса, а не по числу детей). Недостача приоритетно понижает
+      // DONE→BLOCKED с перечнем недостающих сервисов (возврат Архитектору).
+      const dc = p.data_card && typeof p.data_card === 'object' ? p.data_card : {};
+      const planned = jsonArray(dc.planned_services).map((x) => String(x).trim()).filter(Boolean);
+      let missing = [];
+      if (planned.length) {
+        const cov = await c.query(
+          `SELECT DISTINCT lower(s.service_code) AS code
+             FROM tasks ch JOIN services s ON s.id = ch.service_id
+            WHERE ch.parent_task_id = $1 AND ch.task_kind = 'service' AND ch.status <> 'CANCELLED'`,
+          [p.id],
+        );
+        const covered = new Set(cov.rows.map((r) => r.code));
+        missing = planned.filter((code) => !covered.has(code.toLowerCase()));
+      }
+      let toStatus = bad.rows[0].n > 0 ? 'BLOCKED' : 'DONE';
+      if (toStatus === 'DONE' && missing.length) toStatus = 'BLOCKED';
       await c.query(
         `UPDATE tasks SET status = $2::task_status, assigned_agent_id = NULL
           WHERE id = $1 AND status = 'WAITING_FOR_CHILDREN'`,
@@ -3279,7 +3301,12 @@ export async function advanceDecompositionParents(c) {
         `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
          VALUES ($1, $2, 'WAITING_FOR_CHILDREN', $3::task_status, $4, $5::jsonb)`,
         [p.id, toStatus === 'DONE' ? 'TASK_DONE' : 'TASK_BLOCKED', toStatus, p.current_role_id,
-         JSON.stringify({ runner: true, reason: 'epic_rollup', servicesFailed: bad.rows[0].n })],
+         JSON.stringify({
+           runner: true,
+           reason: (missing.length && bad.rows[0].n === 0) ? 'epic_missing_services' : 'epic_rollup',
+           servicesFailed: bad.rows[0].n,
+           missingServices: missing,
+         })],
       );
       await c.query('COMMIT');
       advanced += 1;
@@ -4810,6 +4837,36 @@ export function normalizeWorkItems(card) {
   }));
 }
 
+// JOIN-PLANNED-COVERAGE-001 — целевой список сервисов эпика (декларированный scope
+// Архитектора). Источник — affected_services вердикта Архитектора, ОБЪЕДИНЁННЫЙ с
+// serviceCode из work_items. Это устойчиво к усечению work_items капами/таймаутами,
+// из-за которого терялись заявленные фронты (B1: Smeta/FastTable). Коды резолвим к
+// каноническим service_code зарегистрированных сервисов проекта (регистронезависимо,
+// canonicalByCode: lower(code)→service_code), дедуплицируем. Незарегистрированные
+// коды отбрасываем — сверять покрытие можно только по реально существующим сервисам.
+export function computePlannedServices(card, canonicalByCode) {
+  const str = (v) => (v == null ? '' : String(v)).trim();
+  const codes = [];
+  for (const it of jsonArray(card?.affected_services)) {
+    const code = typeof it === 'string' ? str(it) : str(it?.serviceCode || it?.service);
+    if (code) codes.push(code);
+  }
+  for (const it of normalizeWorkItems(card)) {
+    if (it.serviceCode) codes.push(it.serviceCode);
+  }
+  const out = [];
+  const seen = new Set();
+  for (const code of codes) {
+    const canonical = canonicalByCode.get(code.toLowerCase());
+    if (!canonical) continue;
+    const key = String(canonical).toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(canonical);
+  }
+  return out;
+}
+
 // DECOMP-CONTRACT-001 — материализация декомпозиции эпика в задачи-на-сервис (L1)
 // и подзадачи-на-файл (L2). Один txn. Идемпотентно: если у эпика уже есть дети,
 // повторно не создаём. Эпик паркуется в WAITING_FOR_CHILDREN. Если из карточки не
@@ -4915,11 +4972,16 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
       }
     }
 
+    // JOIN-PLANNED-COVERAGE-001: фиксируем целевой список сервисов эпика в data_card,
+    // чтобы роллап (advanceDecompositionParents) сверял фактических детей с заявленным
+    // scope и не закрывал эпик DONE при потерянных фронтах.
+    const canonicalByCode = new Map(svcRows.rows.map((r) => [String(r.service_code).toLowerCase(), r.service_code]));
+    const plannedServices = computePlannedServices(card, canonicalByCode);
     // Эпик: помечаем видом, паркуем на детях, доливаем карточку Декомпозитора.
     await c.query(
       `UPDATE tasks SET task_kind = 'epic', status = 'WAITING_FOR_CHILDREN', assigned_agent_id = NULL,
               data_card = data_card || $2::jsonb WHERE id = $1`,
-      [claimed.id, JSON.stringify(cardValues || {})],
+      [claimed.id, JSON.stringify({ ...(cardValues || {}), planned_services: plannedServices })],
     );
     const kpiSet = runKpiSet(kpi, 2);
     await c.query(
@@ -5030,11 +5092,17 @@ export async function materializeArchitectSplit(c, claimed, { verdict, response,
       );
     }
 
+    // JOIN-PLANNED-COVERAGE-001: фиксируем целевой список сервисов эпика в data_card —
+    // роллап сверит фактических детей с заявленным Архитектором scope и не закроет
+    // эпик DONE, если часть заявленных сервисов не материализовалась в детей.
+    const canonicalRows = await c.query('SELECT service_code FROM services WHERE project_id = $1', [claimed.project_id]);
+    const canonicalByCode = new Map(canonicalRows.rows.map((r) => [String(r.service_code).toLowerCase(), r.service_code]));
+    const plannedServices = computePlannedServices(card, canonicalByCode);
     // Эпик: помечаем видом, паркуем на детях, доливаем поля вердикта Архитектора.
     await c.query(
       `UPDATE tasks SET task_kind = 'epic', status = 'WAITING_FOR_CHILDREN', assigned_agent_id = NULL,
               data_card = data_card || $2::jsonb WHERE id = $1`,
-      [claimed.id, JSON.stringify(cardValues || {})],
+      [claimed.id, JSON.stringify({ ...(cardValues || {}), planned_services: plannedServices })],
     );
     const kpiSet = runKpiSet(kpi, 2);
     await c.query(

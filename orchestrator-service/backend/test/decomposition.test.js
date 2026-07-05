@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   normalizeWorkItems,
+  computePlannedServices,
   materializeDecomposition,
   advanceDecompositionParents,
   acceptScannerCompletionTx,
@@ -191,6 +192,100 @@ test('advanceDecompositionParents: упавший сервис → эпик BLOC
   assert.equal(n, 1);
   const upd = c.calls.find((q) => /UPDATE tasks SET status = \$2::task_status/.test(q.sql));
   assert.equal(upd.params[1], 'BLOCKED');
+});
+
+// --- computePlannedServices (чистая функция) --------------------------------
+
+test('computePlannedServices: affected_services ∪ work_items, канонические коды, дедуп', () => {
+  const canonicalByCode = new Map([
+    ['svca', 'SvcA'], ['svcb', 'SvcB'], ['svcc', 'SvcC'],
+  ]);
+  const card = {
+    // work_items урезаны до SvcA/SvcB, но affected_services несёт полный scope (SvcC).
+    affected_services: [{ serviceCode: 'SvcA', reason: 'x' }, { serviceCode: 'svcc', reason: 'y' }],
+    work_items: [
+      { serviceCode: 'SvcA', title: 'A', files: [{ path: 'a.js', what: 'x' }] },
+      { serviceCode: 'SvcB', title: 'B', files: [{ path: 'c.js', what: 'z' }] },
+    ],
+  };
+  const planned = computePlannedServices(card, canonicalByCode);
+  assert.deepEqual([...planned].sort(), ['SvcA', 'SvcB', 'SvcC'], 'union каноническими кодами без дублей');
+});
+
+test('computePlannedServices: незарегистрированные коды отбрасываются', () => {
+  const canonicalByCode = new Map([['svca', 'SvcA']]);
+  const card = { affected_services: [{ serviceCode: 'SvcA' }, { serviceCode: 'Ghost' }] };
+  assert.deepEqual(computePlannedServices(card, canonicalByCode), ['SvcA']);
+});
+
+// --- materializeDecomposition: фиксация planned_services --------------------
+
+test('materializeDecomposition: пишет planned_services из affected_services ∪ work_items', async () => {
+  const c = fakeClient([
+    { re: /FROM tasks WHERE parent_task_id = \$1 LIMIT 1/, reply: { rowCount: 0, rows: [] } },
+    { re: /FROM services WHERE project_id/, reply: { rowCount: 3, rows: [
+      { id: 'sidA', service_code: 'SvcA' }, { id: 'sidB', service_code: 'SvcB' }, { id: 'sidC', service_code: 'SvcC' },
+    ] } },
+    { re: /FROM roles WHERE code = 'PROGRAMMER'/, reply: { rowCount: 1, rows: [{ id: 'rProg' }] } },
+    { re: /INSERT INTO tasks[\s\S]*'service'[\s\S]*RETURNING id/, reply: (h) => ({ rowCount: 1, rows: [{ id: `l1-${h}` }] }) },
+  ]);
+  const verdict = { status: 'READY', summary: 's', findings: [], ok: true };
+  // work_items только по SvcA/SvcB (SvcC «съеден» усечением) — affected_services несёт полный scope.
+  const cardValues = {
+    affected_services: [{ serviceCode: 'SvcA', reason: 'x' }, { serviceCode: 'svcc', reason: 'y' }],
+    work_items: [
+      { serviceCode: 'SvcA', title: 'A', files: [{ path: 'a.js', what: 'x' }] },
+      { serviceCode: 'SvcB', title: 'B', files: [{ path: 'c.js', what: 'z' }] },
+    ],
+  };
+  await materializeDecomposition(c, decomposerClaimed(), {
+    verdict, response: '', exchangeId: null, durationMs: 1, decision: { outcome: 'FORWARD' }, cardValues, route: [],
+  });
+  const upd = c.calls.find((q) => /UPDATE tasks SET task_kind = 'epic'/.test(q.sql));
+  assert.ok(upd, 'эпик припаркован');
+  const planned = JSON.parse(upd.params[1]).planned_services;
+  assert.deepEqual([...planned].sort(), ['SvcA', 'SvcB', 'SvcC'], 'целевой scope зафиксирован в data_card');
+});
+
+// --- advanceDecompositionParents: сверка с planned_services -----------------
+
+test('advanceDecompositionParents: planned_services=4, покрыто 2 → эпик BLOCKED (B1), не DONE', async () => {
+  const c = fakeClient([
+    { re: /FROM tasks t\s+WHERE t.task_kind = 'epic'/, reply: { rowCount: 1, rows: [
+      { id: 'epic1', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rD',
+        data_card: { planned_services: ['WEBSTORE', 'Smeta', 'IAM_Service', 'FastTable'] } },
+    ] } },
+    { re: /task_kind = 'service' AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
+    { re: /FROM tasks ch JOIN services s ON s.id = ch.service_id/, reply: { rowCount: 2, rows: [
+      { code: 'webstore' }, { code: 'iam_service' },
+    ] } },
+  ]);
+  const n = await advanceDecompositionParents(c);
+  assert.equal(n, 1);
+  const upd = c.calls.find((q) => /UPDATE tasks SET status = \$2::task_status/.test(q.sql));
+  assert.equal(upd.params[1], 'BLOCKED', 'эпик не DONE при потерянных сервисах');
+  const ev = c.calls.find((q) => /INSERT INTO task_events/.test(q.sql));
+  assert.equal(ev.params[1], 'TASK_BLOCKED', 'событие блокировки эпика');
+  const payload = JSON.parse(ev.params[4]);
+  assert.equal(payload.reason, 'epic_missing_services');
+  assert.deepEqual([...payload.missingServices].sort(), ['FastTable', 'Smeta'], 'перечень недостающих сервисов');
+});
+
+test('advanceDecompositionParents: planned_services полностью покрыты → эпик DONE', async () => {
+  const c = fakeClient([
+    { re: /FROM tasks t\s+WHERE t.task_kind = 'epic'/, reply: { rowCount: 1, rows: [
+      { id: 'epic1', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rD',
+        data_card: { planned_services: ['SvcA', 'SvcB'] } },
+    ] } },
+    { re: /task_kind = 'service' AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
+    { re: /FROM tasks ch JOIN services s ON s.id = ch.service_id/, reply: { rowCount: 2, rows: [
+      { code: 'svca' }, { code: 'svcb' },
+    ] } },
+  ]);
+  const n = await advanceDecompositionParents(c);
+  assert.equal(n, 1);
+  const upd = c.calls.find((q) => /UPDATE tasks SET status = \$2::task_status/.test(q.sql));
+  assert.equal(upd.params[1], 'DONE', 'весь scope покрыт → штатный DONE');
 });
 
 // --- acceptScannerCompletionTx: сдача подзадачи -----------------------------
