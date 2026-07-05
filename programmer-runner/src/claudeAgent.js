@@ -201,8 +201,13 @@ export function makeClaudeRunAgent(cfg = {}) {
     // сравниваются в разрезе модели. Нет назначения → дефолтная модель раннера.
     const effectiveModel =
       typeof task?.model === 'string' && task.model.trim() ? task.model.trim() : model;
-    return worktrees.runForService(repoCwd, serviceKey, (worktreeCwd) =>
+    const out = await worktrees.runForService(repoCwd, serviceKey, (worktreeCwd) =>
       runSdkOnce({ cwd: worktreeCwd, env, task, signal, model: effectiveModel, maxTurns, allowedTools, log }));
+    // Ветка/коммит worktree программиста нужны стадии GIT_INTEGRATION (влить ветку в
+    // main): прокидываем их наверх вместе с остальными полями исхода, ничего не теряя.
+    // Нормализуем в null — чтобы ключи всегда были в agentResult (сдача шлёт их и при
+    // отсутствии, см. buildCompletionBody).
+    return { ...out, branch: out?.branch ?? null, commit: out?.commit ?? null };
   };
   // Доступ к менеджеру (для остановки/чистки из bin).
   runAgent.worktrees = worktrees;

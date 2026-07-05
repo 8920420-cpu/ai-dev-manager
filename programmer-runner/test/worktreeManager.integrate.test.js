@@ -60,6 +60,29 @@ test('integrate: обычная сдача — новый файл примен�
   assert.deepEqual(res.changedFiles, ['pkg/README.md']);
   assert.ok(!res.alreadyApplied, 'обычная сдача что-то применяет');
   assert.equal(readFileSync(join(repo, 'pkg/README.md'), 'utf8'), 'hello\n');
+  // WORKTREE-DELIVERY-001: сдача несёт ветку worktree и SHA коммита дельты —
+  // по ним GIT_INTEGRATION вливает код в main (git log в main), а не только в ветку.
+  assert.equal(res.branch, 'programmer/PROJECT/SVC');
+  assert.match(res.commit, /^[0-9a-f]{40}$/, 'commit — SHA коммита в ветке worktree');
+  // Коммит реально существует в ветке worktree сервиса (его и вольёт GI).
+  const head = git(join(root, 'PROJECT_SVC'), ['rev-parse', 'HEAD']).trim();
+  assert.equal(res.commit, head);
+  cleanup(repo, root);
+});
+
+test('integrate: пустая дельта (агент ничего не изменил) → branch есть, commit=null, changedFiles пуст', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr = new WorktreeManager({ root, log: silent });
+  const res = await mgr.runForService(repo, 'PROJECT:SVC', async () => {
+    // Ничего не пишем в worktree — сдача без изменений кода.
+    return { ok: true, result: { note: 'noop' } };
+  });
+  assert.equal(res.ok, true, `пустая сдача — валидный исход, error=${res.error}`);
+  assert.deepEqual(res.changedFiles, []);
+  // Ветку сервиса всё равно отдаём (GI отличит пустую сдачу), коммита дельты нет.
+  assert.equal(res.branch, 'programmer/PROJECT/SVC');
+  assert.equal(res.commit, null);
   cleanup(repo, root);
 });
 

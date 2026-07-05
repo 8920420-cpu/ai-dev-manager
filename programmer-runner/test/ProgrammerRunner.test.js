@@ -259,6 +259,37 @@ test('buildCompletionBody: usage/cost/coldStart из result.agent → отдел
   assert.equal(body.coldStartMs, 21000);
 });
 
+// WORKTREE-DELIVERY-001: ветка/коммит worktree программиста уходят в тело сдачи —
+// по ним GIT_INTEGRATION вливает код в main, когда changedFiles пуст.
+test('buildCompletionBody: worktreeBranch и deliveredCommit из результата агента', () => {
+  const task = { id: 'X', completion: { completionKey: 'k' } };
+  const body = buildCompletionBody(task, {
+    result: {}, branch: 'programmer/PROJECT_2/IAM', commit: 'a'.repeat(40),
+  });
+  assert.equal(body.worktreeBranch, 'programmer/PROJECT_2/IAM');
+  assert.equal(body.deliveredCommit, 'a'.repeat(40));
+});
+
+// Пустая дельта: ветку всё равно шлём, deliveredCommit=null (не undefined) — чтобы
+// GI увидел «сдача без коммита в ветке» и не закрыл задачу тихим SUCCESS.
+test('buildCompletionBody: пустая дельта → worktreeBranch есть, deliveredCommit=null (ключ сериализуется)', () => {
+  const task = { id: 'X', completion: { completionKey: 'k' } };
+  const body = buildCompletionBody(task, { result: {}, branch: 'programmer/PROJECT_2/IAM', commit: null });
+  assert.equal(body.worktreeBranch, 'programmer/PROJECT_2/IAM');
+  assert.equal(body.deliveredCommit, null);
+  const parsed = JSON.parse(JSON.stringify(body));
+  assert.ok('deliveredCommit' in parsed, 'null сериализуется — GI видит отсутствие коммита');
+  assert.equal(parsed.deliveredCommit, null);
+});
+
+// Обратная совместимость: результат без branch/commit → оба поля = null (ключи есть).
+test('buildCompletionBody: без branch/commit → worktreeBranch и deliveredCommit = null', () => {
+  const task = { id: 'X', completion: { completionKey: 'k' } };
+  const body = buildCompletionBody(task, { result: {} });
+  assert.equal(body.worktreeBranch, null);
+  assert.equal(body.deliveredCommit, null);
+});
+
 // costUsd допускается из totalCostUsd (старое поле result.agent), если costUsd нет.
 test('buildCompletionBody: costUsd фолбэком из totalCostUsd', () => {
   const task = { id: 'X', completion: { completionKey: 'k' } };

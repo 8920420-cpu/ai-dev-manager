@@ -109,7 +109,10 @@ export class WorktreeManager {
   /**
    * Выполнить задачу сервиса в его worktree (сериализованно), затем применить
    * дельту в main. agentFn(worktreeCwd) → { ok, error?, result? }.
-   * @returns {Promise<{ok:boolean, error?:string, changedFiles:string[], result?:object}>}
+   * branch — ветка worktree сервиса (`programmer/<project>/<service>`), commit —
+   * SHA коммита дельты 'programmer: task delta' (null, если дельта пустая): по ним
+   * GIT_INTEGRATION вливает ветку в main, когда changedFiles в сдаче не хватает.
+   * @returns {Promise<{ok:boolean, error?:string, changedFiles:string[], result?:object, branch:string, commit:(string|null)}>}
    */
   runForService(repoCwd, serviceKey, agentFn) {
     return this.withServiceLock(serviceKey, async () => {
@@ -124,12 +127,15 @@ export class WorktreeManager {
       if (!agentOut || agentOut.ok !== true) {
         // Прокидываем маркеры исхода исполнителя (например, limitHit при упоре в
         // лимит ходов) — иначе оркестратор не отличит это от обычного провала.
+        // Ветку сервиса отдаём и здесь (commit=null): контракт результата един.
         return {
           ok: false,
           error: agentOut?.error || 'agent_failed',
           changedFiles: [],
           limitHit: agentOut?.limitHit,
           meta: agentOut?.meta,
+          branch: handle.branch,
+          commit: null,
         };
       }
       return this._commitAndIntegrate(repoCwd, handle, agentOut);
@@ -143,8 +149,10 @@ export class WorktreeManager {
     git(wt, ['add', '-A']);
     const staged = git(wt, ['diff', '--cached', '--name-only']).split('\n').map((s) => s.trim()).filter(Boolean);
     if (!staged.length) {
-      // Агент ничего не изменил — это валидный исход (нечего сливать).
-      return { ok: true, changedFiles: [], result: agentOut.result };
+      // Агент ничего не изменил — это валидный исход (нечего сливать). Ветку сервиса
+      // всё равно отдаём (commit=null): по ней GIT_INTEGRATION отличит «пустую» сдачу
+      // от сдачи с дельтой (и решит, провал это интеграции или штатный no-op).
+      return { ok: true, changedFiles: [], result: agentOut.result, branch: handle.branch, commit: null };
     }
     // Коммитим дельту в ветке сервиса (идентичность фиксируем флагами -c, чтобы
     // не зависеть от глобального git-config на хосте).
@@ -152,6 +160,9 @@ export class WorktreeManager {
       '-c', 'user.name=programmer-runner', '-c', 'user.email=programmer-runner@local',
       'commit', '--quiet', '--no-verify', '-m', 'programmer: task delta',
     ]);
+    // SHA коммита дельты в ветке сервиса — именно его GIT_INTEGRATION вливает в main
+    // (merge/cherry-pick), когда changedFiles в сдаче не хватает.
+    const commit = git(wt, ['rev-parse', 'HEAD']).trim();
     const patch = git(wt, ['diff', '--binary', 'HEAD~1', 'HEAD']);
     const changedFiles = git(wt, ['diff', '--name-only', 'HEAD~1', 'HEAD'])
       .split('\n').map((s) => s.trim()).filter(Boolean);
@@ -160,7 +171,7 @@ export class WorktreeManager {
       // Быстрый путь (обычная, не REWORK, сдача): весь патч ложится одним apply.
       try {
         applyPatch(repoCwd, patch);
-        return { ok: true, changedFiles, result: agentOut.result };
+        return { ok: true, changedFiles, result: agentOut.result, branch: handle.branch, commit };
       } catch (firstErr) {
         // Патч не лёг целиком. Ожидаемо при REWORK-заходе: файлы прошлого прогона
         // уже лежат в основном дереве (untracked ?? packages/), и creation-hunks
@@ -175,7 +186,7 @@ export class WorktreeManager {
         } catch (e) {
           // Не смогли разобрать по файлам — отдаём исходную ошибку apply как есть.
           this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, error: firstErr.message });
-          return { ok: false, conflict: true, error: `integrate_conflict: ${firstErr.message}`, changedFiles };
+          return { ok: false, conflict: true, error: `integrate_conflict: ${firstErr.message}`, changedFiles, branch: handle.branch, commit };
         }
         const conflicts = classes.filter((c) => c.state === 'conflict').map((c) => c.file);
         if (conflicts.length) {
@@ -185,7 +196,7 @@ export class WorktreeManager {
           const msg = `integrate_conflict: содержимое в основном дереве расходится с патчем ветки ${handle.branch}`
             + ` — файлы: ${conflicts.join(', ')}`;
           this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, conflicts });
-          return { ok: false, conflict: true, error: msg, changedFiles, conflictingFiles: conflicts };
+          return { ok: false, conflict: true, error: msg, changedFiles, conflictingFiles: conflicts, branch: handle.branch, commit };
         }
         // Конфликтов нет: применяем недостающие файлы, уже донесённые пропускаем.
         const toApply = classes.filter((c) => c.state === 'apply');
@@ -193,7 +204,7 @@ export class WorktreeManager {
           for (const c of toApply) applyPatch(repoCwd, c.patch);
         } catch (e) {
           this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, error: e.message });
-          return { ok: false, conflict: true, error: `integrate_conflict: ${e.message}`, changedFiles };
+          return { ok: false, conflict: true, error: `integrate_conflict: ${e.message}`, changedFiles, branch: handle.branch, commit };
         }
         const skipped = classes.filter((c) => c.state === 'applied').map((c) => c.file);
         if (skipped.length) {
@@ -207,6 +218,8 @@ export class WorktreeManager {
           changedFiles,
           result: agentOut.result,
           alreadyApplied: toApply.length === 0,
+          branch: handle.branch,
+          commit,
         };
       }
     });

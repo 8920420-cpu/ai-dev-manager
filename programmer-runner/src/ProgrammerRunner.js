@@ -155,6 +155,12 @@ export function buildCompletionBody(task, agentResult) {
     title: c.title ?? task.title,
     sourceDocument: c.sourceDocument,
     changedFiles: Array.isArray(agentResult.changedFiles) ? agentResult.changedFiles : [],
+    // Ветка/коммит worktree программиста для стадии GIT_INTEGRATION: когда changedFiles
+    // пуст (no_changed_files/nothing_to_stage), код всё равно лежит в ветке worktree —
+    // GI вливает её в main по этим полям. Шлём всегда, в т.ч. null (пустая дельта →
+    // deliveredCommit=null): иначе конвейер «зелёный», а код не доехал (инцидент 05.07).
+    worktreeBranch: agentResult.branch ?? null,
+    deliveredCommit: agentResult.commit ?? null,
     result: agentResult.result ?? {},
     numTurns: numOrUndef(numTurns),
     // Токены/стоимость/cold start прогона → agent_runs (token_input/token_output/
