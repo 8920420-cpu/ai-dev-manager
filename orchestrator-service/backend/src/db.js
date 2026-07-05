@@ -379,7 +379,9 @@ export async function acceptScannerCompletionTx(c, payload) {
            VALUES ($1, 'TASK_DONE', $2::task_status, 'DONE', $3, $4::jsonb)`,
           [payload.taskId, task.status, task.current_role_id, JSON.stringify({
             source: 'scanner', completionKey: payload.completionKey, service: payload.service,
-            result: resultSummaryText(payload.result), changedFiles: payload.changedFiles, fields: progCardValues,
+            result: resultSummaryText(payload.result), changedFiles: payload.changedFiles,
+            worktreeBranch: payload.worktreeBranch, deliveredCommit: payload.deliveredCommit,
+            fields: progCardValues,
             parentTaskId: task.parent_task_id, kind: 'subtask', passes: payload.numTurns,
             codeVersion: payload.codeVersion, model: payload.model,
           })],
@@ -441,6 +443,8 @@ export async function acceptScannerCompletionTx(c, payload) {
           service: payload.service,
           result: resultSummaryText(payload.result),
           changedFiles: payload.changedFiles,
+          worktreeBranch: payload.worktreeBranch,
+          deliveredCommit: payload.deliveredCommit,
           nextRole: nextRoleCode,
           fields: progCardValues,
           passes: payload.numTurns,
@@ -474,6 +478,42 @@ async function findProject(c, ref) {
     [v],
   );
   return r.rowCount ? r.rows[0] : null;
+}
+
+// =====================================================================
+// TASK-PRIORITY-SCALE-001 — шкала приоритетов задач (SMALLINT, меньше = важнее).
+//   0 — зарезервирован ЗА ПРОЕКТОМ ОРКЕСТРАТОРА (форсит сервер);
+//   1 — максимальный пользовательский; 2 — обычный (дефолт); 3 — низкий.
+// =====================================================================
+
+// Проект оркестратора: code = env ORCHESTRATOR_PROJECT_CODE (по умолчанию 'PROJECT')
+// ИЛИ root_path содержит 'ai-dev-manager'. Принимает строку проекта из БД
+// ({ code, root_path }); null/пустой → false.
+export function isOrchestratorProject(projectRow) {
+  if (!projectRow) return false;
+  const orchCode = String(process.env.ORCHESTRATOR_PROJECT_CODE || 'PROJECT').trim().toLowerCase();
+  const code = String(projectRow.code ?? '').trim().toLowerCase();
+  if (code && code === orchCode) return true;
+  const rootPath = String(projectRow.root_path ?? projectRow.rootPath ?? '');
+  return /ai-dev-manager/i.test(rootPath);
+}
+
+// Нормализация ПОЛЬЗОВАТЕЛЬСКОГО приоритета к диапазону 1..3: 0 (и любое ≤0) → 1
+// (клиент не может задать 0 — это привилегия сервера), >3 → 3, пусто/мусор → дефолт (2).
+export function normalizeClientPriority(requested, def = 2) {
+  if (requested === null || requested === undefined || requested === '') return def;
+  const n = Math.trunc(Number(requested));
+  if (!Number.isFinite(n)) return def;
+  if (n <= 0) return 1;
+  if (n >= 3) return 3;
+  return n;
+}
+
+// Итоговый приоритет задачи при создании/смене проекта: проект оркестратора → 0
+// (форс сервера), иначе нормализованный пользовательский (1..3, дефолт 2).
+export function computeTaskPriority(projectRow, requested, def = 2) {
+  if (isOrchestratorProject(projectRow)) return 0;
+  return normalizeClientPriority(requested, def);
 }
 
 // Вычислить роль входа, стартовый узел графа и стартовый статус для задачи проекта.
@@ -599,13 +639,17 @@ export async function acceptScannerIntake(s, input) {
           }
         : { requestedProject: payload.project || null };
 
+      // TASK-PRIORITY-SCALE-001: приоритет форсим/нормализуем СЕРВЕРОМ по проекту.
+      // Проект оркестратора → 0 (клиент не влияет); иначе clamp(1..3) с нормализацией
+      // 0→1 и дефолтом 2. Неразобранная (project=null) → не оркестратор → обычный.
+      const priority = computeTaskPriority(project, payload.priority ?? payload.card?.priority);
       const ins = await c.query(
         `INSERT INTO tasks
-           (project_id, service_id, external_id, title, description, status, current_role_id, current_stage_key, created_by, data_card)
-         VALUES ($1, $2, $3, $4, $5, $6::task_status, $7, $8::uuid, 'scanner-intake', $9::jsonb)
+           (project_id, service_id, external_id, title, description, priority, status, current_role_id, current_stage_key, created_by, data_card)
+         VALUES ($1, $2, $3, $4, $5, $6::smallint, $7::task_status, $8, $9::uuid, 'scanner-intake', $10::jsonb)
          RETURNING id`,
         [project?.id ?? null, serviceId, payload.externalId, payload.title, payload.description,
-         status, role.id, entryStageKey, JSON.stringify(dataCard)],
+         priority, status, role.id, entryStageKey, JSON.stringify(dataCard)],
       );
       const taskId = ins.rows[0].id;
 
@@ -846,11 +890,11 @@ export async function listUnassignedTasks(s) {
   return withClient(clientConfig(s), async (c) => {
     const r = await c.query(
       `SELECT t.id, t.external_id, t.title, t.description, t.status::text AS status,
-              t.created_at, t.data_card
+              t.priority, t.created_at, t.data_card
          FROM tasks t
         WHERE t.project_id IS NULL
           AND t.status NOT IN ('DONE', 'CANCELLED')
-        ORDER BY t.created_at DESC`,
+        ORDER BY t.priority ASC, t.created_at ASC`,
     );
     return {
       tasks: r.rows.map((row) => ({
@@ -859,6 +903,7 @@ export async function listUnassignedTasks(s) {
         title: row.title,
         description: row.description,
         status: row.status,
+        priority: row.priority,
         createdAt: row.created_at,
         requestedProject: row.data_card?.requestedProject ?? null,
       })),
@@ -881,7 +926,7 @@ export async function assignTaskProject(s, taskId, projectRef) {
     await c.query('BEGIN');
     try {
       const cur = await c.query(
-        'SELECT id, external_id, project_id FROM tasks WHERE id = $1 FOR UPDATE', [id],
+        'SELECT id, external_id, project_id, priority FROM tasks WHERE id = $1 FOR UPDATE', [id],
       );
       if (!cur.rowCount) throw scannerError(404, 'task_not_found');
       if (cur.rows[0].project_id) throw scannerError(409, 'task_already_assigned');
@@ -897,16 +942,23 @@ export async function assignTaskProject(s, taskId, projectRef) {
       }
 
       const { role, entryStageKey } = await computeEntry(c, project.id);
+      // TASK-PRIORITY-SCALE-001: при назначении проекта форсим/пересчитываем приоритет.
+      // Оркестратор → 0; уход из оркестратора при 0 → 2; иначе сохраняем текущий.
+      const curPriority = cur.rows[0].priority;
+      const newPriority = isOrchestratorProject(project)
+        ? 0
+        : (curPriority === 0 ? 2 : curPriority);
       const upd = await c.query(
         `UPDATE tasks
             SET project_id = $2, status = 'BACKLOG', current_role_id = $3,
                 current_stage_key = $4::uuid, assigned_agent_id = NULL,
+                priority = $7::smallint,
                 data_card = COALESCE(data_card, '{}'::jsonb)
                             || jsonb_build_object('project', $5::text, 'projectPath', $6::text),
                 updated_at = now()
           WHERE id = $1 AND project_id IS NULL
           RETURNING id`,
-        [id, project.id, role.id, entryStageKey, project.code, project.root_path],
+        [id, project.id, role.id, entryStageKey, project.code, project.root_path, newPriority],
       );
       if (!upd.rowCount) throw scannerError(409, 'task_already_assigned');
 
@@ -1082,6 +1134,58 @@ export async function moveTaskTx(c, taskId, input) {
 }
 
 /**
+ * TASK-PRIORITY-SCALE-001 — смена приоритета задачи из карточки/UI (PATCH .../priority).
+ * Та же валидация, что при создании: 0 разрешён ТОЛЬКО проекту оркестратора (форс
+ * сервера) — клиент не может задать 0 чужой задаче; оркестраторную нельзя понизить
+ * ниже 0 (её приоритет всегда 0). Меняем ТОЛЬКО число приоритета — статус/слот
+ * (assigned_agent_id) не трогаем, RUNNING-прогоны не вытесняем. Публичная обёртка над Tx.
+ */
+export async function setTaskPriority(s, taskId, priority) {
+  return withClient(clientConfig(s), (c) => setTaskPriorityTx(c, taskId, priority));
+}
+
+export async function setTaskPriorityTx(c, taskId, priority) {
+  const id = String(taskId ?? '').trim();
+  if (!id) throw scannerError(422, 'task_required');
+  if (priority === null || priority === undefined || priority === '') {
+    throw scannerError(422, 'priority_required');
+  }
+  const n = Math.trunc(Number(priority));
+  if (!Number.isFinite(n) || n < 0 || n > 3) throw scannerError(422, 'priority_out_of_range');
+  await c.query('BEGIN');
+  try {
+    const cur = await c.query(
+      `SELECT t.id, t.priority, p.code AS project_code, p.root_path
+         FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
+        WHERE t.id = $1 FOR UPDATE OF t`,
+      [id],
+    );
+    if (!cur.rowCount) throw scannerError(404, 'task_not_found');
+    const row = cur.rows[0];
+    const isOrch = isOrchestratorProject({ code: row.project_code, root_path: row.root_path });
+    // 0 — привилегия сервера для проекта оркестратора. Клиент не ставит 0 чужой задаче.
+    if (n === 0 && !isOrch) throw scannerError(422, 'priority_zero_orchestrator_only');
+    // Оркестраторную не понижать ниже 0: её приоритет всегда 0 (форс сервера).
+    if (isOrch && n !== 0) throw scannerError(422, 'priority_orchestrator_forced_zero');
+    if (row.priority === n) {
+      await c.query('COMMIT');
+      return { updated: true, taskId: id, priority: n, changed: false };
+    }
+    await c.query('UPDATE tasks SET priority = $2::smallint, updated_at = now() WHERE id = $1', [id, n]);
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, payload_json)
+       VALUES ($1, 'TASK_UPDATED', $2::jsonb)`,
+      [id, JSON.stringify({ source: 'manual-priority', fromPriority: row.priority, toPriority: n })],
+    );
+    await c.query('COMMIT');
+    return { updated: true, taskId: id, priority: n, changed: true };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
+}
+
+/**
  * TASK-RESTART-001 — массовый перезапуск зависших задач из раздела «Задачи».
  * Зависшие = с проектом, НЕ терминальные (DONE/CANCELLED/FAILED), НЕ ждущие
  * подзадачи (WAITING_FOR_CHILDREN) и «не в работе» (свободный слот
@@ -1156,7 +1260,7 @@ export async function getAcceptanceBoard(s) {
          JOIN projects p ON p.id = t.project_id
          LEFT JOIN services sv ON sv.id = t.service_id
         WHERE t.status = 'DONE'
-        ORDER BY t.updated_at DESC NULLS LAST, t.id DESC
+        ORDER BY t.priority ASC, t.created_at ASC, t.id DESC
         LIMIT 1000`,
     );
     const tasks = r.rows.map((row) => ({
@@ -1311,6 +1415,12 @@ export function normalizeScannerIntake(input) {
     // TASK-INTAKE-OFFICER-MCP-001: роль входа (например ARCHITECT) — постановщик через
     // MCP сдаёт готовый интейк сразу в Architect, минуя пайплайновый Приёмщик/BACKLOG.
     entryRole: String(input?.entryRole ?? '').trim().toUpperCase() || null,
+    // TASK-PRIORITY-SCALE-001: пользовательский приоритет (1..3) из тела или карточки.
+    // Сырое значение — нормализацию/форс делает acceptScannerIntake по проекту.
+    priority: input?.priority
+      ?? (input?.card && typeof input.card === 'object' && !Array.isArray(input.card)
+        ? input.card.priority : undefined)
+      ?? null,
     // Карточка интейка (поля контракта Приёмщика) → сливается в data_card для Architect.
     card: input?.card && typeof input.card === 'object' && !Array.isArray(input.card)
       ? input.card : null,
@@ -1503,7 +1613,7 @@ export async function claimNextClaudeTaskTx(c) {
                              + (($1::int[])[LEAST(cd.n_fail::int, array_length($1::int[], 1))])
                                * interval '1 millisecond'
              )
-           ORDER BY t.priority DESC, t.created_at
+           ORDER BY t.priority ASC, t.created_at ASC
            FOR UPDATE OF t SKIP LOCKED
            LIMIT 1
          )
@@ -1820,7 +1930,20 @@ export async function resolveHostTaskContext(c, taskId) {
   // приоры следующих ролей.
   const withResult = ev.rows.find((row) => resultSummaryText(row.payload_json?.result) !== '');
   const result = withResult ? resultSummaryText(withResult.payload_json.result) : '';
-  return { chainIds, rootTask, scan: { payload_json: { changedFiles, result } } };
+  // WORKTREE-BRANCH-CONTEXT-001: последняя непустая ветка/коммит worktree сдачи
+  // программиста по цепочке событий (события отсортированы created_at DESC, поэтому
+  // первое непустое значение — самое свежее). Нужны Git Integrator, чтобы влить
+  // ветку programmer/<...> в main. Старая сдача без этих полей → null (прежнее поведение).
+  const lastNonEmpty = (field) => {
+    const row = ev.rows.find((r) => {
+      const v = r.payload_json?.[field];
+      return typeof v === 'string' && v.trim() !== '';
+    });
+    return row ? row.payload_json[field] : null;
+  };
+  const worktreeBranch = lastNonEmpty('worktreeBranch');
+  const deliveredCommit = lastNonEmpty('deliveredCommit');
+  return { chainIds, rootTask, scan: { payload_json: { changedFiles, result, worktreeBranch, deliveredCommit } } };
 }
 
 /**
@@ -1859,7 +1982,7 @@ export async function claimNextHostTask(s, roleCode) {
                 AND t.status = $2::task_status
               )
             )
-          ORDER BY t.priority DESC, t.created_at
+          ORDER BY t.priority ASC, t.created_at ASC
           FOR UPDATE OF t SKIP LOCKED
           LIMIT 1`,
         [roleCode, role.from],
@@ -1985,6 +2108,11 @@ export async function claimNextHostTask(s, roleCode) {
           repositoryPath: m.repository_path ?? '',
           changedFiles: scan?.payload_json?.changedFiles ?? [],
           programmerResult: scan?.payload_json?.result ?? '',
+          // WORKTREE-BRANCH-CONTEXT-001: ветка/коммит worktree сдачи программиста —
+          // Git Integrator вливает их в main (merge/cherry-pick), а не ищет
+          // незакоммиченные файлы в основном дереве. Нет сдачи через worktree → null.
+          worktreeBranch: scan?.payload_json?.worktreeBranch ?? null,
+          deliveredCommit: scan?.payload_json?.deliveredCommit ?? null,
           agentRunId: run.rows[0].id,
           // Контракт прямого запуска pipeline (только для PIPELINE_SERVICE).
           ...(pipeline ? { pipeline } : {}),
@@ -3920,7 +4048,7 @@ async function claimLlmRoleTask(c, roleCode = null) {
             -- INNER JOIN projects скрывал бы задачу без проекта, и обращение зависло бы.
             OR (t.project_id IS NULL AND r.code = 'TASK_INTAKE_OFFICER' AND t.status::text = 'BACKLOG')
           )
-        ORDER BY t.priority DESC, t.created_at
+        ORDER BY t.priority ASC, t.created_at ASC
         FOR UPDATE OF t SKIP LOCKED
         LIMIT 1`,
       params,
@@ -4583,12 +4711,26 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
   // Git Integrator использовали название, придуманное Приёмщиком, а не сырой заголовок.
   let setDescription;
   let setTitle;
+  // TASK-PRIORITY-SCALE-001: Приёмщик выставляет пользовательский приоритет (fields.priority
+  // 1..3). Форс сервера: проект оркестратора → всегда 0 (роль/значение игнорируем); иначе
+  // применяем нормализованный fields.priority, а если роль его не задала — не трогаем.
+  let setPriority;
   if (claimed.role_code === 'TASK_INTAKE_OFFICER') {
     const dd = verdict.fields?.structured_description ?? cardValues?.structured_description;
     if (typeof dd === 'string' && dd.trim()) setDescription = dd.trim().slice(0, 20000);
     const tt = verdict.fields?.short_title ?? cardValues?.short_title
       ?? verdict.fields?.task_title ?? cardValues?.task_title;
     if (typeof tt === 'string' && tt.trim()) setTitle = tt.trim().slice(0, 300);
+    if (claimed.project_id) {
+      const projRow = await c.query('SELECT code, root_path FROM projects WHERE id = $1', [claimed.project_id]);
+      const proj = projRow.rows[0] ?? null;
+      if (isOrchestratorProject(proj)) {
+        setPriority = 0;
+      } else {
+        const reqPr = verdict.fields?.priority ?? cardValues?.priority;
+        if (reqPr !== null && reqPr !== undefined && reqPr !== '') setPriority = normalizeClientPriority(reqPr);
+      }
+    }
   }
 
   // FORK-JOIN-001: задача с current_stage_key идёт ПО РЁБРАМ графа (граф-режим);
@@ -4597,7 +4739,7 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
     ? await resolveGraphTransition(c, claimed, decision)
     : resolveTransition(route, claimed.role_code, decision);
   return finalizeRole(c, claimed, {
-    verdict, response, exchangeId, durationMs, decision, resolved, cardValues, kpi, setServiceId, setDescription, setTitle,
+    verdict, response, exchangeId, durationMs, decision, resolved, cardValues, kpi, setServiceId, setDescription, setTitle, setPriority,
   });
 }
 
@@ -4642,6 +4784,9 @@ async function routeIntakeToProject(c, claimed, { verdict, response, exchangeId,
   const tt = verdict.fields?.short_title ?? cardValues?.short_title
     ?? verdict.fields?.task_title ?? cardValues?.task_title;
   const setTitle = typeof tt === 'string' && tt.trim() ? tt.trim().slice(0, 300) : null;
+  // TASK-PRIORITY-SCALE-001: приоритет форсим/нормализуем СЕРВЕРОМ по разрешённому
+  // проекту (оркестратор → 0; иначе fields.priority 1..3 или дефолт 2).
+  const newPriority = computeTaskPriority(project, verdict.fields?.priority ?? cardValues?.priority);
 
   await c.query('BEGIN');
   try {
@@ -4660,6 +4805,7 @@ async function routeIntakeToProject(c, claimed, { verdict, response, exchangeId,
     ];
     const params = [claimed.id, project.id, entry.status, entry.role.id, entry.entryStageKey ?? null,
       JSON.stringify(mergedCard)];
+    params.push(newPriority); sets.push(`priority = $${params.length}::smallint`);
     if (serviceId) { params.push(serviceId); sets.push(`service_id = $${params.length}::uuid`); }
     if (setDescription) { params.push(setDescription); sets.push(`description = $${params.length}`); }
     if (setTitle) { params.push(setTitle); sets.push(`title = $${params.length}`); }
@@ -5136,7 +5282,7 @@ export async function materializeArchitectSplit(c, claimed, { verdict, response,
 // Применить переход роли по вердикту в отдельной транзакции.
 // resolved — { nextRole, toStatus, done, blocked } из projectRoute.resolveTransition.
 // cardValues — заполненные ролью исходящие поля → мердж в кумулятивную карточку.
-async function finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues = {}, kpi = null, setServiceId, setDescription, setTitle }) {
+async function finalizeRole(c, claimed, { verdict, response, exchangeId, durationMs, decision, resolved, cardValues = {}, kpi = null, setServiceId, setDescription, setTitle, setPriority }) {
   await c.query('BEGIN');
   try {
     const cur = await c.query('SELECT status::text AS status FROM tasks WHERE id = $1 FOR UPDATE', [claimed.id]);
@@ -5176,6 +5322,11 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
     if (typeof setTitle === 'string' && setTitle) {
       params.push(setTitle);
       sets.push(`title = $${params.length}`);
+    }
+    // TASK-PRIORITY-SCALE-001: серверный приоритет (Приёмщик/форс оркестратора).
+    if (Number.isInteger(setPriority)) {
+      params.push(setPriority);
+      sets.push(`priority = $${params.length}::smallint`);
     }
     await c.query(`UPDATE tasks SET ${sets.join(', ')} WHERE id = $1`, params);
     const kpiSet = runKpiSet(kpi, 3);
@@ -5383,6 +5534,14 @@ export function normalizeScannerCompletion(input) {
     // иначе «[object Object]» в task_events, output_json прогона и приорах.
     result: resultSummaryText(input?.result),
     changedFiles: Array.isArray(input?.changedFiles) ? input.changedFiles.map(String) : [],
+    // WORKTREE-BRANCH-CONTEXT-001: ветка/коммит worktree программиста (programmer-runner
+    // сдаёт код коммитом в programmer/<project>/<service> в отдельном worktree). Нужны
+    // Git Integrator, чтобы влить ветку в main, а не искать незакоммиченные файлы в
+    // основном дереве. Отсутствуют (старый раннер) → null, поведение прежнее.
+    worktreeBranch: typeof input?.worktreeBranch === 'string' && input.worktreeBranch.trim()
+      ? input.worktreeBranch.trim().slice(0, 255) : null,
+    deliveredCommit: typeof input?.deliveredCommit === 'string' && input.deliveredCommit.trim()
+      ? input.deliveredCommit.trim().slice(0, 80) : null,
     // usage/cost/cold start сдачи программиста (контракт с programmer-runner). В
     // теле идут как есть; finalizeProgrammerRunOnCompletion читает их через
     // normalizeRunKpi/runKpiSet. Числа/строки; отсутствуют (старый раннер) → null.

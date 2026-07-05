@@ -143,3 +143,59 @@ test('без предков: цепочка из самой задачи, rootTa
   assert.equal(ctx.rootTask.id, 't1', 'корень — сама задача');
   assert.deepEqual(ctx.scan.payload_json.changedFiles, ['f.js']);
 });
+
+// WORKTREE-BRANCH-CONTEXT-001: сдача через worktree несёт ветку/коммит программиста;
+// они пробрасываются в контекст (Git Integrator вливает ветку в main, а не ищет
+// незакоммиченные файлы в основном дереве).
+test('сдача с worktreeBranch/deliveredCommit → они попадают в scan.payload_json', async () => {
+  const c = fakeClient([
+    { re: CHAIN_RE, reply: { rowCount: 1, rows: [{ id: 't1', title: 'T', description: 'd', depth: 0 }] } },
+    {
+      re: EVENTS_RE,
+      reply: { rowCount: 1, rows: [{ payload_json: {
+        changedFiles: ['src/widget.js'], result: 'сдача',
+        worktreeBranch: 'programmer/PROJECT_2/orchestrator-service', deliveredCommit: 'd42902dd',
+      } }] },
+    },
+  ]);
+
+  const ctx = await resolveHostTaskContext(c, 't1');
+
+  assert.equal(ctx.scan.payload_json.worktreeBranch, 'programmer/PROJECT_2/orchestrator-service');
+  assert.equal(ctx.scan.payload_json.deliveredCommit, 'd42902dd');
+});
+
+// created_at DESC: последняя непустая ветка/коммит выигрывают, но пустой поздний
+// дубль не затирает реальную ветку из более ранней валидной сдачи.
+test('последняя непустая ветка/коммит выигрывают; пустой дубль не затирает', async () => {
+  const c = fakeClient([
+    { re: CHAIN_RE, reply: { rowCount: 1, rows: [{ id: 't1', title: 'T', description: 'd', depth: 0 }] } },
+    {
+      re: EVENTS_RE,
+      reply: { rowCount: 2, rows: [
+        { payload_json: { changedFiles: [], result: 'поздний дубль', worktreeBranch: '', deliveredCommit: '' } },
+        { payload_json: { changedFiles: ['a.js'], result: 'сдача', worktreeBranch: 'programmer/PS/svc', deliveredCommit: 'abc123' } },
+      ] },
+    },
+  ]);
+
+  const ctx = await resolveHostTaskContext(c, 't1');
+
+  assert.equal(ctx.scan.payload_json.worktreeBranch, 'programmer/PS/svc', 'пустой дубль не перекрыл ветку');
+  assert.equal(ctx.scan.payload_json.deliveredCommit, 'abc123');
+});
+
+// Обратная совместимость: сдача без worktree-полей (старый раннер) → они null,
+// прежнее поведение сохраняется.
+test('сдача без worktreeBranch/deliveredCommit → поля пустые (null)', async () => {
+  const c = fakeClient([
+    { re: CHAIN_RE, reply: { rowCount: 1, rows: [{ id: 't1', title: 'T', description: 'd', depth: 0 }] } },
+    { re: EVENTS_RE, reply: { rowCount: 1, rows: [{ payload_json: { changedFiles: ['f.js'], result: 'ok' } }] } },
+  ]);
+
+  const ctx = await resolveHostTaskContext(c, 't1');
+
+  assert.equal(ctx.scan.payload_json.worktreeBranch, null, 'нет worktree-ветки → null');
+  assert.equal(ctx.scan.payload_json.deliveredCommit, null, 'нет коммита → null');
+  assert.deepEqual(ctx.scan.payload_json.changedFiles, ['f.js'], 'прежнее поведение по changedFiles');
+});
