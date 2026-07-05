@@ -96,8 +96,22 @@ node host-runner/bin/host-runner.js
 
 Что делает: каждые 3 с дёргает `GET /api/runner/next-host-task?role=PIPELINE_SERVICE` и
 `...?role=GIT_INTEGRATOR`; на `PIPELINE_SERVICE` запускает реальный прогон через
-`pipeline-runner`, на `GIT_INTEGRATOR` — `git add` файлов задачи + локальный коммит; результат
+`pipeline-runner`, на `GIT_INTEGRATOR` — интеграция сдачи программиста в `main`; результат
 сдаёт через `POST /api/runner/host-task-completed`.
+
+Поведение `GIT_INTEGRATOR` (`host-runner/src/actions.js`, `runGitAction`):
+- Если в контексте задачи задан `worktreeBranch` (программист сдал дельту коммитом в ветке
+  `programmer/<project>/<service>` в отдельном worktree), host-runner вливает коммит
+  `deliveredCommit` в `main` внутри `repoRoot` — cherry-pick'ом (`git cherry-pick -x`),
+  fallback — merge ветки; коммит `main` существует локально даже при провале `push origin HEAD`
+  (push — best-effort).
+- Если `worktreeBranch` не задан — прежний путь (обратная совместимость со старым
+  программистом): `git add` файлов задачи (`changedFiles`) + локальный коммит.
+- Пустой итог интеграции (`no_changed_files` / `nothing_to_stage`), когда изменения
+  ЗАЯВЛЕНЫ (непустой `changedFiles` ИЛИ `worktreeBranch` с непустым `deliveredCommit`),
+  теперь возвращается как провал (`success:false`, note `empty_deliverable_declared_changes`),
+  а не тихий `success:true`: иначе конвейер «зелёный», а код не доехал. Пустой итог при реально
+  пустой сдаче (нет ветки и пустой `changedFiles`) — прежний `success:true` note `no_changed_files`.
 
 Условие, что задача будет взята: проект не `paused`, у роли есть активный агент
 (для не-AI ролей это локальный провайдер, напр. `local_pipeline`), и включённый этап проекта
