@@ -160,6 +160,8 @@ node scanner-service/bin/scanner-service.js
      "sourceDocument": "<метка источника, напр. claude-programmer/...>",
      "result": "<отчёт Programmer: что и как сделано>",
      "changedFiles": ["path/one.js", "path/two.md"],
+     "worktreeBranch": "programmer/PROJECT_2/<service>",
+     "deliveredCommit": "d42902dd",
      "numTurns": 42,
      "tokensIn": 12345,
      "tokensOut": 6789,
@@ -175,6 +177,10 @@ node scanner-service/bin/scanner-service.js
    `agent_runs` (`token_input`, `token_output`, `token_cache_read`,
    `token_cache_creation`, `cost`, `cold_start_ms`) через COALESCE: старый
    раннер без этих полей не затирает данные (обратная совместимость).
+   Поля `worktreeBranch`, `deliveredCommit` — **опциональные** (WORKTREE-BRANCH-CONTEXT-001):
+   ветка и коммит worktree программиста (`programmer/<project>/<service>`). Нужны роли
+   `GIT_INTEGRATOR`, чтобы влить ветку в `main`, а не искать незакоммиченные файлы в
+   основном дереве. При отсутствии (старый раннер) пишутся как `null`, поведение прежнее.
    → `{ accepted: true, nextRole: "TASK_REVIEWER" }`. Задача уходит на ревью.
    Ревьюер отклоняет, если нет `result` и `changedFiles` — отчёт обязателен.
 
