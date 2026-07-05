@@ -52,7 +52,9 @@ agent_runs.id    → context_snapshots.agent_run_id
 ### Основные индексы
 
 `tasks(status)`, `tasks(service_id)`, `tasks(current_role_id)`,
-очередь `tasks(priority DESC, created_at) WHERE status='READY'`,
+очередь `tasks(status, priority, created_at)` (миграция 0047; сортировка
+priority ASC, затем created_at ASC — priority SMALLINT 0..3, меньше = важнее,
+0 зарезервирован для проекта оркестратора, FIFO внутри одного приоритета),
 `agent_runs(agent_id)`, `pipeline_runs(task_id)`, `service_locks(service_id)`,
 `task_events(task_id)`. Полный список — в DATA_MODEL.md §5.
 

@@ -40,6 +40,8 @@ Scanner вызывает endpoint после появления завершён
   "title": "Исправить reconnect",
   "result": "Исправлено",
   "changedFiles": ["src/chat.js"],
+  "worktreeBranch": "programmer/PROJECT_2/<service>",
+  "deliveredCommit": "d42902dd",
   "sourceDocument": "/workspace/<service>.md",
   "nextRole": "TASK_REVIEWER",
   "numTurns": 42,
@@ -63,6 +65,16 @@ Scanner вызывает endpoint после появления завершён
 `tokensOut→token_output`, `tokensCacheRead→token_cache_read`,
 `tokensCacheCreation→token_cache_creation`, `costUsd→cost`,
 `coldStartMs→cold_start_ms`.
+
+Поля `worktreeBranch`, `deliveredCommit` — **опциональные** (WORKTREE-BRANCH-CONTEXT-001):
+ветка и коммит worktree программиста. `programmer-runner` сдаёт код коммитом в ветку
+`programmer/<project>/<service>` в отдельном worktree; поля нужны роли `GIT_INTEGRATOR`,
+чтобы влить эту ветку в `main`, а не искать незакоммиченные файлы в основном дереве.
+`worktreeBranch` — `string|null` (обрезается до 255 символов), `deliveredCommit` —
+`string|null` (обрезается до 80 символов). Оба нормализуются в `db.js`; при отсутствии
+(старый раннер) пишутся как `null`, поведение прежнее. Значения кладутся в `payload_json`
+события сдачи, агрегируются по цепочке событий (последнее непустое) и прокидываются в
+контекст роли `GIT_INTEGRATOR`.
 
 Успех: `{"accepted":true,"duplicate":false,"nextRole":"TASK_REVIEWER"}`.
 Повторная доставка возвращает `duplicate:true` и не создаёт второй переход.
@@ -290,9 +302,11 @@ PIPELINE_SERVICE предварительно резолвит `services.reposit
 ```sql
 SELECT * FROM tasks
 WHERE status = 'READY'
-ORDER BY priority DESC, created_at
+ORDER BY priority ASC, created_at ASC
 FOR UPDATE SKIP LOCKED
 LIMIT 1;
+-- priority — SMALLINT 0..3, меньше = важнее; 0 — проект оркестратора (форсит сервер).
+-- Соответствует claimNextClaudeTaskTx / claimNextHostTask / claimLlmRoleTask (db.js).
 ```
 
 Захват сервиса под изменение:
