@@ -3,11 +3,11 @@
 // проекта (PROJECT_2 → репозиторий ПС, Bash, GOWORK=off; PROJECT → ai-dev-manager).
 //
 // Карту можно переопределить через env PROGRAMMER_REPO_MAP (JSON):
-//   {"PROJECT_2":{"cwd":"K:/.../PS","env":{"GOWORK":"off"}}, "PROJECT":{"cwd":"..."}}
+//   {"PROJECT_2":{"cwd":"F:/git/PS","env":{"GOWORK":"off"}}, "PROJECT":{"cwd":"..."}}
 
 const DEFAULT_MAP = {
-  PROJECT_2: { cwd: 'K:/Роботы/Golang/git/PS', env: { GOWORK: 'off' } },
-  PROJECT: { cwd: 'K:/Роботы/Golang/git/ai-dev-manager', env: {} },
+  PROJECT_2: { cwd: 'F:/git/PS', env: { GOWORK: 'off' } },
+  PROJECT: { cwd: 'F:/git/ai-dev-manager', env: {} },
 };
 
 export function loadRepoMap(env = process.env) {

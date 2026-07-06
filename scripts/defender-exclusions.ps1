@@ -22,10 +22,11 @@ if (-not $admin) {
   exit 1
 }
 
-# Пути-исключения: корень всех Go-проектов на K: (покрывает git\ai-dev-manager,
-# git\ps, clear36) и CODEX_HOME (~/.codex с крупными sqlite-логами codex).
+# Пути-исключения: корень всех Go-проектов (с 2026-07-06 разработка живёт на
+# F:\git — покрывает ai-dev-manager, PS и остальные) и CODEX_HOME (~/.codex с
+# крупными sqlite-логами codex).
 $paths = @(
-  'K:\Роботы\Golang',
+  'F:\git',
   (Join-Path $env:USERPROFILE '.codex')
 )
 # Процессы-исключения (по имени бинарника): раннеры и сам codex.

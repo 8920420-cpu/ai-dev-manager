@@ -56,7 +56,7 @@ services:
       # PROJECT-PATH-MAP-001: трансляция host root_path → путь внутри tools-service.
       # root_path в БД — путь хоста (Windows), а tools-service монтирует родитель
       # проектов в /projects. Префикс берём из PROJECTS_HOST_ROOT (.env).
-      TOOLS_PROJECT_PATH_MAP: "${PROJECTS_HOST_ROOT:-K:\\Роботы\\Golang\\git}=>/projects"
+      TOOLS_PROJECT_PATH_MAP: "${PROJECTS_HOST_ROOT:-F:\\git}=>/projects"
       # Задачи ставит Codex чётко → роли не тратят много токенов на вывод.
       # Меньше max_tokens = быстрее генерация и ниже нагрузка на провайдера.
       CONNECTOR_LLM_MAX_TOKENS: "${CONNECTOR_LLM_MAX_TOKENS:-2048}"
