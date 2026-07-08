@@ -50,6 +50,22 @@ async function git(repoRoot, args) {
   return pexec('git', ['-C', repoRoot, ...args], { maxBuffer: 8 << 20 });
 }
 
+// Blob-SHA пути в дереве коммита/ref (пусто, если пути там нет — напр. удаление).
+async function blobInCommit(repoRoot, ref, p) {
+  return git(repoRoot, ['rev-parse', '--verify', '--quiet', `${ref}:${p}`])
+    .then((r) => r.stdout.trim())
+    .catch(() => '');
+}
+
+// Blob-SHA файла в рабочем дереве (пусто, если файла нет). hash-object устойчив к
+// бинарным файлам и работает для untracked-путей — в отличие от `git diff`, который
+// untracked-файл игнорирует и ложно показывает расхождение.
+async function blobInWorktree(repoRoot, p) {
+  return git(repoRoot, ['hash-object', '--', p])
+    .then((r) => r.stdout.trim())
+    .catch(() => '');
+}
+
 // Гарантировать, что репозиторий существует: если каталог ещё не git-репо —
 // инициализировать его и задать минимальную identity, иначе commit упадёт.
 // Так GIT_INTEGRATOR самодостаточен: ему не нужен заранее созданный репозиторий.
@@ -125,26 +141,118 @@ async function integrateChangedFiles(repoRoot, task, files) {
   return { integrated: true, commit: head.stdout.trim(), branch: branch.stdout.trim(), files: stagedFiles };
 }
 
-// Новый путь: программист сдал дельту КОММИТОМ в ветке worktree
-// (programmer/<project>/<service>). Вливаем ИМЕННО дельту программиста в main
-// внутри repoRoot cherry-pick'ом коммита deliveredCommit (fallback — ветка).
-// cherry-pick применяет только дельту задачи поверх текущего main и устойчив к
-// расхождению истории (другие сервисы/док-коммиты уже влиты в main).
-async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredCommit }) {
-  const ref = deliveredCommit || worktreeBranch;
+// Новый путь: программист сдал дельту КОММИТАМИ в ветке worktree
+// (programmer/<project>/<service>). Вливаем ВСЮ дельту ветки в main внутри
+// repoRoot — cherry-pick'ом ДИАПАЗОНА merge-base(HEAD, tip)..tip по порядку, а не
+// только последнего deliveredCommit. Иначе при многокоммитной сдаче (первый
+// прогон упал по max turns, но закоммитил основную работу; второй докоммитил
+// мелочь) в main уезжала лишь последняя дельта, а основная работа тихо терялась.
+// cherry-pick диапазона применяет дельту задачи поверх текущего main и устойчив к
+// расхождению истории (другие сервисы/док-коммиты уже влиты в main). deliveredCommit
+// оставлен как подсказка/валидация (tip ветки должен его содержать), с fallback на
+// него, если ветка почему-то не резолвится.
+async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredCommit, taskId }) {
   // Ветка/коммит программиста должны существовать в этом же репозитории (worktree
   // — отдельное дерево ТОГО ЖЕ репо). Иначе интегрировать нечего — честный провал.
-  const resolved = await git(repoRoot, ['rev-parse', '--verify', `${ref}^{commit}`])
-    .then((r) => r.stdout.trim())
-    .catch(() => '');
-  if (!resolved) return { error: `worktree ref not found: ${ref}`, note: 'worktree_ref_missing' };
+  const resolveRef = (ref) =>
+    git(repoRoot, ['rev-parse', '--verify', `${ref}^{commit}`]).then((r) => r.stdout.trim()).catch(() => '');
+
+  // tip интеграции = tip ветки программиста (вливаем ВСЮ её дельту). Fallback на
+  // deliveredCommit, если ветка не резолвится.
+  const delivered = deliveredCommit ? await resolveRef(deliveredCommit) : '';
+  let tip = worktreeBranch ? await resolveRef(worktreeBranch) : '';
+  if (!tip) tip = delivered;
+  if (!tip) {
+    const ref = deliveredCommit || worktreeBranch;
+    return { error: `worktree ref not found: ${ref}`, note: 'worktree_ref_missing' };
+  }
+
+  // Валидация подсказки: tip ветки ДОЛЖЕН содержать deliveredCommit. Если ветка
+  // рассинхронизирована и его не содержит — вливаем ДО deliveredCommit, чтобы
+  // заявленная дельта точно доехала до main.
+  if (delivered && tip !== delivered) {
+    const contained = await git(repoRoot, ['merge-base', '--is-ancestor', delivered, tip])
+      .then(() => true).catch(() => false);
+    if (!contained) tip = delivered;
+  }
 
   const before = await git(repoRoot, ['rev-parse', 'HEAD']).then((r) => r.stdout.trim()).catch(() => null);
-  // Дельта уже в main (коммит — предок HEAD)? Тогда доносить нечего.
+
+  // Диапазон дельты: merge-base(HEAD, tip)..tip — коммиты ветки после расхождения
+  // с main. Если tip уже предок HEAD (merge-base === tip) — вся ветка в main.
+  let range = tip;
   if (before) {
-    const already = await git(repoRoot, ['merge-base', '--is-ancestor', resolved, 'HEAD'])
-      .then(() => true).catch(() => false);
-    if (already) return { integrated: false, note: 'already_integrated' };
+    const mergeBase = await git(repoRoot, ['merge-base', 'HEAD', tip]).then((r) => r.stdout.trim()).catch(() => '');
+    if (mergeBase === tip) return { integrated: false, note: 'already_integrated' };
+    range = mergeBase ? `${mergeBase}..${tip}` : tip;
+  }
+
+  // Коммиты диапазона по порядку (старые → новые), чтобы cherry-pick ложился
+  // поверх main последовательно.
+  const revList = await git(repoRoot, ['rev-list', '--reverse', '--topo-order', range])
+    .then((r) => r.stdout).catch(() => '');
+  const commits = revList.split('\n').map((s) => s.trim()).filter(Boolean);
+  if (commits.length === 0) return { integrated: false, note: 'already_integrated' };
+
+  // ── Санитайзер грязного дубля дельты ─────────────────────────────────────────
+  // Pipeline Service гоняет тесты/сборку в ОСНОВНОМ дереве repoRoot и оставляет
+  // там незакоммиченный дубль дельты сдачи. cherry-pick тех же путей затем
+  // детерминированно падает: «Your local changes ... would be overwritten by
+  // merge» (для новых файлов — «untracked working tree files would be
+  // overwritten»). Если грязные пути интегрируемого диапазона — именно дубль (их
+  // содержимое в рабочем дереве совпадает с tip), уносим их в stash и продолжаем;
+  // после успешной интеграции stash дропаем (дельта уже в main). Если содержимое
+  // НЕ совпадает с tip — это чужая незакоммиченная работа: честный провал, файлы
+  // не трогаем (не затираем чужой труд).
+  const affected = new Set();
+  for (const commit of commits) {
+    const names = await git(repoRoot, ['diff-tree', '--no-commit-id', '--name-only', '-r', commit])
+      .then((r) => r.stdout).catch(() => '');
+    names.split('\n').map((s) => s.trim()).filter(Boolean).forEach((n) => affected.add(n));
+  }
+  let autostashRef = null;
+  if (affected.size > 0) {
+    const status = await git(repoRoot, ['status', '--porcelain', '--', ...affected])
+      .then((r) => r.stdout).catch(() => '');
+    // Пути дельты, которые git видит грязными (модификация / удаление / untracked).
+    const dirty = status.split('\n').filter(Boolean).map((line) => {
+      const p = line.slice(3);
+      const arrow = p.indexOf(' -> ');
+      return arrow >= 0 ? p.slice(arrow + 4) : p; // при rename берём целевое имя
+    }).filter(Boolean);
+    if (dirty.length > 0) {
+      // Дубль дельты ⇔ содержимое рабочего дерева совпадает с tip для КАЖДОГО
+      // грязного пути (удаление: путь отсутствует и в дереве, и в tip → оба blob
+      // пусты). Иначе это не дубль, а чужое незакоммиченное содержимое.
+      const mismatched = [];
+      for (const p of dirty) {
+        const [tipBlob, workBlob] = await Promise.all([
+          blobInCommit(repoRoot, tip, p),
+          blobInWorktree(repoRoot, p),
+        ]);
+        if (tipBlob !== workBlob) mismatched.push(p);
+      }
+      if (mismatched.length > 0) {
+        return {
+          error:
+            `dirty worktree conflicts with integration and is NOT a delta duplicate ` +
+            `(содержимое расходится с веткой ${worktreeBranch}, чужая незакоммиченная ` +
+            `работа не затирается): ${mismatched.join(', ')}`,
+          note: 'dirty_worktree_conflict',
+          extra: { dirtyPaths: dirty, mismatchedPaths: mismatched },
+        };
+      }
+      // Все грязные пути — дубль дельты раннера: уносим в stash с говорящим
+      // сообщением (для ручного разбора) и продолжаем интеграцию.
+      const stashMsg = `gi-autostash ${taskId || 'unknown'} ${worktreeBranch}`;
+      try {
+        await git(repoRoot, ['stash', 'push', '-u', '-m', stashMsg, '--', ...dirty]);
+        autostashRef = 'stash@{0}';
+      } catch (error) {
+        const stderr = String(error.stderr || error.message || '').trim();
+        return { error: `autostash failed: ${stderr.slice(0, 500)}`, note: 'autostash_failed' };
+      }
+    }
   }
 
   // Идентичность коммитера задаём флагами -c, чтобы не зависеть от глобального
@@ -153,29 +261,59 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
     '-c', `user.email=${process.env.GIT_AUTHOR_EMAIL || 'ai-dev-manager@local'}`,
     '-c', `user.name=${process.env.GIT_AUTHOR_NAME || 'AI Dev Manager'}`,
   ];
-  try {
-    // -x фиксирует исходный SHA в теле коммита — дельту в main можно проследить.
-    await git(repoRoot, [...ident, 'cherry-pick', '-x', resolved]);
-  } catch (error) {
-    // Конфликт/пустая дельта: cherry-pick атомарен, откатываем незавершённое
-    // состояние, чтобы не оставить дерево в mid-state.
-    await git(repoRoot, ['cherry-pick', '--abort']).catch(() => {});
-    const stderr = String(error.stderr || error.message || '').trim();
-    if (/empty/i.test(stderr)) return { integrated: false, note: 'empty_delta' };
-    return { error: `cherry-pick failed: ${stderr.slice(0, 500)}`, note: 'cherry_pick_failed' };
+
+  let applied = 0;
+  for (const commit of commits) {
+    // Коммит уже в main (предок HEAD)? пропускаем как уже влитый.
+    const already = await git(repoRoot, ['merge-base', '--is-ancestor', commit, 'HEAD'])
+      .then(() => true).catch(() => false);
+    if (already) continue;
+    try {
+      // -x фиксирует исходный SHA в теле коммита — дельту в main можно проследить.
+      await git(repoRoot, [...ident, 'cherry-pick', '-x', commit]);
+      applied += 1;
+    } catch (error) {
+      const stderr = String(error.stderr || error.message || '').trim();
+      // Пустая дельта (коммит уже эквивалентно в main) — не провал: пропускаем
+      // этот коммит и продолжаем с остальными.
+      if (/empty|nothing to commit/i.test(stderr)) {
+        await git(repoRoot, ['cherry-pick', '--skip'])
+          .catch(() => git(repoRoot, ['cherry-pick', '--abort']).catch(() => {}));
+        continue;
+      }
+      // Конфликт/иная ошибка: cherry-pick атомарен, откатываем незавершённое
+      // состояние, чтобы не оставить дерево в mid-state.
+      await git(repoRoot, ['cherry-pick', '--abort']).catch(() => {});
+      // Провал: autostash с дублем дельты НЕ дропаем — оставляем для ручного
+      // разбора и отдаём его ref в диагностике.
+      return {
+        error: `cherry-pick failed: ${stderr.slice(0, 500)}`,
+        note: 'cherry_pick_failed',
+        ...(autostashRef ? { extra: { autostash: autostashRef } } : {}),
+      };
+    }
   }
 
   const head = await git(repoRoot, ['rev-parse', 'HEAD']).then((r) => r.stdout.trim());
-  if (before && head === before) return { integrated: false, note: 'empty_delta' };
+  // Пустой итог — интеграция не состоялась: autostash (если был) НЕ дропаем,
+  // оставляем для ручного разбора и отдаём ref в диагностике.
+  if (applied === 0 || (before && head === before)) {
+    return { integrated: false, note: 'empty_delta', ...(autostashRef ? { extra: { autostash: autostashRef } } : {}) };
+  }
+  // Интеграция удалась: дубль дельты уже в main — снимаем autostash.
+  if (autostashRef) await git(repoRoot, ['stash', 'drop']).catch(() => {});
   const branch = await git(repoRoot, ['rev-parse', '--abbrev-ref', 'HEAD']).catch(() => ({ stdout: '' }));
-  const changed = await git(repoRoot, ['diff', '--name-only', `${head}^`, head]).then((r) => r.stdout).catch(() => '');
+  // Файлы = изменения по ВСЕМУ интегрированному диапазону (before..HEAD), а не
+  // только по последнему коммиту.
+  const diffBase = before || `${head}^`;
+  const changed = await git(repoRoot, ['diff', '--name-only', diffBase, head]).then((r) => r.stdout).catch(() => '');
   return {
     integrated: true,
     commit: head,
     branch: branch.stdout.trim(),
     files: changed.split('\n').map((s) => s.trim()).filter(Boolean),
     mergedFrom: worktreeBranch,
-    deliveredCommit: resolved,
+    deliveredCommit: delivered || tip,
   };
 }
 
@@ -219,7 +357,7 @@ export async function runGitAction(task, opts = {}) {
   const repo = await ensureRepo(repoRoot);
 
   const res = worktreeBranch
-    ? await integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredCommit })
+    ? await integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredCommit, taskId: task.id })
     : await integrateChangedFiles(repoRoot, task, files);
 
   // Явная ошибка интеграции (конфликт cherry-pick, сбой commit, нет ref) — провал.

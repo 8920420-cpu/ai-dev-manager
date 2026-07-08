@@ -101,10 +101,23 @@ node host-runner/bin/host-runner.js
 
 Поведение `GIT_INTEGRATOR` (`host-runner/src/actions.js`, `runGitAction`):
 - Если в контексте задачи задан `worktreeBranch` (программист сдал дельту коммитом в ветке
-  `programmer/<project>/<service>` в отдельном worktree), host-runner вливает коммит
-  `deliveredCommit` в `main` внутри `repoRoot` — cherry-pick'ом (`git cherry-pick -x`),
-  fallback — merge ветки; коммит `main` существует локально даже при провале `push origin HEAD`
-  (push — best-effort).
+  `programmer/<project>/<service>` в отдельном worktree), host-runner берёт tip ветки,
+  проверяет, что он содержит `deliveredCommit` (если ветка не резолвится или не содержит
+  подсказку — использует `deliveredCommit`), и вливает в `main` внутри `repoRoot` весь диапазон
+  `merge-base(HEAD, tip)..tip` по порядку через `git cherry-pick -x`. Многокоммитная сдача
+  интегрируется полностью, а уже влитые или пустые коммиты пропускаются как
+  `already_integrated`/`empty_delta`; коммит `main` существует локально даже при провале
+  `push origin HEAD` (push — best-effort).
+- Перед cherry-pick для путей интегрируемых коммитов выполняется
+  `git status --porcelain -- <пути интегрируемых коммитов>`. Если грязные пути по blob-содержимому
+  совпадают с tip интегрируемой ветки, host-runner считает их незакоммиченным дублем дельты,
+  уносит в `git stash push -u` с сообщением `gi-autostash <taskId> <worktreeBranch>` и продолжает;
+  после успешной интеграции autostash удаляется.
+- Если грязные пути не совпадают с tip ветки, интеграция завершается `success:false` с note
+  `dirty_worktree_conflict`, диагностикой `dirtyPaths`/`mismatchedPaths`, без изменения файлов и
+  без создания stash.
+- Если autostash создан, но cherry-pick или пустой итог интеграции завершается провалом, stash не
+  удаляется; ref возвращается в диагностике как `autostash`.
 - Если `worktreeBranch` не задан — прежний путь (обратная совместимость со старым
   программистом): `git add` файлов задачи (`changedFiles`) + локальный коммит.
 - Пустой итог интеграции (`no_changed_files` / `nothing_to_stage`), когда изменения
