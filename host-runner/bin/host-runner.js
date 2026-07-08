@@ -74,7 +74,9 @@ const http = {
 const executors = {
   // Пути pipeline берутся из контракта claim (task.pipeline), не из REPO_ROOT.
   PIPELINE_SERVICE: (task) => runPipelineAction(task),
-  GIT_INTEGRATOR: (task) => runGitAction(task, { repoRoot: REPO_ROOT }),
+  // Репозиторий задачи = root_path её проекта из claim (PROJECT_2 живёт в другом
+  // репо, чем оркестратор); пустой projectRoot → прежний фолбэк на REPO_ROOT.
+  GIT_INTEGRATOR: (task) => runGitAction(task, { repoRoot: task.projectRoot || REPO_ROOT }),
 };
 
 const runner = new HostRunner({ http, executors });
