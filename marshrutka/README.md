@@ -71,6 +71,14 @@ docker exec marshrutka-oxidized git -C /home/oxidized/.config/oxidized/configs.g
 
 - правило `:80 (http) → server_port 30080 (http)`, health-check `GET /healthz`
   (inter 10 c, rise 2 / fall 3), алгоритм roundrobin;
+- правило `:443 (tcp) → server_port 30443 (tcp)` (id 185391, добавлено 08.07) —
+  TLS-passthrough, терминация в ingress-nginx; на giga добавлен DNAT
+  `ip static tcp ISP 30443 192.168.1.157 30443`. Сертификаты — cert-manager
+  v1.20.3 в кластере (ClusterIssuer `letsencrypt-prod`, HTTP-01 через LB:80,
+  манифест `cert-manager-issuer.yaml`): выпуск сработает сам после перевода
+  DNS домена на 186.246.1.150, до этого Certificate в Pending и ingress отдаёт
+  fake-cert. При TLS на хосте ingress включает redirect 80→443 (308) — health
+  `/healthz` не задет (default backend);
 - бэкенды — **белые IP трёх площадок** (решение: LB заходит на площадки
   снаружи через их WAN; VPN-сервер 72.56.73.96 бэкендом НЕ является):
   - **195.98.86.63** базовая (giga): DNAT `ip static tcp ISP 30080
