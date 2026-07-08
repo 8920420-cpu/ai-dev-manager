@@ -13,8 +13,12 @@
 # Кластерный трафик ходит по node_ip; белые IP площадок используются
 # только для входа от Cloudflare.
 # flannel-backend=wireguard-native: flannel строит собственный шифрованный
-# mesh между нодами и сам подбирает MTU — критично, т.к. путь между
-# площадками идёт через WG-туннели (MTU ~1420, vxlan бы фрагментировался).
+# mesh между нодами. MTU flannel сам НЕ подбирает — берёт от интерфейса
+# дефолт-маршрута (eth0=1500 → flannel-wg 1420), а реальный путь между
+# площадками — WG-в-WG через wg-cluster (PMTU ~1112). Поэтому пишем свой
+# net-conf c Backend.MTU=$K3S_FLANNEL_MTU (бюджет ВНЕШНЕГО пакета; сам
+# интерфейс flannel-wg получит MTU на 80 меньше) и передаём через
+# --flannel-conf в /etc/rancher/k3s/config.yaml.
 set -eu
 
 : "${ALBIA_REGISTRY_DIR:=/opt/albia/registry}"
@@ -24,6 +28,11 @@ set -eu
 : "${K3S_REGISTRY:=${ALBIA_PROVISION_PXE_SERVER_IP}:5000}"
 : "${K3S_TLS_SAN_EXTRA:=}" # запятая-список доп. SAN (белые IP, домен API)
 : "${K3S_INSTALL_URL:=https://get.k3s.io}"
+# Бюджет внешнего WG-пакета flannel: 1080 → flannel-wg MTU 1000 ≤ PMTU ~1112
+# межплощадочного пути (см. runbook «Кластерная сеть»).
+: "${K3S_FLANNEL_MTU:=1080}"
+# Network должен совпадать с cluster-cidr k3s (дефолт 10.42.0.0/16).
+: "${K3S_CLUSTER_CIDR:=10.42.0.0/16}"
 
 NODES_FILE="$ALBIA_REGISTRY_DIR/nodes.jsonl"
 KUBECONFIG_OUT="$ALBIA_REGISTRY_DIR/kubeconfig"
@@ -81,6 +90,23 @@ write_registries() { # доверие к локальному http-registry до
 '      - \"http://$K3S_REGISTRY\"' | sudo tee /etc/rancher/k3s/registries.yaml >/dev/null"
 }
 
+write_flannel_conf() { # свой net-conf: жёсткий MTU вместо взятого от eth0
+  run "$1" "sudo mkdir -p /etc/rancher/k3s && printf '%s\n' \
+'{' \
+'  \"Network\": \"$K3S_CLUSTER_CIDR\",' \
+'  \"EnableIPv6\": false,' \
+'  \"EnableIPv4\": true,' \
+'  \"IPv6Network\": \"::/0\",' \
+'  \"Backend\": {' \
+'    \"Type\": \"wireguard\",' \
+'    \"MTU\": $K3S_FLANNEL_MTU,' \
+'    \"PersistentKeepaliveInterval\": 25' \
+'  }' \
+'}' | sudo tee /etc/rancher/k3s/flannel-netconf.json >/dev/null && \
+printf '%s\n' 'flannel-conf: /etc/rancher/k3s/flannel-netconf.json' \
+  | sudo tee /etc/rancher/k3s/config.yaml >/dev/null"
+}
+
 node_ready() {
   run "$1" "systemctl is-active --quiet k3s" 2>/dev/null
 }
@@ -91,6 +117,7 @@ first_ssh="$(ssh_of "$first")"
 
 echo "== bootstrap first server: $first =="
 write_registries "$first"
+write_flannel_conf "$first"
 if node_ready "$first"; then
   echo "k3s already active on $first, skip install"
 else
@@ -112,6 +139,7 @@ for e in "$@"; do
   [ "$e" = "$first" ] && continue
   echo "== join server: $e =="
   write_registries "$e"
+  write_flannel_conf "$e"
   if node_ready "$e"; then
     echo "k3s already active on $e, skip install"
     continue
