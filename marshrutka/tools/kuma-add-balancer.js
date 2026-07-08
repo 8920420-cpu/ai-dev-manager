@@ -1,4 +1,4 @@
-// Балансировщик Timeweb «Humble Hoopoe» (id 134251, 85.198.81.20) и вход k3s:
+// Балансировщик Timeweb «Humble Hoopoe» (id 134251, 186.246.1.150) и вход k3s:
 // мониторы ping/HTTP на LB + HTTP на оба бэкенда (базовая giga:30080 и VPS:30080).
 // Запуск (см. грабли ESM в README): KUMA_PASS=... node kuma-add-balancer.cjs
 const { io } = require("socket.io-client");
@@ -12,8 +12,8 @@ const base = {
 };
 
 const monitors = [
-  { ...base, type: "ping", name: "LB Timeweb: ping", hostname: "85.198.81.20" },
-  { ...base, type: "http", name: "LB Timeweb: k3s ingress (80/healthz)", url: "http://85.198.81.20/healthz" },
+  { ...base, type: "ping", name: "LB Timeweb: ping", hostname: "186.246.1.150" },
+  { ...base, type: "http", name: "LB Timeweb: k3s ingress (80/healthz)", url: "http://186.246.1.150/healthz" },
   { ...base, type: "http", name: "k3s вход: базовая (giga 30080)", url: "http://195.98.86.63:30080/healthz" },
   { ...base, type: "http", name: "k3s вход: резерв VPS (30080)", url: "http://72.56.73.96:30080/healthz" },
 ];
