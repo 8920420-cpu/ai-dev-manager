@@ -4270,6 +4270,33 @@ async function priorFailureAnalystMissedArtifact(c, taskId, excludeRunId) {
   return isMissingArtifactComplaint({ summary: o.summary, findings: o.findings });
 }
 
+// MISSING-OUTPUTS-CAP-001 — сколько ПОДРЯД последних завершённых прогонов этой роли
+// по задаче кончились недобором обязательных выходных полей (reason missing_outputs:*).
+// Нужен капу в applyReasoningVerdict: REWORK от missing_outputs назначается ПОСЛЕ
+// decideOutcome, мимо его защиты max_rework_exceeded, и никаким счётчиком не покрыт:
+// кап провалов считает FAILED-прогоны (а эти SUCCESS), reworkCount — только возвраты
+// с FAILURE_ANALYSIS. Для ПЕРВОЙ роли маршрута REWORK ведёт в неё же саму
+// (reworkTarget → firstStep) — без капа это вечная петля. Инцидент: Приёмщик с
+// легитимно пустым required-списком (см. миграцию 0050) крутился BACKLOG→BACKLOG
+// прогоном LLM каждые ~40 секунд.
+async function priorMissingOutputsStreak(c, taskId, roleCode, excludeRunId, limit) {
+  if (limit <= 0) return 0;
+  const r = await c.query(
+    `SELECT ar.output_json->>'reason' AS reason
+       FROM agent_runs ar JOIN roles r ON r.id = ar.role_id
+      WHERE ar.task_id = $1 AND r.code = $2 AND ar.finished_at IS NOT NULL
+        AND ($3::uuid IS NULL OR ar.id <> $3)
+      ORDER BY ar.started_at DESC LIMIT $4`,
+    [taskId, roleCode, excludeRunId ?? null, limit],
+  );
+  let n = 0;
+  for (const row of r.rows) {
+    if (String(row.reason ?? '').startsWith('missing_outputs')) n += 1;
+    else break;
+  }
+  return n;
+}
+
 // INTAKE-INTEGRATIONS-001 / INTAKE-CATEGORY-VALIDATION-001 — собрать компактный блок
 // обращения (intakeReport) для контекста роли. Чистая функция (без БД). Блок
 // формируется ТОЛЬКО для задач-обращений (isIntakeTask, т.е. intake_integration_id
@@ -4702,7 +4729,14 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
     priorMissingArtifact,
   });
   if (missingOut.length && decision.outcome !== 'BLOCK') {
-    decision = { outcome: 'REWORK', agentRunStatus: 'SUCCESS', reason: `missing_outputs:${missingOut.join(',')}` };
+    // MISSING-OUTPUTS-CAP-001: недобор обязательных выходов → REWORK, но КАПЛЕННЫЙ.
+    // После MAX_REWORK одинаковых недоборов подряд — BLOCKED на ручной разбор:
+    // контракт полей роли расходится с её фактическим выходом, и ещё прогон той же
+    // модели по тому же промту нового результата не даст.
+    const streak = await priorMissingOutputsStreak(c, claimed.id, claimed.role_code, claimed.agentRunId, MAX_REWORK);
+    decision = streak >= MAX_REWORK
+      ? { outcome: 'BLOCK', blockStatus: 'BLOCKED', agentRunStatus: 'FAILED', reason: 'missing_outputs_exceeded' }
+      : { outcome: 'REWORK', agentRunStatus: 'SUCCESS', reason: `missing_outputs:${missingOut.join(',')}` };
   }
   // INTAKE-INTEGRATIONS-001: беспроектное обращение из канала «интеграции в
   // приложения». Приёмщик определил проект (verdict.fields.project) по каталогу
