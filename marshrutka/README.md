@@ -61,6 +61,45 @@ docker exec marshrutka-oxidized git -C /home/oxidized/.config/oxidized/configs.g
 
 Оттуда же можно `git push` на приватный remote (например, в Gitea: `docker compose --profile git-server up -d`).
 
+## Вход для фронтов ПС: балансировщик Timeweb → k3s
+
+Публичная точка входа сайтов — балансировщик Timeweb Cloud **«Humble Hoopoe»**
+(id 134251, IP **85.198.81.20**, локация ru-3; управление — API-токен
+`TIMEWEB_CLOUD_TOKEN` из `.env`, дубль в Key Store Semaphore
+«timeweb-cloud-api (token)»). Настроен 08.07.2026:
+
+- правило `:80 (http) → server_port 30080 (http)`, health-check `GET /healthz`
+  (inter 10 c, rise 2 / fall 3), алгоритм roundrobin;
+- бэкенд: **72.56.73.96** (timeweb-vpn: nginx `k3s-ingress` слушает 80+30080 →
+  upstream 10.10.8.8/10.10.8.9:30080 через awg0);
+- бэкенд **195.98.86.63** (базовая, giga: DNAT `ip static tcp ISP 30080
+  192.168.1.157 30080` → нода k3s; проброс работает — проверен с VPS) из LB
+  **убран 08.07.2026**: трафик LB → офисный ISP не доходил (из Амстердама тот же
+  порт доступен), бэкенд флапал и давал клиентам таймауты. Вернуть:
+  `POST /api/v1/balancers/134251/ips {"ips":["195.98.86.63"]}` — после починки
+  связности Timeweb-Москва ↔ офисный ISP (у LB 85.198.81.20 с офисной сети
+  наблюдалась и обратная беда: ICMP ходит, TCP:80 блокируется);
+- в кластере развёрнут **ingress-nginx** (controller-v1.15.1, Service NodePort
+  **30080/30443**) — фронты подключаются обычными Ingress-манифестами;
+  `/healthz` его default-backend'а — общий health-эндпоинт всей цепочки;
+- обе ноды k3s — пиры awg0 хаба timeweb-vpn: 157 = **10.10.8.8**, ВМ «ПС-2» =
+  **10.10.8.9** (`awg-quick@awg0`, конфиги `/etc/amnezia/amneziawg/awg0.conf`
+  на нодах; на хабе пиры `k3s-node-*` дописаны в `awg0.conf`, бэкап
+  `awg0.conf.bak-20260708`).
+
+**Каскад и Барикадная (psvrn) бэкендами быть пока не могут**: NDMS пробрасывает
+порты только в собственные сегменты — DNAT в адрес за site-to-site туннелем
+(проверено на Каскаде, NDMS 5.0.12) пакеты не пересылает, а SNAT для симметрии
+ответа Keenetic не умеет. Станет возможно, когда на их площадках появятся ноды
+кластера (нода 5.3 на Каскаде зарезервирована) — тогда DNAT в локальную ноду и
+`POST /api/v1/balancers/134251/ips` с их белым IP. Диагностические правила с
+Каскада откачены (`no ip static…30080/30081`, `no ip route 10.10.8.8…`).
+
+Инструменты: `tools/kssh.py` — драйвер CLI Keenetic с хоста (аналог kssh.rb;
+выручает, когда контейнер oxidized не видит 192.168.1.1: `RPASS=... python
+tools/kssh.py 192.168.1.1 Semaphore "команда"`); `tools/kuma-add-balancer.js` —
+мониторы Kuma на LB и оба бэкенда.
+
 ## Порты подсистемы
 
 4231 (Semaphore), 4232 (Kuma), 4233 (Oxidized REST/web), 4234-4235 (Gitea, опц.) —

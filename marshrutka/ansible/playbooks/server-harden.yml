@@ -75,6 +75,9 @@
       loop:
         - ufw allow 22/tcp comment SSH
         - ufw allow 42666/udp comment AmneziaWG
+        # 80/30080 — nginx-прокси до k3s ingress, вход с балансировщика Timeweb 85.198.81.20
+        - ufw allow 80/tcp comment LB-k3s-ingress
+        - ufw allow 30080/tcp comment LB-k3s-ingress
       register: ufw_rules
       changed_when: "'Skipping' not in ufw_rules.stdout"
 
