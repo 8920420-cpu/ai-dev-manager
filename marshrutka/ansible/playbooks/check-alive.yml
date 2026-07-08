@@ -1,0 +1,29 @@
+---
+# Вендоро-независимая проверка: хост пингуется и SSH-порт открыт.
+# Выполняется с контрол-ноды, на устройства не заходит.
+- name: Проверка доступности роутеров и серверов
+  hosts: all
+  gather_facts: false
+  connection: local
+  vars:
+    # Локальная игра всегда исполняется питоном контрол-ноды: без этого discovery
+    # кэширует путь venv-питона Semaphore и тащит его в SSH-игры на серверы.
+    ansible_python_interpreter: "{{ ansible_playbook_python }}"
+  tasks:
+    - name: ICMP ping
+      ansible.builtin.command: ping -c 2 -W 2 {{ ansible_host }}
+      changed_when: false
+
+    - name: Порт управления открыт (mgmt_port, по умолчанию SSH 22)
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: "{{ mgmt_port | default(22) }}"
+        timeout: 5
+
+# Linux-серверы: реальный заход по SSH (модулю ping нужен Python на хосте).
+- name: Проверка SSH-входа на серверы
+  hosts: servers
+  gather_facts: false
+  tasks:
+    - name: SSH + Python отвечают
+      ansible.builtin.ping:

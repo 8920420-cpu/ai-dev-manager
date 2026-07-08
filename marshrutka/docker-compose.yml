@@ -1,0 +1,76 @@
+name: marshrutka
+
+services:
+  # Ansible с веб-интерфейсом: запуск плейбуков, расписания, история, секреты
+  semaphore:
+    image: semaphoreui/semaphore:latest
+    container_name: marshrutka-semaphore
+    restart: unless-stopped
+    ports:
+      - "4231:3000"
+    environment:
+      SEMAPHORE_DB_DIALECT: sqlite
+      SEMAPHORE_DB_HOST: /home/semaphore/database.sqlite
+      SEMAPHORE_ADMIN: ${SEMAPHORE_ADMIN:-admin}
+      SEMAPHORE_ADMIN_PASSWORD: ${SEMAPHORE_ADMIN_PASSWORD:-marshrutka}
+      SEMAPHORE_ADMIN_NAME: ${SEMAPHORE_ADMIN_NAME:-Admin}
+      SEMAPHORE_ADMIN_EMAIL: ${SEMAPHORE_ADMIN_EMAIL:-admin@marshrutka.local}
+      # Обязательно зафиксировать в .env: иначе при пересоздании контейнера
+      # генерируются новые случайные ключи и секреты в БД перестают читаться.
+      SEMAPHORE_ACCESS_KEY_ENCRYPTION: ${SEMAPHORE_ACCESS_KEY_ENCRYPTION:?set in .env}
+      SEMAPHORE_COOKIE_HASH: ${SEMAPHORE_COOKIE_HASH:?set in .env}
+      SEMAPHORE_COOKIE_ENCRYPTION: ${SEMAPHORE_COOKIE_ENCRYPTION:?set in .env}
+      TZ: ${TZ:-Europe/Moscow}
+    volumes:
+      - semaphore-data:/home/semaphore
+      # Плейбуки лежат в репозитории; в Semaphore подключаются как Repository типа Local: /ansible
+      - ./ansible:/ansible:ro
+      # Писабельный карман для fetch-бэкапов с серверов (в .gitignore — там ключи)
+      - ./ansible/backups:/ansible/backups
+
+  # Автобэкап конфигов роутеров в git с диффами (наследник RANCID)
+  oxidized:
+    image: oxidized/oxidized:latest
+    container_name: marshrutka-oxidized
+    restart: unless-stopped
+    ports:
+      - "4233:8888"
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+    volumes:
+      - ./oxidized:/home/oxidized/.config/oxidized
+
+  # Мониторинг живости роутеров (ping/TCP), алерты в telegram и т.п.
+  uptime-kuma:
+    image: louislam/uptime-kuma:1
+    container_name: marshrutka-kuma
+    restart: unless-stopped
+    ports:
+      - "4232:3001"
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+    volumes:
+      - kuma-data:/app/data
+
+  # Опционально: собственный веб-git для репозитория конфигов.
+  # Запуск: docker compose --profile git-server up -d
+  gitea:
+    image: gitea/gitea:1.22
+    container_name: marshrutka-gitea
+    restart: unless-stopped
+    profiles: ["git-server"]
+    ports:
+      - "4234:3000"
+      - "4235:22"
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__server__ROOT_URL: http://localhost:4234/
+      TZ: ${TZ:-Europe/Moscow}
+    volumes:
+      - gitea-data:/data
+
+volumes:
+  semaphore-data:
+  kuma-data:
+  gitea-data:
