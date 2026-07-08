@@ -710,13 +710,47 @@ function normalizeIntakeCategory(v) {
   return INTAKE_CATEGORY_VALUES.has(c) ? c : null;
 }
 
+// INTAKE-WORKER-FORMAT-001 — совместимость с воркерами доставки подсистем ПС
+// (Go internal/problemreports|problemdelivery): они шлют snake_case-поля
+// (id/message_text/reporter_login/screen/context{build_version,...}), а канонический
+// контракт — externalId/message/user/form/autocontext. Признак формата воркера —
+// message_text без message; такой вход переводим в канонический ДО валидации.
+// reporter_login может быть пуст (анонимная сессия) — доставку не роняем ('unknown').
+function adaptWorkerIntakeReport(input) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return input;
+  const str = (v) => String(v ?? '').trim();
+  if (str(input.message) || !str(input.message_text)) return input;
+  const ctx = input.context && typeof input.context === 'object' && !Array.isArray(input.context)
+    ? input.context : {};
+  return {
+    token: input.token,
+    externalId: input.id,
+    message: input.message_text,
+    user: str(input.reporter_login) || str(input.reporter_user_id) || 'unknown',
+    service: str(input.service_code) || str(input.service),
+    form: input.screen,
+    category: input.category,
+    sourceTicketNo: input.ticket_no,
+    autocontext: {
+      url: ctx.url,
+      buildVersion: ctx.build_version,
+      userAgent: ctx.user_agent,
+      timestamp: str(ctx.client_timestamp) || str(input.created_at),
+      jsErrors: ctx.recent_errors,
+      lastFailedApiRequestId: ctx.last_failed_request_id,
+    },
+  };
+}
+
 /**
  * INTAKE-INTEGRATIONS-001 — нормализация обращения из канала «интеграции в
  * приложения» (POST /api/intake/report). Чистая функция (без БД): проверяет
  * обязательные поля и собирает автоконтекст. token приходит из заголовка запроса
  * (Authorization: Bearer / X-Intake-Token) — сервер кладёт его в input.token.
+ * Формат Go-воркеров подсистем принимается через adaptWorkerIntakeReport.
  */
-export function normalizeIntakeReport(input) {
+export function normalizeIntakeReport(rawInput) {
+  const input = adaptWorkerIntakeReport(rawInput);
   const str = (v) => String(v ?? '').trim();
   const token = str(input?.token);
   if (!token) throw scannerError(401, 'token_required');
@@ -753,6 +787,9 @@ export function normalizeIntakeReport(input) {
     autocontext,
     // Ссылка на объект-скриншот в MinIO (грузит бэкенд приложения-источника).
     screenshotUrl: str(input?.screenshotUrl) || null,
+    // Номер тикета в подсистеме-источнике (его видел пользователь в виджете).
+    sourceTicketNo: Number.isFinite(Number(input?.sourceTicketNo)) && Number(input?.sourceTicketNo) > 0
+      ? Number(input.sourceTicketNo) : null,
   };
 }
 
@@ -832,6 +869,8 @@ export async function acceptIntakeReport(s, input) {
         integration: integration.name,
         reportNumber,
         externalId: payload.externalId,
+        // Номер тикета в подсистеме-источнике (виджет показал его пользователю).
+        sourceTicketNo: payload.sourceTicketNo,
         reporterUser: payload.user,
         reporterService: payload.service || null,
         reporterForm: payload.form || null,
@@ -4252,6 +4291,8 @@ export function buildIntakeReportContext(dataCard, { roleCode, isIntakeTask } = 
     : [];
   return {
     reportNumber: card.reportNumber ?? null,
+    // Номер тикета в подсистеме-источнике — пользователь ссылается на него.
+    sourceTicketNo: card.sourceTicketNo ?? null,
     integration: card.integration ?? null,
     reporterUser: card.reporterUser ?? null,
     reporterService: card.reporterService ?? null,
