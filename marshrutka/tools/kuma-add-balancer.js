@@ -15,7 +15,8 @@ const monitors = [
   { ...base, type: "ping", name: "LB Timeweb: ping", hostname: "186.246.1.150" },
   { ...base, type: "http", name: "LB Timeweb: k3s ingress (80/healthz)", url: "http://186.246.1.150/healthz" },
   { ...base, type: "http", name: "k3s вход: базовая (giga 30080)", url: "http://195.98.86.63:30080/healthz" },
-  { ...base, type: "http", name: "k3s вход: резерв VPS (30080)", url: "http://72.56.73.96:30080/healthz" },
+  // не бэкенд LB, а запасной вход в кластер через awg0 — мониторим, чтобы резерв не протух
+  { ...base, type: "http", name: "k3s запасной вход: timeweb-vpn (30080)", url: "http://72.56.73.96:30080/healthz" },
 ];
 
 const socket = io("http://localhost:4232", { transports: ["websocket"] });
