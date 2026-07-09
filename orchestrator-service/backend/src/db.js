@@ -4960,7 +4960,9 @@ function runKpiSet(kpi, base) {
   };
 }
 
-async function applyReasoningVerdict(c, claimed, { route, contract, verdict, response, exchangeId, durationMs, kpi = null }) {
+// Экспортируется для тестов (SERVICE-REPO-PATH-PREFLIGHT-001): проверяем ранний
+// preflight repository_path на split-ветке Архитектора без поднятия всей БД.
+export async function applyReasoningVerdict(c, claimed, { route, contract, verdict, response, exchangeId, durationMs, kpi = null }) {
   const { values: cardValues, missingRequired: missingOut } = extractOutputs(verdict.fields, contract.outputs);
   // FA-MISSING-ARTIFACT-001 (анти-петля): если Аналитик сбоя СНОВА жалуется на
   // отсутствие артефакта провала — проверяем, была ли та же жалоба в его прошлом
@@ -5014,6 +5016,29 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
     // прежнее поведение: одна задача (ensureArchitectService; 0 сервисов → BLOCKED).
     const split = await resolveArchitectSplit(c, claimed, verdict.fields, cardValues);
     if (split.services.length >= 2) {
+      // SERVICE-REPO-PATH-PREFLIGHT-001: ту же проверку repository_path, что и на
+      // одиночном пути (ensureArchitectService ниже), прогоняем по КАЖДОМУ сервису
+      // split ДО материализации детей. Дочерние service-задачи создаются сразу в
+      // статусе/роли следующего этапа (CODING/PROGRAMMER), поэтому без раннего
+      // диагноза хотя бы один сервис без валидного пути дошёл бы до Pipeline лишь
+      // ради «repository_path не задан/не найден», впустую заняв слоты Programmer.
+      // Провал хотя бы одного сервиса → блокируем ЭПИК (детей НЕ создаём) с кодом
+      // missing_repository_path и перечнем проблемных сервисов.
+      const failed = [];
+      for (const svc of split.services) {
+        const pf = await preflightServiceRepoPath(c, svc.serviceId);
+        if (!pf.ok) failed.push({ code: svc.serviceCode, message: pf.message });
+      }
+      if (failed.length) {
+        return blockClaimedReason(
+          c, claimed,
+          `missing_repository_path:${failed.map((f) => f.code).join(',')}`,
+          {
+            verdict, cardValues, kpi, event: 'missing_repository_path',
+            detail: failed.map((f) => f.message).join('; '),
+          },
+        );
+      }
       return materializeArchitectSplit(c, claimed, {
         verdict, response, exchangeId, durationMs, decision, cardValues, route, kpi, split,
       });
@@ -5021,6 +5046,17 @@ async function applyReasoningVerdict(c, claimed, { route, contract, verdict, res
     const ensured = await ensureArchitectService(c, claimed, verdict.fields, cardValues);
     if (ensured.blocked) {
       return blockClaimedReason(c, claimed, ensured.reason, { verdict, cardValues, kpi, event: 'architect_no_service' });
+    }
+    // SERVICE-REPO-PATH-PREFLIGHT-001: repository_path эффективного сервиса ОБЯЗАН
+    // быть задан и указывать на существующий каталог ДО перехода в CODING. Раньше это
+    // ловил только claim PIPELINE_SERVICE — задачу успевали прогнать через Architect и
+    // Programmer, и она падала лишь на Pipeline с тем же диагнозом, впустую тратя слоты.
+    // Сервис без пути/с несуществующим каталогом → BLOCKED c кодом missing_repository_path.
+    const preflight = await preflightServiceRepoPath(c, ensured.resolvedServiceId);
+    if (!preflight.ok) {
+      return blockClaimedReason(c, claimed, preflight.reason, {
+        verdict, cardValues, kpi, event: 'missing_repository_path', detail: preflight.message,
+      });
     }
     setServiceId = ensured.serviceId; // uuid, либо undefined если service_id уже задан
   }
@@ -5167,7 +5203,10 @@ async function routeIntakeToProject(c, claimed, { verdict, response, exchangeId,
 // первый зарегистрированный сервис проекта). Не удалось → { blocked, reason }.
 async function ensureArchitectService(c, claimed, verdictFields, cardValues) {
   const cur = await c.query('SELECT service_id FROM tasks WHERE id = $1', [claimed.id]);
-  if (cur.rows[0]?.service_id) return { serviceId: undefined };
+  // resolvedServiceId — ЭФФЕКТИВНЫЙ сервис задачи (уже заданный ИЛИ вновь резолвнутый),
+  // нужен для раннего preflight repository_path (SERVICE-REPO-PATH-PREFLIGHT-001);
+  // serviceId остаётся undefined, когда обновлять service_id в finalizeRole не нужно.
+  if (cur.rows[0]?.service_id) return { serviceId: undefined, resolvedServiceId: cur.rows[0].service_id };
 
   const card = {
     ...(claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {}),
@@ -5179,10 +5218,51 @@ async function ensureArchitectService(c, claimed, verdictFields, cardValues) {
   const byCode = new Map(svcRows.rows.map((r) => [String(r.service_code).toLowerCase(), r.id]));
   for (const item of plan) {
     const sid = byCode.get(String(item.serviceCode).toLowerCase());
-    if (sid) return { serviceId: sid };
+    if (sid) return { serviceId: sid, resolvedServiceId: sid };
   }
   const attempted = plan.map((p) => p.serviceCode).filter(Boolean);
   return { blocked: true, reason: `architect_no_service:${attempted.join(',') || 'empty'}` };
+}
+
+// SERVICE-REPO-PATH-PREFLIGHT-001 — ранний диагноз отсутствующего/невалидного
+// repository_path сервиса. Та же проверка, что и в claim PIPELINE_SERVICE
+// (resolveServiceRepoPath), но выполняется на финализации Архитектора — ДО того как
+// задача займёт слоты Programmer и дойдёт до Pipeline лишь ради того же диагноза.
+// Инцидент: PIPELINE_SERVICE падал поздно с «repository_path не задан/не найден»
+// (CHAT, auth-registration), успев прогнать задачу через Architect и Programmer.
+// Читает repository_path/код сервиса и корень проекта, прогоняет через
+// resolveServiceRepoPath (логику НЕ дублируем — переиспользуем). Ветка
+// CONTAINER-FS-DEGRADE-001 сохранена: безопасный непустой путь доверяем (реальную
+// проверку сделает host-runner на хосте), пустой/NULL/небезопасный — провал.
+// ВАЖНО: claim на хосте при пустом/невалидном сохранённом пути делает бэкфилл
+// каталога по КОДУ сервиса (findServiceDirByCode) и продолжает — resolveServiceRepoPath
+// в этом случае возвращает { ok:true, changed:true }. Для РАННЕГО диагноза такой
+// бэкфилл — это как раз missing_repository_path: в реестре путь фактически не задан,
+// а угадывание по коду каталога маскирует проблему (подтверждённый провал ревью:
+// repository_path=NULL + рядом каталог с именем=service_code проходил как ok). Поэтому
+// принимаем ТОЛЬКО валидный сохранённый путь (changed:false); бэкфилл (changed:true)
+// трактуем как провал. Возвращает { ok: true } либо { ok: false, code, reason, message }.
+// Только чтение.
+export async function preflightServiceRepoPath(c, serviceId) {
+  if (!serviceId) return { ok: true };
+  const row = await c.query(
+    `SELECT s.service_code, s.repository_path, p.root_path
+       FROM services s JOIN projects p ON p.id = s.project_id
+      WHERE s.id = $1`,
+    [serviceId],
+  );
+  const svc = row.rows[0];
+  if (!svc) return { ok: true }; // сервис не найден — не наша ветка диагноза
+  const resolved = resolveServiceRepoPath(svc.root_path, svc.service_code, svc.repository_path);
+  if (resolved.ok && !resolved.changed) return { ok: true };
+  const code = String(svc.service_code ?? '').trim() || '(без кода)';
+  return {
+    ok: false,
+    code: 'missing_repository_path',
+    reason: `missing_repository_path:${code}`,
+    message: `сервис ${code}: repository_path не задан или каталог сервиса не найден — `
+      + 'укажите корректный repository_path сервиса в реестре сервисов проекта и верните задачу в работу',
+  };
 }
 
 // ARCH-SERVICE-SPLIT-001 — резолвим разбивку Архитектора в РАЗНЫЕ зарегистрированные
@@ -5224,7 +5304,7 @@ function filterCardForService(card, byCode, serviceId) {
 // DECOMPOSER-REMOVE-001 — заблокировать задачу с понятной причиной, СОХРАНИВ роль
 // (current_role_id не обнуляем — задача остаётся видимой под своей ролью как BLOCKED).
 // Прогон роли помечаем SUCCESS (роль отработала; блок — из-за нерезолвимых данных).
-async function blockClaimedReason(c, claimed, reason, { verdict, cardValues, kpi = null, event = 'blocked' } = {}) {
+async function blockClaimedReason(c, claimed, reason, { verdict, cardValues, kpi = null, event = 'blocked', detail = null } = {}) {
   await c.query('BEGIN');
   try {
     // DB-FINALIZE-RETRY-001: идемпотентность повторной финализации на свежем соединении.
@@ -5237,6 +5317,7 @@ async function blockClaimedReason(c, claimed, reason, { verdict, cardValues, kpi
       `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet.sql} WHERE id = $1`,
       [claimed.agentRunId, JSON.stringify({
         status: verdict?.status, summary: verdict?.summary, reason, outcome: 'BLOCK', fields: cardValues,
+        ...(detail ? { detail } : {}),
       }), ...kpiSet.params],
     );
     await c.query(
@@ -5248,6 +5329,7 @@ async function blockClaimedReason(c, claimed, reason, { verdict, cardValues, kpi
        VALUES ($1, 'TASK_BLOCKED', $2::task_status, 'BLOCKED', $3, $4::jsonb)`,
       [claimed.id, claimed.status, claimed.role_id, JSON.stringify({
         runner: true, ai: true, role: claimed.role_code, reason, event,
+        ...(detail ? { detail } : {}),
       })],
     );
     await c.query('COMMIT');
