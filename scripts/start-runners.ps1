@@ -15,11 +15,21 @@
 # работающие процессы по командной строке). Логи пишутся в logs/.
 #
 # Параметры:
-#   -Restart   сначала остановить уже запущенные демоны, затем поднять заново.
+#   -Restart        сначала остановить уже запущенные демоны, затем поднять заново.
+#   -Only <имена>   ограничить действие перечисленными демонами (host-runner,
+#                   programmer-runner, codex-runner, claude-reasoning-runner) —
+#                   используется вотчдогом свежести (ensure-fresh-runners.ps1),
+#                   чтобы перезапускать ТОЛЬКО устаревший демон, не трогая остальные.
 
 param(
-  [switch]$Restart
+  [switch]$Restart,
+  [string[]]$Only
 )
+
+# Демон входит в текущий запуск? (без -Only — все)
+function Want([string]$Name) {
+  return (-not $Only) -or ($Only -contains $Name)
+}
 
 $ErrorActionPreference = 'Stop'
 
@@ -155,18 +165,18 @@ function Start-Runner([string]$Name, [string]$WorkDir, [string]$ScriptRel) {
 
 if ($Restart) {
   Write-Host 'Останавливаю запущенные демоны...'
-  Stop-Runner 'host-runner.js'            'host-runner'
-  Stop-Runner 'programmer-runner.js'      'programmer-runner'
-  Stop-Runner 'codex-runner.js'           'codex-runner'
-  Stop-Runner 'claude-reasoning-runner.js' 'claude-reasoning-runner'
+  if (Want 'host-runner')             { Stop-Runner 'host-runner.js'             'host-runner' }
+  if (Want 'programmer-runner')       { Stop-Runner 'programmer-runner.js'       'programmer-runner' }
+  if (Want 'codex-runner')            { Stop-Runner 'codex-runner.js'            'codex-runner' }
+  if (Want 'claude-reasoning-runner') { Stop-Runner 'claude-reasoning-runner.js' 'claude-reasoning-runner' }
   Start-Sleep -Milliseconds 400
 }
 
 Write-Host "Оркестратор: $($env:ORCHESTRATOR_URL)"
-Start-Runner 'host-runner'             (Join-Path $RepoRoot 'host-runner')       'bin/host-runner.js'
-Start-Runner 'programmer-runner'       (Join-Path $RepoRoot 'programmer-runner') 'bin/programmer-runner.js'
-Start-Runner 'codex-runner'            (Join-Path $RepoRoot 'codex-runner')      'bin/codex-runner.js'
+if (Want 'host-runner')             { Start-Runner 'host-runner'             (Join-Path $RepoRoot 'host-runner')       'bin/host-runner.js' }
+if (Want 'programmer-runner')       { Start-Runner 'programmer-runner'       (Join-Path $RepoRoot 'programmer-runner') 'bin/programmer-runner.js' }
+if (Want 'codex-runner')            { Start-Runner 'codex-runner'            (Join-Path $RepoRoot 'codex-runner')      'bin/codex-runner.js' }
 # Claude как движок рассуждающих ролей (engine=claude_code) живёт в пакете
 # programmer-runner (общий Agent SDK и загрузка токена), отдельной bin-точкой.
-Start-Runner 'claude-reasoning-runner' (Join-Path $RepoRoot 'programmer-runner') 'bin/claude-reasoning-runner.js'
+if (Want 'claude-reasoning-runner') { Start-Runner 'claude-reasoning-runner' (Join-Path $RepoRoot 'programmer-runner') 'bin/claude-reasoning-runner.js' }
 Write-Host 'Готово. Проверить: Get-Content logs/host-runner.log -Tail 20'

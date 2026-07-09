@@ -3,3 +3,10 @@
 # Логика — в общем mark-deploy.sh рядом (чтобы не дублировать в post-rewrite).
 dir=$(dirname "$0")
 . "$dir/mark-deploy.sh"
+
+# RUNNER-FRESHNESS-001 — pull/merge мог принести правки кода хостовых демонов:
+# сразу зовём вотчдог свежести (точечный рестарт устаревших). Сбои тихо игнорим.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden \
+  -File "$top/scripts/ensure-fresh-runners.ps1" >/dev/null 2>&1 &
+exit 0
