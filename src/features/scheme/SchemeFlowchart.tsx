@@ -322,20 +322,20 @@ export function SchemeFlowchart({
             {!enabled && <span className={styles.offChip}>Отключён</span>}
           </div>
         ) : (
-          <>
-            <div className={styles.nodeMeta}>
-              {role ? (
-                <span className={cn(styles.roleChip, scanner && styles.roleChipScanner)}>
-                  {role.name}
-                </span>
-              ) : (
-                <span className={styles.roleEmpty}>Роль не выбрана</span>
-              )}
-              {enabled && stage.taskStatus && (
-                <span className={styles.statusChip}>{taskStatusLabel(stage.taskStatus)}</span>
-              )}
-              {!enabled && <span className={styles.offChip}>Отключён</span>}
-            </div>
+          // Роль/статус и действия — одним рядом (при нехватке ширины перенос),
+          // чтобы карточка была компактнее.
+          <div className={styles.nodeMeta}>
+            {role ? (
+              <span className={cn(styles.roleChip, scanner && styles.roleChipScanner)}>
+                {role.name}
+              </span>
+            ) : (
+              <span className={styles.roleEmpty}>Роль не выбрана</span>
+            )}
+            {enabled && stage.taskStatus && (
+              <span className={styles.statusChip}>{taskStatusLabel(stage.taskStatus)}</span>
+            )}
+            {!enabled && <span className={styles.offChip}>Отключён</span>}
 
             <div className={styles.nodeActions}>
               <button
@@ -364,7 +364,7 @@ export function SchemeFlowchart({
                 {runningCount}
               </span>
             </div>
-          </>
+          </div>
         )}
       </div>
     );

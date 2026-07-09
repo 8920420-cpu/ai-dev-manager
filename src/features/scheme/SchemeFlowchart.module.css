@@ -172,8 +172,8 @@
   max-width: 420px;
   display: flex;
   flex-direction: column;
-  gap: var(--space-2);
-  padding: var(--space-3) var(--space-4);
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-lg);
   background: var(--surface);
@@ -259,7 +259,7 @@
 .nodeHead {
   display: flex;
   align-items: center;
-  gap: var(--space-2);
+  gap: var(--space-1);
 }
 
 .grip {
@@ -267,8 +267,8 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 24px;
-  height: 24px;
+  width: 22px;
+  height: 22px;
   padding: 0;
   border: none;
   border-radius: var(--radius-sm);
@@ -291,8 +291,8 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 26px;
-  height: 26px;
+  width: 22px;
+  height: 22px;
   border-radius: var(--radius-full);
   background: var(--primary-soft);
   border: 1px solid var(--primary-soft-border);
@@ -318,8 +318,8 @@
 }
 
 .checkbox {
-  width: 18px;
-  height: 18px;
+  width: 16px;
+  height: 16px;
   accent-color: var(--primary);
   cursor: pointer;
 }
@@ -329,8 +329,8 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 30px;
-  height: 30px;
+  width: 26px;
+  height: 26px;
   padding: 0;
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
@@ -353,15 +353,17 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-2);
-  padding-left: calc(24px + var(--space-2));
+  gap: var(--space-1) var(--space-2);
+  padding-left: calc(22px + var(--space-1));
 }
 
+/* Действия карточки (кнопка «Задачи» + счётчик процессов) идут в общем ряду с
+   ролью/статусом и прижаты вправо; при нехватке ширины ряд переносится. */
 .nodeActions {
-  display: flex;
+  display: inline-flex;
   align-items: center;
   gap: var(--space-2);
-  padding-left: calc(24px + var(--space-2));
+  margin-left: auto;
 }
 
 .tasksBtn {
