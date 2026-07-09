@@ -3,6 +3,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import { runServicePipeline } from '../../pipeline-runner/src/index.js';
+import { runAutodeploy } from './autodeploy.js';
 
 const pexec = promisify(execFile);
 
@@ -183,7 +184,7 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
   let range = tip;
   if (before) {
     const mergeBase = await git(repoRoot, ['merge-base', 'HEAD', tip]).then((r) => r.stdout.trim()).catch(() => '');
-    if (mergeBase === tip) return { integrated: false, note: 'already_integrated' };
+    if (mergeBase === tip) return { integrated: false, note: 'already_integrated', tip };
     range = mergeBase ? `${mergeBase}..${tip}` : tip;
   }
 
@@ -192,7 +193,7 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
   const revList = await git(repoRoot, ['rev-list', '--reverse', '--topo-order', range])
     .then((r) => r.stdout).catch(() => '');
   const commits = revList.split('\n').map((s) => s.trim()).filter(Boolean);
-  if (commits.length === 0) return { integrated: false, note: 'already_integrated' };
+  if (commits.length === 0) return { integrated: false, note: 'already_integrated', tip };
 
   // ── Санитайзер грязного дубля дельты ─────────────────────────────────────────
   // Pipeline Service гоняет тесты/сборку в ОСНОВНОМ дереве repoRoot и оставляет
@@ -296,9 +297,14 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
 
   const head = await git(repoRoot, ['rev-parse', 'HEAD']).then((r) => r.stdout.trim());
   // Пустой итог — интеграция не состоялась: autostash (если был) НЕ дропаем,
-  // оставляем для ручного разбора и отдаём ref в диагностике.
+  // оставляем для ручного разбора и отдаём ref в диагностике. tip и affectedFiles
+  // отдаём вызывающему — runGitAction сверит содержимое tip с HEAD и отличит
+  // «дельта уже в main» (штатный повторный прогон) от «дельта потерялась» (провал).
   if (applied === 0 || (before && head === before)) {
-    return { integrated: false, note: 'empty_delta', ...(autostashRef ? { extra: { autostash: autostashRef } } : {}) };
+    return {
+      integrated: false, note: 'empty_delta', tip, affectedFiles: [...affected],
+      ...(autostashRef ? { extra: { autostash: autostashRef } } : {}),
+    };
   }
   // Интеграция удалась: дубль дельты уже в main — снимаем autostash.
   if (autostashRef) await git(repoRoot, ['stash', 'drop']).catch(() => {});
@@ -331,8 +337,17 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
  * Пустой итог интеграции (нечего сливать), КОГДА изменения ЗАЯВЛЕНЫ (непустой
  * changedFiles ИЛИ worktreeBranch с непустым deliveredCommit) — это ПРОВАЛ
  * (success:false, note empty_deliverable_declared_changes): иначе конвейер
- * «зелёный», а код не доехал до main. Пустой итог при реально пустой сдаче
- * (нет ветки и пустой changedFiles) — прежний success:true note no_changed_files.
+ * «зелёный», а код не доехал до main. ИСКЛЮЧЕНИЕ: если содержимое tip ветки уже
+ * дословно в HEAD (повторный прогон после успешной интеграции / ручного вливания) —
+ * это success note already_integrated_content, и доставка выполняется как обычно.
+ * Пустой итог при реально пустой сдаче (нет ветки и пустой changedFiles) —
+ * прежний success:true note no_changed_files.
+ *
+ * TASK-AUTODEPLOY-K3S-001: после успешной интеграции файлы дельты сопоставляются
+ * с картой доставки репозитория (deploy/autodeploy.json) — совпавшие цели
+ * пересобираются, пушатся в registry и раскатываются в k3s (см. autodeploy.js).
+ * Провал доставки = провал роли (note autodeploy_failed): «код в main, а прод
+ * старый» перестал быть тихим состоянием.
  */
 export async function runGitAction(task, opts = {}) {
   const repoRoot = opts.repoRoot ?? process.cwd();
@@ -365,10 +380,50 @@ export async function runGitAction(task, opts = {}) {
     return { success: false, output: { error: res.error, note: res.note ?? 'integration_failed', ...(res.extra ?? {}) } };
   }
 
-  // Пустой итог: заявленные изменения не доехали — провал; иначе тихий success.
+  // TASK-AUTODEPLOY-K3S-001: доставка дельты до прода по карте репозитория
+  // (deploy/autodeploy.json; нет карты/совпадений → no-op). Общая для свежей
+  // интеграции и подтверждённого повтора (already_integrated_content), чтобы
+  // ретрай упавшей доставки был обычным повторным прогоном роли.
+  const autodeploy = opts.autodeploy ?? runAutodeploy;
+  const deployAndFinish = async (payload, deployFiles) => {
+    const deploy = await autodeploy(repoRoot, deployFiles, { log: opts.deployLog ?? (() => {}) })
+      .catch((error) => ({ attempted: true, ok: false, targets: [], error: String(error?.message ?? error).slice(0, 700) }));
+    if (deploy.attempted && !deploy.ok) {
+      // Интеграция состоялась, но прод не обновился — честный провал с диагностикой
+      // (BLOCKED). Повторный прогон роли доинтегрирует ничего (контент уже в main)
+      // и повторит только доставку.
+      return { success: false, output: { ...payload, note: 'autodeploy_failed', deploy } };
+    }
+    return { success: true, output: { ...payload, ...(deploy.attempted ? { deploy } : {}) } };
+  };
+
+  // Пустой итог: если содержимое tip уже в HEAD (повторный прогон после успешной
+  // интеграции — например, ретрай упавшей доставки или ручное вливание) — это
+  // успех already_integrated_content, и доставка всё равно выполняется. Иначе
+  // заявленные изменения не доехали — провал; при пустой сдаче — тихий success.
   if (!res.integrated) {
     const note = res.note ?? 'no_changed_files';
     if (declaredChanges) {
+      const verifyPaths = (res.affectedFiles?.length ? res.affectedFiles : files).filter(Boolean);
+      const contentPresent = res.tip
+        ? await git(repoRoot, ['diff', '--quiet', res.tip, 'HEAD', '--', ...(verifyPaths.length ? verifyPaths : ['.'])])
+          .then(() => true).catch(() => false)
+        : false;
+      if (contentPresent) {
+        // Дубль дельты в autostash больше не нужен: содержимое подтверждено в main.
+        if (res.extra?.autostash) await git(repoRoot, ['stash', 'drop']).catch(() => {});
+        const push = await pushHead(repoRoot);
+        return deployAndFinish({
+          commit: null,
+          files: verifyPaths,
+          note: 'already_integrated_content',
+          reason: note,
+          worktreeBranch,
+          deliveredCommit,
+          pushed: push.pushed,
+          pushError: push.pushError,
+        }, verifyPaths);
+      }
       return {
         success: false,
         output: {
@@ -386,16 +441,13 @@ export async function runGitAction(task, opts = {}) {
   }
 
   const push = await pushHead(repoRoot);
-  return {
-    success: true,
-    output: {
-      commit: res.commit,
-      branch: res.branch,
-      files: res.files,
-      ...(res.mergedFrom ? { mergedFrom: res.mergedFrom, deliveredCommit: res.deliveredCommit } : {}),
-      pushed: push.pushed,
-      pushError: push.pushError,
-      repoInitialized: repo.created,
-    },
-  };
+  return deployAndFinish({
+    commit: res.commit,
+    branch: res.branch,
+    files: res.files,
+    ...(res.mergedFrom ? { mergedFrom: res.mergedFrom, deliveredCommit: res.deliveredCommit } : {}),
+    pushed: push.pushed,
+    pushError: push.pushError,
+    repoInitialized: repo.created,
+  }, res.files);
 }
