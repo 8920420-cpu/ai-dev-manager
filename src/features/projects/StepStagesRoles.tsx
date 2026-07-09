@@ -5,12 +5,18 @@ import { isScannerRole } from '../../data/presets';
 import { TASK_STATUSES } from '../../data/taskStatuses';
 import type { StageSaveErrorItem } from '../../api/projectsApi';
 import type { Role, Stage } from '../../types/project';
+import { RouteHealthPanel } from './RouteHealthPanel';
 import { StageRow } from './StageRow';
 import styles from './StepStagesRoles.module.css';
 
 interface StepStagesRolesProps {
   stages: Stage[];
   roles: Role[];
+  /**
+   * Идентификатор сохранённого проекта. Задан — показываем панель health-check
+   * маршрута; для нового несохранённого проекта проп отсутствует и панель скрыта.
+   */
+  projectId?: string;
   /** Ошибки названий этапов по id этапа. */
   stageErrors: Record<string, string>;
   /** Ошибки обязательной папки Scanner по id этапа. */
@@ -41,6 +47,7 @@ interface StepStagesRolesProps {
 export function StepStagesRoles({
   stages,
   roles,
+  projectId,
   stageErrors,
   scanErrors,
   statusErrors,
@@ -198,6 +205,8 @@ export function StepStagesRoles({
           Добавить этап
         </Button>
       </section>
+
+      {projectId && <RouteHealthPanel projectId={projectId} />}
 
       <ConfirmDialog
         open={confirmDefaults}

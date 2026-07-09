@@ -212,6 +212,36 @@ export function asStageSaveError(err: unknown): StageSaveError | null {
   return null;
 }
 
+// --- Health-check маршрута проекта (route-health) --------------------------
+
+/**
+ * Одна проблема целостности маршрута проекта.
+ * Контракт бэка: GET /api/projects/:projectId/route-health.
+ * Известные коды `code`:
+ *  - 'role_without_executor'     — роль этапа не входит ни в reasoning-роли,
+ *    ни в HOST_ROLES, ни в auto-переходы ROLE_FLOW — этап зависнет;
+ *  - 'stage_missing_status'      — этап kind=stage с пустым task_status;
+ *  - 'host_role_llm_connector'   — host-роли назначен LLM/reasoning-коннектор;
+ *  - 'reasoning_role_no_connector' — reasoning-роль без включённого коннектора;
+ *  - 'fork_join_unpaired'        — непарная FORK_GATE/JOIN_GATE graph-нода.
+ */
+export interface RouteHealthProblem {
+  code: string;
+  severity: 'error' | 'warning';
+  stageId: string | null;
+  stageName: string | null;
+  roleCode: string | null;
+  message: string;
+  recommendation: string;
+}
+
+/** Структурированный отчёт health-check маршрута проекта. */
+export interface RouteHealthReport {
+  projectId: string;
+  problems: RouteHealthProblem[];
+  summary: { error: number; warning: number; total: number; ok: boolean };
+}
+
 export const projectsApi = {
   async list(signal?: AbortSignal): Promise<Project[]> {
     // Опции передаём только при наличии signal — иначе вызов остаётся
@@ -286,5 +316,12 @@ export const projectsApi = {
   async remove(id: string): Promise<void> {
     await http.del(`/api/projects/${encodeURIComponent(id)}`);
     emitProjectsChanged();
+  },
+
+  /** Health-check маршрута проекта: структурированный отчёт о тупиках маршрута. */
+  async getRouteHealth(id: string): Promise<RouteHealthReport> {
+    return http.get<RouteHealthReport>(
+      `/api/projects/${encodeURIComponent(id)}/route-health`,
+    );
   },
 };
