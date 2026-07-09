@@ -173,6 +173,80 @@ Backend реализован (FEEDBACK-WIDGET-001):
 
 ---
 
+## Performance Monitor
+
+### `GET /api/performance/daily-models`
+
+Daily `agent_runs` statistics grouped as `day -> models/totals` for the
+Performance Monitor. Query parameters:
+
+- `windowDays` — optional positive integer; default `7`, maximum `365`.
+- `projectId` — optional project selector accepted by backend project
+  resolution.
+
+The response shape is:
+
+```json
+{
+  "generatedAt": "2026-07-09T00:00:00.000Z",
+  "projectId": "uuid-or-null",
+  "windowDays": 7,
+  "days": [
+    {
+      "day": "2026-07-09",
+      "totals": {
+        "runs": 2,
+        "success": 1,
+        "failed": 0,
+        "returns": 0,
+        "timeout": 1,
+        "throttle": 0,
+        "running": 0,
+        "tokensIn": 100,
+        "tokensOut": 20,
+        "cost": 0.001,
+        "successRate": 0.5,
+        "models": 2
+      },
+      "models": [
+        {
+          "connectorId": "uuid-or-null",
+          "provider": "openai",
+          "model": "gpt-5",
+          "driverType": "api",
+          "roleCode": "PROGRAMMER",
+          "roleName": "Programmer",
+          "runs": 1,
+          "success": 1,
+          "failed": 0,
+          "returns": 0,
+          "timeout": 0,
+          "throttle": 0,
+          "running": 0,
+          "successRate": 1,
+          "avgDurationMs": 1200,
+          "medianDurationMs": 1200,
+          "tokensIn": 100,
+          "tokensOut": 20,
+          "avgTokens": 120,
+          "cost": 0.001,
+          "avgCost": 0.001
+        }
+      ]
+    }
+  ]
+}
+```
+
+Model identity is not inferred from the role name. The backend groups by the
+actual connector snapshot persisted in `agent_runs.snapshot_connector_id`,
+`snapshot_provider`, `snapshot_model`, and `snapshot_driver_type`, plus role
+code/name. Calendar days are UTC (`YYYY-MM-DD`). `failed` excludes service
+release outcomes, which are counted in `returns`; `throttle` is classified from
+`agent_runs.outcome`.
+
+---
+
 ## tester-service (HTTP, по умолчанию :4187)
 
 ### `GET /health`

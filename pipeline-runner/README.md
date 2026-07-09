@@ -96,6 +96,8 @@ cat claim.json | pipeline-runner --task - --projects-root /abs/projects/root
   `{ taskId, roleCode:"PIPELINE_SERVICE", success, output:{ summary, failedStage,
   startedAt, logPath } }`. `summary` содержит `projectId`, `serviceId`, имя
   сервиса и `actions[]` (status, exitCode, durationMs, безопасный фрагмент лога).
+  При `success:false` в `output.summary.error` возвращаются `code`, `message` и
+  `logTail`; `logTail` — безопасно усечённый хвост stdout/stderr упавшей команды.
 
 Как библиотека:
 

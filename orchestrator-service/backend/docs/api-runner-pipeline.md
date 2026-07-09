@@ -75,6 +75,12 @@ PIPELINE-NON-AI-EXECUTOR-001 (ORCHESTRATOR-P1.3). `PIPELINE_SERVICE` — host/
 }
 ```
 
+При провале `PIPELINE_SERVICE` runner возвращает `success:false`,
+`output.failedStage`, `output.startedAt`, `output.logPath` и
+`output.summary.error` с `code`, `message`, `logTail`. `logTail` — безопасно
+усечённый хвост stdout/stderr упавшей команды; `logPath` остаётся путём на хосте
+и не требуется для чтения причины провала оркестратором, UI или Failure Analyst.
+
 Переход (детерминированный, без интерпретации моделью):
 
 - `success: true` → статус `COMMIT`, следующая роль `DOCUMENTATION_AUDITOR`

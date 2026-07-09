@@ -26,8 +26,11 @@
 
 **Важно (типичная причина «задачи застряли»):** роли `PIPELINE_SERVICE`/`GIT_INTEGRATOR`
 **не** исполняются внутри контейнера — им нужны docker/git. Если host-runner не запущен,
-задачи бессрочно стоят в статусе `TESTING` (этап «Пайплайн и тесты» / в UI — «Тестировщик»)
-и `COMMIT`. Лечится запуском host-runner (раздел 3).
+незахваченные задачи без `assigned_agent_id` стоят в статусе `TESTING` (этап «Пайплайн и тесты» /
+в UI — «Тестировщик») и `COMMIT`. Лечится запуском host-runner (раздел 3). Если задача уже
+была захвачена через `GET /api/runner/next-host-task` и host-runner умер до
+`POST /api/runner/host-task-completed` или `POST /api/runner/release-host-task`, оркестратор
+вернёт её в пул по `RUNNER_HOST_TIMEOUT_MS`.
 
 Роль `TESTER` существует в каталоге ролей, но **не подключена ни к одному исполнителю**
 (нет в `LLM_ROLE_CODES`, нет в `HOST_ROLES`). Если завести этап с ролью `TESTER`, задачи
@@ -48,9 +51,19 @@
   `TASK_BLOCKED` (`reason='run_budget_exhausted'`). Действие: разобрать причину (лог
   прогонов этапа, бюджет времени роли) и запустить вручную — переместить задачу на
   нужный этап (`POST /api/tasks/:id/move`).
+- `PROGRAMMER-RELEASE-BACKOFF-001`: после неудачного release PROGRAMMER-прогона
+  повторный claim той же `CODING`-задачи задерживается по backoff. Дефолтное расписание
+  `30s → 2m → 10m` задаётся `PROGRAMMER_RELEASE_BACKOFF_MS_SCHEDULE`. После
+  `PROGRAMMER_RELEASE_LOOP_MAX` (дефолт 5) подряд `FAILED`/`TIMEOUT` PROGRAMMER-прогонов
+  после последнего `SUCCESS` задача без `assigned_agent_id` уходит в `BLOCKED`; событие
+  `STATUS_CHANGED` содержит `reason='programmer_release_loop'` и `failedRuns`.
 Найти такие задачи: `SELECT id,title,data_card->'auto_run_limit' AS run_cap,
 data_card->'architect_budget_block' AS arch_budget FROM tasks WHERE status='BLOCKED'
 AND (data_card ? 'auto_run_limit' OR data_card ? 'architect_budget_block');`
+Для PROGRAMMER release-loop причина хранится в событии: `SELECT t.id,t.title,e.payload_json
+FROM tasks t JOIN task_events e ON e.task_id=t.id WHERE t.status='BLOCKED'
+AND e.event_type='STATUS_CHANGED' AND e.payload_json->>'reason'='programmer_release_loop'
+ORDER BY e.created_at DESC;`
 
 ---
 
@@ -98,6 +111,14 @@ node host-runner/bin/host-runner.js
 `...?role=GIT_INTEGRATOR`; на `PIPELINE_SERVICE` запускает реальный прогон через
 `pipeline-runner`, на `GIT_INTEGRATOR` — интеграция сдачи программиста в `main`; результат
 сдаёт через `POST /api/runner/host-task-completed`.
+
+Если host-runner умирает после захвата host-задачи и не успевает вызвать
+`POST /api/runner/host-task-completed` или `POST /api/runner/release-host-task`, зависший
+`agent_run` по ролям `PIPELINE_SERVICE`/`GIT_INTEGRATOR` переводится в `TIMEOUT` после
+`RUNNER_HOST_TIMEOUT_MS` (дефолт 40 минут), у задачи очищается `assigned_agent_id` без смены
+её статуса, и следующий host claim может взять её снова. В `task_events` пишется
+`STATUS_CHANGED` с тем же `from_status`/`to_status` и payload `reason=host_orphan_timeout`,
+`roleCode`, `hungMs`, `runStatus=TIMEOUT`.
 
 Поведение `GIT_INTEGRATOR` (`host-runner/src/actions.js`, `runGitAction`):
 - Если в контексте задачи задан `worktreeBranch` (программист сдал дельту коммитом в ветке
@@ -158,6 +179,11 @@ node scanner-service/bin/scanner-service.js
    `GET /api/runner/next-claude-task`
    → `{ task: { id, project, service, title, description, priorRoleOutputs, lastReview } }`
    (или `{ task: null }`, если очередь пуста). Назначает задачу агенту `claude_programmer`.
+   Если та же задача ранее была освобождена неуспешным PROGRAMMER-прогоном, claim
+   применяет cooldown по числу подряд идущих `FAILED`/`TIMEOUT` после последнего
+   `SUCCESS`: по умолчанию `30s → 2m → 10m` с потолком на последнем значении
+   (`PROGRAMMER_RELEASE_BACKOFF_MS_SCHEDULE`). Приоритет очереди и сериализация
+   worktree по сервису сохраняются.
 
 2. **Выполнить** реализацию в репозитории, прогнать тесты.
 
@@ -198,6 +224,11 @@ node scanner-service/bin/scanner-service.js
    Ревьюер отклоняет, если нет `result` и `changedFiles` — отчёт обязателен.
 
 4. **Откатить захват** (если не смог сделать): `POST /api/runner/release-claude-task` `{ "taskId": "..." }`.
+   Эндпоинт освобождает задачу и финализирует последний `RUNNING` PROGRAMMER `agent_run`:
+   как `FAILED` для обычного release либо как `TIMEOUT`, если `reason=agent_timeout`.
+   Эти `FAILED`/`TIMEOUT` после последнего `SUCCESS` используются для cooldown и счётчика
+   подряд идущих провалов; при достижении `PROGRAMMER_RELEASE_LOOP_MAX` задача блокируется
+   с `reason='programmer_release_loop'`.
 
 ### 5.2. Host-роли (обычно дёргает host-runner, не ИИ напрямую)
 
@@ -266,8 +297,12 @@ node scanner-service/bin/scanner-service.js
 2. Распределение задач по ролям (SQL из раздела 2) — на какой роли затык?
 3. Затык на `CODING`/`PROGRAMMER` → нужен ИИ-агент (раздел 5.1) либо задача уже назначена
    (`assigned_agent_id` ≠ null) и ждёт фидер.
-4. Затык на `TESTING`/`PIPELINE_SERVICE` или `COMMIT`/`GIT_INTEGRATOR` → **не запущен host-runner**
-   (раздел 3). Проверь процессы: должен быть `node host-runner/bin/host-runner.js`.
+4. Затык на `TESTING`/`PIPELINE_SERVICE` или `COMMIT`/`GIT_INTEGRATOR` без `assigned_agent_id` →
+   **не запущен host-runner** (раздел 3). Проверь процессы: должен быть
+   `node host-runner/bin/host-runner.js`. Если `assigned_agent_id` есть и последний
+   `agent_run` остался `RUNNING`, это уже захваченная host-задача: после
+   `RUNNER_HOST_TIMEOUT_MS` оркестратор переведёт прогон в `TIMEOUT`, очистит назначение и
+   запишет `task_events` с `reason=host_orphan_timeout`.
 5. Затык на роли без исполнителя (напр. `TESTER`) → ошибка конфигурации этапов: перенастрой этап
    на поддерживаемую роль.
 6. Активный агент роли есть? `SELECT a.code,a.provider,a.is_active FROM agents a JOIN roles r ON r.id=a.role_id WHERE r.code='<РОЛЬ>';`

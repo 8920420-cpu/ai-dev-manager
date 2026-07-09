@@ -195,6 +195,13 @@ CHECK `task_id <> depends_on_task_id`.
 | error_text | text |
 | token_input / token_output | bigint |
 | cost | numeric(14,6) |
+| snapshot_connector_id | uuid → connectors ON DELETE SET NULL |
+| snapshot_provider | text |
+| snapshot_model | text |
+| snapshot_driver_type | text |
+
+`snapshot_*` fields store the connector/provider/model/driver snapshot used for
+the run. Existing historical rows can keep `NULL` values in these fields.
 
 ### service_locks
 Блокировки сервисов. Частичный уникальный индекс
@@ -285,7 +292,9 @@ UPDATE/DELETE. `snapshot_json` хранит полный контекст (до�
 `tasks(status, priority, created_at)` (TASK-PRIORITY-SCALE-001, миграция 0047:
 priority — SMALLINT 0..3, меньше = важнее; 0 зарезервирован за проектом
 оркестратора; сортировка priority ASC, затем created_at ASC — FIFO внутри приоритета);
-`agent_runs(agent_id|task_id|status)`; `pipeline_runs(task_id)`;
+`agent_runs(agent_id|task_id|status)`; `idx_agent_runs_day_provider_model`
+(`date_trunc('day', started_at AT TIME ZONE 'UTC')`, `snapshot_provider`,
+`snapshot_model`); `pipeline_runs(task_id)`;
 `pipeline_stages(pipeline_run_id)`; `service_locks(service_id|task_id)`;
 `task_events(task_id|created_at)`; `task_dependencies(task_id|depends_on)`;
 `reviews(task_id)`; `deployments(task_id|service_id)`; `artifacts(task_id)`;

@@ -415,3 +415,35 @@ FAILED, TASK_INTAKE_OFFICER ~48 TIMEOUT).
 приводит к потере результата прогона и не оставляет задачу в зависшем `RUNNING`;
 повторная финализация идемпотентна. Новых env, эндпоинтов и изменений схемы БД
 не вводится.
+
+---
+
+## ADR-017 — Cooldown и предохранитель PROGRAMMER release-loop — PROGRAMMER-RELEASE-BACKOFF-001
+
+**Дата:** 2026-07-09
+**Решение:** повторный claim одной и той же `CODING`-задачи роли `PROGRAMMER` после
+неудачного release задерживается на стороне оркестратора в `claimNextClaudeTaskTx`
+(`orchestrator-service/backend/src/db.js`). Cooldown считается по числу подряд идущих
+PROGRAMMER-прогонов со статусом `FAILED`/`TIMEOUT` после последнего `SUCCESS` этой
+задачи. Дефолтное расписание задержек: `[30000,120000,600000]` мс (`30s → 2m → 10m`),
+с потолком на последнем значении; переопределяется через
+`PROGRAMMER_RELEASE_BACKOFF_MS_SCHEDULE`.
+
+`POST /api/runner/release-claude-task` финализирует последний `RUNNING` PROGRAMMER
+`agent_run`: обычный release пишет `FAILED`, `reason=agent_timeout` пишет `TIMEOUT`.
+Успешная сдача сбрасывает счётчик не отдельным полем, а окном подсчёта: учитываются
+только `FAILED`/`TIMEOUT` после последнего `SUCCESS`.
+
+Предохранитель `escalateProgrammerReleaseLoop` переводит `CODING`-задачу без
+`assigned_agent_id` в `BLOCKED` после `PROGRAMMER_RELEASE_LOOP_MAX` подряд таких
+провалов; дефолт порога — `5`. Событие `STATUS_CHANGED` содержит
+`reason='programmer_release_loop'` и `failedRuns`.
+**Причина:** инцидент 2026-07-03: задача PRINT-054 за два часа дала 1407 коротких
+провальных PROGRAMMER-прогонов подряд; при одном активном программисте это полностью
+заблокировало стадию `CODING` для остальных задач.
+**Последствия:** одиночные инфраструктурные падения больше не приводят к немедленному
+повторному захвату той же задачи, а длинная петля останавливается вручную разбираемым
+`BLOCKED`. Выбран `BLOCKED`, а не `FAILURE_ANALYSIS`, потому что при таких провалах нет
+результата пайплайна для анализа, и переход через `FAILURE_ANALYSIS` может вернуть
+задачу обратно в `CODING`. Приоритетная очередь PROGRAMMER, worktree-сериализация по
+сервису, `releaseStaleClaudeClaims`, `reapOrphanRunningRuns` и clock-guard не меняются.
