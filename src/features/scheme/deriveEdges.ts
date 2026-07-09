@@ -2,11 +2,24 @@
  * FORK-JOIN-001 — авто-вывод рёбер блок-схемы из упорядоченного списка узлов.
  *
  * Рёбра НЕ рисуются вручную: топология выводится из порядка узлов + маркеров
- * fork/join. Узел fork и идущие за ним этапы-ветки до ближайшего join образуют
- * параллельные ветки; на каждой ветке — один этап (MVP). Если узлов fork/join
- * нет — рёбра не генерируются (схема остаётся линейной, маршрут по позиции).
+ * fork/join. Узел fork и идущие за ним этапы до ближайшего join образуют
+ * параллельные ветки. Узлы одного «семейства ролей» (напр. документационная
+ * ветка Auditor → Keeper) сворачиваются в ОДНУ последовательную ветку-цепочку,
+ * а не в отдельные параллельные колонки; остальные узлы — по ветке на каждый.
+ * Если узлов fork/join нет — рёбра не генерируются (схема остаётся линейной,
+ * маршрут по позиции).
  */
-import type { SchemeEdge, Stage } from '../../types/project';
+import type { Role, SchemeEdge, Stage } from '../../types/project';
+import { roleCanonicalCode } from '../../data/presets';
+
+/**
+ * Документационная ветка: Documentation Auditor → Documentation Keeper идут
+ * последовательно (Keeper потребляет вывод Auditor), а не параллельно. Источник
+ * истины о составе ветки — backend (db.js `advanceStuckDocumentationBranches`,
+ * `DOC_ROLES`); держим согласованным по каноническим кодам ролей.
+ */
+const DOCUMENTATION_BRANCH_ROLE_CODES = new Set(['DOCUMENTATION_AUDITOR', 'DOCUMENTATION_KEEPER']);
+const DOCUMENTATION_BRANCH_FAMILY = 'DOCUMENTATION';
 
 function newKey(): string {
   const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
@@ -27,13 +40,58 @@ export interface DerivedScheme {
 }
 
 /**
+ * Семейство ветки узла: узлы одного семейства сворачиваются в одну
+ * последовательную ветку-цепочку. null — узел не относится к семейству (каждый
+ * такой узел остаётся отдельной параллельной веткой). Семейство определяется по
+ * КАНОНИЧЕСКОМУ коду роли (не по названию) через переданный справочник ролей;
+ * без ролей семейства нет — узел остаётся своей веткой.
+ */
+function branchFamilyOf(stage: Stage, codeByRoleId: Map<string, string>): string | null {
+  for (const roleId of stage.roleIds) {
+    const code = codeByRoleId.get(roleId);
+    if (code && DOCUMENTATION_BRANCH_ROLE_CODES.has(code)) return DOCUMENTATION_BRANCH_FAMILY;
+  }
+  return null;
+}
+
+/**
+ * Сгруппировать узлы-ветки между fork и join в цепочки: узлы одного семейства
+ * попадают в одну цепочку (в порядке появления), узлы без семейства — каждый в
+ * свою одноузловую цепочку. Порядок цепочек стабилен (по первому узлу семейства).
+ */
+function groupBranchChains(branches: Stage[], codeByRoleId: Map<string, string>): Stage[][] {
+  const chains: Stage[][] = [];
+  const chainByFamily = new Map<string, Stage[]>();
+  for (const b of branches) {
+    const family = branchFamilyOf(b, codeByRoleId);
+    const existing = family !== null ? chainByFamily.get(family) : undefined;
+    if (existing) {
+      existing.push(b);
+    } else {
+      const chain = [b];
+      chains.push(chain);
+      if (family !== null) chainByFamily.set(family, chain);
+    }
+  }
+  return chains;
+}
+
+/**
  * Вывести рёбра из узлов. Возвращает копию узлов (с проставленными stageKey и
  * joinKey на fork) и список рёбер. Для схемы без управляющих узлов edges = [].
+ * `roles` — справочник ролей проекта: нужен, чтобы по коду роли определить узлы
+ * одного семейства (напр. документационную ветку Auditor → Keeper).
  */
-export function deriveSchemeEdges(stages: Stage[]): DerivedScheme {
+export function deriveSchemeEdges(stages: Stage[], roles: Role[] = []): DerivedScheme {
   const withKeys: Stage[] = stages.map((s) => ({ ...s, stageKey: s.stageKey ?? newKey() }));
   const hasControl = withKeys.some((s) => (s.kind ?? 'stage') !== 'stage');
   if (!hasControl) return { stages: withKeys, edges: [] };
+
+  const codeByRoleId = new Map<string, string>();
+  for (const r of roles) {
+    const code = roleCanonicalCode(r);
+    if (code) codeByRoleId.set(r.id, code);
+  }
 
   const edges: SchemeEdge[] = [];
   let pos = 0;
@@ -66,9 +124,15 @@ export function deriveSchemeEdges(stages: Stage[]): DerivedScheme {
       if (prev) addEdge(prev, key);
       if (join && branches.length) {
         node.joinKey = join.stageKey;
-        for (const b of branches) {
-          addEdge(key, b.stageKey!);
-          addEdge(b.stageKey!, join.stageKey!);
+        // Узлы одного семейства (напр. Auditor → Keeper) — одна последовательная
+        // ветка-цепочка: F → голова → … → хвост → join. Прочие — по ветке на узел.
+        const chains = groupBranchChains(branches, codeByRoleId);
+        for (const chain of chains) {
+          addEdge(key, chain[0]!.stageKey!);
+          for (let k = 0; k < chain.length - 1; k += 1) {
+            addEdge(chain[k]!.stageKey!, chain[k + 1]!.stageKey!);
+          }
+          addEdge(chain[chain.length - 1]!.stageKey!, join.stageKey!);
         }
         prev = join.stageKey!;
         i = j + 1;

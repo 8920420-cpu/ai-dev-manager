@@ -203,6 +203,39 @@ export function SchemeFlowchart({
     </div>
   );
 
+  // Исходы проверки Task Reviewer вынесены ЗА карточку: две стрелки-ответвления с
+  // подписями. «Ошибка → Programmer» — боковое ответвление с загибом (CornerDownLeft,
+  // красный); «Успех → Pipeline Service» — совмещён с обычным коннектором вниз к
+  // следующему этапу (ArrowDown, зелёный). Список исходов сохраняет aria-разметку.
+  const reviewOutcomes = (
+    <div
+      className={styles.reviewOutcomes}
+      role="list"
+      aria-label="Исходы проверки Task Reviewer"
+    >
+      <span
+        className={cn(styles.reviewOutcome, styles.reviewOutcomeError)}
+        role="listitem"
+      >
+        <CornerDownLeft className={styles.reviewOutcomeIcon} size={16} aria-hidden="true" />
+        <span className={styles.reviewOutcomeText}>
+          <span className={styles.reviewOutcomeLabel}>Ошибка</span>
+          <span className={styles.reviewOutcomeTarget}>Programmer</span>
+        </span>
+      </span>
+      <span
+        className={cn(styles.reviewOutcome, styles.reviewOutcomeSuccess)}
+        role="listitem"
+      >
+        <ArrowDown className={styles.reviewOutcomeIcon} size={16} aria-hidden="true" />
+        <span className={styles.reviewOutcomeText}>
+          <span className={styles.reviewOutcomeLabel}>Успех</span>
+          <span className={styles.reviewOutcomeTarget}>Pipeline Service</span>
+        </span>
+      </span>
+    </div>
+  );
+
   // Карточка одного узла-этапа. Вынесена из рендера, чтобы переиспользовать её и
   // в линейной цепочке, и внутри колонок параллельных веток.
   const renderCard = (stage: Stage, index: number) => {
@@ -210,7 +243,6 @@ export function SchemeFlowchart({
     const kind = stage.kind ?? 'stage';
     const control = kind !== 'stage';
     const role = roles.find((r) => r.id === stage.roleIds[0]);
-    const taskReviewer = role?.code === 'TASK_REVIEWER';
     const scanner = !control && role ? isScannerRole(role) : false;
     const hasError = Boolean(
       stageErrors[stage.id] || scanErrors[stage.id] || statusErrors[stage.id],
@@ -370,28 +402,6 @@ export function SchemeFlowchart({
                 {runningCount}
               </span>
             </div>
-
-            {taskReviewer && (
-              <div
-                className={styles.reviewRoutes}
-                role="list"
-                aria-label="Исходы проверки Task Reviewer"
-              >
-                <span
-                  className={cn(styles.reviewRoute, styles.reviewRouteSuccess)}
-                  role="listitem"
-                >
-                  <ArrowDown size={14} aria-hidden="true" />
-                  <span>Успех</span>
-                  <span className={styles.reviewTarget}>Pipeline Service</span>
-                </span>
-                <span className={cn(styles.reviewRoute, styles.reviewRouteError)} role="listitem">
-                  <CornerDownLeft size={14} aria-hidden="true" />
-                  <span>Ошибка</span>
-                  <span className={styles.reviewTarget}>Programmer</span>
-                </span>
-              </div>
-            )}
           </div>
         )}
       </div>
@@ -529,10 +539,13 @@ export function SchemeFlowchart({
           const { item } = unit;
           if (item.type === 'node') {
             const { stage, index } = item.node;
+            // Task Reviewer: исходы проверки выносим ЗА карточку — вместо обычного
+            // коннектора рисуем ветвление «Успех → Pipeline Service / Ошибка → Programmer».
+            const isReviewer = roleCodeOfStage(stage) === 'TASK_REVIEWER';
             return (
               <li key={stage.id} className={styles.nodeWrap}>
                 {renderCard(stage, index)}
-                {connector}
+                {isReviewer ? reviewOutcomes : connector}
               </li>
             );
           }
@@ -564,6 +577,14 @@ export function SchemeFlowchart({
             </li>
           );
         })}
+
+        {/* Терминальный узел «Выполнено» — симметричен «Старту»: декоративная
+            пилюля с точкой-индикатором в тоне success. Трейлинг-стрелка
+            последнего этапа/join естественно ведёт в него. */}
+        <li className={styles.finishNode} aria-hidden="true">
+          <span className={styles.finishDot} />
+          Выполнено
+        </li>
 
         <li className={styles.addNodeWrap}>
           <button type="button" className={styles.addNode} onClick={onAddStage}>

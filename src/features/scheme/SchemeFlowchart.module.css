@@ -135,16 +135,41 @@
   background: var(--success);
 }
 
+/* Терминальный узел «Выполнено» — симметричен .startNode, но в тоне success. */
+.finishNode {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-4);
+  border-radius: var(--radius-full);
+  background: var(--success-soft);
+  border: 1px solid var(--success);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--success-text);
+}
+
+.finishDot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  background: var(--success);
+}
+
 .connector {
   display: flex;
   align-items: center;
   justify-content: center;
-  height: var(--space-6);
+  /* Высота отрезка между карточками: даёт видимый кусок линии над и под
+     стрелкой (иконка 16px по центру). ≤48px, чтобы схема не растягивалась. */
+  height: var(--space-10);
   color: var(--border-strong);
   position: relative;
 }
 
-/* Линия по центру стрелки. */
+/* Линия по центру стрелки: тянется на всю высоту коннектора (top/bottom:0). */
 .connector::before {
   content: '';
   position: absolute;
@@ -154,9 +179,19 @@
   background: var(--border);
 }
 
+/* Иконка на фоне окружения — плашка маскирует линию под стрелкой, чтобы
+   линия не перечёркивала её. По умолчанию фон схемы var(--bg) (линейная
+   цепочка и колонки параллельных веток лежат поверх него). */
 .connector > svg {
   position: relative;
   background: var(--bg);
+}
+
+/* Внутри группы «Тесты и анализ сбоя» фон другой (var(--surface-2)) —
+   подгоняем плашку под иконкой, иначе под стрелкой видна чужеродная
+   плашка цвета var(--bg). */
+.groupBlock .connector > svg {
+  background: var(--surface-2);
 }
 
 .nodeWrap {
@@ -171,7 +206,7 @@
    на hover — лёгкий «подъём». */
 .node {
   width: 100%;
-  max-width: 420px;
+  max-width: 310px;
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
@@ -444,43 +479,76 @@
   color: var(--success-text, var(--primary));
 }
 
-.reviewRoutes {
-  display: inline-flex;
+/* ---- Исходы проверки Task Reviewer (ветвление ЗА карточкой) ---- */
+/* Две стрелки-ответвления под карточкой Task Reviewer: «Ошибка» уводит вбок к
+   Programmer (красный), «Успех» продолжает ось вниз к Pipeline Service (зелёный,
+   совмещён с обычным коннектором). Все цвета — токены темы (работают в тёмной). */
+.reviewOutcomes {
+  position: relative;
+  display: flex;
   flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-1);
+  align-items: stretch;
+  justify-content: center;
+  gap: var(--space-4);
+  width: 100%;
+  max-width: 310px;
+  padding: var(--space-4) 0 var(--space-3);
 }
 
-.reviewRoute {
+/* Ось вниз к следующему этапу (Pipeline Service) — как у обычного коннектора. */
+.reviewOutcomes::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 50%;
+  height: var(--space-4);
+  width: 2px;
+  background: var(--border);
+}
+
+.reviewOutcome {
+  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: var(--space-1);
-  min-height: 24px;
-  padding: 2px var(--space-2);
-  border-radius: var(--radius-full);
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-lg);
   border: 1px solid var(--border);
-  background: var(--surface-2);
+  background: var(--surface);
   color: var(--text-secondary);
-  font-size: var(--text-xs);
-  font-weight: var(--weight-medium);
+}
+
+.reviewOutcomeIcon {
+  flex: none;
+}
+
+.reviewOutcomeText {
+  display: inline-flex;
+  flex-direction: column;
   line-height: var(--leading-tight);
 }
 
-.reviewRouteSuccess {
+.reviewOutcomeLabel {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+}
+
+.reviewOutcomeTarget {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+  opacity: 0.85;
+}
+
+.reviewOutcomeSuccess {
   border-color: var(--success);
   background: var(--success-soft);
   color: var(--success-text);
 }
 
-.reviewRouteError {
+.reviewOutcomeError {
   border-color: var(--danger);
   background: var(--danger-soft);
   color: var(--danger);
-}
-
-.reviewTarget {
-  font-weight: var(--weight-semibold);
-  color: inherit;
 }
 
 /* Роль в шапке карточки: сжимается с многоточием, чтобы шапка всегда была одной строкой. */
@@ -544,7 +612,7 @@
 .groupBlock {
   position: relative;
   width: 100%;
-  max-width: 420px;
+  max-width: 310px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -593,8 +661,8 @@
    многоузловой соседки (Documentation Auditor → Documentation Keeper). */
 .branch {
   flex: 1 1 0;
-  min-width: 240px;
-  max-width: 420px;
+  min-width: 270px;
+  max-width: 310px;
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -619,11 +687,14 @@
   display: flex;
   justify-content: center;
   width: 100%;
+  /* Между финальным узлом «Выполнено» и кнопкой нет коннектора —
+     явный отступ, чтобы кнопка не сливалась с терминальным узлом. */
+  margin-top: var(--space-6);
 }
 
 .addNode {
   width: 100%;
-  max-width: 420px;
+  max-width: 310px;
   display: inline-flex;
   align-items: center;
   justify-content: center;

@@ -85,8 +85,14 @@ export function DevelopmentSchemePage() {
         developmentSchemeApi.get(),
         developmentSchemeApi.getRuntime(),
       ]);
-      dispatch({ type: 'reset', state: toWizardState(scheme) });
-      setEdges(scheme.edges);
+      // FORK-JOIN-001: рёбра для ОТОБРАЖЕНИЯ выводим из узлов + ролей теми же
+      // правилами, что и при сохранении (deriveSchemeEdges) — единый источник рёбер.
+      // Иначе уже сохранённая схема со старыми рёбрами (Documentation Auditor и
+      // Keeper как параллельные ветки) рисовалась бы неверно до повторного
+      // сохранения. Группировка документационной ветки Auditor → Keeper видна сразу.
+      const derived = deriveSchemeEdges(scheme.stages, scheme.roles);
+      dispatch({ type: 'reset', state: toWizardState({ ...scheme, stages: derived.stages }) });
+      setEdges(derived.edges);
       setOrchestratorEnabled(runtime.orchestratorEnabled);
       setLoadState('ready');
     } catch {
@@ -138,7 +144,7 @@ export function DevelopmentSchemePage() {
     try {
       // FORK-JOIN-001: рёбра выводятся из порядка узлов + маркеров fork/join
       // (joinKey проставляется на fork). Без fork/join — edges пуст (линейная схема).
-      const derived = deriveSchemeEdges(state.stages);
+      const derived = deriveSchemeEdges(state.stages, state.roles);
       const saved = await developmentSchemeApi.save(derived.stages, state.roles, derived.edges);
       dispatch({ type: 'reset', state: toWizardState(saved) });
       setEdges(saved.edges);

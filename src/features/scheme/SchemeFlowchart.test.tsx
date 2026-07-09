@@ -37,13 +37,26 @@ function renderFlow(stages: Stage[]) {
 }
 
 describe('SchemeFlowchart — ветвление исходов Task Reviewer', () => {
-  it('на карточке Task Reviewer показывает оба исхода: успех → Pipeline Service, ошибка → Programmer', () => {
+  it('выносит исходы Task Reviewer ЗА карточку: успех → Pipeline Service, ошибка → Programmer', () => {
     renderFlow([stage('s-prog', PROG_ROLE.id), stage('s-rev', REVIEWER_ROLE.id)]);
-    const routes = screen.getByRole('list', { name: /Исходы проверки Task Reviewer/i });
-    expect(within(routes).getByText(/Успех/i)).toBeInTheDocument();
-    expect(within(routes).getByText(/Pipeline Service/i)).toBeInTheDocument();
-    expect(within(routes).getByText(/Ошибка/i)).toBeInTheDocument();
-    expect(within(routes).getByText(/Programmer/i)).toBeInTheDocument();
+
+    // Список исходов существует, оба исхода с целями остаются текстом (доступность).
+    const outcomes = screen.getByRole('list', { name: /Исходы проверки Task Reviewer/i });
+    expect(within(outcomes).getByText(/Успех/i)).toBeInTheDocument();
+    expect(within(outcomes).getByText(/Pipeline Service/i)).toBeInTheDocument();
+    expect(within(outcomes).getByText(/Ошибка/i)).toBeInTheDocument();
+    expect(within(outcomes).getByText(/Programmer/i)).toBeInTheDocument();
+
+    // Список вынесен ЗА карточку Task Reviewer: он не вложен в неё, а стоит рядом
+    // (сиблинг) внутри того же узла потока. Карточку находим по её кнопке настроек.
+    const gear = screen.getByRole('button', { name: /Настройки этапа «s-rev»/i });
+    const nodeWrap = gear.closest('li') as HTMLElement;
+    let card = gear as HTMLElement;
+    while (card.parentElement && card.parentElement !== nodeWrap) {
+      card = card.parentElement;
+    }
+    expect(card).not.toContainElement(outcomes);
+    expect(outcomes.parentElement).toBe(nodeWrap);
   });
 
   it('для не-Task Reviewer этапов блок ветвления исходов не рендерится', () => {
@@ -51,5 +64,25 @@ describe('SchemeFlowchart — ветвление исходов Task Reviewer', 
     expect(
       screen.queryByRole('list', { name: /Исходы проверки Task Reviewer/i }),
     ).not.toBeInTheDocument();
+  });
+});
+
+describe('SchemeFlowchart — терминальный узел «Выполнено»', () => {
+  it('в конце схемы отрисован декоративный узел «Выполнено» (симметричный «Старту»)', () => {
+    renderFlow([stage('s-prog', PROG_ROLE.id)]);
+    expect(screen.getByText('Старт')).toBeInTheDocument();
+    expect(screen.getByText('Выполнено')).toBeInTheDocument();
+  });
+
+  it('узел «Выполнено» декоративный (aria-hidden) и не является кнопкой', () => {
+    renderFlow([stage('s-prog', PROG_ROLE.id)]);
+    const finish = screen.getByText('Выполнено');
+    // Ближайший <li> помечен aria-hidden — узел исключён из дерева доступности.
+    expect(finish.closest('[aria-hidden="true"]')).not.toBeNull();
+    expect(finish.closest('button')).toBeNull();
+    // Кнопка «Добавить этап» сохраняется отдельно.
+    expect(
+      screen.getByRole('button', { name: /Добавить этап/i }),
+    ).toBeInTheDocument();
   });
 });

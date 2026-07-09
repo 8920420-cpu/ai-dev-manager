@@ -1,10 +1,21 @@
 import { describe, expect, it } from 'vitest';
 import { deriveSchemeEdges } from './deriveEdges';
-import type { Stage, StageKind } from '../../types/project';
+import type { Role, Stage, StageKind } from '../../types/project';
 
 function node(id: string, kind: StageKind = 'stage'): Stage {
   return { id, kind, stageKey: id, name: id, roleIds: [], enabled: true };
 }
+
+function roleNode(id: string, roleId: string): Stage {
+  return { id, kind: 'stage', stageKey: id, name: id, roleIds: [roleId], enabled: true };
+}
+
+// Роли документационной ветки и Git Integrator — сопоставление по каноническому коду.
+const DOC_ROLES: Role[] = [
+  { id: 'rDA', name: 'Documentation Auditor', code: 'DOCUMENTATION_AUDITOR' },
+  { id: 'rDK', name: 'Documentation Keeper', code: 'DOCUMENTATION_KEEPER' },
+  { id: 'rGI', name: 'Git Integrator', code: 'GIT_INTEGRATOR' },
+];
 
 describe('deriveSchemeEdges', () => {
   it('линейная схема без fork/join → рёбра не генерируются', () => {
@@ -41,6 +52,51 @@ describe('deriveSchemeEdges', () => {
     // Нет «сквозного» ребра мимо веток.
     expect(pairs).not.toContain('A->B');
     expect(pairs).not.toContain('B->C');
+  });
+
+  it('документационная ветка Auditor→Keeper — одна последовательная цепочка, Git Integrator параллельно', () => {
+    const stages = [
+      node('A'),
+      node('F', 'fork'),
+      roleNode('DA', 'rDA'), // Documentation Auditor
+      roleNode('DK', 'rDK'), // Documentation Keeper
+      roleNode('GI', 'rGI'), // Git Integrator
+      node('J', 'join'),
+      node('D'),
+    ];
+    const { stages: out, edges } = deriveSchemeEdges(stages, DOC_ROLES);
+    const pairs = edges.map((e) => `${e.fromKey}->${e.toKey}`);
+
+    expect(out.find((s) => s.id === 'F')!.joinKey).toBe('J');
+    expect(pairs).toContain('A->F'); // backbone до fork
+    // Ветка документации — последовательная: fork → Auditor → Keeper → join.
+    expect(pairs).toContain('F->DA');
+    expect(pairs).toContain('DA->DK');
+    expect(pairs).toContain('DK->J');
+    // Git Integrator — отдельная параллельная ветка.
+    expect(pairs).toContain('F->GI');
+    expect(pairs).toContain('GI->J');
+    expect(pairs).toContain('J->D'); // backbone после join
+    // Keeper НЕ параллелен Auditor: нет прямого F→Keeper и нет Auditor→join.
+    expect(pairs).not.toContain('F->DK');
+    expect(pairs).not.toContain('DA->J');
+  });
+
+  it('без справочника ролей документационные узлы остаются отдельными ветками (семейства нет)', () => {
+    const stages = [
+      node('F', 'fork'),
+      roleNode('DA', 'rDA'),
+      roleNode('DK', 'rDK'),
+      node('J', 'join'),
+    ];
+    // roles не передан → код роли неизвестен → каждый узел = своя ветка.
+    const { edges } = deriveSchemeEdges(stages);
+    const pairs = edges.map((e) => `${e.fromKey}->${e.toKey}`);
+    expect(pairs).toContain('F->DA');
+    expect(pairs).toContain('DA->J');
+    expect(pairs).toContain('F->DK');
+    expect(pairs).toContain('DK->J');
+    expect(pairs).not.toContain('DA->DK');
   });
 
   it('явный joinKey приоритетнее ближайшего join (выбор парного барьера)', () => {

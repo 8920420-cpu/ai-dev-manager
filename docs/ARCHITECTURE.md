@@ -41,9 +41,12 @@ Backlog
   ↓ Task Reviewer            (ревью изменений до pipeline)
   ↓ Pipeline Service         (tester-service → pipeline-runner)
   ↓ Failure Analyst          (только при падении; возврат к Programmer)
-  ↓ Documentation Auditor    (проверка актуальности документации)
-  ↓ Documentation Keeper     (только если нужны обновления)
-  ↓ Git Integrator           (фиксация проверенных изменений)
+  ↓ fork
+  ├─ Documentation Auditor → Documentation Keeper
+  │  (проверка и обновление подтверждённо устаревшей документации)
+  └─ Git Integrator
+     (фиксация проверенных изменений)
+  ↓ join
 Done
 ```
 
@@ -77,8 +80,9 @@ Done
    `pipeline_runs` / `pipeline_stages`, артефакты → `artifacts`.
 6. **Падение.** При `failed` управление уходит к Аналитику ошибок; событие
    `PIPELINE_FAILED`.
-7. **Документация/Git.** После успешного pipeline документация проверяется и при
-   необходимости обновляется; затем Git Integrator создаёт итоговый commit.
+7. **Документация/Git.** После успешного pipeline маршрут расходится на две
+   параллельные ветки: `Documentation Auditor → Documentation Keeper` и
+   `Git Integrator`; после их завершения ветки сходятся в join.
 8. **Расщепление Архитектора.** При `FORWARD`-вердикте с ≥2 затронутыми
    зарегистрированными сервисами исходная задача превращается в эпик
    (`WAITING_FOR_CHILDREN`), а на каждый сервис создаётся независимая задача-на-
