@@ -8,6 +8,7 @@ import { subscribeTaskChanges, tasksApi } from '../../api/tasksApi';
 import { StageSaveError, type StageSaveErrorItem } from '../../api/projectsApi';
 import { isStageEnabled, type Role, type SchemeEdge, type Stage } from '../../types/project';
 import { wizardReducer, type WizardState } from '../projects/wizardState';
+import { RouteHealthPanel } from '../projects/RouteHealthPanel';
 import { SchemeFlowchart } from './SchemeFlowchart';
 import { deriveSchemeEdges } from './deriveEdges';
 import styles from './scheme.module.css';
@@ -217,6 +218,8 @@ export function DevelopmentSchemePage() {
               {orchestratorEnabled ? 'Выключить' : 'Включить'}
             </Button>
           </div>
+
+          <RouteHealthPanel />
 
           <SchemeFlowchart
             stages={state.stages}

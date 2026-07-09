@@ -2,14 +2,9 @@ import { useState } from 'react';
 import { ShieldCheck } from 'lucide-react';
 import { Badge, Button, Callout } from '../../components/ui';
 import type { BadgeTone } from '../../components/ui';
-import { projectsApi } from '../../api/projectsApi';
-import type { RouteHealthProblem, RouteHealthReport } from '../../api/projectsApi';
+import { developmentSchemeApi } from '../../api/developmentSchemeApi';
+import type { RouteHealthProblem, RouteHealthReport } from '../../api/developmentSchemeApi';
 import styles from './RouteHealthPanel.module.css';
-
-interface RouteHealthPanelProps {
-  /** Идентификатор сохранённого проекта (панель рендерится только для него). */
-  projectId: string;
-}
 
 const SEVERITY_TONE: Record<RouteHealthProblem['severity'], BadgeTone> = {
   error: 'danger',
@@ -22,11 +17,12 @@ const SEVERITY_LABEL: Record<RouteHealthProblem['severity'], string> = {
 };
 
 /**
- * Панель health-check маршрута проекта: находит потенциальные тупики маршрута
- * (роль без исполнителя, этап без статуса, несоответствие типа коннектора и т.п.)
- * ДО того, как на них зависнет задача.
+ * Панель health-check единого маршрута разработки: находит потенциальные тупики
+ * маршрута (роль без исполнителя, этап без статуса, несоответствие типа коннектора
+ * и т.п.) ДО того, как на них зависнет задача. Маршрут единый/глобальный — проп
+ * projectId не требуется.
  */
-export function RouteHealthPanel({ projectId }: RouteHealthPanelProps) {
+export function RouteHealthPanel() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [report, setReport] = useState<RouteHealthReport | null>(null);
@@ -35,10 +31,10 @@ export function RouteHealthPanel({ projectId }: RouteHealthPanelProps) {
     setLoading(true);
     setError(null);
     try {
-      setReport(await projectsApi.getRouteHealth(projectId));
+      setReport(await developmentSchemeApi.getRouteHealth());
     } catch (err) {
       setError(
-        err instanceof Error ? err.message : 'Не удалось проверить маршрут проекта.',
+        err instanceof Error ? err.message : 'Не удалось проверить маршрут.',
       );
       setReport(null);
     } finally {
@@ -56,8 +52,8 @@ export function RouteHealthPanel({ projectId }: RouteHealthPanelProps) {
             Проверка маршрута
           </h3>
           <p className={styles.desc}>
-            Находит потенциальные тупики маршрута проекта до того, как на них зависнет
-            задача.
+            Находит потенциальные тупики маршрута разработки до того, как на них
+            зависнет задача.
           </p>
         </div>
         <Button
