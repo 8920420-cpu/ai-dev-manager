@@ -14,7 +14,7 @@ import { reconcileClockSkew } from './clockGuard.js';
 import { isDbConnectionError, noteDbConnectionFailure, claimGraceActive } from './bootClaimGuard.js';
 import { resolveDuration, resolveInt, logEffectiveConfig, parseDurationMs } from './envConfig.js';
 import { isDriverProvider } from './connectors.js';
-import { hashToken } from './intakeIntegrations.js';
+import { hashToken, messageFingerprint } from './intakeIntegrations.js';
 
 const { Client } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -585,12 +585,93 @@ async function entryRole(c) {
 }
 
 /**
+ * TASK-DUPLICATE-CLOSE-001 — поиск живого «оригинала» по отпечатку текста
+ * (messageFingerprint в data_card). Ловит повторную подачу одной и той же задачи
+ * с РАЗНЫМИ external_id (пользователь дважды отправил репорт из виджета,
+ * постановщик повторно завёл ту же задачу) — идемпотентность по external_id такое
+ * не видит. Скоуп: канал интеграции (intakeIntegrationId) ЛИБО проект (projectId,
+ * включая NULL-пул неразобранных). Дублем считаем только НЕтерминальную задачу
+ * (DONE/CANCELLED/FAILED не в счёт: повторное обращение после закрытия может быть
+ * регрессом, а не дублем) не старше 30 дней.
+ */
+export async function findDuplicateTaskTx(c, { intakeIntegrationId = null, projectId, fingerprint }) {
+  const fp = String(fingerprint ?? '');
+  if (!fp) return null;
+  let r;
+  if (intakeIntegrationId) {
+    r = await c.query(
+      `SELECT id, title FROM tasks
+        WHERE intake_integration_id = $1 AND data_card->>'messageFingerprint' = $2
+          AND status NOT IN ('DONE','CANCELLED','FAILED')
+          AND created_at > now() - interval '30 days'
+        ORDER BY created_at LIMIT 1`,
+      [intakeIntegrationId, fp],
+    );
+  } else if (projectId) {
+    r = await c.query(
+      `SELECT id, title FROM tasks
+        WHERE project_id = $1 AND data_card->>'messageFingerprint' = $2
+          AND status NOT IN ('DONE','CANCELLED','FAILED')
+          AND created_at > now() - interval '30 days'
+        ORDER BY created_at LIMIT 1`,
+      [projectId, fp],
+    );
+  } else {
+    r = await c.query(
+      `SELECT id, title FROM tasks
+        WHERE project_id IS NULL AND data_card->>'messageFingerprint' = $1
+          AND status NOT IN ('DONE','CANCELLED','FAILED')
+          AND created_at > now() - interval '30 days'
+        ORDER BY created_at LIMIT 1`,
+      [fp],
+    );
+  }
+  return r.rowCount ? r.rows[0] : null;
+}
+
+// TASK-DUPLICATE-CLOSE-001 — создать задачу-дубль СРАЗУ закрытой (CANCELLED) со
+// ссылкой на оригинал: след подачи сохраняется в журнале (карточка + события
+// TASK_CREATED/TASK_CANCELLED), но конвейер повторную работу не запускает.
+async function insertDuplicateClosedTaskTx(c, {
+  projectId = null, serviceId = null, externalId = null, intakeIntegrationId = null,
+  title, description, roleId = null, dataCard, duplicateOf, source,
+}) {
+  const card = {
+    ...(dataCard && typeof dataCard === 'object' ? dataCard : {}),
+    duplicateOf,
+    duplicateNote: `Дубль живой задачи ${duplicateOf} (совпал отпечаток текста): закрыт автоматически`,
+  };
+  const ins = await c.query(
+    `INSERT INTO tasks
+       (project_id, service_id, external_id, intake_integration_id, title, description,
+        status, current_role_id, current_stage_key, created_by, data_card)
+     VALUES ($1, $2, $3, $4, $5, $6, 'CANCELLED'::task_status, NULL, NULL, $7, $8::jsonb)
+     RETURNING id`,
+    [projectId, serviceId, externalId, intakeIntegrationId, title, description, source, JSON.stringify(card)],
+  );
+  const taskId = ins.rows[0].id;
+  await c.query(
+    `INSERT INTO task_events (task_id, event_type, to_status, role_id, payload_json)
+     VALUES ($1, 'TASK_CREATED', 'CANCELLED'::task_status, $2, $3::jsonb)`,
+    [taskId, roleId, JSON.stringify({ source, externalId, duplicate: true, duplicateOf })],
+  );
+  await c.query(
+    `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+     VALUES ($1, 'TASK_CANCELLED', 'CANCELLED'::task_status, 'CANCELLED'::task_status, $2, $3::jsonb)`,
+    [taskId, roleId, JSON.stringify({ source, reason: 'duplicate_closed', duplicateOf })],
+  );
+  return taskId;
+}
+
+/**
  * SCANNER-INTAKE-001 (TASK-INTAKE-OFFICER-001). Приём сырой задачи: Scanner
  * забирает запрос из папки (или задача приходит из модального окна) и создаёт её
  * в БД под ПЕРВОЙ ролью движения — Приёмщиком задач (TASK_INTAKE_OFFICER) в статусе
  * BACKLOG, после чего runner ведёт её по цепочке (BACKLOG → ARCHITECTURE → …). Сервис
  * при импорте АВТО-регистрируется. Идемпотентность — по UNIQUE (project_id,
  * external_id): повторный приём того же файла возвращает duplicate, не создавая дубль.
+ * TASK-DUPLICATE-CLOSE-001: повторная подача того же ТЕКСТА с другим external_id
+ * создаёт задачу сразу закрытой (CANCELLED, duplicateOf в карточке).
  */
 export async function acceptScannerIntake(s, input) {
   const payload = normalizeScannerIntake(input);
@@ -611,6 +692,10 @@ export async function acceptScannerIntake(s, input) {
       ? c.query('SELECT id FROM tasks WHERE project_id = $1 AND external_id = $2', [project.id, payload.externalId])
       : c.query('SELECT id FROM tasks WHERE project_id IS NULL AND external_id = $1', [payload.externalId]));
 
+    // TASK-DUPLICATE-CLOSE-001: отпечаток содержимого задачи — по заголовку и
+    // описанию (external_id у повторной подачи другой, его uniq-проверка не ловит).
+    const fingerprint = messageFingerprint(`${payload.title}\n${payload.description}`);
+
     await c.query('BEGIN');
     try {
       const existing = await findDup();
@@ -619,6 +704,25 @@ export async function acceptScannerIntake(s, input) {
         return {
           accepted: true, imported: false, duplicate: true,
           taskId: existing.rows[0].id, externalId: payload.externalId,
+        };
+      }
+
+      // Повторная подача того же текста (другой external_id) → задача-дубль
+      // создаётся сразу закрытой, конвейер не запускается.
+      const original = await findDuplicateTaskTx(c, { projectId: project?.id ?? null, fingerprint });
+      if (original) {
+        const dupCard = project
+          ? { project: project.code, projectPath: project.root_path, messageFingerprint: fingerprint }
+          : { requestedProject: payload.project || null, messageFingerprint: fingerprint };
+        const taskId = await insertDuplicateClosedTaskTx(c, {
+          projectId: project?.id ?? null, serviceId, externalId: payload.externalId,
+          title: payload.title, description: payload.description,
+          dataCard: dupCard, duplicateOf: original.id, source: 'scanner-intake',
+        });
+        await c.query('COMMIT');
+        return {
+          accepted: true, imported: false, duplicate: true, duplicateClosed: true,
+          taskId, duplicateOf: original.id, externalId: payload.externalId,
         };
       }
 
@@ -638,6 +742,9 @@ export async function acceptScannerIntake(s, input) {
             ...(payload.card && typeof payload.card === 'object' ? payload.card : {}),
           }
         : { requestedProject: payload.project || null };
+      // TASK-DUPLICATE-CLOSE-001: отпечаток текста — по нему ловится повторная
+      // подача той же задачи с другим external_id (см. findDuplicateTaskTx).
+      if (fingerprint) dataCard.messageFingerprint = fingerprint;
 
       // TASK-PRIORITY-SCALE-001: приоритет форсим/нормализуем СЕРВЕРОМ по проекту.
       // Проект оркестратора → 0 (клиент не влияет); иначе clamp(1..3) с нормализацией
@@ -854,6 +961,11 @@ export async function acceptIntakeReport(s, input) {
 
     // 4. Создание обращения: беспроектная задача СРАЗУ в BACKLOG под Приёмщиком.
     const role = await entryRole(c);
+    // TASK-DUPLICATE-CLOSE-001: отпечаток текста обращения — повторная отправка
+    // того же сообщения приходит с НОВЫМ external_id, uniq-проверка её не ловит
+    // (инцидент 08.07: один и тот же репорт об ошибке каталога прислан дважды →
+    // два параллельных конвейера сделали одну работу).
+    const fingerprint = messageFingerprint(payload.message);
     await c.query('BEGIN');
     try {
       // Повторная проверка дубля под транзакцией (гонка параллельной доставки).
@@ -881,7 +993,25 @@ export async function acceptIntakeReport(s, input) {
         autocontext: payload.autocontext,
         // Ссылка на скриншот в MinIO — сохраняется в карточке и доступна ролям.
         screenshotUrl: payload.screenshotUrl,
+        // TASK-DUPLICATE-CLOSE-001: отпечаток текста для ловли повторной подачи.
+        ...(fingerprint ? { messageFingerprint: fingerprint } : {}),
       };
+      // Повторная подача того же текста в тот же канал при живом оригинале →
+      // обращение фиксируем (пользователь получает номер), но задачу создаём сразу
+      // закрытой (CANCELLED, duplicateOf) — конвейер повторную работу не запускает.
+      const original = await findDuplicateTaskTx(c, { intakeIntegrationId: integration.id, fingerprint });
+      if (original) {
+        const taskId = await insertDuplicateClosedTaskTx(c, {
+          externalId: payload.externalId, intakeIntegrationId: integration.id,
+          title: intakeReportTitle(payload.message), description: payload.message,
+          roleId: role.id, dataCard, duplicateOf: original.id, source: 'intake-integration',
+        });
+        await c.query('COMMIT');
+        return {
+          accepted: true, duplicate: true, duplicateClosed: true, imported: false,
+          taskId, duplicateOf: original.id, reportNumber, externalId: payload.externalId,
+        };
+      }
       const ins = await c.query(
         `INSERT INTO tasks
            (project_id, service_id, external_id, intake_integration_id, title, description,

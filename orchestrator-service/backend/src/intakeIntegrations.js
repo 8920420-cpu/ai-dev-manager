@@ -66,6 +66,19 @@ export function generateToken() {
   return `itk_${randomBytes(24).toString('hex')}`;
 }
 
+// TASK-DUPLICATE-CLOSE-001 — отпечаток текста обращения/задачи для ловли повторной
+// подачи одного и того же (пользователь дважды отправил один репорт из виджета,
+// постановщик повторно завёл ту же задачу). Идемпотентность по external_id это НЕ
+// ловит: каждая доставка приходит с новым external_id. Нормализация: NFC, нижний
+// регистр, схлопывание пробельных прогонов — косметические отличия не ломают
+// совпадение; содержательно другой текст даёт другой отпечаток. Пустой текст → ''
+// (отпечатка нет, дедуп не применяется).
+export function messageFingerprint(text) {
+  const norm = String(text ?? '').normalize('NFC').toLowerCase().replace(/\s+/g, ' ').trim();
+  if (!norm) return '';
+  return createHash('sha256').update(norm, 'utf8').digest('hex');
+}
+
 const COLUMNS = `id, name, token_hash, enabled, rate_limit_per_min,
   user_rate_limit_per_min, min_message_length, created_at, updated_at`;
 
