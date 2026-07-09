@@ -76,6 +76,16 @@
   white-space: nowrap;
 }
 
+/* Причина отмены под названием отменённой задачи — приглушённо, второй строкой. */
+.cancelReason {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: normal;
+  word-break: break-word;
+}
+
 .muted {
   color: var(--text-muted);
 }

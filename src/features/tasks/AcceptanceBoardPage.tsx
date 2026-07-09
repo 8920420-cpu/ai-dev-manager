@@ -21,6 +21,7 @@ import {
 import { projectsApi } from '../../api/projectsApi';
 import type { Project, Stage } from '../../types/project';
 import { taskStatusLabel } from '../../data/taskStatuses';
+import { selectAcceptanceRows, type AcceptanceStatusFilter } from './acceptanceRows';
 import {
   SELECTABLE_PRIORITIES,
   isOrchestratorPriority,
@@ -51,6 +52,8 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
   const [board, setBoard] = useState<AcceptanceTask[]>([]);
   const [projects, setProjects] = useState<Project[]>([]);
   const [selected, setSelected] = useState<AcceptanceTask | null>(null);
+  // Клиентский фильтр по статусу для подраздела «Выполнено» (Все/DONE/CANCELLED).
+  const [statusFilter, setStatusFilter] = useState<AcceptanceStatusFilter>('all');
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoadState('loading');
@@ -85,9 +88,11 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
     });
   }, []);
 
+  // «Проверка» — не принятые DONE (без CANCELLED); «Выполнено» — принятые DONE +
+  // отменённые, с клиентским фильтром по статусу. Фильтрация без перезагрузки.
   const rows = useMemo(
-    () => board.filter((t) => (mode === 'review' ? !t.accepted : t.accepted)),
-    [board, mode],
+    () => selectAcceptanceRows(board, mode, statusFilter),
+    [board, mode, statusFilter],
   );
 
   const projectById = useMemo(
@@ -123,14 +128,27 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
         title={title}
         description={description}
         actions={
-          <Button
-            variant="secondary"
-            leftIcon={<RefreshCw size={16} aria-hidden="true" />}
-            onClick={() => void load()}
-            disabled={loadState === 'loading'}
-          >
-            Обновить
-          </Button>
+          <>
+            {mode === 'done' && (
+              <Select
+                label="Статус"
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value as AcceptanceStatusFilter)}
+              >
+                <option value="all">Все</option>
+                <option value="DONE">Выполнено (DONE)</option>
+                <option value="CANCELLED">Отменено (CANCELLED)</option>
+              </Select>
+            )}
+            <Button
+              variant="secondary"
+              leftIcon={<RefreshCw size={16} aria-hidden="true" />}
+              onClick={() => void load()}
+              disabled={loadState === 'loading'}
+            >
+              Обновить
+            </Button>
+          </>
         }
       />
 
@@ -173,6 +191,7 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
                   <th>Сервис</th>
                   <th>Название</th>
                   <th>Приоритет</th>
+                  {mode === 'done' && <th>Статус</th>}
                   {mode === 'done' && <th>Принята</th>}
                 </tr>
               </thead>
@@ -200,12 +219,22 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
                     <td className={styles.muted}>{task.serviceName ?? '—'}</td>
                     <td className={styles.titleCell} title={task.title}>
                       {task.title}
+                      {task.status === 'CANCELLED' && task.cancelReason && (
+                        <span className={styles.cancelReason}>{task.cancelReason}</span>
+                      )}
                     </td>
                     <td>
                       <Badge tone={taskPriorityTone(task.priority)}>
                         {taskPriorityLabel(task.priority)}
                       </Badge>
                     </td>
+                    {mode === 'done' && (
+                      <td>
+                        <Badge tone={task.status === 'CANCELLED' ? 'neutral' : 'success'}>
+                          {taskStatusLabel(task.status)}
+                        </Badge>
+                      </td>
+                    )}
                     {mode === 'done' && (
                       <td className={styles.muted}>{formatDate(task.acceptedAt)}</td>
                     )}
@@ -443,7 +472,9 @@ function TaskAcceptanceModal({
         size="lg"
         footer={
           task ? (
-            mode === 'review' ? (
+            // Приём/доработка применимы только к DONE-задачам в «Проверке».
+            // Для CANCELLED (и в «Выполнено») показываем лишь «Закрыть».
+            mode === 'review' && task.status === 'DONE' ? (
               <>
                 <Button
                   variant="secondary"
@@ -494,6 +525,18 @@ function TaskAcceptanceModal({
               </Select>
             )}
           </section>
+
+          {task && task.status === 'CANCELLED' && (
+            <section className={styles.block}>
+              <h3 className={styles.blockTitle}>Причина отмены</h3>
+              <p className={styles.muted}>
+                {task.cancelReason?.trim() ? task.cancelReason : 'Причина отмены не указана.'}
+              </p>
+              {task.duplicateOf && (
+                <p className={styles.muted}>Дубликат задачи: {task.duplicateOf}</p>
+              )}
+            </section>
+          )}
 
           {historyState === 'loading' && <LoadingBlock label="Загрузка задачи…" />}
           {historyState === 'error' && (
