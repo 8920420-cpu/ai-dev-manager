@@ -284,6 +284,17 @@ export function SchemeFlowchart({
               {KIND_META[kind].label}
             </span>
           )}
+          {!control &&
+            (role ? (
+              <span
+                className={cn(styles.roleChip, scanner && styles.roleChipScanner)}
+                title={role.name}
+              >
+                {role.name}
+              </span>
+            ) : (
+              <span className={styles.roleEmpty}>Роль не выбрана</span>
+            ))}
           <span className={styles.spacer} />
           {hasError && (
             <AlertCircle
@@ -324,15 +335,9 @@ export function SchemeFlowchart({
             {!enabled && <span className={styles.offChip}>Отключён</span>}
           </div>
         ) : (
-          // Роль/статус, действия и маршруты — одним компактным рядом с переносом.
+          // Статус, действия и маршруты — одним компактным рядом с переносом
+          // (роль показана выше, в шапке карточки).
           <div className={styles.nodeMeta}>
-            {role ? (
-              <span className={cn(styles.roleChip, scanner && styles.roleChipScanner)}>
-                {role.name}
-              </span>
-            ) : (
-              <span className={styles.roleEmpty}>Роль не выбрана</span>
-            )}
             {enabled && stage.taskStatus && (
               <span className={styles.statusChip}>{taskStatusLabel(stage.taskStatus)}</span>
             )}
