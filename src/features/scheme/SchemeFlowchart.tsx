@@ -251,7 +251,11 @@ export function SchemeFlowchart({
   // круглый значок с иконкой GitFork/GitMerge и краткой подписью рядом. Клик по
   // пиктограмме открывает настройки узла (StageSettingsModal), где доступны роль,
   // парный join, включение и удаление. Цвет: fork — success, join — info.
-  const renderControlPictogram = (stage: Stage, _index: number) => {
+  // Порядок узла меняется перетаскиванием за «ручку» (grip) — той же механикой
+  // drag (dragEnabledIndex + handleDrop), что и у карточек этапов; поэтому сам
+  // контейнер пиктограммы — draggable-div, а grip и кнопка настроек — отдельные
+  // вложенные кнопки (вложенный интерактив внутри <button> недопустим).
+  const renderControlPictogram = (stage: Stage, index: number) => {
     const enabled = stage.enabled !== false;
     const kind = (stage.kind ?? 'stage') as 'fork' | 'join';
     const hasError = Boolean(
@@ -260,36 +264,69 @@ export function SchemeFlowchart({
     const customName = stage.name.trim();
     const stageLabel = customName || KIND_META[kind].label;
     return (
-      <button
-        type="button"
+      <div
         className={cn(
           styles.pictogram,
           kind === 'fork' && styles.pictogramFork,
           kind === 'join' && styles.pictogramJoin,
           !enabled && styles.pictogramDisabled,
           hasError && styles.pictogramError,
+          dragIndex === index && styles.pictogramDragging,
+          overIndex === index &&
+            dragIndex !== null &&
+            dragIndex !== index &&
+            styles.pictogramDropTarget,
         )}
-        onClick={() => setOpenStageId(stage.id)}
-        aria-label={`Настройки узла «${stageLabel}»`}
-        title={KIND_META[kind].hint}
+        draggable={dragEnabledIndex === index}
+        onDragStart={() => setDragIndex(index)}
+        onDragEnter={() => setOverIndex(index)}
+        onDragOver={(e: DragEvent) => e.preventDefault()}
+        onDrop={(e: DragEvent) => {
+          e.preventDefault();
+          handleDrop(index);
+        }}
+        onDragEnd={() => {
+          setDragEnabledIndex(null);
+          setDragIndex(null);
+          setOverIndex(null);
+        }}
       >
-        <span className={styles.pictogramBadge} aria-hidden="true">
-          {kind === 'fork' ? <GitFork size={16} /> : <GitMerge size={16} />}
-        </span>
-        <span className={styles.pictogramText}>
-          <span className={styles.pictogramLabel}>{KIND_META[kind].label}</span>
-          {customName && <span className={styles.pictogramName}>{customName}</span>}
-        </span>
-        {!enabled && <span className={styles.offChip}>Отключён</span>}
-        {hasError && (
-          <AlertCircle
-            size={14}
-            className={styles.errorIcon}
-            aria-label="В настройках узла есть ошибки"
-          />
-        )}
-        <Settings className={styles.pictogramGear} size={14} aria-hidden="true" />
-      </button>
+        <button
+          type="button"
+          className={styles.pictogramGrip}
+          onMouseDown={() => setDragEnabledIndex(index)}
+          onMouseUp={() => setDragEnabledIndex(null)}
+          onBlur={() => setDragEnabledIndex(null)}
+          aria-label={`Перетащите, чтобы изменить порядок узла «${stageLabel}»`}
+          title="Перетащить для изменения порядка"
+        >
+          <GripVertical size={14} aria-hidden="true" />
+        </button>
+        <button
+          type="button"
+          className={styles.pictogramButton}
+          onClick={() => setOpenStageId(stage.id)}
+          aria-label={`Настройки узла «${stageLabel}»`}
+          title={KIND_META[kind].hint}
+        >
+          <span className={styles.pictogramBadge} aria-hidden="true">
+            {kind === 'fork' ? <GitFork size={16} /> : <GitMerge size={16} />}
+          </span>
+          <span className={styles.pictogramText}>
+            <span className={styles.pictogramLabel}>{KIND_META[kind].label}</span>
+            {customName && <span className={styles.pictogramName}>{customName}</span>}
+          </span>
+          {!enabled && <span className={styles.offChip}>Отключён</span>}
+          {hasError && (
+            <AlertCircle
+              size={14}
+              className={styles.errorIcon}
+              aria-label="В настройках узла есть ошибки"
+            />
+          )}
+          <Settings className={styles.pictogramGear} size={14} aria-hidden="true" />
+        </button>
+      </div>
     );
   };
 

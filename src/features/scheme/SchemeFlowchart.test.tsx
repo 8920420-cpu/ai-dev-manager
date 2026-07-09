@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { fireEvent, render, screen, within } from '@testing-library/react';
-import type { ReactElement } from 'react';
+import type { ComponentProps, ReactElement } from 'react';
 import { SchemeFlowchart } from './SchemeFlowchart';
 import { ToastProvider } from '../../components/ui';
 import type { Role, SchemeEdge, Stage } from '../../types/project';
@@ -15,7 +15,11 @@ function stage(id: string, roleId: string, extra: Partial<Stage> = {}): Stage {
   return { id, name: id, roleIds: [roleId], enabled: true, ...extra };
 }
 
-function renderFlow(stages: Stage[], edges?: SchemeEdge[]) {
+function renderFlow(
+  stages: Stage[],
+  edges?: SchemeEdge[],
+  overrides: Partial<ComponentProps<typeof SchemeFlowchart>> = {},
+) {
   const ui: ReactElement = (
     <SchemeFlowchart
       stages={stages}
@@ -34,6 +38,7 @@ function renderFlow(stages: Stage[], edges?: SchemeEdge[]) {
       onSetStageStatus={vi.fn()}
       onSetStageJoinKey={vi.fn()}
       onApplyDefaults={vi.fn()}
+      {...overrides}
     />
   );
   // ToastProvider — StageSettingsModal внутри использует useToast (выбор папки).
@@ -122,12 +127,47 @@ describe('SchemeFlowchart — компактные пиктограммы fork/j
     expect(forkBtn.querySelector('.lucide-git-fork')).not.toBeNull();
     expect(joinBtn.querySelector('.lucide-git-merge')).not.toBeNull();
 
-    // Это не полноразмерная карточка: у пиктограммы нет кнопки «Задачи» и «ручки»
-    // перетаскивания (drag/чекбокс перенесены в модал настроек).
+    // Это не полноразмерная карточка: у пиктограммы нет кнопки «Задачи» (задачи —
+    // атрибут этапа с ролью). Но порядок узла по-прежнему меняется перетаскиванием:
+    // на пиктограмме есть отдельная «ручка» (grip) рядом с кнопкой настроек.
     expect(within(forkBtn).queryByText(/Задачи/i)).not.toBeInTheDocument();
+    const forkPictogram = forkBtn.parentElement as HTMLElement;
     expect(
-      screen.queryByRole('button', { name: /Перетащите, чтобы изменить порядок/i }),
-    ).not.toBeInTheDocument();
+      within(forkPictogram).getByRole('button', {
+        name: /Перетащите, чтобы изменить порядок/i,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it('пиктограмму fork/join можно перетащить за «ручку» — вызывается onReorderStage', () => {
+    const onReorderStage = vi.fn();
+    renderFlow(
+      [
+        stage('s-fork', '', { kind: 'fork', stageKey: 'F' }),
+        stage('s-join', '', { kind: 'join', stageKey: 'J' }),
+      ],
+      undefined,
+      { onReorderStage },
+    );
+
+    const forkPictogram = screen
+      .getByRole('button', { name: /Настройки узла «s-fork»/i })
+      .parentElement as HTMLElement;
+    const joinPictogram = screen
+      .getByRole('button', { name: /Настройки узла «s-join»/i })
+      .parentElement as HTMLElement;
+
+    // Перетаскивание включается захватом «ручки» (grip) пиктограммы fork, затем
+    // fork (index 0) переносится на позицию join (index 1) — как у карточек этапов.
+    const grip = within(forkPictogram).getByRole('button', {
+      name: /Перетащите, чтобы изменить порядок/i,
+    });
+    fireEvent.mouseDown(grip);
+    fireEvent.dragStart(forkPictogram);
+    fireEvent.dragEnter(joinPictogram);
+    fireEvent.drop(joinPictogram);
+
+    expect(onReorderStage).toHaveBeenCalledWith(0, 1);
   });
 
   it('клик по пиктограмме открывает настройки узла (StageSettingsModal)', () => {
