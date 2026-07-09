@@ -231,18 +231,124 @@
   border-left: 3px solid var(--info);
 }
 
+/* ---- Компактные пиктограммы управляющих узлов (fork/join) ---- */
+/* Небольшой значок на оси схемы вместо полноразмерной карточки: круглый бейдж с
+   иконкой GitFork/GitMerge + краткая подпись рядом. Вся пиктограмма — кнопка,
+   открывающая настройки узла (StageSettingsModal). Заметно меньше карточек этапов
+   (width: auto, а не max-width: 310px). Цветовая кодировка: fork — success, join — info. */
+.pictogram {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3) var(--space-1) var(--space-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  color: var(--text-secondary);
+  box-shadow: var(--shadow-sm);
+  cursor: pointer;
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+
+.pictogram:hover {
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+/* Круглый значок с иконкой — «пиктограмма» узла. */
+.pictogramBadge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: var(--radius-full);
+  border: 1px solid var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+}
+
+.pictogramText {
+  display: inline-flex;
+  flex-direction: column;
+  line-height: var(--leading-tight);
+  min-width: 0;
+}
+
+.pictogramLabel {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.pictogramName {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 22ch;
+}
+
+.pictogramGear {
+  flex: none;
+  color: var(--text-muted);
+}
+
+/* Цветовая кодировка: fork — success. */
+.pictogramFork {
+  border-color: var(--success);
+}
+
+.pictogramFork .pictogramBadge {
+  border-color: var(--success);
+  background: var(--success-soft);
+  color: var(--success-text, var(--success));
+}
+
+.pictogramFork:hover {
+  border-color: var(--success);
+}
+
+/* Цветовая кодировка: join — info. */
+.pictogramJoin {
+  border-color: var(--info);
+}
+
+.pictogramJoin .pictogramBadge {
+  border-color: var(--info);
+  background: var(--info-soft);
+  color: var(--info-text, var(--info));
+}
+
+.pictogramJoin:hover {
+  border-color: var(--info);
+}
+
+.pictogramDisabled {
+  opacity: 0.6;
+  box-shadow: none;
+}
+
+.pictogramDisabled:hover {
+  box-shadow: none;
+  transform: none;
+}
+
+.pictogramError {
+  border-color: var(--danger);
+  box-shadow: 0 0 0 1px var(--danger-soft);
+}
+
 /* ---- Управляющие узлы блок-схемы ---- */
 .nodeControl {
   background: var(--surface-2);
   border-style: dashed;
-}
-
-.nodeFork {
-  border-left: 3px solid var(--success);
-}
-
-.nodeJoin {
-  border-left: 3px solid var(--info);
 }
 
 .nodeCondition {
