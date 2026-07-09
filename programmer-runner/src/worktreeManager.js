@@ -76,6 +76,7 @@ export class WorktreeManager {
     this.log = log;
     this.services = new Map(); // serviceKey -> { worktreeCwd, branch }
     this.locks = new Map();    // serviceKey -> Promise (mutex по сервису)
+    this.repoLocks = new Map();// repoCwd -> Promise (mutex по репозиторию)
   }
 
   // Сериализация задач одного микросервиса: следующая ждёт предыдущую.
@@ -83,6 +84,25 @@ export class WorktreeManager {
     const prev = this.locks.get(key) || Promise.resolve();
     const run = prev.then(() => fn());
     this.locks.set(key, run.then(() => {}, () => {}));
+    return run;
+  }
+
+  // Сериализация СТРУКТУРНЫХ git-worktree операций одного репозитория. withServiceLock
+  // разводит только задачи ОДНОГО сервиса, но ensureWorktree дёргает глобальные для
+  // всего репо команды (`worktree prune`, `branch -D`, `worktree add`, `worktree
+  // remove`). При concurrency>1 два РАЗНЫХ сервиса входят в ensureWorktree
+  // одновременно, и `worktree prune` одного сносит полусозданную admin-запись
+  // (`.git/worktrees/<id>`) другого из-под ног → `worktree add` падает
+  // «Unable to create '<dir>/.git/index.lock': No such file or directory» (ENOENT).
+  // Инцидент 09.07: рестарт раннера опустошил кэш worktree → массовое одновременное
+  // пересоздание worktree разных сервисов → шторм worktree_ensure_failed увёл 8 задач
+  // в BLOCKED (programmer_release_loop). Лок держится только на короткий шаг
+  // ensureWorktree; дорогой шаг агента и слияние в main остаются параллельными.
+  withRepoLock(repoCwd, fn) {
+    const key = String(repoCwd);
+    const prev = this.repoLocks.get(key) || Promise.resolve();
+    const run = prev.then(() => fn());
+    this.repoLocks.set(key, run.then(() => {}, () => {}));
     return run;
   }
 
@@ -208,7 +228,10 @@ export class WorktreeManager {
     return this.withServiceLock(serviceKey, async () => {
       let handle;
       try {
-        handle = this.ensureWorktree(repoCwd, serviceKey);
+        // Структурные worktree-операции сериализуем по репозиторию (не только по
+        // сервису): prune/branch -D/worktree add глобальны для .git и гонятся между
+        // разными сервисами при concurrency>1 (см. withRepoLock).
+        handle = await this.withRepoLock(repoCwd, () => this.ensureWorktree(repoCwd, serviceKey));
       } catch (e) {
         this.log.warn?.('worktree ensure failed', { serviceKey, error: e.message });
         return { ok: false, error: `worktree_ensure_failed: ${e.message}`, changedFiles: [] };

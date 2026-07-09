@@ -262,6 +262,38 @@ test('restart: недокоммиченный мусор убитого прог
   cleanup(repo, root);
 });
 
+// Регрессия WORKTREE-REPO-LOCK-001 (инцидент 09.07): при concurrency>1 разные
+// сервисы входят в ensureWorktree одновременно, и глобальные для репо команды
+// (`worktree prune`, `branch -D`, `worktree add`) гонятся — prune одного сносит
+// полусозданную admin-запись другого → `worktree add` падает «Unable to create
+// '<dir>/.git/index.lock': No such file or directory» (ENOENT). Шторм увёл 8 задач
+// в BLOCKED (programmer_release_loop). Структурные операции сериализуются по
+// репозиторию (withRepoLock) — параллельное создание worktree не должно падать.
+test('concurrency: параллельное создание worktree разных сервисов одного репо не гонится', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr = new WorktreeManager({ root, log: silent });
+  const services = ['SVC_A', 'SVC_B', 'SVC_C', 'SVC_D', 'SVC_E', 'SVC_F'];
+  // Все сервисы стартуют «с нуля» одновременно (пустая карта → чистое создание с
+  // prune/branch -D/add) — ровно тот путь, что гонялся в инциденте.
+  const results = await Promise.all(services.map((s) =>
+    mgr.runForService(repo, `PROJECT:${s}`, async (wt) => {
+      put(wt, `pkg/${s}.txt`, `${s}\n`);
+      return { ok: true, result: {} };
+    })));
+  for (let i = 0; i < services.length; i++) {
+    assert.equal(results[i].ok, true,
+      `сервис ${services[i]} не должен падать worktree_ensure_failed: ${results[i].error}`);
+    assert.doesNotMatch(String(results[i].error || ''), /index\.lock|worktree_ensure_failed/,
+      'нет гонки prune/add');
+  }
+  // Дельта каждого сервиса доехала до основного дерева.
+  for (const s of services) {
+    assert.equal(readFileSync(join(repo, `pkg/${s}.txt`), 'utf8'), `${s}\n`);
+  }
+  cleanup(repo, root);
+});
+
 test('integrate: смешанный REWORK — часть уже в дереве, часть новых → успех, недостающие применены', async () => {
   const repo = makeRepo();
   put(repo, 'pkg/a.txt', 'AAA\n'); // уже донесён первым прогоном (untracked)
