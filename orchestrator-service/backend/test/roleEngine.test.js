@@ -163,16 +163,16 @@ test('decideTransition: TASK_REVIEWER APPROVED => TESTING/PIPELINE_SERVICE', () 
   assert.equal(d.agentRunStatus, 'SUCCESS');
 });
 
-test('decideTransition: TASK_REVIEWER NEEDS_FIX => FAILURE_ANALYSIS/FAILURE_ANALYST', () => {
+test('decideTransition: TASK_REVIEWER NEEDS_FIX => CODING/PROGRAMMER', () => {
   const d = decideTransition('TASK_REVIEWER', { ok: false, status: 'NEEDS_FIX' }, { reworkCount: 0 });
-  assert.equal(d.toStatus, 'FAILURE_ANALYSIS');
-  assert.equal(d.nextRole, 'FAILURE_ANALYST');
+  assert.equal(d.toStatus, 'CODING');
+  assert.equal(d.nextRole, 'PROGRAMMER');
   assert.equal(d.blocked, false);
 });
 
 test('decideTransition: TASK_REVIEWER неразобранный вердикт не апрувит', () => {
   const d = decideTransition('TASK_REVIEWER', { ok: null, status: '' }, { reworkCount: 0 });
-  assert.equal(d.nextRole, 'FAILURE_ANALYST');
+  assert.equal(d.nextRole, 'PROGRAMMER');
 });
 
 test('decideTransition: защита от цикла — max rework => BLOCKED', () => {

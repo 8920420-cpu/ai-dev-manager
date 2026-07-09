@@ -610,11 +610,12 @@ export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = 
   switch (roleCode) {
     case 'TASK_REVIEWER':
     case 'REVIEWER':
-      // Гейт качества: дальше только при явном APPROVED. Провал — на анализ
-      // причины (а если аналитика нет в маршруте — на доработку исполнителю).
+      // Гейт качества: дальше только при явном APPROVED. Провал ревью — сразу
+      // на доработку ближайшему исполнителю; Failure Analyst нужен для падений
+      // pipeline/host-ролей, а не для обычных замечаний ревьюера.
       if (verdict.ok === true) return forward;
       if (reworkCount >= maxRework) return block('max_rework_exceeded');
-      return branch('analyst', 'FAILURE_ANALYST', 'review_failed', 'rework');
+      return rework('review_failed');
     case 'FAILURE_ANALYST':
       if (verdict.ok === false && ['INCONCLUSIVE', 'INFRASTRUCTURE_BLOCKED'].includes(verdict.status)) {
         return block(verdict.status.toLowerCase());
@@ -676,22 +677,20 @@ export function decideTransition(roleCode, verdict, { reworkCount = 0, maxRework
     agentRunStatus: 'FAILED',
     reason,
   });
-  const toAnalyst = () => ({
-    toStatus: 'FAILURE_ANALYSIS',
-    nextRole: 'FAILURE_ANALYST',
-    done: false,
-    blocked: false,
-    agentRunStatus: 'SUCCESS',
-    reason: 'review_failed',
-  });
-
   switch (roleCode) {
     case 'TASK_REVIEWER':
       // Гейт качества: проходим только при явном APPROVED. Любой не-успех
-      // (включая неразобранный вердикт) — на анализ причины.
+      // возвращает задачу Programmer на доработку.
       if (verdict.ok === true) return proceed();
       if (reworkCount >= maxRework) return block('max_rework_exceeded');
-      return toAnalyst();
+      return {
+        toStatus: 'CODING',
+        nextRole: 'PROGRAMMER',
+        done: false,
+        blocked: false,
+        agentRunStatus: 'SUCCESS',
+        reason: 'review_failed',
+      };
     case 'FAILURE_ANALYST':
       // Диагност всегда возвращает работу Programmer, кроме явного тупика.
       if (verdict.ok === false && ['INCONCLUSIVE', 'INFRASTRUCTURE_BLOCKED'].includes(verdict.status)) {

@@ -181,12 +181,13 @@ test('TASK_REVIEWER APPROVED → вперёд на Pipeline (аналитик-э
   assert.equal(d.outcome, 'FORWARD');
 });
 
-test('TASK_REVIEWER NEEDS_FIX → BRANCH к аналитику', () => {
+test('TASK_REVIEWER NEEDS_FIX → REWORK к программисту', () => {
   const route = buildRoute(sampleStages());
   const d = decideOutcome('TASK_REVIEWER', { ok: false, status: 'NEEDS_FIX' }, { reworkCount: 0 });
-  assert.equal(d.outcome, 'BRANCH');
+  assert.equal(d.outcome, 'REWORK');
   const r = resolveTransition(route, 'TASK_REVIEWER', d);
-  assert.equal(r.nextRole, 'FAILURE_ANALYST');
+  assert.equal(r.nextRole, 'PROGRAMMER');
+  assert.equal(r.toStatus, 'CODING');
 });
 
 test('FAILURE_ANALYST DIAGNOSED → REWORK к исполнителю', () => {
