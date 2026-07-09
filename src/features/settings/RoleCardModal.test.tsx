@@ -48,10 +48,22 @@ const GROUPS: RoleGroup[] = [
   { id: 'g2', name: 'Контроль качества', sortOrder: 20 },
 ];
 
+// Программист — НЕ рассуждающая роль (ROLE-EXEC-TYPE-001): отдельный конвейер
+// Claude Code, без матрицы reasoning-движков.
 const ROLE: RoleCard = {
   code: 'PROGRAMMER',
   name: 'Programmer',
   description: 'Пишет код',
+  prompt: '',
+  groupId: 'g1',
+  skills: ['b.md'],
+};
+
+// Рассуждающая роль — у неё есть выбор «Движок (исполнитель роли)».
+const ARCHITECT_ROLE: RoleCard = {
+  code: 'ARCHITECT',
+  name: 'Architect',
+  description: 'Проектирует решение',
   prompt: '',
   groupId: 'g1',
   skills: ['b.md'],
@@ -148,22 +160,24 @@ describe('RoleCardModal — карточка роли', () => {
     expect(onSaved).toHaveBeenCalled();
   });
 
-  it('подставляет текущий движок (интеграцию) роли', async () => {
-    rcList.mockResolvedValue([{ id: 'rc-x', role: 'PROGRAMMER', integrationId: 'int2' }]);
-    renderModal();
-    const select = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
-    await waitFor(() => expect(select.value).toBe('int2'));
-  });
+  // --- ROLE-EXEC-TYPE-001: «Движок» только у рассуждающих ролей ---
 
-  it('поле движка показывается для любой роли (единое поле вместо двух)', async () => {
-    renderModal();
+  it('ARCHITECT (reasoning) → показывает Select «Движок (исполнитель роли)»', async () => {
+    renderModal(ARCHITECT_ROLE);
     expect(await screen.findByLabelText(/Движок \(исполнитель роли\)/i)).toBeInTheDocument();
     // Бывшего отдельного поля «Интеграция (коннектор)» больше нет.
     expect(screen.queryByLabelText(/Интеграция \(коннектор\)/i)).not.toBeInTheDocument();
   });
 
+  it('подставляет текущий движок (интеграцию) рассуждающей роли', async () => {
+    rcList.mockResolvedValue([{ id: 'rc-x', role: 'ARCHITECT', integrationId: 'int2' }]);
+    renderModal(ARCHITECT_ROLE);
+    const select = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
+    await waitFor(() => expect(select.value).toBe('int2'));
+  });
+
   it('в списке движков только включённые интеграции (выключенные скрыты)', async () => {
-    renderModal();
+    renderModal(ARCHITECT_ROLE);
     const select = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
     await waitFor(() => expect(intgList).toHaveBeenCalled());
     const labels = Array.from(select.options).map((o) => o.textContent);
@@ -174,10 +188,10 @@ describe('RoleCardModal — карточка роли', () => {
     expect(labels.some((l) => l?.includes('Старый коннектор'))).toBe(false);
   });
 
-  it('назначает движок роли (интеграцию) и сохраняет через role-connectors', async () => {
+  it('назначает движок рассуждающей роли и сохраняет через role-connectors', async () => {
     const user = userEvent.setup();
-    update.mockResolvedValue(ROLE);
-    renderModal();
+    update.mockResolvedValue(ARCHITECT_ROLE);
+    renderModal(ARCHITECT_ROLE);
     await waitFor(() => expect(intgList).toHaveBeenCalled());
 
     await user.selectOptions(screen.getByLabelText(/Движок \(исполнитель роли\)/i), 'int1');
@@ -185,12 +199,12 @@ describe('RoleCardModal — карточка роли', () => {
 
     await waitFor(() => expect(rcSaveAll).toHaveBeenCalled());
     const [items] = rcSaveAll.mock.calls[0]!;
-    expect(items).toEqual([{ id: 'rc1', role: 'PROGRAMMER', integrationId: 'int1' }]);
+    expect(items).toEqual([{ id: 'rc1', role: 'ARCHITECT', integrationId: 'int1' }]);
   });
 
   it('выбор драйвера показывает подсказку про хостовый драйвер', async () => {
     const user = userEvent.setup();
-    renderModal();
+    renderModal(ARCHITECT_ROLE);
     await waitFor(() => expect(intgList).toHaveBeenCalled());
 
     await user.selectOptions(screen.getByLabelText(/Движок \(исполнитель роли\)/i), 'int3');
@@ -201,8 +215,8 @@ describe('RoleCardModal — карточка роли', () => {
 
   it('не дёргает role-connectors, если движок не менялся', async () => {
     const user = userEvent.setup();
-    update.mockResolvedValue(ROLE);
-    renderModal();
+    update.mockResolvedValue(ARCHITECT_ROLE);
+    renderModal(ARCHITECT_ROLE);
     await waitFor(() => expect(intgList).toHaveBeenCalled());
 
     await user.click(screen.getByRole('button', { name: /^Сохранить$/i }));
@@ -224,14 +238,14 @@ describe('RoleCardModal — карточка роли', () => {
     expect(selected.textContent).not.toContain('DeepSeek');
   });
 
-  it('роль с claude_code-интеграцией: «Движок» показывает Claude Code', async () => {
+  it('рассуждающая роль с claude_code-интеграцией: «Движок» показывает Claude Code', async () => {
     // Добавляем драйвер Claude Code в список интеграций и назначаем его роли.
     intgList.mockResolvedValue([
       { id: 'int1', name: 'DeepSeek API', provider: 'deepseek', isEnabled: true, status: 'success' },
       { id: 'int5', name: 'Claude Code (драйвер)', provider: 'claude_code', isEnabled: true },
     ]);
-    rcList.mockResolvedValue([{ id: 'rc-cc', role: 'PROGRAMMER', integrationId: 'int5' }]);
-    renderModal();
+    rcList.mockResolvedValue([{ id: 'rc-cc', role: 'ARCHITECT', integrationId: 'int5' }]);
+    renderModal(ARCHITECT_ROLE);
 
     const select = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
     await waitFor(() => expect(select.value).toBe('int5'));
@@ -239,15 +253,62 @@ describe('RoleCardModal — карточка роли', () => {
     expect(selected.textContent).toContain('Claude Code');
   });
 
-  it('роль с DeepSeek-интеграцией: «Движок» показывает DeepSeek (backward compat)', async () => {
+  it('рассуждающая роль с DeepSeek-интеграцией: «Движок» показывает DeepSeek (backward compat)', async () => {
     // Старое назначение через API-коннектор DeepSeek (int1) — должно работать как раньше.
-    rcList.mockResolvedValue([{ id: 'rc-ds', role: 'PROGRAMMER', integrationId: 'int1' }]);
-    renderModal();
+    rcList.mockResolvedValue([{ id: 'rc-ds', role: 'ARCHITECT', integrationId: 'int1' }]);
+    renderModal(ARCHITECT_ROLE);
 
     const select = (await screen.findByLabelText(/Движок \(исполнитель роли\)/i)) as HTMLSelectElement;
     await waitFor(() => expect(select.value).toBe('int1'));
     const selected = select.options[select.selectedIndex];
     expect(selected.textContent).toContain('DeepSeek');
+  });
+
+  // --- Не рассуждающие роли: статичная метка вместо Select ---
+
+  it('PIPELINE_SERVICE (host) → нет Select «Движок», метка «исполняется host-runner»', async () => {
+    const role: RoleCard = { ...ROLE, code: 'PIPELINE_SERVICE', name: 'Pipeline Service' };
+    renderModal(role);
+    await waitFor(() => expect(listSkills).toHaveBeenCalled());
+    expect(screen.queryByLabelText(/Движок \(исполнитель роли\)/i)).not.toBeInTheDocument();
+    expect(screen.getByText('исполняется host-runner')).toBeInTheDocument();
+  });
+
+  it('GIT_INTEGRATOR (host) → нет Select «Движок», метка «исполняется host-runner»', async () => {
+    const role: RoleCard = { ...ROLE, code: 'GIT_INTEGRATOR', name: 'Git Integrator' };
+    renderModal(role);
+    await waitFor(() => expect(listSkills).toHaveBeenCalled());
+    expect(screen.queryByLabelText(/Движок \(исполнитель роли\)/i)).not.toBeInTheDocument();
+    expect(screen.getByText('исполняется host-runner')).toBeInTheDocument();
+  });
+
+  it('SCANNER (файловый сервис) → нет Select «Движок», метка «файловый сервис»', async () => {
+    const role: RoleCard = { ...ROLE, code: 'SCANNER', name: 'Scanner' };
+    renderModal(role);
+    await waitFor(() => expect(listSkills).toHaveBeenCalled());
+    expect(screen.queryByLabelText(/Движок \(исполнитель роли\)/i)).not.toBeInTheDocument();
+    expect(screen.getByText('файловый сервис')).toBeInTheDocument();
+  });
+
+  it('PROGRAMMER → нет Select «Движок», метка «Claude Code (отдельный конвейер)»', async () => {
+    renderModal();
+    await waitFor(() => expect(listSkills).toHaveBeenCalled());
+    expect(screen.queryByLabelText(/Движок \(исполнитель роли\)/i)).not.toBeInTheDocument();
+    expect(screen.getByText('Claude Code (отдельный конвейер)')).toBeInTheDocument();
+  });
+
+  it('сохранение НЕ рассуждающей роли не вызывает role-connectors (бэкенд вернёт 422)', async () => {
+    const user = userEvent.setup();
+    update.mockResolvedValue(ROLE);
+    // Даже если у роли осталось стороннее назначение — фронт его не переписывает.
+    rcList.mockResolvedValue([{ id: 'rc-stale', role: 'PROGRAMMER', integrationId: 'int1' }]);
+    renderModal();
+    await waitFor(() => expect(listSkills).toHaveBeenCalled());
+
+    await user.click(screen.getByRole('button', { name: /^Сохранить$/i }));
+
+    await waitFor(() => expect(update).toHaveBeenCalled());
+    expect(rcSaveAll).not.toHaveBeenCalled();
   });
 
   it('не закрывается по Escape (правило проекта)', async () => {

@@ -33,6 +33,45 @@ export function isReasoningRole(code: string): boolean {
 }
 
 /**
+ * ROLE-EXEC-TYPE-001 — разделение ролей по ТИПУ ИСПОЛНЕНИЯ. Reasoning-«движок»
+ * (матрица DeepSeek/Codex/Claude Code) применим только к рассуждающим ролям;
+ * остальные исполняются другими механизмами и не должны показывать выбор движка.
+ *
+ * host    — исполняет хостовый демон host-runner (PIPELINE_SERVICE, GIT_INTEGRATOR);
+ * scanner — файловый/локальный сервис (SCANNER);
+ * programmer — отдельный конвейер Claude Code (модель настраивается отдельно, по
+ *              сложности задачи в оркестраторе); канонический код роли — PROGRAMMER,
+ *              CODING — код стадии того же исполнителя;
+ * legacy  — вне активного маршрута (прочие роли).
+ */
+export const HOST_ROLE_CODES: ReadonlyArray<string> = ['PIPELINE_SERVICE', 'GIT_INTEGRATOR'];
+export const SCANNER_ROLE_CODES: ReadonlyArray<string> = ['SCANNER'];
+export const PROGRAMMER_ROLE_CODES: ReadonlyArray<string> = ['PROGRAMMER', 'CODING'];
+
+const HOST_ROLE_SET: ReadonlySet<string> = new Set(HOST_ROLE_CODES);
+const SCANNER_ROLE_SET: ReadonlySet<string> = new Set(SCANNER_ROLE_CODES);
+const PROGRAMMER_ROLE_SET: ReadonlySet<string> = new Set(PROGRAMMER_ROLE_CODES);
+
+export type RoleExecutionType = 'reasoning' | 'programmer' | 'host' | 'scanner' | 'legacy';
+
+/** Тип исполнения роли по её каноническому коду. */
+export function roleExecutionType(code: string): RoleExecutionType {
+  if (isReasoningRole(code)) return 'reasoning';
+  if (PROGRAMMER_ROLE_SET.has(code)) return 'programmer';
+  if (HOST_ROLE_SET.has(code)) return 'host';
+  if (SCANNER_ROLE_SET.has(code)) return 'scanner';
+  return 'legacy';
+}
+
+/** Человекочитаемая метка исполнителя для НЕ рассуждающих ролей. */
+export const ROLE_EXECUTION_LABEL: Record<Exclude<RoleExecutionType, 'reasoning'>, string> = {
+  host: 'исполняется host-runner',
+  scanner: 'файловый сервис',
+  programmer: 'Claude Code (отдельный конвейер)',
+  legacy: 'вне активного маршрута',
+};
+
+/**
  * INTEGRATION-ENGINE-UNIFY-001 — провайдеры-«драйверы»: хостовые исполнители
  * рассуждающих ролей (Codex / Claude Code). В разделе «Интеграции» они показаны
  * наравне с API-коннекторами, но не требуют endpoint/токена. Должно совпадать с

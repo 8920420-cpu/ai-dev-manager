@@ -16,7 +16,7 @@ import { rolesApi } from '../../api/rolesApi';
 import { toolsApi } from '../../api/toolsApi';
 import { integrationsApi } from '../../api/integrationsApi';
 import { roleConnectionsApi } from '../../api/roleConnectionsApi';
-import { providerToEngine } from './roleEngines';
+import { providerToEngine, roleExecutionType, ROLE_EXECUTION_LABEL } from './roleEngines';
 import {
   TOOL_CAPABILITIES,
   TOOL_CAPABILITY_LABEL,
@@ -178,6 +178,12 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
 
   const mcpTools = useMemo(() => allTools.filter((t) => t.kind === 'mcp'), [allTools]);
 
+  // ROLE-EXEC-TYPE-001: тип исполнения роли. Reasoning-роли настраивают «Движок»
+  // (матрица интеграций); прочие исполняются другими механизмами и вместо Select
+  // показывают статичную метку исполнителя (backend вернёт 422 на попытку записи).
+  const execType = useMemo(() => (role ? roleExecutionType(role.code) : 'legacy'), [role]);
+  const isReasoning = execType === 'reasoning';
+
   const selectedIntegration = useMemo(
     () => integrations.find((i) => i.id === integrationId),
     [integrations, integrationId],
@@ -269,10 +275,11 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
       // Уровни доступа и назначенные MCP-инструменты сохраняем отдельными вызовами.
       await toolsApi.saveCapabilities(role.code, capabilities);
       await toolsApi.saveRoleTools(role.code, mcpToolIds);
-      // Движок роли = назначение интеграции. Сохраняем только при изменении. PUT —
-      // upsert по коду роли (см. roleConnectors.js), прочие назначения не трогаем.
-      // Backend выводит из этого назначения маршрутизацию движков (role_engines).
-      if (integrationId !== loadedIntegration.current) {
+      // Движок роли = назначение интеграции. Сохраняем только при изменении и
+      // только для рассуждающих ролей — для host/scanner/programmer/legacy бэкенд
+      // вернёт 422 (ROLE-EXEC-TYPE-001), поэтому вызов пропускаем. PUT — upsert по
+      // коду роли (см. roleConnectors.js), прочие назначения не трогаем.
+      if (isReasoning && integrationId !== loadedIntegration.current) {
         await roleConnectionsApi.saveAll([roleConnectionsApi.make(role.code, integrationId)]);
         loadedIntegration.current = integrationId;
       }
@@ -339,44 +346,54 @@ export function RoleCardModal({ open, onClose, role, groups, onSaved }: RoleCard
               ))}
             </Select>
 
-            <div className={styles.integrationRow}>
-              <div className={styles.integrationSelect}>
-                <Select
-                  label="Движок (исполнитель роли)"
-                  value={integrationId}
-                  onChange={(e) => setIntegrationId(e.target.value)}
-                  disabled={engineOptions.length === 0}
-                  helper="Интеграция, которая исполняет роль: API-коннектор (DeepSeek — внутренний tool-loop) либо хостовый драйвер (Codex / Claude Code). Список — только включённые интеграции из раздела «Интеграции»."
-                >
-                  <option value="">— не назначено —</option>
-                  {engineOptions.map((intg) => (
-                    <option key={intg.id} value={intg.id}>
-                      {intg.name}
-                      {intg.isEnabled ? '' : ' (выключено)'}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <div className={styles.integrationStatus}>
-                {selectedIntegration ? (
-                  <ConnectionBadge state={selectedIntegration.status ?? 'unknown'} />
-                ) : (
-                  <Badge tone="neutral">Не назначено</Badge>
+            {execType === 'reasoning' ? (
+              <>
+                <div className={styles.integrationRow}>
+                  <div className={styles.integrationSelect}>
+                    <Select
+                      label="Движок (исполнитель роли)"
+                      value={integrationId}
+                      onChange={(e) => setIntegrationId(e.target.value)}
+                      disabled={engineOptions.length === 0}
+                      helper="Интеграция, которая исполняет роль: API-коннектор (DeepSeek — внутренний tool-loop) либо хостовый драйвер (Codex / Claude Code). Список — только включённые интеграции из раздела «Интеграции»."
+                    >
+                      <option value="">— не назначено —</option>
+                      {engineOptions.map((intg) => (
+                        <option key={intg.id} value={intg.id}>
+                          {intg.name}
+                          {intg.isEnabled ? '' : ' (выключено)'}
+                        </option>
+                      ))}
+                    </Select>
+                  </div>
+                  <div className={styles.integrationStatus}>
+                    {selectedIntegration ? (
+                      <ConnectionBadge state={selectedIntegration.status ?? 'unknown'} />
+                    ) : (
+                      <Badge tone="neutral">Не назначено</Badge>
+                    )}
+                  </div>
+                </div>
+
+                {integrations.length === 0 && (
+                  <Callout tone="info" title="Нет доступных интеграций">
+                    Добавьте интеграцию в разделе «Интеграции» (DeepSeek API, Codex или
+                    Claude Code драйвер), чтобы назначить роли движок.
+                  </Callout>
                 )}
-              </div>
-            </div>
 
-            {integrations.length === 0 && (
-              <Callout tone="info" title="Нет доступных интеграций">
-                Добавьте интеграцию в разделе «Интеграции» (DeepSeek API, Codex или
-                Claude Code драйвер), чтобы назначить роли движок.
-              </Callout>
-            )}
-
-            {selectedEngine && selectedEngine !== 'deepseek' && (
-              <Callout tone="info" title="Хостовый драйвер">
-                Роль исполняет драйвер {selectedEngine === 'codex' ? 'Codex' : 'Claude Code'} —
-                нужен запущенный хостовый раннер (вход выполнен на машине).
+                {selectedEngine && selectedEngine !== 'deepseek' && (
+                  <Callout tone="info" title="Хостовый драйвер">
+                    Роль исполняет драйвер {selectedEngine === 'codex' ? 'Codex' : 'Claude Code'} —
+                    нужен запущенный хостовый раннер (вход выполнен на машине).
+                  </Callout>
+                )}
+              </>
+            ) : (
+              // ROLE-EXEC-TYPE-001: не рассуждающие роли не выбирают reasoning-движок —
+              // показываем статичную метку исполнителя (host/scanner/programmer/legacy).
+              <Callout tone="info" title="Тип исполнения роли">
+                {ROLE_EXECUTION_LABEL[execType]}
               </Callout>
             )}
 
