@@ -89,6 +89,19 @@ describe('SchemeFlowchart — терминальный узел «Выполне
       screen.getByRole('button', { name: /Добавить этап/i }),
     ).toBeInTheDocument();
   });
+
+  it('когда последний этап — Task Reviewer, к узлу «Выполнено» ведёт отдельная стрелка', () => {
+    renderFlow([stage('s-prog', PROG_ROLE.id), stage('s-rev', REVIEWER_ROLE.id)]);
+    const finishLi = screen.getByText('Выполнено').closest('li') as HTMLElement;
+    // У Task Reviewer трейлинг-блок — ветвление исходов, а не стрелка вниз, поэтому
+    // перед финальным узлом добавлен отдельный декоративный коннектор со стрелкой.
+    const prev = finishLi.previousElementSibling as HTMLElement | null;
+    expect(prev).not.toBeNull();
+    expect(prev!.getAttribute('aria-hidden')).toBe('true');
+    expect(prev!.querySelector('.lucide-arrow-down')).not.toBeNull();
+    // Это выделенный li-коннектор, а не карточка (в нём нет кнопок).
+    expect(prev!.querySelector('button')).toBeNull();
+  });
 });
 
 describe('SchemeFlowchart — компактные пиктограммы fork/join', () => {

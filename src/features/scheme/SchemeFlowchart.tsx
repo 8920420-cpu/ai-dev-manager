@@ -197,6 +197,17 @@ export function SchemeFlowchart({
     }
   }
 
+  // Инвариант схемы: трейлинг-стрелка последнего юнита ведёт в узел «Выполнено».
+  // Он держится для групп, одиночных узлов и участка fork→join (все они
+  // заканчиваются обычным connector), но НАРУШАЕТСЯ, когда последний юнит —
+  // карточка Task Reviewer: у неё вместо стрелки вниз рисуется ветвление исходов
+  // (reviewOutcomes). В этом случае добавляем явную стрелку перед «Выполнено».
+  const lastUnit = renderUnits[renderUnits.length - 1];
+  const needsFinishConnector =
+    lastUnit?.type === 'layout' &&
+    lastUnit.item.type === 'node' &&
+    roleCodeOfStage(lastUnit.item.node.stage) === 'TASK_REVIEWER';
+
   const connector = (
     <div className={styles.connector} aria-hidden="true">
       <ArrowDown size={16} />
@@ -623,6 +634,15 @@ export function SchemeFlowchart({
             </li>
           );
         })}
+
+        {/* Когда последний юнит — Task Reviewer, его трейлинг-блок это ветвление
+            исходов (без стрелки вниз). Добавляем явный коннектор, чтобы к узлу
+            «Выполнено» вела стрелка. */}
+        {needsFinishConnector && (
+          <li className={styles.connector} aria-hidden="true">
+            <ArrowDown size={16} />
+          </li>
+        )}
 
         {/* Терминальный узел «Выполнено» — симметричен «Старту»: декоративная
             пилюля с точкой-индикатором в тоне success. Трейлинг-стрелка
