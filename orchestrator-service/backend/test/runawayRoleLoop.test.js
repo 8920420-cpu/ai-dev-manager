@@ -43,6 +43,12 @@ test('escalateRunawayRoleLoops: K подряд CANCELLED/TIMEOUT любой ро
   assert.match(main.sql, /ar\.status IN \('CANCELLED','TIMEOUT'\)/);
   assert.match(main.sql, /ok\.status = 'SUCCESS'/);
   assert.match(main.sql, /cd\.n_cancel >= \$1/);
+  // Ручное перемещение (runbook: «переместите задачу на этап») выдаёт этапу свежий
+  // бюджет: окно счёта — после последнего SUCCESS роли ИЛИ manual-move (что позже).
+  // Инцидент 09.07: задача, возвращённая руками после починки причины, мгновенно
+  // блокировалась повторно тем же счётчиком, ни разу не запустив этап.
+  assert.match(main.sql, /GREATEST\(/);
+  assert.match(main.sql, /mv\.payload_json->>'via' = 'manual-move'/);
   assert.equal(main.params[0], 5, 'дефолтный порог = 5 (узкие жнецы срабатывают раньше)');
   // Пометка — в карточке задачи (auto_run_limit) и в событии.
   assert.match(main.sql, /auto_run_limit/);

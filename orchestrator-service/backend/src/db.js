@@ -1803,10 +1803,17 @@ export async function claimNextClaudeTaskTx(c) {
                     AND ar.role_id = t.current_role_id
                     AND ar.status IN ('FAILED','TIMEOUT')
                     AND ar.finished_at IS NOT NULL
-                    AND ar.finished_at > COALESCE((
-                          SELECT max(ok.finished_at) FROM agent_runs ok
-                           WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
-                             AND ok.status = 'SUCCESS'), '-infinity'::timestamptz)
+                    -- manual-move сбрасывает и cooldown: оператор перезапустил задачу
+                    -- руками — не заставляем её досиживать хвост backoff.
+                    AND ar.finished_at > GREATEST(
+                          COALESCE((
+                            SELECT max(ok.finished_at) FROM agent_runs ok
+                             WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
+                               AND ok.status = 'SUCCESS'), '-infinity'::timestamptz),
+                          COALESCE((
+                            SELECT max(mv.created_at) FROM task_events mv
+                             WHERE mv.task_id = t.id AND mv.event_type = 'TASK_UPDATED'
+                               AND mv.payload_json->>'via' = 'manual-move'), '-infinity'::timestamptz))
                ) cd
                WHERE cd.n_fail > 0
                  AND now() < cd.last_fail
@@ -3908,10 +3915,18 @@ export async function escalateProgrammerReleaseLoop(c, maxFails = PROGRAMMER_REL
               AND ar.role_id = t.current_role_id
               AND ar.status IN ('FAILED','TIMEOUT')
               AND ar.finished_at IS NOT NULL
-              AND ar.finished_at > COALESCE((
-                    SELECT max(ok.finished_at) FROM agent_runs ok
-                     WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
-                       AND ok.status = 'SUCCESS'), '-infinity'::timestamptz)
+              -- Окно счёта: после последнего SUCCESS роли И после последнего ручного
+              -- перемещения (manual-move) — оператор по runbook разобрался и перезапустил
+              -- этап, бюджет выдаётся заново (иначе тот же счётчик мгновенно блокирует повторно).
+              AND ar.finished_at > GREATEST(
+                    COALESCE((
+                      SELECT max(ok.finished_at) FROM agent_runs ok
+                       WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
+                         AND ok.status = 'SUCCESS'), '-infinity'::timestamptz),
+                    COALESCE((
+                      SELECT max(mv.created_at) FROM task_events mv
+                       WHERE mv.task_id = t.id AND mv.event_type = 'TASK_UPDATED'
+                         AND mv.payload_json->>'via' = 'manual-move'), '-infinity'::timestamptz))
          ) cd
         WHERE t.status = 'CODING'
           AND t.assigned_agent_id IS NULL
@@ -3958,10 +3973,18 @@ export async function escalateArchitectBudgetLoop(c, maxCancels = ARCHITECT_BUDG
               AND ar.role_id = t.current_role_id
               AND ar.status IN ('CANCELLED','TIMEOUT')
               AND ar.finished_at IS NOT NULL
-              AND ar.finished_at > COALESCE((
-                    SELECT max(ok.finished_at) FROM agent_runs ok
-                     WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
-                       AND ok.status = 'SUCCESS'), '-infinity'::timestamptz)
+              -- Окно счёта: после последнего SUCCESS роли И после последнего ручного
+              -- перемещения (manual-move) — оператор по runbook разобрался и перезапустил
+              -- этап, бюджет выдаётся заново (иначе тот же счётчик мгновенно блокирует повторно).
+              AND ar.finished_at > GREATEST(
+                    COALESCE((
+                      SELECT max(ok.finished_at) FROM agent_runs ok
+                       WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
+                         AND ok.status = 'SUCCESS'), '-infinity'::timestamptz),
+                    COALESCE((
+                      SELECT max(mv.created_at) FROM task_events mv
+                       WHERE mv.task_id = t.id AND mv.event_type = 'TASK_UPDATED'
+                         AND mv.payload_json->>'via' = 'manual-move'), '-infinity'::timestamptz))
          ) cd
         WHERE t.status = 'ARCHITECTURE'
           AND t.assigned_agent_id IS NULL
@@ -4010,10 +4033,18 @@ export async function escalateRunawayRoleLoops(c, maxCancels = TASK_RUN_LOOP_MAX
               AND ar.role_id = t.current_role_id
               AND ar.status IN ('CANCELLED','TIMEOUT')
               AND ar.finished_at IS NOT NULL
-              AND ar.finished_at > COALESCE((
-                    SELECT max(ok.finished_at) FROM agent_runs ok
-                     WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
-                       AND ok.status = 'SUCCESS'), '-infinity'::timestamptz)
+              -- Окно счёта: после последнего SUCCESS роли И после последнего ручного
+              -- перемещения (manual-move) — оператор по runbook разобрался и перезапустил
+              -- этап, бюджет выдаётся заново (иначе тот же счётчик мгновенно блокирует повторно).
+              AND ar.finished_at > GREATEST(
+                    COALESCE((
+                      SELECT max(ok.finished_at) FROM agent_runs ok
+                       WHERE ok.task_id = t.id AND ok.role_id = t.current_role_id
+                         AND ok.status = 'SUCCESS'), '-infinity'::timestamptz),
+                    COALESCE((
+                      SELECT max(mv.created_at) FROM task_events mv
+                       WHERE mv.task_id = t.id AND mv.event_type = 'TASK_UPDATED'
+                         AND mv.payload_json->>'via' = 'manual-move'), '-infinity'::timestamptz))
          ) cd
         WHERE t.status NOT IN ('DONE','CANCELLED','FAILED','BLOCKED','WAITING_FOR_CHILDREN')
           AND t.assigned_agent_id IS NULL
