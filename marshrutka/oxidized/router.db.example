@@ -1,7 +1,0 @@
-# Формат: имя:ip:модель:логин:пароль (строки с # игнорируются)
-# Модели: ndms (Keenetic), routeros (MikroTik), ios (Cisco), junos (Juniper) и др.
-# Поле ip принимает только литеральный IP; для DNS-имени (KeenDNS) —
-# писать имя хоста в поле name, а ip оставлять пустым (резолв при подключении).
-# Реальный файл — router.db (в .gitignore, содержит пароли).
-my-router.keenetic.link::ndms:LOGIN:PASSWORD
-lan-router:192.168.1.1:ndms:LOGIN:PASSWORD

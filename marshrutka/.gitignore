@@ -1,8 +1,0 @@
-.env
-keys/
-ansible/backups/
-oxidized/router.db
-oxidized/configs.git/
-oxidized/pid
-oxidized/crash
-oxidized/*.log
