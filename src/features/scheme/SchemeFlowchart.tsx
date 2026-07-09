@@ -3,6 +3,7 @@ import {
   Activity,
   AlertCircle,
   ArrowDown,
+  CornerDownLeft,
   Diamond,
   GitFork,
   GitMerge,
@@ -209,6 +210,7 @@ export function SchemeFlowchart({
     const kind = stage.kind ?? 'stage';
     const control = kind !== 'stage';
     const role = roles.find((r) => r.id === stage.roleIds[0]);
+    const taskReviewer = role?.code === 'TASK_REVIEWER';
     const scanner = !control && role ? isScannerRole(role) : false;
     const hasError = Boolean(
       stageErrors[stage.id] || scanErrors[stage.id] || statusErrors[stage.id],
@@ -322,8 +324,7 @@ export function SchemeFlowchart({
             {!enabled && <span className={styles.offChip}>Отключён</span>}
           </div>
         ) : (
-          // Роль/статус и действия — одним рядом (при нехватке ширины перенос),
-          // чтобы карточка была компактнее.
+          // Роль/статус, действия и маршруты — одним компактным рядом с переносом.
           <div className={styles.nodeMeta}>
             {role ? (
               <span className={cn(styles.roleChip, scanner && styles.roleChipScanner)}>
@@ -364,6 +365,21 @@ export function SchemeFlowchart({
                 {runningCount}
               </span>
             </div>
+
+            {taskReviewer && (
+              <div className={styles.reviewRoutes} aria-label="Маршруты Task Reviewer">
+                <span className={cn(styles.reviewRoute, styles.reviewRouteSuccess)}>
+                  <ArrowDown size={14} aria-hidden="true" />
+                  <span>Успех</span>
+                  <span className={styles.reviewTarget}>Pipeline Service</span>
+                </span>
+                <span className={cn(styles.reviewRoute, styles.reviewRouteError)}>
+                  <CornerDownLeft size={14} aria-hidden="true" />
+                  <span>Ошибка</span>
+                  <span className={styles.reviewTarget}>Programmer</span>
+                </span>
+              </div>
+            )}
           </div>
         )}
       </div>
