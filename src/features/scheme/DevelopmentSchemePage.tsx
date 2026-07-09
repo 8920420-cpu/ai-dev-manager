@@ -10,6 +10,7 @@ import { isStageEnabled, type Role, type SchemeEdge, type Stage } from '../../ty
 import { wizardReducer, type WizardState } from '../projects/wizardState';
 import { SchemeFlowchart } from './SchemeFlowchart';
 import { deriveSchemeEdges } from './deriveEdges';
+import { roleHasExecutor } from '../settings/roleEngines';
 import styles from './scheme.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
@@ -221,7 +222,10 @@ export function DevelopmentSchemePage() {
           <SchemeFlowchart
             stages={state.stages}
             edges={edges}
-            roles={state.roles}
+            // STAGE-ROLE-EXECUTOR-001: скрываем роли без исполнителя из выбора
+            // «Ответственная роль» этапа — иначе задача в таком этапе зависнет.
+            // Уже сохранённые роли этапов не трогаем: правим только выбор новых.
+            roles={state.roles.filter((r) => roleHasExecutor(r.code ?? ''))}
             stageErrors={errors.stages}
             scanErrors={{}}
             statusErrors={errors.statuses}

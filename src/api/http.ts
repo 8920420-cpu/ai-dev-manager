@@ -53,6 +53,8 @@ const ERROR_MESSAGES: Record<string, string> = {
   // Этапы и Scanner
   stage_field_inconsistent: 'Контракты данных ролей не согласованы. Проверьте поля и порядок этапов.',
   stage_validation_failed: 'Этапы не прошли проверку. Исправьте отмеченные поля.',
+  stage_role_no_executor:
+    'В этапе выбрана роль без исполнителя — задача зависнет. Уберите роль или назначьте ей исполнителя.',
   scanner_watch_directory_required: 'Для Scanner нужно указать папку документов проекта.',
   scanner_watch_directory_must_be_absolute: 'Путь к папке Scanner должен быть абсолютным.',
   scanner_stage_conflict: 'В схеме найден конфликт этапа Scanner.',

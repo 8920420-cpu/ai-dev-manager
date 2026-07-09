@@ -72,6 +72,25 @@ export const ROLE_EXECUTION_LABEL: Record<Exclude<RoleExecutionType, 'reasoning'
 };
 
 /**
+ * STAGE-ROLE-EXECUTOR-001 — роли без исполнителя. Список ролей без исполнителя
+ * должен совпадать с бэкендом (roles.hidden + отсутствие в ROLE_FLOW rolePipeline.js):
+ * их не клеймят claimLlmRoleTask/claimNextHostTask, поэтому задача в таком этапе
+ * зависнет. Модель Role несёт только code, поэтому фильтруем по коду.
+ */
+export const NON_EXECUTABLE_ROLE_CODES: ReadonlySet<string> = new Set([
+  'STRUCTURE_KEEPER',
+  'TESTER',
+  'REVIEWER',
+  'COMMITTER',
+  'DEPLOYER',
+]);
+
+/** Есть ли у роли с таким кодом исполнитель (кого-то, кто подхватит задачу этапа). */
+export function roleHasExecutor(code: string): boolean {
+  return code !== '' && !NON_EXECUTABLE_ROLE_CODES.has(code);
+}
+
+/**
  * INTEGRATION-ENGINE-UNIFY-001 — провайдеры-«драйверы»: хостовые исполнители
  * рассуждающих ролей (Codex / Claude Code). В разделе «Интеграции» они показаны
  * наравне с API-коннекторами, но не требуют endpoint/токена. Должно совпадать с
