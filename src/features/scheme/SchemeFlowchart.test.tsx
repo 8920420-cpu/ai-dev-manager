@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, within, fireEvent } from '@testing-library/react';
 import type { ReactElement } from 'react';
+import { ToastProvider } from '../../components/ui';
 import { SchemeFlowchart } from './SchemeFlowchart';
 import type { Role, Stage } from '../../types/project';
 
@@ -64,6 +65,65 @@ describe('SchemeFlowchart — ветвление исходов Task Reviewer', 
     expect(
       screen.queryByRole('list', { name: /Исходы проверки Task Reviewer/i }),
     ).not.toBeInTheDocument();
+  });
+});
+
+// STAGE-ROLE-EXECUTOR-001 — регресс: роли без исполнителя фильтруются только из
+// выпадающего списка «Ответственная роль», но уже сохранённая роль этапа обязана
+// оставаться видимой (и на карточке схемы, и в опциях при редактировании).
+describe('SchemeFlowchart — сохранённая роль без исполнителя (STAGE-ROLE-EXECUTOR-001)', () => {
+  // TESTER — роль без исполнителя, но уже назначенная сохранённому этапу;
+  // REVIEWER — тоже без исполнителя, но НЕ назначена; PROGRAMMER — исполняемая.
+  const TESTER_ROLE: Role = { id: 'r-test', name: 'Tester', code: 'TESTER' };
+  const REVIEWER_HIDDEN_ROLE: Role = { id: 'r-rev-hidden', name: 'Reviewer', code: 'REVIEWER' };
+  const ROLES_WITH_HIDDEN = [PROG_ROLE, TESTER_ROLE, REVIEWER_HIDDEN_ROLE];
+
+  function renderWithHidden(stages: Stage[]) {
+    // StageSettingsModal использует useToast → нужен ToastProvider вокруг схемы.
+    const ui: ReactElement = (
+      <ToastProvider>
+        <SchemeFlowchart
+          stages={stages}
+          roles={ROLES_WITH_HIDDEN}
+          stageErrors={{}}
+          scanErrors={{}}
+          statusErrors={{}}
+          onAddStage={vi.fn()}
+          onRemoveStage={vi.fn()}
+          onRenameStage={vi.fn()}
+          onReorderStage={vi.fn()}
+          onSetStageRole={vi.fn()}
+          onSetStageEnabled={vi.fn()}
+          onSetStageScanPath={vi.fn()}
+          onSetStageStatus={vi.fn()}
+          onApplyDefaults={vi.fn()}
+        />
+      </ToastProvider>
+    );
+    return render(ui);
+  }
+
+  it('сохранённая роль без исполнителя остаётся видимой на карточке схемы', () => {
+    renderWithHidden([stage('s-test', TESTER_ROLE.id, { name: 'Тестирование' })]);
+    // Карточка показывает имя роли, а не заглушку «Роль не выбрана».
+    expect(screen.getByText('Tester')).toBeInTheDocument();
+    expect(screen.queryByText('Роль не выбрана')).not.toBeInTheDocument();
+  });
+
+  it('в выборе «Ответственная роль» видна сохранённая роль без исполнителя и скрыты неназначенные', () => {
+    renderWithHidden([stage('s-test', TESTER_ROLE.id, { name: 'Тестирование' })]);
+
+    // Открываем модалку настроек этапа по кнопке-шестерёнке.
+    fireEvent.click(screen.getByRole('button', { name: /Настройки этапа «Тестирование»/i }));
+
+    const select = screen.getByRole('combobox', { name: /Ответственная роль/i });
+    // Сохранённая роль без исполнителя присутствует в опциях и выбрана.
+    expect(within(select).getByRole('option', { name: 'Tester' })).toBeInTheDocument();
+    expect((select as HTMLSelectElement).value).toBe(TESTER_ROLE.id);
+    // Исполняемая роль доступна для выбора.
+    expect(within(select).getByRole('option', { name: 'Programmer' })).toBeInTheDocument();
+    // Неназначенная роль без исполнителя из выбора исключена.
+    expect(within(select).queryByRole('option', { name: 'Reviewer' })).not.toBeInTheDocument();
   });
 });
 

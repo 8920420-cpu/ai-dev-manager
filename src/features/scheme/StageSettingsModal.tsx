@@ -3,6 +3,7 @@ import { Button, Input, Modal, Select, useToast } from '../../components/ui';
 import { fsAccess } from '../../api/fsAccess';
 import { isScannerRole } from '../../data/presets';
 import { taskStatusLabel } from '../../data/taskStatuses';
+import { roleHasExecutor } from '../settings/roleEngines';
 import type { Role, Stage, StageKind } from '../../types/project';
 import styles from './StageSettingsModal.module.css';
 
@@ -74,6 +75,13 @@ export function StageSettingsModal({
   const stageLabel = stage.name.trim() || `Этап ${index + 1}`;
   const selectedRoleId = stage.roleIds[0] ?? '';
   const selectedRole = roles.find((r) => r.id === selectedRoleId);
+  // STAGE-ROLE-EXECUTOR-001: из выбора «Ответственная роль» убираем роли без
+  // исполнителя — задача в этапе с такой ролью зависнет (её никто не подхватит).
+  // Уже выбранную (сохранённую) роль оставляем в опциях, даже если она без
+  // исполнителя: иначе оператор не увидит её и не сможет сменить.
+  const roleOptions = roles.filter(
+    (role) => roleHasExecutor(role.code ?? '') || role.id === selectedRoleId,
+  );
   const enabled = stage.enabled !== false;
   const isScanner = !control && selectedRole ? isScannerRole(selectedRole) : false;
   const showStatus = !control && enabled && selectedRoleId !== '';
@@ -154,7 +162,7 @@ export function StageSettingsModal({
             helper="Роль, которая обрабатывает задачу на этом этапе."
           >
             <option value="">— не выбрана —</option>
-            {roles.map((role) => (
+            {roleOptions.map((role) => (
               <option key={role.id} value={role.id}>
                 {role.name}
               </option>
