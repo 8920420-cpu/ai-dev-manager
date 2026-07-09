@@ -12,6 +12,43 @@
   color: var(--text-muted);
 }
 
+/* Панель фильтра подраздела «Выполнено». */
+.toolbar {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-3);
+}
+
+.filterSelect {
+  min-width: 220px;
+}
+
+/* Ячейка названия: заголовок + причина отмены отдельной строкой. */
+.title {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reason {
+  display: block;
+  margin-top: 2px;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Причина отмены в карточке задачи. */
+.reasonText {
+  margin: 0;
+  font-size: var(--text-sm);
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
 .tableWrap {
   overflow-x: auto;
   border: 1px solid var(--border);
@@ -74,16 +111,6 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-/* Причина отмены под названием отменённой задачи — приглушённо, второй строкой. */
-.cancelReason {
-  display: block;
-  margin-top: 2px;
-  font-size: var(--text-xs);
-  color: var(--text-muted);
-  white-space: normal;
-  word-break: break-word;
 }
 
 .muted {

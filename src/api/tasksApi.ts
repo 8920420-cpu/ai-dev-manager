@@ -186,15 +186,11 @@ export interface SetTaskPriorityResult {
   priority: string;
 }
 
-/**
- * Задача на доске приёмки. Обычно это завершённые конвейером задачи (status=DONE),
- * но для подраздела «Выполнено» сюда попадают и отменённые (status=CANCELLED).
- */
+/** Завершённая задача (status=DONE или CANCELLED) на доске приёмки. */
 export interface AcceptanceTask {
   id: string;
-  title: string;
-  /** 'DONE' — прошла конвейер; 'CANCELLED' — отменена (видна только в «Выполнено»). */
   status: string;
+  title: string;
   priority: string;
   projectId: string;
   projectName: string;
@@ -203,13 +199,9 @@ export interface AcceptanceTask {
   accepted: boolean;
   acceptedAt: string | null;
   updatedAt: string | null;
-  /**
-   * Причина отмены для задач в статусе CANCELLED (последнее событие task_events
-   * с to_status='CANCELLED'). Для DONE — null. До выката backend поле может
-   * отсутствовать/быть null — UI деградирует мягко (просто ничего не показывает).
-   */
+  /** Причина отмены для CANCELLED (дубль/reason/note); у DONE — null. */
   cancelReason: string | null;
-  /** Для отменённых дублей — идентификатор исходной задачи (duplicateOf), иначе null. */
+  /** Ссылка на оригинал для задачи-дубля; иначе null. */
   duplicateOf: string | null;
 }
 
@@ -295,8 +287,8 @@ export const tasksApi = {
   },
 
   /**
-   * `GET /api/tasks/acceptance-board` — задачи для подразделов «Проверка» (DONE,
-   * не приняты) и «Выполнено» (принятые DONE + отменённые CANCELLED с причиной).
+   * `GET /api/tasks/acceptance-board` — завершённые конвейером задачи (DONE) для
+   * подразделов «Проверка» (не приняты) и «Выполнено» (приняты).
    */
   async acceptanceBoard(signal?: AbortSignal): Promise<AcceptanceBoard> {
     return http.get<AcceptanceBoard>('/api/tasks/acceptance-board', { signal });

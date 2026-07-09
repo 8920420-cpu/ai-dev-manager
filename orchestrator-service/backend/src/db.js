@@ -1411,27 +1411,54 @@ export async function restartStuckTasksTx(c) {
 
 /**
  * TASK-ACCEPTANCE-001 — доска приёмки для подразделов «Проверка»/«Выполнено».
- * Плоский список завершённых конвейером задач (status = DONE) с проектом, сервисом
- * и признаком приёма. Клиент делит его на «Проверка» (accepted = false) и
- * «Выполнено» (accepted = true). Подзадачи (parent_task_id) учитываются наравне с
- * верхним уровнем — приём выполняется по любой задаче, дошедшей до DONE. Read-only.
- * Возвращает { tasks: [{ id, title, projectId, projectName, serviceName, status,
- * accepted, acceptedAt, updatedAt, priority }] } в порядке свежести.
+ * Плоский список завершённых задач (status IN ('DONE','CANCELLED')) с проектом,
+ * сервисом и признаком приёма. Клиент делит его так: «Проверка» — только не принятые
+ * DONE (accepted = false); «Выполнено» — принятые DONE и все CANCELLED (у отменённых
+ * приёма нет, но их показывают в архиве с причиной отмены). Подзадачи
+ * (parent_task_id) учитываются наравне с верхним уровнем. Read-only.
+ *
+ * Для CANCELLED-задач отдаём причину отмены cancelReason: приоритет — заметка о
+ * дубле (data_card->>'duplicateNote'), иначе reason/note последнего события
+ * task_events с to_status='CANCELLED' (LEFT JOIN LATERAL ev), иначе ссылка на
+ * оригинал (data_card->>'duplicateOf'). Для DONE cancelReason = null. Поле
+ * duplicateOf пробрасывается из data_card (иначе null).
+ *
+ * Возвращает { tasks: [{ id, title, status, priority, projectId, projectName,
+ * serviceName, accepted, acceptedAt, updatedAt, cancelReason, duplicateOf }] }.
  */
 export async function getAcceptanceBoard(s) {
-  return withClient(clientConfig(s), async (c) => {
-    const r = await c.query(
+  return withClient(clientConfig(s), (c) => getAcceptanceBoardTx(c));
+}
+
+export async function getAcceptanceBoardTx(c) {
+  const r = await c.query(
       `SELECT t.id, t.title, t.status::text AS status, t.priority::text AS priority,
               t.accepted_at, t.updated_at,
               p.id AS project_id, p.name AS project_name,
-              sv.service_name
+              sv.service_name,
+              t.data_card->>'duplicateNote' AS duplicate_note,
+              t.data_card->>'duplicateOf'   AS duplicate_of,
+              ev.reason AS ev_reason, ev.note AS ev_note
          FROM tasks t
          JOIN projects p ON p.id = t.project_id
          LEFT JOIN services sv ON sv.id = t.service_id
-        WHERE t.status = 'DONE'
+         LEFT JOIN LATERAL (
+           SELECT te.payload_json->>'reason' AS reason,
+                  te.payload_json->>'note'   AS note
+             FROM task_events te
+            WHERE te.task_id = t.id AND te.to_status = 'CANCELLED'
+            ORDER BY te.created_at DESC, te.id DESC
+            LIMIT 1
+         ) ev ON true
+        WHERE t.status IN ('DONE','CANCELLED')
         ORDER BY t.priority ASC, t.created_at ASC, t.id DESC
         LIMIT 1000`,
     );
+    // Первое непустое строковое значение — аналог COALESCE(NULLIF(x, ''), …).
+    const firstNonEmpty = (...vals) => {
+      for (const v of vals) if (typeof v === 'string' && v.trim() !== '') return v;
+      return null;
+    };
     const tasks = r.rows.map((row) => ({
       id: row.id,
       title: row.title,
@@ -1443,9 +1470,13 @@ export async function getAcceptanceBoard(s) {
       accepted: row.accepted_at != null,
       acceptedAt: row.accepted_at ? new Date(row.accepted_at).toISOString() : null,
       updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : null,
+      // Причина отмены только у CANCELLED; у DONE — null.
+      cancelReason: row.status === 'CANCELLED'
+        ? firstNonEmpty(row.duplicate_note, row.ev_reason, row.ev_note, row.duplicate_of)
+        : null,
+      duplicateOf: firstNonEmpty(row.duplicate_of),
     }));
-    return { tasks };
-  });
+  return { tasks };
 }
 
 /**

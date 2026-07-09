@@ -712,8 +712,9 @@ export function createApp() {
           return sendJson(res, 200, result);
         }
 
-        // Доска приёмки: завершённые конвейером задачи (DONE) для подразделов
-        // «Проверка» (не приняты) и «Выполнено» (приняты). Read-only.
+        // Доска приёмки: завершённые задачи (DONE и CANCELLED) для подразделов
+        // «Проверка» (не принятые DONE) и «Выполнено» (принятые DONE + все CANCELLED
+        // с причиной отмены). Read-only.
         if (req.method === 'GET' && p === '/api/tasks/acceptance-board')
           return sendJson(res, 200, await getAcceptanceBoard(await loadSettings()));
 
