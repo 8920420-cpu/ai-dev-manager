@@ -1837,14 +1837,14 @@ export async function claimNextClaudeTaskTx(c) {
       }
       const row = picked.rows[0];
       const meta = await c.query(
-        `SELECT p.code AS project_code, s.service_code
+        `SELECT p.code AS project_code, s.service_code, t.task_kind
            FROM tasks t
            JOIN projects p ON p.id = t.project_id
            LEFT JOIN services s ON s.id = t.service_id
           WHERE t.id = $1`,
         [row.id],
       );
-      const { project_code, service_code } = meta.rows[0];
+      const { project_code, service_code, task_kind } = meta.rows[0];
       // Проброс контекста Programmer'у: вывод ARCHITECT/DECOMPOSER и последнее
       // ревью, чтобы Claude реализовывал по проекту, а не с нуля.
       const prior = await fetchPriorOutputs(c, row.id);
@@ -1893,8 +1893,12 @@ export async function claimNextClaudeTaskTx(c) {
       );
       const connModel = String(progConn.rows[0]?.model ?? '').trim();
       const agentModel = String(progAgent.rows[0]?.model ?? '').trim();
-      // Эффективная модель: коннектор роли > дефолт агента > пусто (раннер сам решит).
-      const programmerModel = connModel || agentModel || null;
+      // PROGRAMMER-MODEL-ROUTING-001: модель по сложности задачи (Sonnet для мелких
+      // подзадач-на-файл, Opus для цельных задач-на-сервис). Эффективная модель:
+      // явный Claude-коннектор роли (осознанный override оператора) > роутинг по
+      // сложности > дефолт агента > пусто (раннер сам решит).
+      const routedModel = programmerModelForKind(task_kind);
+      const programmerModel = connModel || routedModel || agentModel || null;
       // ROLE-ENGINE-ROUTING-002: неизменяемый снимок фактического движка программиста.
       // Источник истины — назначенный роли Claude-совместимый коннектор (см. выше). Нет
       // назначения → снимок пустой (раннер исполняет дефолтным агентом, коннектор не
@@ -2058,7 +2062,42 @@ export async function releaseClaudeTaskTx(c, taskId, opts = {}) {
         [id, runStatus, turns, outcome, errorText, r.rows[0].current_role_id],
       );
     }
-    return { released, taskId: id };
+    // PROGRAMMER-CROSS-SERVICE-PREFLIGHT-001: агент явно упёрся в контракт/сгенерированный
+    // код ДРУГОГО сервиса (meta.blockerKind='cross_service'). Гонять такую задачу по
+    // кругу в CODING бессмысленно — граница сервиса выбрана неверно. Сразу уводим в
+    // BLOCKED с точной причиной и именем блокирующего сервиса: оператор переразобьёт
+    // (Архитектор/Декомпозер) через manual-move. Ловим на ПЕРВОМ явном сигнале, а не
+    // после исчерпания backoff/loop-cap (5 холостых прогонов). Причину дублируем в
+    // data_card (видно в карточке, как у прочих авто-блоков).
+    let crossServiceBlocked = false;
+    if (released && opts.meta && opts.meta.blockerKind === 'cross_service') {
+      const upd = await c.query(
+        `UPDATE tasks SET status = 'BLOCKED' WHERE id = $1 AND status = 'CODING' RETURNING id`,
+        [id],
+      );
+      if (upd.rowCount) {
+        crossServiceBlocked = true;
+        const blockedBy = opts.meta.blockedByService
+          ? String(opts.meta.blockedByService).slice(0, 120) : null;
+        const detail = 'Программист заблокирован контрактом/сгенерированным кодом другого '
+          + 'сервиса — нужна ре-декомпозиция (Архитектор/Декомпозер), а не повтор в CODING.';
+        await c.query(
+          `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+           VALUES ($1, 'TASK_BLOCKED', 'CODING', 'BLOCKED', $2, $3::jsonb)`,
+          [id, r.rows[0].current_role_id, JSON.stringify({
+            runner: true, reason: 'cross_service_dependency', blockedByService: blockedBy, detail,
+          })],
+        );
+        await c.query(
+          `UPDATE tasks SET data_card = COALESCE(data_card, '{}'::jsonb) || jsonb_build_object(
+             'cross_service_block',
+             jsonb_build_object('reason', 'cross_service_dependency', 'blockedByService', $2::text))
+            WHERE id = $1`,
+          [id, blockedBy],
+        );
+      }
+    }
+    return { released, taskId: id, crossServiceBlocked };
   }
 }
 
@@ -2811,6 +2850,19 @@ const PROGRAMMER_RELEASE_BACKOFF_MS = parseBackoffScheduleMs(
 );
 const programmerLoopMaxCfg = resolveInt('PROGRAMMER_RELEASE_LOOP_MAX', 5, { min: 1, max: 1000 });
 const PROGRAMMER_RELEASE_LOOP_MAX = programmerLoopMaxCfg.value;
+// PROGRAMMER-MODEL-ROUTING-001: модель программиста по сложности задачи. Мелкая
+// подзадача-на-файл декомпозиции (task_kind='subtask') — точечная правка: дефолт
+// Sonnet (быстрее и дешевле Opus, без потери качества на узкой задаче). Цельная
+// задача-на-сервис (task_kind='service', в т.ч. legacy-одиночки) — шире по контексту:
+// дефолт Opus. Раньше ВСЕ CODING шли на Opus (дефолт агента/раннера) — избыточно для
+// мелочи. Имена моделей переопределяемы через env (сменить поколение без правки кода).
+// Явно назначенный роли Claude-коннектор (role_connectors) ПЕРЕБИВАЕТ роутинг — это
+// осознанный выбор оператора «одна модель на всё» (см. claimNextClaudeTaskTx).
+const PROGRAMMER_MODEL_SIMPLE = String(process.env.PROGRAMMER_MODEL_SIMPLE || 'claude-sonnet-5').trim();
+const PROGRAMMER_MODEL_COMPLEX = String(process.env.PROGRAMMER_MODEL_COMPLEX || 'claude-opus-4-8').trim();
+export function programmerModelForKind(taskKind) {
+  return String(taskKind) === 'subtask' ? PROGRAMMER_MODEL_SIMPLE : PROGRAMMER_MODEL_COMPLEX;
+}
 // ARCHITECT-BUDGET-LOOP-001: сколько подряд CANCELLED/TIMEOUT-прогонов Архитектора
 // (мега-эпик не влезает в бюджет одного прогона) уводят задачу в BLOCKED С ПРИЧИНОЙ.
 // Дефолт 3 — по инциденту («три CANCELLED подряд по таймауту»). Настройка.
