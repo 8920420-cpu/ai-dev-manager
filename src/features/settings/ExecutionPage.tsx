@@ -32,9 +32,10 @@ export function ExecutionPage() {
   const toast = useToast();
   const [loadState, setLoadState] = useState<LoadState>('loading');
   const [concurrency, setConcurrency] = useState('3');
-  // PROGRAMMER-PRIORITY-001: программист зафиксирован на 1 выделенном агенте
-  // (приоритетный слот). Значение приходит с сервера и не редактируется.
-  const [programmerConcurrency, setProgrammerConcurrency] = useState('1');
+  // PROGRAMMER-PRIORITY-001 отменён: worktree-параллелизм программиста возвращён до
+  // 3 агентов по РАЗНЫМ сервисам (appSettings.js: programmer_concurrency [1..3]).
+  // Значение приходит с сервера и редактируется в диапазоне 1..3.
+  const [programmerConcurrency, setProgrammerConcurrency] = useState('3');
   // TASK-AUTO-ACCEPT-001: «не проверять выполненные» — авто-приёмка DONE. По
   // умолчанию выключена (false): DONE ждут ручной приёмки через гейт «Проверка».
   const [autoAcceptDone, setAutoAcceptDone] = useState(false);
@@ -243,19 +244,21 @@ export function ExecutionPage() {
           </Section>
 
           <Section
-            title="Программист (CODING): приоритетная роль"
-            description="Программист держит ровно 1 выделенный агент и работает без остановки, пока есть CODING-задачи (приоритетный слот). Один агент не конкурирует сам с собой за подписку Claude, а высвобождённая ёмкость уходит другим ролям (рассуждающие роли на Codex/Claude). Значение зафиксировано на 1 и не редактируется."
+            title="Программист (CODING): параллельность"
+            description="Сколько CODING-задач программист ведёт одновременно — по РАЗНЫМ микросервисам (каждый в своём git worktree). Задачи одного сервиса всё равно сериализуются (один активный CODING на сервис), поэтому агенты не конфликтуют в общем дереве. Больше — быстрее разгребается очередь кода, но выше нагрузка на подписку Claude. Диапазон 1..3."
           >
             <div className={styles.executionForm}>
               <Input
                 type="number"
                 min={1}
-                max={1}
+                max={3}
                 step={1}
-                label="Выделенных агентов программиста"
+                label="Параллельных агентов программиста"
                 value={programmerConcurrency}
-                disabled
-                helper="Зафиксировано на 1: приоритетный слот, работает без остановки. Остальная ёмкость — другим ролям."
+                onChange={(e) => setProgrammerConcurrency(e.target.value)}
+                disabled={saving}
+                helper="Целое число от 1 до 3. По умолчанию 3. Применяется на лету, без перезапуска раннера."
+                error={!progValid ? 'Введите целое число от 1 до 3' : undefined}
               />
               <Button
                 variant="primary"
