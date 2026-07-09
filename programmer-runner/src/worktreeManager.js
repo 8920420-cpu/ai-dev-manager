@@ -65,18 +65,57 @@ function withMainLock(fn) {
 
 const sanitize = (s) => String(s ?? '').replace(/[^A-Za-z0-9_.-]/g, '_') || '_';
 
+// PROGRAMMER-DELTA-DENYLIST-001: артефакты сборки/генерации не должны попадать в
+// дельту программиста. Они регенерируются из исходников, побайтово пляшут между
+// прогонами и дают ЛОЖНЫЙ integrate_conflict в main (частый случай — *.tsbuildinfo,
+// dist/ при неполном .gitignore ЦЕЛЕВОГО репозитория: `git add -A` уважает .gitignore,
+// но целевые репо нередко забывают их исключить). Это страховочный слой ПОВЕРХ
+// .gitignore. Расширяется через PROGRAMMER_DELTA_DENY_GLOBS (список через запятую;
+// `*.ext` — по расширению, имя без `*` — как сегмент пути: `dist` ловит `dist/a`,
+// `x/dist/b`). Осознанный риск: если целевой репо КОММИТИТ такой путь как исходник,
+// правка в нём не доедет — сузьте deny-list через env. Выброшенные пути логируются.
+const DEFAULT_DENY_GLOBS = [
+  '*.tsbuildinfo',
+  'node_modules', 'dist',
+  '.next', '.nuxt', '.svelte-kit', '.turbo',
+  '__pycache__', '*.pyc',
+];
+
+function parseDenyGlobs(raw) {
+  const list = String(raw ?? '').split(',').map((s) => s.trim()).filter(Boolean);
+  return list.length ? list : DEFAULT_DENY_GLOBS;
+}
+
+// Совпадает ли путь дельты с deny-glob. path — от git (уже forward-slash, но на
+// всякий случай нормализуем). `*.ext` → по суффиксу; имя без `*` → как ТОЧНЫЙ
+// сегмент пути (не подстрока: `dist` не заденет `distributor.js`).
+function matchesDeny(path, globs) {
+  const p = String(path).replace(/\\/g, '/');
+  const segs = p.split('/');
+  for (const g of globs) {
+    if (g.startsWith('*.')) {
+      if (p.endsWith(g.slice(1))) return true;
+    } else if (segs.includes(g)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export class WorktreeManager {
   /**
    * @param {Object} [cfg]
    * @param {string} [cfg.root]  корень для worktree сервисов (по умолчанию tmp)
    * @param {Console} [cfg.log]
    */
-  constructor({ root, log = console } = {}) {
+  constructor({ root, log = console, denyGlobs } = {}) {
     this.root = root || process.env.PROGRAMMER_WORKTREE_ROOT || join(tmpdir(), 'programmer-worktrees');
     this.log = log;
     this.services = new Map(); // serviceKey -> { worktreeCwd, branch }
     this.locks = new Map();    // serviceKey -> Promise (mutex по сервису)
     this.repoLocks = new Map();// repoCwd -> Promise (mutex по репозиторию)
+    // PROGRAMMER-DELTA-DENYLIST-001: артефакты, исключаемые из дельты (см. выше).
+    this.denyGlobs = denyGlobs || parseDenyGlobs(process.env.PROGRAMMER_DELTA_DENY_GLOBS);
   }
 
   // Сериализация задач одного микросервиса: следующая ждёт предыдущую.
@@ -252,6 +291,9 @@ export class WorktreeManager {
           error: agentOut?.error || 'agent_failed',
           changedFiles: [],
           limitHit: agentOut?.limitHit,
+          // PROGRAMMER-CROSS-SERVICE-PREFLIGHT-001: маркер кросс-сервисного блокера
+          // должен дойти до ProgrammerRunner → оркестратора (иначе теряется здесь).
+          blockerKind: agentOut?.blockerKind,
           meta: agentOut?.meta,
           branch: handle.branch,
           commit: null,
@@ -266,7 +308,21 @@ export class WorktreeManager {
   async _commitAndIntegrate(repoCwd, handle, agentOut) {
     const wt = handle.worktreeCwd;
     git(wt, ['add', '-A']);
-    const staged = git(wt, ['diff', '--cached', '--name-only']).split('\n').map((s) => s.trim()).filter(Boolean);
+    let staged = git(wt, ['diff', '--cached', '--name-only']).split('\n').map((s) => s.trim()).filter(Boolean);
+    // PROGRAMMER-DELTA-DENYLIST-001: убрать из индекса артефакты сборки/генерации,
+    // чтобы они не попали в коммит-дельту и не порождали ложный integrate_conflict.
+    const denied = staged.filter((f) => matchesDeny(f, this.denyGlobs));
+    if (denied.length) {
+      try {
+        git(wt, ['reset', '--quiet', '--', ...denied]);
+      } catch (e) {
+        // Не смогли снять из индекса — не валим задачу, просто предупреждаем.
+        this.log.warn?.('deny-list: не удалось снять артефакты из индекса', { branch: handle.branch, error: e.message });
+      }
+      staged = staged.filter((f) => !matchesDeny(f, this.denyGlobs));
+      this.log.info?.('дельта: исключены артефакты сборки/генерации (deny-list)',
+        { branch: handle.branch, dropped: denied });
+    }
     if (!staged.length) {
       // Агент ничего не изменил — это валидный исход (нечего сливать). Ветку сервиса
       // всё равно отдаём (commit=null): по ней GIT_INTEGRATION отличит «пустую» сдачу

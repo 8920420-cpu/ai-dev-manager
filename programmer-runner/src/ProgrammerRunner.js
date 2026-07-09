@@ -64,6 +64,9 @@ export class ProgrammerRunner {
     const task = claimed?.task;
     if (!task) return { idle: true };
 
+    // PROGRAMMER-OBSERVABILITY-001: стенка-часы прогона для лога метрик (turns/ms/
+    // tokens/cost/changedFiles/conflictFiles) — по образцу claude-reasoning-runner.
+    const startedAt = Date.now();
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), this.taskTimeoutMs);
     let agentResult;
@@ -74,7 +77,7 @@ export class ProgrammerRunner {
       // Возвращаем захват в пул, чтобы задачу не заклинило с назначенным агентом.
       clearTimeout(timer);
       const reason = ac.signal.aborted ? 'agent_timeout' : error.message;
-      this.log.error?.('programmer agent threw', { taskId: task.id, reason });
+      this.log.error?.('programmer agent threw', { taskId: task.id, reason, totalMs: Date.now() - startedAt });
       // Прокидываем причину: без неё в agent_runs остаётся outcome='released' и
       // источник петли захват→провал→release установить нельзя (инцидент 03.07.2026).
       await this.safeRelease(task.id, { reason });
@@ -84,19 +87,30 @@ export class ProgrammerRunner {
 
     if (!agentResult || agentResult.ok !== true) {
       const reason = agentResult?.error || 'agent_reported_failure';
+      const metrics = runMetrics(agentResult, Date.now() - startedAt);
       // Упор в лимит ходов — ОТДЕЛЬНЫЙ помеченный исход: логируем заметно и сообщаем
       // оркестратору reason+meta, чтобы он записал событие KPI (отслеживаем работу
       // Декомпозитора/Архитектора — задача не уложилась в бюджет ходов).
       if (agentResult?.limitHit) {
         this.log.error?.('programmer LIMIT EXCEEDED (max turns)', {
-          taskId: task.id, numTurns: agentResult.meta?.numTurns, maxTurns: agentResult.meta?.maxTurns,
+          taskId: task.id, numTurns: agentResult.meta?.numTurns, maxTurns: agentResult.meta?.maxTurns, ...metrics,
         });
         await this.safeRelease(task.id, { reason: 'max_turns_exceeded', meta: agentResult.meta });
         return { taskId: task.id, released: true, reason, limitHit: true, meta: agentResult.meta };
       }
-      this.log.warn?.('programmer agent did not succeed', { taskId: task.id, reason });
-      // meta прокидываем, если исполнитель его вернул (например turns) — иначе только reason.
-      await this.safeRelease(task.id, agentResult?.meta ? { reason, meta: agentResult.meta } : { reason });
+      // conflictFiles видны отдельно: integrate_conflict — самая частая непродуктивная
+      // трата слота, и по списку файлов сразу ясно, код это или артефакт (см. deny-list).
+      this.log.warn?.('programmer agent did not succeed', {
+        taskId: task.id, reason, conflict: agentResult?.conflict || undefined,
+        conflictFiles: agentResult?.conflictingFiles,
+        blockerKind: agentResult?.blockerKind || undefined, ...metrics,
+      });
+      // meta прокидываем, если исполнитель его вернул (turns, кросс-сервисный блокер) —
+      // иначе только reason. PROGRAMMER-CROSS-SERVICE-PREFLIGHT-001: blockerKind в meta
+      // говорит оркестратору увести задачу на переразбиение, а не оставить в CODING.
+      const meta = { ...(agentResult?.meta || {}) };
+      if (agentResult?.blockerKind) meta.blockerKind = agentResult.blockerKind;
+      await this.safeRelease(task.id, Object.keys(meta).length ? { reason, meta } : { reason });
       return { taskId: task.id, released: true, reason };
     }
 
@@ -107,6 +121,7 @@ export class ProgrammerRunner {
         taskId: task.id,
         nextRole: res?.nextRole,
         duplicate: res?.duplicate,
+        ...runMetrics(agentResult, Date.now() - startedAt),
       });
       return { taskId: task.id, success: true, complete: res };
     } catch (error) {
@@ -125,6 +140,28 @@ export class ProgrammerRunner {
       this.log.error?.('programmer release failed', { taskId, error: error.message });
     }
   }
+}
+
+// PROGRAMMER-OBSERVABILITY-001: компактная сводка метрик прогона для лога —
+// turns/totalMs/changedFiles/conflictFiles/токены/стоимость/cold start. Образец —
+// metrics() в claudeReasoningAgent.js: раньше в логе программиста был виден только
+// исход, но не «куда ушло время». undefined-поля JSON.stringify опускает, поэтому
+// старый исход без usage даёт чистую строку.
+export function runMetrics(agentResult, totalMs) {
+  const agent = agentResult?.result?.agent || {};
+  const fin = (v) => (Number.isFinite(v) ? v : undefined);
+  return {
+    turns: fin(agent.numTurns),
+    totalMs,
+    coldStartMs: fin(agent.coldStartMs),
+    changedFiles: Array.isArray(agentResult?.changedFiles) ? agentResult.changedFiles.length : undefined,
+    conflictFiles: Array.isArray(agentResult?.conflictingFiles) && agentResult.conflictingFiles.length
+      ? agentResult.conflictingFiles.length : undefined,
+    tokensIn: fin(agent.tokensIn),
+    tokensOut: fin(agent.tokensOut),
+    costUsd: fin(agent.costUsd) ?? fin(agent.totalCostUsd),
+    model: typeof agentResult?.model === 'string' ? agentResult.model : undefined,
+  };
 }
 
 // Тело сдачи для POST /api/scanner/task-completed. Поля берём из блока completion

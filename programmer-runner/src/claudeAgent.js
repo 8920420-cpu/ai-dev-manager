@@ -126,7 +126,16 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
   const parsed = ok ? parseAgentJson(final.result) : null;
   // Агент явно сообщил о провале — уважаем.
   if (parsed && parsed.success === false) {
-    return { ok: false, error: `agent_reported_failure: ${parsed.summary || ''}`.trim() };
+    const out = { ok: false, error: `agent_reported_failure: ${parsed.summary || ''}`.trim() };
+    // PROGRAMMER-CROSS-SERVICE-PREFLIGHT-001: агент явно назвал блокер — правку
+    // контракта/сгенерированного кода ДРУГОГО сервиса. Помечаем исход, чтобы
+    // оркестратор увёл задачу на переразбиение, а не гонял её по кругу в CODING.
+    const blockedBy = typeof parsed.blocked_by_service === 'string' ? parsed.blocked_by_service.trim() : '';
+    if (blockedBy) {
+      out.blockerKind = 'cross_service';
+      out.meta = { blockedByService: blockedBy.slice(0, 120), summary: String(parsed.summary || '').slice(0, 500) };
+    }
+    return out;
   }
   if (!ok) {
     const reason = final ? `${final.subtype}${final.error ? `: ${final.error}` : ''}` : 'no_result_message';

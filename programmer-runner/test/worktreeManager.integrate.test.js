@@ -294,6 +294,70 @@ test('concurrency: параллельное создание worktree разны
   cleanup(repo, root);
 });
 
+// PROGRAMMER-DELTA-DENYLIST-001: артефакты сборки/генерации (напр. *.tsbuildinfo)
+// исключаются из дельты программиста — они регенерируются и дают ложный
+// integrate_conflict. Легитимный исходник рядом с ними доезжает как обычно.
+test('deny-list: артефакт сборки исключён из дельты, исходник рядом доезжает', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr = new WorktreeManager({ root, log: silent });
+  const res = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    put(wt, 'src/app.ts', 'export const x = 1;\n');            // исходник — доезжает
+    put(wt, 'tsconfig.tsbuildinfo', '{"version":"5.0"}\n');    // артефакт — исключается
+    put(wt, 'dist/app.js', 'var x=1;\n');                       // build-вывод — исключается
+    put(wt, 'node_modules/dep/index.js', 'module.exports=1;\n'); // deps — исключается
+    return { ok: true, result: {} };
+  });
+  assert.equal(res.ok, true, `ожидали успех, error=${res.error}`);
+  assert.deepEqual(res.changedFiles, ['src/app.ts'], 'в дельте только исходник');
+  assert.equal(readFileSync(join(repo, 'src/app.ts'), 'utf8'), 'export const x = 1;\n');
+  assert.equal(existsSync(join(repo, 'tsconfig.tsbuildinfo')), false, 'артефакт не доехал в main');
+  assert.equal(existsSync(join(repo, 'dist/app.js')), false, 'build-вывод не доехал в main');
+  cleanup(repo, root);
+});
+
+test('deny-list: задача трогает ТОЛЬКО артефакты → пустая дельта (commit=null), а не ложный конфликт', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr = new WorktreeManager({ root, log: silent });
+  const res = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    put(wt, 'tsconfig.tsbuildinfo', '{"v":1}\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res.ok, true, `пустая после фильтра дельта — валидный исход, error=${res.error}`);
+  assert.deepEqual(res.changedFiles, []);
+  assert.equal(res.commit, null, 'нечего коммитить — commit=null');
+  cleanup(repo, root);
+});
+
+test('deny-list: сегментное совпадение не задевает похожие имена (distributor.ts ≠ dist)', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr = new WorktreeManager({ root, log: silent });
+  const res = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    put(wt, 'src/distributor.ts', 'export const d = 1;\n'); // содержит "dist" как подстроку — НЕ артефакт
+    return { ok: true, result: {} };
+  });
+  assert.equal(res.ok, true, `ожидали успех, error=${res.error}`);
+  assert.deepEqual(res.changedFiles, ['src/distributor.ts'], 'файл с подстрокой dist не исключён');
+  cleanup(repo, root);
+});
+
+test('deny-list: настраиваемый список через denyGlobs (кастомный артефакт исключён)', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr = new WorktreeManager({ root, log: silent, denyGlobs: ['*.gen.go', 'generated'] });
+  const res = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    put(wt, 'api/user.go', 'package api\n');          // исходник — доезжает
+    put(wt, 'api/user.gen.go', 'package api // gen\n'); // *.gen.go — исключается
+    put(wt, 'generated/schema.go', 'package generated\n'); // сегмент generated — исключается
+    return { ok: true, result: {} };
+  });
+  assert.equal(res.ok, true, `ожидали успех, error=${res.error}`);
+  assert.deepEqual(res.changedFiles, ['api/user.go']);
+  cleanup(repo, root);
+});
+
 test('integrate: смешанный REWORK — часть уже в дереве, часть новых → успех, недостающие применены', async () => {
   const repo = makeRepo();
   put(repo, 'pkg/a.txt', 'AAA\n'); // уже донесён первым прогоном (untracked)
