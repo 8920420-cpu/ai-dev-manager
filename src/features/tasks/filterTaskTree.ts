@@ -27,3 +27,20 @@ export function filterTaskTree(tree: TaskTree, showDone: boolean): TaskTree {
 export function countTopLevelTasks(tree: TaskTree): number {
   return tree.projects.reduce((acc, p) => acc + p.taskCount, 0);
 }
+
+/**
+ * Число задач и подзадач с непогашенным документационным долгом (docsDebt != null)
+ * по дереву. Индикатор для последующей доработки документации.
+ */
+export function countDocsDebt(tree: TaskTree): number {
+  let count = 0;
+  for (const project of tree.projects) {
+    for (const task of project.tasks) {
+      if (task.docsDebt) count += 1;
+      for (const sub of task.subtasks) {
+        if (sub.docsDebt) count += 1;
+      }
+    }
+  }
+  return count;
+}

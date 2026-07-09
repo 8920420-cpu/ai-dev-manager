@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import type { TaskTree } from '../../api/tasksApi';
-import { countTopLevelTasks, filterTaskTree } from './filterTaskTree';
+import { countDocsDebt, countTopLevelTasks, filterTaskTree } from './filterTaskTree';
 
 const tree: TaskTree = {
   projects: [
@@ -57,5 +57,55 @@ describe('filterTaskTree — фильтр выполненных (DONE)', () => 
 
   it('countTopLevelTasks суммирует задачи верхнего уровня по проектам', () => {
     expect(countTopLevelTasks(tree)).toBe(2);
+  });
+});
+
+describe('countDocsDebt — счётчик непогашенного документационного долга', () => {
+  it('считает задачи и подзадачи с docsDebt != null', () => {
+    const withDebt: TaskTree = {
+      projects: [
+        {
+          id: 'p1',
+          name: 'Проект',
+          code: 'P',
+          taskCount: 2,
+          tasks: [
+            {
+              id: 't1',
+              title: 'С долгом',
+              status: 'REVIEW',
+              priority: 'P2',
+              docsDebt: {
+                role: 'DOCUMENTATION_AUDITOR',
+                reason: 'нет описания API',
+                status: 'BLOCKED',
+                at: '2026-07-09T00:00:00.000Z',
+              },
+              subtasks: [
+                {
+                  id: 's1',
+                  title: 'Подзадача с долгом',
+                  status: 'CODING',
+                  priority: 'P2',
+                  docsDebt: {
+                    role: 'DOCUMENTATION_KEEPER',
+                    reason: 'нет changelog',
+                    status: 'BLOCKED',
+                    at: '2026-07-09T00:00:00.000Z',
+                  },
+                },
+                { id: 's2', title: 'Без долга', status: 'CODING', priority: 'P2', docsDebt: null },
+              ],
+            },
+            { id: 't2', title: 'Без долга', status: 'CODING', priority: 'P2', subtasks: [] },
+          ],
+        },
+      ],
+    };
+    expect(countDocsDebt(withDebt)).toBe(2);
+  });
+
+  it('возвращает 0, когда долга нет ни у одного узла', () => {
+    expect(countDocsDebt(tree)).toBe(0);
   });
 });

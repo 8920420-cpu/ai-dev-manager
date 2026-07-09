@@ -16,12 +16,14 @@ interface BadgeProps {
   tone?: BadgeTone;
   dot?: boolean;
   pulse?: boolean;
+  /** Нативная подсказка (tooltip) при наведении. */
+  title?: string;
   children: ReactNode;
 }
 
-export function Badge({ tone = 'neutral', dot = true, pulse, children }: BadgeProps) {
+export function Badge({ tone = 'neutral', dot = true, pulse, title, children }: BadgeProps) {
   return (
-    <span className={cn(styles.badge, styles[tone], pulse && styles.pulse)}>
+    <span className={cn(styles.badge, styles[tone], pulse && styles.pulse)} title={title}>
       {dot && <span className={styles.dot} aria-hidden="true" />}
       {children}
     </span>

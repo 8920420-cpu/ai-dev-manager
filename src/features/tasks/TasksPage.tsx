@@ -35,7 +35,7 @@ import {
 } from '../../api/tasksApi';
 import { projectsApi } from '../../api/projectsApi';
 import type { Project, Stage } from '../../types/project';
-import { countTopLevelTasks, filterTaskTree } from './filterTaskTree';
+import { countDocsDebt, countTopLevelTasks, filterTaskTree } from './filterTaskTree';
 import { expandedForLoad, projectKey, taskKey } from './treeExpansion';
 import styles from './TasksPage.module.css';
 
@@ -199,6 +199,7 @@ export function TasksPage() {
   };
 
   const totalTopLevel = displayed ? countTopLevelTasks(displayed) : 0;
+  const docsDebtCount = displayed ? countDocsDebt(displayed) : 0;
 
   return (
     <div className={styles.page}>
@@ -251,6 +252,14 @@ export function TasksPage() {
         <>
           <p className={styles.summary}>
             Проектов: {displayed.projects.length} · Задач верхнего уровня в работе: {totalTopLevel}
+            {docsDebtCount > 0 && (
+              <>
+                {' · '}
+                <Badge tone="warning" title="Задачи и подзадачи с непогашенным документационным долгом">
+                  Документационный долг: {docsDebtCount}
+                </Badge>
+              </>
+            )}
           </p>
           <ul className={styles.tree} role="tree">
             {displayed.projects.map((project) => (
@@ -360,6 +369,11 @@ function TaskNode({
         </span>
         {hasSubs && <span className={styles.count}>{task.subtasks.length}</span>}
         <Badge tone={statusTone(task.status)}>{taskStatusLabel(task.status)}</Badge>
+        {task.docsDebt && (
+          <Badge tone="warning" title={task.docsDebt.reason}>
+            документационный долг
+          </Badge>
+        )}
         <Badge tone={taskPriorityTone(task.priority)}>{taskPriorityLabel(task.priority)}</Badge>
         <TaskRowActions
           taskId={task.id}
@@ -390,6 +404,11 @@ function SubtaskNode({ subtask, actions }: { subtask: TaskTreeSubtask; actions: 
           {subtask.title}
         </span>
         <Badge tone={statusTone(subtask.status)}>{taskStatusLabel(subtask.status)}</Badge>
+        {subtask.docsDebt && (
+          <Badge tone="warning" title={subtask.docsDebt.reason}>
+            документационный долг
+          </Badge>
+        )}
         <Badge tone={taskPriorityTone(subtask.priority)}>{taskPriorityLabel(subtask.priority)}</Badge>
         <TaskRowActions
           taskId={subtask.id}

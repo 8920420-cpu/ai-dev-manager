@@ -5,12 +5,29 @@
  */
 import { getApiToken, http } from './http';
 
+/**
+ * Документационный долг задачи. Выставляется оркестратором при мягком проходе
+ * документации (DOCUMENTATION_AUDITOR/KEEPER вынесли BLOCKED, но поток осознанно
+ * не блокируется — ветка docForward). Наблюдаемость непогашенного долга.
+ */
+export interface DocsDebt {
+  role: string;
+  reason: string;
+  status: string;
+  at: string;
+}
+
 /** Подзадача — лист дерева (третий уровень). */
 export interface TaskTreeSubtask {
   id: string;
   title: string;
   status: string;
   priority: string;
+  /**
+   * Открытый документационный долг узла; null/отсутствует, если долга нет.
+   * Контракт: GET /api/tasks/tree возвращает docsDebt в узлах при открытом долге.
+   */
+  docsDebt?: DocsDebt | null;
 }
 
 /** Задача — второй уровень; содержит подзадачи. */
