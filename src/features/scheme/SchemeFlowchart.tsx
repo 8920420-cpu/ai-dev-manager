@@ -367,13 +367,20 @@ export function SchemeFlowchart({
             </div>
 
             {taskReviewer && (
-              <div className={styles.reviewRoutes} aria-label="Маршруты Task Reviewer">
-                <span className={cn(styles.reviewRoute, styles.reviewRouteSuccess)}>
+              <div
+                className={styles.reviewRoutes}
+                role="list"
+                aria-label="Исходы проверки Task Reviewer"
+              >
+                <span
+                  className={cn(styles.reviewRoute, styles.reviewRouteSuccess)}
+                  role="listitem"
+                >
                   <ArrowDown size={14} aria-hidden="true" />
                   <span>Успех</span>
                   <span className={styles.reviewTarget}>Pipeline Service</span>
                 </span>
-                <span className={cn(styles.reviewRoute, styles.reviewRouteError)}>
+                <span className={cn(styles.reviewRoute, styles.reviewRouteError)} role="listitem">
                   <CornerDownLeft size={14} aria-hidden="true" />
                   <span>Ошибка</span>
                   <span className={styles.reviewTarget}>Programmer</span>
