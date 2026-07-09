@@ -96,16 +96,63 @@ export class WorktreeManager {
     if (cached && existsSync(cached.worktreeCwd)) return cached;
     const dir = join(this.root, sanitize(serviceKey));
     const branch = `programmer/${serviceKey.split(':').map(sanitize).join('/')}`;
-    // Подчистим возможный осиротевший worktree/ветку от прошлого запуска.
+    mkdirSync(this.root, { recursive: true });
+    // WORKTREE-REUSE-001: ветка сервиса может нести дельты, сданные, но ещё НЕ
+    // влитые GI в main. Пересоздание от HEAD (branch -D) их ТЕРЯЛО: содержимое
+    // оставалось незакоммиченной грязью в основном дереве, а ветка о нём забывала —
+    // побайтовые сверки GI (санитайзер дубля) и _syncWithMain расходились, и
+    // конвейер сервиса клинило (инцидент 09.07: рестарт раннера вотчдогом свежести
+    // выбросил коммит дельты, GI встал на dirty_worktree_conflict). Поэтому после
+    // рестарта процесса прицепляемся к существующей ветке, а не зачищаем её.
+    const reused = this._reattachWorktree(repoCwd, dir, branch);
+    if (reused) {
+      this.services.set(serviceKey, reused);
+      return reused;
+    }
+    // Ветки нет (или прицепиться не удалось — сломанное состояние): чистое
+    // создание от HEAD с зачисткой обломков, как раньше.
     try { git(repoCwd, ['worktree', 'remove', '--force', dir]); } catch { /* нет — ок */ }
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* нет — ок */ }
     try { git(repoCwd, ['branch', '-D', branch]); } catch { /* нет — ок */ }
     try { git(repoCwd, ['worktree', 'prune']); } catch { /* не критично */ }
-    mkdirSync(this.root, { recursive: true });
     git(repoCwd, ['worktree', 'add', '--quiet', '-b', branch, dir, 'HEAD']);
     const handle = { worktreeCwd: dir, branch };
     this.services.set(serviceKey, handle);
     return handle;
+  }
+
+  // Прицепиться к существующим worktree/ветке сервиса после рестарта процесса.
+  // Возвращает handle либо null (ветки нет / состояние не поддаётся переиспользованию).
+  _reattachWorktree(repoCwd, dir, branch) {
+    try {
+      git(repoCwd, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
+    } catch {
+      return null; // ветки нет — терять нечего, штатное чистое создание
+    }
+    try {
+      let dirOnBranch = false;
+      if (existsSync(dir)) {
+        try { dirOnBranch = git(dir, ['rev-parse', '--abbrev-ref', 'HEAD']).trim() === branch; } catch { /* не git-каталог */ }
+      }
+      if (dirOnBranch) {
+        // Каталог уже смотрит в нужную ветку. Недокоммиченные правки в нём — след
+        // прогона, убитого рестартом; его задача переигрывается заново, поэтому
+        // сбрасываем только НЕЗАКОММИЧЕННОЕ (коммиты-дельты ветки целы).
+        git(dir, ['reset', '--hard']);
+        git(dir, ['clean', '-fd']);
+      } else {
+        // Каталога нет (tmp почищен) или он смотрит не туда — поднимаем worktree
+        // НА существующей ветке (без -b), предварительно сняв мёртвую регистрацию.
+        try { rmSync(dir, { recursive: true, force: true }); } catch { /* нет — ок */ }
+        try { git(repoCwd, ['worktree', 'prune']); } catch { /* не критично */ }
+        git(repoCwd, ['worktree', 'add', '--quiet', dir, branch]);
+      }
+      this.log.info?.('worktree переиспользован после рестарта (ветка сохранена)', { branch });
+      return { worktreeCwd: dir, branch };
+    } catch (e) {
+      this.log.warn?.('worktree reattach не удался — пересоздаю с нуля', { branch, error: e.message });
+      return null;
+    }
   }
 
   // Освежить ветку сервиса от текущего main, когда это безопасно. Ветка живёт

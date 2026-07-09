@@ -8,7 +8,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { WorktreeManager } from '../src/worktreeManager.js';
@@ -185,6 +185,80 @@ test('sync: неинтегрированная дельта в ветке → о
   // Коммит невлитой дельты по-прежнему в ветке (его вольёт GI).
   const kept = git(join(root, 'PROJECT_SVC'), ['merge-base', '--is-ancestor', res1.commit, 'HEAD']);
   assert.equal(kept, '', 'коммит первой сдачи не потерян при пропуске освежения');
+  cleanup(repo, root);
+});
+
+// Регрессия WORKTREE-REUSE-001 (инцидент 09.07, frontend): рестарт раннера
+// (вотчдог свежести) пересоздавал worktree от HEAD с branch -D — коммиты дельт,
+// сданных, но ещё не влитых GI в main, исчезали из ветки, а их содержимое
+// оставалось грязью в основном дереве → все побайтовые сверки расходились и
+// конвейер сервиса клинило. Новый экземпляр менеджера обязан прицепиться к
+// существующей ветке, не теряя её коммиты.
+test('restart: новый менеджер переиспользует worktree/ветку с невлитой дельтой', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr1 = new WorktreeManager({ root, log: silent });
+  // Задача 1 сдана, GI ещё НЕ вливал: дельта живёт коммитом в ветке + untracked в main.
+  const res1 = await mgr1.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    put(wt, 'pkg/f.txt', 'v1\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res1.ok, true, `первая сдача, error=${res1.error}`);
+  // «Рестарт раннера»: новый экземпляр с пустой картой сервисов.
+  const mgr2 = new WorktreeManager({ root, log: silent });
+  const res2 = await mgr2.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    assert.equal(readFileSync(join(wt, 'pkg/f.txt'), 'utf8'), 'v1\n', 'невлитая дельта пережила рестарт');
+    put(wt, 'pkg/g.txt', 'v2\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res2.ok, true, `после рестарта, error=${res2.error}`);
+  const kept = git(join(root, 'PROJECT_SVC'), ['merge-base', '--is-ancestor', res1.commit, 'HEAD']);
+  assert.equal(kept, '', 'коммит невлитой дельты не потерян рестартом');
+  cleanup(repo, root);
+});
+
+test('restart: каталог worktree утерян (tmp почищен) → worktree поднимается на существующей ветке', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr1 = new WorktreeManager({ root, log: silent });
+  const res1 = await mgr1.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    put(wt, 'pkg/f.txt', 'v1\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res1.ok, true, `первая сдача, error=${res1.error}`);
+  // tmp зачищен между запусками — каталога worktree больше нет, ветка в репо есть.
+  rmSync(join(root, 'PROJECT_SVC'), { recursive: true, force: true });
+  const mgr2 = new WorktreeManager({ root, log: silent });
+  const res2 = await mgr2.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    assert.equal(readFileSync(join(wt, 'pkg/f.txt'), 'utf8'), 'v1\n', 'ветка с дельтой поднята в новый каталог');
+    put(wt, 'pkg/g.txt', 'v2\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res2.ok, true, `после потери каталога, error=${res2.error}`);
+  const kept = git(join(root, 'PROJECT_SVC'), ['merge-base', '--is-ancestor', res1.commit, 'HEAD']);
+  assert.equal(kept, '', 'коммит невлитой дельты не потерян');
+  cleanup(repo, root);
+});
+
+test('restart: недокоммиченный мусор убитого прогона сбрасывается, коммиты ветки целы', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr1 = new WorktreeManager({ root, log: silent });
+  const res1 = await mgr1.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    put(wt, 'pkg/f.txt', 'v1\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res1.ok, true, `первая сдача, error=${res1.error}`);
+  // Прогон убит на середине: в worktree остались незакоммиченные правки.
+  put(join(root, 'PROJECT_SVC'), 'pkg/halfdone.txt', 'garbage\n');
+  writeFileSync(join(root, 'PROJECT_SVC', 'pkg/f.txt'), 'mangled\n');
+  const mgr2 = new WorktreeManager({ root, log: silent });
+  const res2 = await mgr2.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    assert.equal(existsSync(join(wt, 'pkg/halfdone.txt')), false, 'мусор убитого прогона сброшен');
+    assert.equal(readFileSync(join(wt, 'pkg/f.txt'), 'utf8'), 'v1\n', 'закоммиченная дельта восстановлена');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res2.ok, true, `после сброса мусора, error=${res2.error}`);
   cleanup(repo, root);
 });
 
