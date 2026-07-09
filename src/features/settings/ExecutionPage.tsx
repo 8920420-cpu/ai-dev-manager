@@ -36,7 +36,8 @@ export function ExecutionPage() {
   // (приоритетный слот). Значение приходит с сервера и не редактируется.
   const [programmerConcurrency, setProgrammerConcurrency] = useState('1');
   // TASK-AUTO-ACCEPT-001: «не проверять выполненные» — авто-приёмка DONE.
-  const [autoAcceptDone, setAutoAcceptDone] = useState(true);
+  // Дефолт по умолчанию — ручная приёмка (false); реальное значение приходит с API.
+  const [autoAcceptDone, setAutoAcceptDone] = useState(false);
   const [integrations, setIntegrations] = useState<Integration[]>([]);
   const [assignments, setAssignments] = useState<AssignMap>({});
   const [savedAssignments, setSavedAssignments] = useState<AssignMap>({});
@@ -218,7 +219,7 @@ export function ExecutionPage() {
 
           <Section
             title="Приёмка выполненных задач"
-            description="Гейт «Проверка»: когда включён, дошедшие до статуса «Выполнено» (DONE) задачи ждут ручного подтверждения в подразделе «Задачи → Проверка». Выключив проверку (по умолчанию), выполненные задачи сразу считаются принятыми и попадают в «Выполнено» — их не нужно проверять вручную."
+            description="Гейт «Проверка»: по умолчанию дошедшие до статуса «Выполнено» (DONE) задачи ждут ручного подтверждения в подразделе «Задачи → Проверка» и только после «Принять» попадают в «Выполнено». Включите тумблер «Не проверять выполненные задачи», чтобы выполненные сразу считались принятыми в обход гейта — их не нужно подтверждать вручную."
           >
             <div className={styles.executionForm}>
               <label className={styles.toggleRow}>
