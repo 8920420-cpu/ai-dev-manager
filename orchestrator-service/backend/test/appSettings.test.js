@@ -2,6 +2,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { getAppSettingsTx, updateAppSettingsTx } from '../src/appSettings.js';
+import { parseBoolSetting, readAppSetting, autoAcceptDoneTasks } from '../src/db.js';
 
 function fakeClient(rules) {
   const calls = [];
@@ -114,20 +115,27 @@ test('updateAppSettings: значение вне границ клампится
   assert.equal(high.calls.find((q) => /INSERT/.test(q.sql)).params[1], '50');
 });
 
-test('autoAcceptDone: дефолт true, читается из БД, сохраняется как boolean', async () => {
-  // Пустая таблица → дефолт true.
+test('autoAcceptDone: дефолт false (ручная приёмка), читается из БД, сохраняется как boolean', async () => {
+  // TASK-AUTO-ACCEPT-001: пустая таблица → дефолт false. Свежие DONE ждут ручной
+  // приёмки в подразделе «Проверка», авто-приёмка не срабатывает из коробки.
   const empty = fakeClient([
     { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 0, rows: [] } },
   ]);
-  assert.equal((await getAppSettingsTx(empty)).autoAcceptDone, true);
+  assert.equal((await getAppSettingsTx(empty)).autoAcceptDone, false);
 
-  // Значение из БД (false).
+  // Значение из БД: true → true (авто-приёмка включена вручную).
+  const on = fakeClient([
+    { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 1, rows: [{ key: 'auto_accept_done', value: true }] } },
+  ]);
+  assert.equal((await getAppSettingsTx(on)).autoAcceptDone, true);
+
+  // Значение из БД: false → false.
   const off = fakeClient([
     { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 1, rows: [{ key: 'auto_accept_done', value: false }] } },
   ]);
   assert.equal((await getAppSettingsTx(off)).autoAcceptDone, false);
 
-  // Патч сохраняется как boolean-строка.
+  // Патч апсертит ключ 'auto_accept_done' как boolean-строку.
   const upd = fakeClient([
     { re: /INSERT INTO app_settings/, reply: { rowCount: 1, rows: [] } },
     { re: /SELECT key, value FROM app_settings/, reply: { rowCount: 0, rows: [] } },
@@ -136,6 +144,21 @@ test('autoAcceptDone: дефолт true, читается из БД, сохра�
   const upsert = upd.calls.find((q) => /INSERT INTO app_settings/.test(q.sql));
   assert.equal(upsert.params[0], 'auto_accept_done');
   assert.equal(upsert.params[1], 'false');
+});
+
+test('autoAcceptDone=false (гейт тика): свежая DONE не принимается — autoAcceptDoneTasks не вызывается', async () => {
+  // Ключа auto_accept_done в БД нет → readAppSetting отдаёт fallback false, а
+  // parseBoolSetting(false, false) === false → ветка autoAcceptDoneTasks(c) НЕ входит.
+  // Это точная копия гейта фонового тика (db.js): оба дефолта — false.
+  const c = fakeClient([
+    { re: /SELECT value FROM app_settings WHERE key = \$1/, reply: { rowCount: 0, rows: [] } },
+  ]);
+  const enabled = parseBoolSetting(await readAppSetting(c, 'auto_accept_done', false), false);
+  assert.equal(enabled, false, 'при отсутствии ключа авто-приёмка выключена');
+  if (enabled) await autoAcceptDoneTasks(c);
+  // Ветка не вошла: массового UPDATE tasks ... accepted_at по свежим DONE не было.
+  const massAccept = c.calls.some((q) => /accepted_at IS NULL/.test(q.sql));
+  assert.equal(massAccept, false, 'свежие DONE остаются в «Проверке», accepted_at не проставляется');
 });
 
 test('updateAppSettings: пустой патч → без upsert', async () => {

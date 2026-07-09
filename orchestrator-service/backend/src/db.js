@@ -1495,7 +1495,7 @@ export async function acceptTask(s, taskId) {
 // фоновым тиком, когда включена настройка auto_accept_done — тогда гейт «Проверка»
 // пуст, а свежие DONE сразу попадают в «Выполнено». Идемпотентно (WHERE accepted_at
 // IS NULL), пишет audit-событие source='auto-accept'. Возвращает число принятых.
-async function autoAcceptDoneTasks(c) {
+export async function autoAcceptDoneTasks(c) {
   const r = await c.query(
     `WITH upd AS (
        UPDATE tasks SET accepted_at = now(), updated_at = now()
@@ -3071,11 +3071,14 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // завершается (DONE) или блокируется (BLOCKED, если сервис упал). Линейный
     // аналог снятия join-барьера для декомпозиции по микросервисам.
     await advanceDecompositionParents(c);
-    // TASK-AUTO-ACCEPT-001: если включена авто-приёмка («не проверять выполненные»),
-    // помечаем свежие DONE принятыми в том же тике — задача сразу в «Выполнено», а не
-    // копится в подразделе «Проверка». Делаем ПОСЛЕ шагов, приводящих к DONE (join/
-    // rollup), чтобы не ждать следующего тика. Выключение вернёт ручную приёмку.
-    if (parseBoolSetting(await readAppSetting(c, 'auto_accept_done', true), true)) {
+    // TASK-AUTO-ACCEPT-001: авто-приёмка DONE по умолчанию ВЫКЛЮЧЕНА. Оба дефолта
+    // (readAppSetting fallback и parseBoolSetting fallback) — false: при отсутствии
+    // ключа 'auto_accept_done' гейт закрыт, autoAcceptDoneTasks НЕ вызывается, и свежие
+    // DONE остаются в подразделе «Проверка» до ручного «Принять». Если авто-приёмку
+    // включили в UI, помечаем свежие DONE принятыми в том же тике — задача сразу в
+    // «Выполнено». Делаем ПОСЛЕ шагов, приводящих к DONE (join/rollup), чтобы не ждать
+    // следующего тика.
+    if (parseBoolSetting(await readAppSetting(c, 'auto_accept_done', false), false)) {
       await autoAcceptDoneTasks(c);
     }
     // ROLE-ENGINE-ROUTING-001: роли, делегированные внешнему движку (codex/
@@ -3164,7 +3167,7 @@ async function computeRoleFreeSlots(c, cap, roleCodes = LLM_ROLE_CODES) {
 
 // Низкоуровневое чтение app_settings (рантайм-конфиг). Таблицы может ещё не быть
 // (миграция не накатана) — тогда отдаём fallback, не роняя runner.
-async function readAppSetting(c, key, fallback) {
+export async function readAppSetting(c, key, fallback) {
   try {
     const r = await c.query('SELECT value FROM app_settings WHERE key = $1', [key]);
     return r.rowCount ? r.rows[0].value : fallback;
@@ -3173,7 +3176,7 @@ async function readAppSetting(c, key, fallback) {
   }
 }
 
-function parseBoolSetting(value, fallback = true) {
+export function parseBoolSetting(value, fallback = true) {
   if (typeof value === 'boolean') return value;
   if (typeof value === 'string') {
     const v = value.trim().toLowerCase();
