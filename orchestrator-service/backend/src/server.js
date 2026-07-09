@@ -54,7 +54,7 @@ import {
 import { acceptFeedback, saveScreenshot, readScreenshot } from './feedback.js';
 import { getScheme, saveScheme } from './developmentScheme.js';
 import { getTaskStatistics } from './taskStats.js';
-import { getPerformanceMetrics, getVersionMetrics, getDailyModelStats, getRoleLoadTotals, getKpiMarkers, createKpiMarker } from './performance.js';
+import { getPerformanceMetrics, getVersionMetrics, getDailyModelStats, getRoleLoadTotals, getProgrammerKindStats, getKpiMarkers, createKpiMarker } from './performance.js';
 import { createAuditRun, listAuditRuns, completeAuditRun } from './auditRuns.js';
 import { getTaskTree, getTaskStatusCounts, getTasksByStage, getTaskHistory } from './taskTree.js';
 import { openTaskEventsStream, publishTaskChange } from './taskEvents.js';
@@ -514,6 +514,18 @@ export function createApp() {
             200,
             await getRoleLoadTotals(await loadSettings(), {
               period: url.searchParams.get('period'),
+            }),
+          );
+
+        // PROGRAMMER-KIND-STATS-001: разрез программиста по типу задачи и модели
+        // (?windowHours=&projectId=) — валидация выигрыша модель-роутинга (Sonnet/Opus).
+        if (req.method === 'GET' && p === '/api/performance/programmer-by-kind')
+          return sendJson(
+            res,
+            200,
+            await getProgrammerKindStats(await loadSettings(), {
+              windowHours: url.searchParams.get('windowHours'),
+              projectId: url.searchParams.get('projectId'),
             }),
           );
 

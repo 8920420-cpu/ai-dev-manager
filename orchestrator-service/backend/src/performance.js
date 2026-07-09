@@ -967,6 +967,105 @@ async function programmerVersionRows(c, hours, projectDbId) {
 }
 
 // =====================================================================
+// PROGRAMMER-KIND-STATS-001 — разрез программиста по типу задачи (task_kind) и
+// модели. Валидирует выигрыш модель-роутинга (PROGRAMMER-MODEL-ROUTING-001): мелкая
+// подзадача-на-файл (subtask) едет на дефолт-простой модели (Sonnet), цельная
+// задача-на-сервис (service) — на сложной (Opus). Считаем средние cost/turns/tokens/
+// cold-start по (task_kind × model) из agent_runs (там уже лежат usage/cold_start/
+// turns программиста, PROGRAMMER-USAGE-KPI-001) — видно, что Sonnet на мелочи дешевле
+// и не хуже по проходам.
+// =====================================================================
+
+/**
+ * ЧИСТЫЙ маппинг сырых строк агрегата (task_kind × model) в вид для UI. Вынесен для
+ * юнит-теста без БД. successRate = success/runs; средние округляются; нет данных →
+ * поле null («—» в UI). Служебные «Возвраты» (returns) отделены от «Провала» (failed),
+ * как и в блоке ролей (RELEASE-OUTCOMES-001).
+ * @param {Array<Object>} rows сырые строки (по одной на task_kind×model)
+ * @returns {Array<Object>}
+ */
+export function buildProgrammerKindStats(rows = []) {
+  return rows.map((row) => {
+    const runs = Number(row.runs) || 0;
+    const success = Number(row.success) || 0;
+    const failed = Number(row.failed) || 0;
+    const timeout = Number(row.timeout) || 0;
+    // successRate — по РЕАЛЬНЫМ попыткам (success+failed+timeout), БЕЗ служебных
+    // возвратов захвата (returns): они не попытки агента, а backoff-churn пула, и в
+    // знаменателе дают ложно-низкий процент (инцидент 03.07: 1407 возвратов маскировались
+    // под провалы). runs (все прогоны) отдаём отдельным столбцом для полноты.
+    const attempts = success + failed + timeout;
+    return {
+      taskKind: row.task_kind ?? null,
+      model: row.model ?? null,
+      runs,
+      tasks: Number(row.tasks) || 0,
+      success,
+      failed,
+      returns: Number(row.returns) || 0,
+      timeout,
+      successRate: attempts > 0 ? Math.round((success / attempts) * 1000) / 1000 : null,
+      avgTurns: numOrNull(row.avg_turns, 1),
+      avgCost: numOrNull(row.avg_cost, 4),
+      avgTokensIn: numOrNull(row.avg_tokens_in, 0),
+      avgTokensOut: numOrNull(row.avg_tokens_out, 0),
+      avgColdStartMs: numOrNull(row.avg_cold_start, 0),
+      avgDurationMs: numOrNull(row.avg_ms, 0),
+    };
+  });
+}
+
+/**
+ * GET /api/performance/programmer-by-kind?windowHours=N[&projectId=...]
+ * Разрез программиста по (task_kind × model) из agent_runs за окно (дефолт 720ч).
+ */
+export async function getProgrammerKindStats(s, { windowHours, projectId } = {}) {
+  const hours = Number.isFinite(Number(windowHours)) && Number(windowHours) > 0 ? Number(windowHours) : 720;
+  return withClient(clientConfig(s), async (c) => {
+    const projectDbId = await resolveProjectId(c, projectId);
+    const params = [hours, RELEASE_OUTCOMES];
+    let projFilter = '';
+    if (projectDbId) {
+      params.push(projectDbId);
+      projFilter = `AND ar.task_id IN (SELECT id FROM tasks WHERE project_id = $${params.length})`;
+    }
+    const r = await c.query(
+      `SELECT t.task_kind, ar.model,
+              count(*)::int AS runs,
+              count(DISTINCT ar.task_id)::int AS tasks,
+              count(*) FILTER (WHERE ar.status = 'SUCCESS')::int AS success,
+              count(*) FILTER (WHERE ar.status = 'FAILED'
+                               AND coalesce(lower(ar.outcome), '') <> ALL($2::text[]))::int AS failed,
+              count(*) FILTER (WHERE ar.status = 'FAILED'
+                               AND coalesce(lower(ar.outcome), '') = ANY($2::text[]))::int AS returns,
+              count(*) FILTER (WHERE ar.status = 'TIMEOUT')::int AS timeout,
+              avg(ar.turns) FILTER (WHERE ar.turns IS NOT NULL) AS avg_turns,
+              avg(ar.cost) FILTER (WHERE ar.cost IS NOT NULL) AS avg_cost,
+              avg(ar.token_input) FILTER (WHERE ar.token_input IS NOT NULL) AS avg_tokens_in,
+              avg(ar.token_output) FILTER (WHERE ar.token_output IS NOT NULL) AS avg_tokens_out,
+              avg(ar.cold_start_ms) FILTER (WHERE ar.cold_start_ms IS NOT NULL) AS avg_cold_start,
+              avg(extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000)
+                FILTER (WHERE ar.finished_at IS NOT NULL) AS avg_ms
+         FROM agent_runs ar
+         JOIN roles r ON r.id = ar.role_id
+         JOIN tasks t ON t.id = ar.task_id
+        WHERE r.code = 'PROGRAMMER'
+          AND ar.started_at >= now() - ($1::int * interval '1 hour')
+          ${projFilter}
+        GROUP BY t.task_kind, ar.model
+        ORDER BY t.task_kind NULLS LAST, runs DESC`,
+      params,
+    );
+    return {
+      generatedAt: new Date().toISOString(),
+      windowHours: hours,
+      projectId: projectDbId,
+      rows: buildProgrammerKindStats(r.rows),
+    };
+  });
+}
+
+// =====================================================================
 // ROLE-ENGINE-ROUTING-002 — дневная статистика по коннекторам/моделям.
 //
 // Отвечает на «сменили модель/коннектор внутри дня — как изменились скорость,

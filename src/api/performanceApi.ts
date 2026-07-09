@@ -231,6 +231,34 @@ export interface VersionMetrics {
   markers: KpiMarker[];
 }
 
+// PROGRAMMER-KIND-STATS-001 — разрез программиста по типу задачи (task_kind) и модели.
+// Валидирует модель-роутинг: subtask (мелкая правка) → Sonnet, service → Opus.
+export interface ProgrammerKindRow {
+  taskKind: string | null;
+  model: string | null;
+  runs: number;
+  tasks: number;
+  success: number;
+  failed: number;
+  returns: number;
+  timeout: number;
+  // successRate считается по реальным попыткам (success+failed+timeout), без возвратов.
+  successRate: number | null;
+  avgTurns: number | null;
+  avgCost: number | null;
+  avgTokensIn: number | null;
+  avgTokensOut: number | null;
+  avgColdStartMs: number | null;
+  avgDurationMs: number | null;
+}
+
+export interface ProgrammerKindStats {
+  generatedAt: string;
+  windowHours: number;
+  projectId: string | null;
+  rows: ProgrammerKindRow[];
+}
+
 export const performanceApi = {
   async get(projectId?: string, signal?: AbortSignal): Promise<PerformanceMetrics> {
     const qs = projectId ? `?projectId=${encodeURIComponent(projectId)}` : '';
@@ -246,6 +274,21 @@ export const performanceApi = {
     if (opts.windowHours) params.set('windowHours', String(opts.windowHours));
     if (opts.projectId) params.set('projectId', opts.projectId);
     return http.get<VersionMetrics>(`/api/performance/versions?${params.toString()}`, { signal });
+  },
+
+  // PROGRAMMER-KIND-STATS-001: разрез программиста по типу задачи и модели.
+  async programmerByKind(
+    opts: { windowHours?: number; projectId?: string } = {},
+    signal?: AbortSignal,
+  ): Promise<ProgrammerKindStats> {
+    const params = new URLSearchParams();
+    if (opts.windowHours) params.set('windowHours', String(opts.windowHours));
+    if (opts.projectId) params.set('projectId', opts.projectId);
+    const qs = params.toString();
+    return http.get<ProgrammerKindStats>(
+      `/api/performance/programmer-by-kind${qs ? `?${qs}` : ''}`,
+      { signal },
+    );
   },
 
   // ROLE-LOAD-LAST-DATA-001: суммарные значения блока «Нагрузка по ролям» за период.

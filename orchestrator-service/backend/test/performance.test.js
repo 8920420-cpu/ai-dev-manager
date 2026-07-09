@@ -14,6 +14,7 @@ import {
   attachRoleLoadTaskTotalsDelta,
   isReleaseOutcome,
   RELEASE_OUTCOMES,
+  buildProgrammerKindStats,
 } from '../src/performance.js';
 
 test('deriveKpi: базовые агрегаты по статусам', () => {
@@ -302,6 +303,42 @@ test('buildRoleLoadTotals: суммы прокидываются как есть
 test('buildRoleLoadTotals: пустой вход не падает', () => {
   assert.deepEqual(buildRoleLoadTotals(), []);
   assert.deepEqual(buildRoleLoadTotals([]), []);
+});
+
+// PROGRAMMER-KIND-STATS-001 — разрез программиста по (task_kind × model).
+test('buildProgrammerKindStats: successRate, средние и разделение failed/returns', () => {
+  const rows = [
+    // 10 прогонов, из них 3 — возвраты захвата: реальных попыток 7 (6 success + 1 failed).
+    { task_kind: 'subtask', model: 'claude-sonnet-5', runs: 10, tasks: 8, success: 6,
+      failed: 1, returns: 3, timeout: 0, avg_turns: 12.4, avg_cost: 0.03123, avg_tokens_in: 21000,
+      avg_tokens_out: 1500, avg_cold_start: 18000, avg_ms: 95000 },
+    { task_kind: 'service', model: 'claude-opus-4-8', runs: 4, tasks: 4, success: 3,
+      failed: 1, returns: 2, timeout: 0, avg_turns: 41, avg_cost: 0.51, avg_tokens_in: null,
+      avg_tokens_out: null, avg_cold_start: null, avg_ms: null },
+  ];
+  const out = buildProgrammerKindStats(rows);
+  assert.equal(out.length, 2);
+  assert.equal(out[0].taskKind, 'subtask');
+  assert.equal(out[0].model, 'claude-sonnet-5');
+  // successRate по РЕАЛЬНЫМ попыткам (6+1+0=7), без 3 возвратов: 6/7 ≈ 0.857.
+  assert.equal(out[0].successRate, 0.857, 'successRate = success/(success+failed+timeout), без returns');
+  assert.equal(out[0].runs, 10, 'runs — все прогоны, отдельно от знаменателя');
+  assert.equal(out[0].avgTurns, 12.4);
+  assert.equal(out[0].avgCost, 0.0312, 'стоимость округлена до 4 знаков');
+  assert.equal(out[0].failed, 1);
+  assert.equal(out[0].returns, 3);
+  // Пустые средние (нет данных) → null, а не 0.
+  assert.equal(out[1].avgTokensIn, null);
+  assert.equal(out[1].avgColdStartMs, null);
+  assert.equal(out[1].successRate, 0.75, '3/(3+1+0)');
+});
+
+test('buildProgrammerKindStats: пустой вход и null-поля не падают', () => {
+  assert.deepEqual(buildProgrammerKindStats(), []);
+  const [m] = buildProgrammerKindStats([{ task_kind: null, model: null, runs: 0 }]);
+  assert.equal(m.taskKind, null);
+  assert.equal(m.model, null);
+  assert.equal(m.successRate, null, 'runs=0 → successRate null (нет деления на ноль)');
 });
 
 // ROLE-LOAD-TASK-TOTALS-001 — «Итого (полная задача)»: истинное сквозное среднее

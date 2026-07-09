@@ -13,6 +13,7 @@ import {
   type VersionMetrics,
   type VersionRow,
   type VersionDelta,
+  type ProgrammerKindStats,
 } from '../../api/performanceApi';
 import { cn } from '../../lib/cn';
 import styles from './monitor.module.css';
@@ -732,6 +733,92 @@ function VersionsSection({ roleCodes }: { roleCodes: { code: string; name: strin
   );
 }
 
+// PROGRAMMER-KIND-STATS-001 — человекочитаемые типы задач для разреза программиста.
+const KIND_LABEL: Record<string, string> = {
+  subtask: 'Подзадача (файл)',
+  service: 'Сервис',
+  epic: 'Эпик',
+};
+
+/**
+ * Раздел «Программист: разрез по типу задач и модели». Средние затраты прогонов
+ * программиста по (task_kind × model) за 30 дней. Валидирует модель-роутинг
+ * (PROGRAMMER-MODEL-ROUTING-001): подзадача-на-файл едет на Sonnet (дешевле/быстрее),
+ * цельный сервис — на Opus. Если у Sonnet проходы/успех не хуже при меньшей
+ * стоимости — роутинг оправдан; иначе поднять сложную модель для kind через env.
+ */
+function ProgrammerKindSection() {
+  const [data, setData] = useState<ProgrammerKindStats | null>(null);
+  const [state, setState] = useState<LoadState>('loading');
+
+  useEffect(() => {
+    const ctrl = new AbortController();
+    setState('loading');
+    performanceApi
+      .programmerByKind({ windowHours: 720 }, ctrl.signal)
+      .then((d) => {
+        if (ctrl.signal.aborted) return;
+        setData(d);
+        setState('ready');
+      })
+      .catch((e) => {
+        if (ctrl.signal.aborted || (e instanceof DOMException && e.name === 'AbortError')) return;
+        setState('error');
+      });
+    return () => ctrl.abort();
+  }, []);
+
+  return (
+    <Section
+      title="Программист: разрез по типу задач и модели"
+      description="Средние затраты прогонов программиста по типу задачи (подзадача-на-файл / сервис) и модели за 30 дней. Валидирует модель-роутинг: мелкие подзадачи едут на Sonnet (дешевле и быстрее), цельные сервисы — на Opus. Если у Sonnet «Ср. проходы» и «Успех» не хуже при меньшей «Ср. стоимости» — роутинг оправдан."
+    >
+      {state === 'loading' && <LoadingBlock label="Загрузка разреза…" />}
+      {state === 'error' && <Callout tone="error" title="Не удалось загрузить разрез по типу задач" />}
+      {state === 'ready' && data && (
+        data.rows.length === 0 ? (
+          <span className={styles.muted}>За окно 30 дней прогонов программиста нет.</span>
+        ) : (
+          <div className={styles.tableScroll}><table className={styles.table}>
+            <thead>
+              <tr>
+                <th>Тип задачи</th>
+                <th>Модель</th>
+                <th className={styles.num}>Прогоны</th>
+                <th className={styles.num}>Задачи</th>
+                <th className={styles.num} title="Доля SUCCESS среди РЕАЛЬНЫХ попыток (success+failed+timeout), без служебных возвратов захвата">Успех</th>
+                <th className={styles.num} title="Возвраты захвата в пул без результата агента (backoff-churn), не провалы кода">Возвраты</th>
+                <th className={styles.num} title="Среднее число ходов агента (проходов) до сдачи">Ср. проходы</th>
+                <th className={styles.num}>Ср. стоимость</th>
+                <th className={styles.num}>Ср. токены вх</th>
+                <th className={styles.num}>Ср. токены исх</th>
+                <th className={styles.num} title="Средний холодный старт (спавн агента SDK)">Ср. cold start</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.rows.map((r, i) => (
+                <tr key={`${r.taskKind ?? '-'}:${r.model ?? '-'}:${i}`}>
+                  <td>{r.taskKind ? (KIND_LABEL[r.taskKind] ?? r.taskKind) : '—'}</td>
+                  <td>{r.model ?? '—'}</td>
+                  <td className={styles.num}>{r.runs}</td>
+                  <td className={styles.num}>{r.tasks}</td>
+                  <td className={styles.num}>{r.successRate == null ? '—' : `${Math.round(r.successRate * 100)}%`}</td>
+                  <td className={styles.num}>{r.returns || '—'}</td>
+                  <td className={styles.num}>{r.avgTurns ?? '—'}</td>
+                  <td className={styles.num}>{r.avgCost == null ? '—' : fmtCost(r.avgCost)}</td>
+                  <td className={styles.num}>{r.avgTokensIn == null ? '—' : fmtTokens(r.avgTokensIn)}</td>
+                  <td className={styles.num}>{r.avgTokensOut == null ? '—' : fmtTokens(r.avgTokensOut)}</td>
+                  <td className={styles.num}>{fmtDuration(r.avgColdStartMs)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table></div>
+        )
+      )}
+    </Section>
+  );
+}
+
 function fmtRange(a: string | null, b: string | null): string {
   if (!a) return '—';
   const fa = new Date(a).toLocaleDateString('ru-RU', { day: '2-digit', month: '2-digit' });
@@ -907,6 +994,8 @@ export function PerformanceMonitorPage() {
               />
             </div>
           </Section>
+
+          <ProgrammerKindSection />
 
           <Section title="Задачи по этапам" description="Текущее распределение всех задач по статусам.">
             <div className={styles.statusRow}>
