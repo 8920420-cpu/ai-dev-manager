@@ -6,6 +6,8 @@
 // их можно вести параллельно. Поэтому изоляция ключуется по микросервису:
 //
 //   • один персистентный worktree на микросервис (ветка programmer/<project>/<service>);
+//   • перед каждой задачей ветка освежается от main, если вся её дельта уже
+//     влита (иначе база протухает и дельты перестают ложиться на main);
 //   • задачи одного сервиса сериализуются на его worktree (mutex по ключу сервиса);
 //   • разные сервисы работают в своих worktree параллельно;
 //   • каждая задача коммитит в ветку сервиса и применяет в main ТОЛЬКО свою дельту
@@ -106,6 +108,47 @@ export class WorktreeManager {
     return handle;
   }
 
+  // Освежить ветку сервиса от текущего main, когда это безопасно. Ветка живёт
+  // столько же, сколько процесс раннера, а main тем временем уезжает вперёд
+  // (GI вливает дельты, ручные merge). Без освежения база ветки протухает:
+  // агент правит устаревшее содержимое, и дельта задачи перестаёт ложиться на
+  // main — integrate_conflict «содержимое расходится» (инцидент 09.07, CHAT:
+  // main получил auth-гейт виджета, ветка его не видела).
+  // Сбрасываем ветку на HEAD main ТОЛЬКО когда сброс ничего не теряет — вся
+  // дельта ветки уже в main: каждый её коммит эквивалентно влит (git cherry,
+  // patch-id) либо содержимое затронутых файлов побайтово совпадает с HEAD.
+  // Неинтегрированную дельту (окно «сдано, GI ещё не вливал») не трогаем.
+  _syncWithMain(repoCwd, handle) {
+    const wt = handle.worktreeCwd;
+    const mainHead = git(repoCwd, ['rev-parse', 'HEAD']).trim();
+    const tip = git(wt, ['rev-parse', 'HEAD']).trim();
+    if (tip === mainHead) return; // уже синхронны
+    const mergeBase = git(repoCwd, ['merge-base', mainHead, tip]).trim();
+    if (mergeBase === mainHead) return; // main не двигался — ветка просто несёт свежую дельту
+    if (mergeBase !== tip) {
+      // Ветка несёт коммиты после развилки — сброс безопасен, только если все
+      // они уже в main (git cherry: '+' = патча в main нет)…
+      const pending = git(repoCwd, ['cherry', mainHead, tip])
+        .split('\n').filter((line) => line.startsWith('+'));
+      if (pending.length) {
+        // …либо содержимое всех затронутых веткой файлов побайтово совпадает с
+        // HEAD main (влито с иной историей). git diff --quiet кидает при отличиях.
+        const changed = git(repoCwd, ['diff', '--name-only', `${mergeBase}..${tip}`])
+          .split('\n').map((s) => s.trim()).filter(Boolean);
+        try {
+          if (changed.length) git(repoCwd, ['diff', '--quiet', tip, mainHead, '--', ...changed]);
+        } catch {
+          this.log.info?.('worktree sync skipped: в ветке неинтегрированная дельта',
+            { branch: handle.branch, pending: pending.length });
+          return;
+        }
+      }
+    }
+    git(wt, ['reset', '--hard', mainHead]);
+    this.log.info?.('worktree branch синхронизирована с main',
+      { branch: handle.branch, head: mainHead.slice(0, 12) });
+  }
+
   /**
    * Выполнить задачу сервиса в его worktree (сериализованно), затем применить
    * дельту в main. agentFn(worktreeCwd) → { ok, error?, result? }.
@@ -122,6 +165,12 @@ export class WorktreeManager {
       } catch (e) {
         this.log.warn?.('worktree ensure failed', { serviceKey, error: e.message });
         return { ok: false, error: `worktree_ensure_failed: ${e.message}`, changedFiles: [] };
+      }
+      try {
+        this._syncWithMain(repoCwd, handle);
+      } catch (e) {
+        // Сбой синхронизации не валит задачу — работаем на текущей базе ветки.
+        this.log.warn?.('worktree sync failed, работаем на текущей базе', { serviceKey, error: e.message });
       }
       const agentOut = await agentFn(handle.worktreeCwd);
       if (!agentOut || agentOut.ok !== true) {
