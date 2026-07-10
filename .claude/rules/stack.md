@@ -41,3 +41,8 @@
 - `codebase-memory.cmd analyze .` regenerates local Claude/Codex-facing memory markdown.
 - `codebase-memory.cmd update .` appends incremental local memory updates.
 - `npm run memory:sync:pg` mirrors memory markdown into PostgreSQL.
+
+## New Commands (added 2026-07-10)
+| Command | What it does |
+|---------|-------------|
+| `npm run memory:sync:pg:all` | node scripts/sync-codebase-memory-to-postgres.js --all-projects |
