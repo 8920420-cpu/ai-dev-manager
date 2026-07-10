@@ -7,6 +7,7 @@
  * concurrency (PUT возвращает 409 при рассинхронизации).
  */
 import { http, ApiError } from './http';
+import { looksLikeUuid } from '../lib/ids';
 import type {
   CreateProjectInput,
   Project,
@@ -112,10 +113,6 @@ function fromRich(rich: RichProject): Project {
 // --- Преобразование этапов фронт → сервер (roleIds локальные → roleCodes) ---
 
 /** uuid v4-подобный признак: не локальный wizard-id (stage_xxx / role_xxx). */
-function looksLikeUuid(id: string | undefined): id is string {
-  return !!id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id);
-}
-
 interface StagePayload {
   id?: string;
   name: string;

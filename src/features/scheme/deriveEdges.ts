@@ -11,6 +11,7 @@
  */
 import type { Role, SchemeEdge, Stage } from '../../types/project';
 import { roleCanonicalCode } from '../../data/presets';
+import { makeUuid } from '../../lib/ids';
 
 /**
  * Документационная ветка: Documentation Auditor → Documentation Keeper идут
@@ -20,17 +21,6 @@ import { roleCanonicalCode } from '../../data/presets';
  */
 const DOCUMENTATION_BRANCH_ROLE_CODES = new Set(['DOCUMENTATION_AUDITOR', 'DOCUMENTATION_KEEPER']);
 const DOCUMENTATION_BRANCH_FAMILY = 'DOCUMENTATION';
-
-function newKey(): string {
-  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
-  if (c?.randomUUID) return c.randomUUID();
-  // Фолбэк (UUID-подобный) — на случай отсутствия crypto.randomUUID.
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (ch) => {
-    const r = Math.floor(Math.random() * 16);
-    const v = ch === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
 
 export interface DerivedScheme {
   /** Узлы с гарантированными stageKey (и joinKey на fork). */
@@ -83,7 +73,7 @@ function groupBranchChains(branches: Stage[], codeByRoleId: Map<string, string>)
  * одного семейства (напр. документационную ветку Auditor → Keeper).
  */
 export function deriveSchemeEdges(stages: Stage[], roles: Role[] = []): DerivedScheme {
-  const withKeys: Stage[] = stages.map((s) => ({ ...s, stageKey: s.stageKey ?? newKey() }));
+  const withKeys: Stage[] = stages.map((s) => ({ ...s, stageKey: s.stageKey ?? makeUuid() }));
   const hasControl = withKeys.some((s) => (s.kind ?? 'stage') !== 'stage');
   if (!hasControl) return { stages: withKeys, edges: [] };
 

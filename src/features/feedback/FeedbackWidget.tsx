@@ -9,6 +9,7 @@ import { useToast } from '../../components/ui/Toast';
 import { useRouter } from '../../app/router';
 import { ApiError } from '../../api/http';
 import { feedbackApi } from '../../api/feedbackApi';
+import { makeUuid } from '../../lib/ids';
 import type { FeedbackCategory, FeedbackPayload } from '../../types/feedback';
 import { captureScreenshot } from './captureScreenshot';
 import { getRecentJsErrors, installJsErrorCapture } from './jsErrorBuffer';
@@ -62,29 +63,6 @@ function persistUser(name: string): void {
   }
 }
 
-/** UUID для externalId: crypto.randomUUID при наличии, иначе безопасный fallback. */
-function generateUuid(): string {
-  try {
-    if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-      return crypto.randomUUID();
-    }
-    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
-      const b = crypto.getRandomValues(new Uint8Array(16));
-      b[6] = (b[6]! & 0x0f) | 0x40;
-      b[8] = (b[8]! & 0x3f) | 0x80;
-      const hex = Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('');
-      return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-    }
-  } catch {
-    /* падаем во fallback ниже */
-  }
-  return `xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx`.replace(/[xy]/g, (c) => {
-    const r = Math.floor(Math.random() * 16);
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
-
 const CATEGORY_LABEL: Record<FeedbackCategory, string> = Object.fromEntries(
   CATEGORIES.map((c) => [c.value, `${c.emoji} ${c.label}`]),
 ) as Record<FeedbackCategory, string>;
@@ -134,7 +112,7 @@ export function FeedbackWidget() {
 
   const handleOpen = useCallback(() => {
     resetForm();
-    externalIdRef.current = generateUuid();
+    externalIdRef.current = makeUuid();
     setName(loadUser());
     setOpen(true);
   }, [resetForm]);

@@ -1,5 +1,6 @@
 /** Состояние и редьюсер мастера создания/редактирования проекта. */
 import { makeId } from '../../lib/format';
+import { makeUuid } from '../../lib/ids';
 import {
   DEFAULT_STAGE_ROLE_MAP,
   PRESET_ROLES,
@@ -7,15 +8,6 @@ import {
   roleCanonicalCode,
 } from '../../data/presets';
 import type { Project, ProjectStatus, Role, Stage, StageKind } from '../../types/project';
-
-/** Стабильный ключ узла (UUID) для ссылок рёбер блок-схемы. */
-function newStageKey(): string {
-  // crypto.randomUUID есть в браузере и в node (jsdom-тесты) — даёт UUID-формат,
-  // который требует backend (normalizeKey). Фолбэк на случай отсутствия.
-  const c = (globalThis as { crypto?: { randomUUID?: () => string } }).crypto;
-  return c?.randomUUID ? c.randomUUID() : makeId('key').replace(/[^0-9a-f]/gi, '').padEnd(32, '0').slice(0, 32)
-    .replace(/(.{8})(.{4})(.{4})(.{4})(.{12})/, '$1-$2-$3-$4-$5');
-}
 
 export interface WizardState {
   name: string;
@@ -116,7 +108,7 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
         ...state,
         stages: [
           ...state.stages,
-          { id: makeId('stage'), kind: 'stage', stageKey: newStageKey(), name: '', roleIds: [], enabled: true },
+          { id: makeId('stage'), kind: 'stage', stageKey: makeUuid(), name: '', roleIds: [], enabled: true },
         ],
       };
     case 'addNode': {
@@ -134,7 +126,7 @@ export function wizardReducer(state: WizardState, action: WizardAction): WizardS
           {
             id: makeId('stage'),
             kind: action.kind,
-            stageKey: newStageKey(),
+            stageKey: makeUuid(),
             name: labels[action.kind],
             roleIds: [],
             enabled: true,
