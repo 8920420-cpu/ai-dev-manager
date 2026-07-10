@@ -4,9 +4,30 @@
 dir=$(dirname "$0")
 . "$dir/mark-deploy.sh"
 
+top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+
 # RUNNER-FRESHNESS-001 — pull/merge мог принести правки кода хостовых демонов:
 # сразу зовём вотчдог свежести (точечный рестарт устаревших). Сбои тихо игнорим.
-top=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden \
   -File "$top/scripts/ensure-fresh-runners.ps1" >/dev/null 2>&1 &
+
+# CODEBASE-MEMORY-AUTOREFRESH-001 — если влитие тронуло ИСХОДНИКИ вложенного
+# memory-корня, инкрементально обновляем его codebase-memory. Набор изменённых
+# файлов берём из ORIG_HEAD..HEAD; если ORIG_HEAD недоступен — обновляем все
+# вложенные корни. Правки самих memory-файлов игнорим (не триггерят сами себя).
+changed=$(git diff-tree --no-commit-id --name-only -r ORIG_HEAD HEAD 2>/dev/null)
+mem() {
+  powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden \
+    -File "$top/scripts/refresh-codebase-memory.ps1" "$@" >/dev/null 2>&1 &
+}
+touched() {
+  echo "$changed" | grep -E "^$1/" | grep -qvE '(^|/)\.claude/|/CLAUDE\.md$'
+}
+if [ -n "$changed" ]; then
+  touched 'orchestrator-service/backend' && mem -Only 'orchestrator-service/backend'
+  touched 'programmer-runner'            && mem -Only 'programmer-runner'
+else
+  mem
+fi
+
 exit 0

@@ -15,6 +15,62 @@
 
 Если память выглядит устаревшей, проверяй исходники и обновляй память через `codebase-memory.cmd update .`.
 
+### Авто-обновление вложенных memory-корней (CODEBASE-MEMORY-AUTOREFRESH-001)
+
+`codebase-memory setup` ставит глобальные хуки Claude Code, но их auto-update гоняет
+`codebase-memory update .` только в **корне репозитория** (cwd сессии). Вложенные
+memory-корни со своим `CLAUDE.md` + `.claude/rules` (`orchestrator-service/backend`,
+`programmer-runner`) так не обновлялись и протухали.
+
+Их держит свежими `scripts/refresh-codebase-memory.ps1`, вызываемый:
+- из git-хуков `post-commit`/`post-merge` — точечно, когда коммит/влитие тронули
+  ИСХОДНИКИ корня (правки самих memory-файлов игнорим; hooksPath=`scripts/git-hooks`);
+- периодически из Scheduled Task `ai-dev-manager codebase-memory refresh` (каждые
+  30 мин; регистрация `scripts/register-memory-refresh-watchdog.ps1`) с ключами
+  `-IfStale -AllProjects -SyncPg`: `-AllProjects` перебирает `root_path` ВСЕХ
+  не-archived проектов оркестратора из БД (ПС, LandingHub, Smeta и др., не только
+  дерево ai-dev-manager); `-IfStale` обновляет корень, только если его исходники новее
+  памяти (иначе тихо пропускает — changelog не пухнет вхолостую); `-SyncPg` при любом
+  обновлении зеркалит память в PostgreSQL. Паттерн — как у RUNNER-FRESHNESS-001.
+
+Вручную: `.\scripts\refresh-codebase-memory.ps1` (вложенные корни дерева) /
+`-AllProjects` (все проекты оркестратора) / `-Only <корень>` / `-IncludeRoot` /
+`-SyncPg`. Лог — `logs/codebase-memory-refresh.log`. `update` инкрементальный
+(структурные изменения + changelog); полное наполнение пустой памяти —
+`codebase-memory analyze <корень>` (сделано 10.07 для backend, programmer-runner,
+ПС, LandingHub, Smeta — модули/модели/стек теперь реальные).
+
+Две гочи `codebase-memory` v1.1.0 на Windows (скрипт их обходит):
+- CLI на top-level читает `process.env.HOME` (setup.js) — в PowerShell/cmd HOME не
+  задан, импорт падает ещё до команды; скрипт подставляет `$env:USERPROFILE`.
+- **Патч глобального тула:** его `glob` отдаёт пути с `\`, а код фильтрует модули
+  через `startsWith(folder+'/')` → у ВСЕХ модулей «0 файлов». Правка в
+  `%APPDATA%\npm\node_modules\codebase-memory\src\utils\scanner.js` (`getFileTree`
+  нормализует separator в `/`). Правка ВНЕ репозитория — теряется при `npm i -g` /
+  апдейте тула; тогда analyze/update снова дадут пустые модули — накатить заново.
+  (Побочно фикс улучшил и детект маршрутов/моделей корня — `update .` теперь видит
+  `src/api/*` и миграции, которые раньше пропускал.)
+
+**Зеркало во PostgreSQL (MCP-Codebase-Memory).** Таблица `codebase_memory_documents`
+ключуется `(project_id, doc_key)` с фиксированными 10 ключами (и MCP-`get` принимает
+строгий enum этих ключей), поэтому память вложенных корней держим как ОТДЕЛЬНЫЕ
+inert-проекты (`scanner_enabled=false`, без задач/папок — Scanner их не трогает):
+- `AI_DEV_MANAGER_BACKEND` → `orchestrator-service/backend`
+- `AI_DEV_MANAGER_PROGRAMMER_RUNNER` → `programmer-runner`
+- root ai-dev-manager остаётся `PROJECT`.
+
+Заливка/обновление зеркала — `npm run memory:sync:pg:all` (перебирает все не-archived
+проекты по их `root_path`; новые корни подхватываются автоматически). Чтение:
+`orchestrator_get_codebase_memory(projectId='AI_DEV_MANAGER_BACKEND', key='modules')`.
+PG-зеркало держит свежим тот же вотчдог (`-SyncPg` после обновления любого корня),
+так что ручной `memory:sync:pg:all` нужен только для разовой заливки/проверки.
+
+Прочие проекты оркестратора (`PROJECT`=ai-dev-manager, `PROJECT_2`=ПС, `LANDINGHUB`,
+`SMETA`) — обычные проекты со своими `root_path`; их память тоже наполнена (10.07) и
+входит в `-AllProjects`/`memory:sync:pg:all`. Память НЕ генерится автоматически —
+только `codebase-memory analyze <root>` создаёт её; вотчдог лишь поддерживает свежей
+существующую (проект без `.claude/rules` в `-AllProjects`/sync тихо пропускается).
+
 ### ПРАВИЛО: Codebase Memory MCP — по умолчанию, без напоминаний
 
 При любой задаче, где нужна ориентация в кодовой базе (что где лежит, архитектура,
