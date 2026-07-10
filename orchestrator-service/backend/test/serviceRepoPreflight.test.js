@@ -187,25 +187,27 @@ test('split: один из сервисов без валидного repository
   assert.match(payload.detail, /SvcB/, 'detail поясняет, какой сервис и что указать');
 });
 
-test('split: все сервисы с валидным repository_path → дети создаются, эпик WAITING_FOR_CHILDREN', async () => {
+test('split: все сервисы с валидным repository_path → элементы стека созданы, эпик WAITING_FOR_CHILDREN', async () => {
+  // WORK-STACK-001: при валидных путях split кладёт разбивку в очередь work_stack
+  // (дочерние CODING-задачи заведёт промоутер), а не материализует детей в tasks.
   const c = fakeClient([
     { re: /FROM services s JOIN projects p/, reply: preflightBy({
       sidA: { service_code: 'SvcA', repository_path: 'CRM/SvcA', root_path: 'K:\\no\\such\\host\\root' },
       sidB: { service_code: 'SvcB', repository_path: 'CRM/SvcB', root_path: 'K:\\no\\such\\host\\root' },
     }) },
-    { re: /FROM tasks WHERE parent_task_id = \$1 LIMIT 1/, reply: { rowCount: 0, rows: [] } },
+    { re: /EXISTS \(SELECT 1 FROM work_stack WHERE epic_task_id/, reply: { rowCount: 1, rows: [{ dup: false }] } },
     twoServicesRule,
     { re: /FROM roles WHERE code = \$1/, reply: { rowCount: 1, rows: [{ id: 'rProg' }] } },
-    { re: /INSERT INTO tasks[\s\S]*'service'[\s\S]*RETURNING id/, reply: (h) => ({ rowCount: 1, rows: [{ id: `child-${h}` }] }) },
   ]);
 
   const res = await runArchitect(c);
-  assert.equal(res.toStatus, 'WAITING_FOR_CHILDREN', 'валидные пути → штатная материализация');
+  assert.equal(res.toStatus, 'WAITING_FOR_CHILDREN', 'валидные пути → штатное расщепление в стек');
   assert.equal(res.services, 2);
   assert.equal(res.nextRole, 'PROGRAMMER');
 
-  const svcInserts = c.calls.filter((q) => /INSERT INTO tasks[\s\S]*'service'[\s\S]*RETURNING id/.test(q.sql));
-  assert.equal(svcInserts.length, 2, 'две независимые задачи-на-сервис созданы');
+  const stackInserts = c.calls.filter((q) => /INSERT INTO work_stack/.test(q.sql));
+  assert.equal(stackInserts.length, 2, 'два элемента очереди работ (по одному на сервис)');
+  assert.equal(c.calls.some((q) => /INSERT INTO tasks[\s\S]*'service'[\s\S]*RETURNING id/.test(q.sql)), false, 'детей в tasks не создаём');
 });
 
 // ARCH-SPLIT-NO-RECURSION-001 — split-ребёнок (parent_task_id задан) при ≥2 сервисах

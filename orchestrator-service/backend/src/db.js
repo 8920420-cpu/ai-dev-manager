@@ -3183,6 +3183,12 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // дети попадали в очередь, а родитель не клеймился на gate-узле.
     await advanceForkNodes(c);
     await advanceJoinNodes(c);
+    // WORK-STACK-001: очередь работ Архитектор→Программист. Reconcile промоутнутых
+    // (терминальная дочерняя задача → терминальный элемент, снимаем замок сервиса) +
+    // promote следующего PENDING-элемента на каждый свободный микросервис (заводит
+    // дочернюю CODING-задачу). ДО роллапа — чтобы свежесозданные дети и освободившиеся
+    // сервисы учитывались тем же тиком.
+    await advanceWorkStack(c);
     // DECOMP-CONTRACT-001: эпик, у которого все задачи-на-сервис стали терминальны,
     // завершается (DONE) или блокируется (BLOCKED, если сервис упал). Линейный
     // аналог снятия join-барьера для декомпозиции по микросервисам.
@@ -3686,6 +3692,115 @@ export async function advanceJoinNodes(c) {
   return advanced;
 }
 
+// WORK-STACK-001 — advisory-lock промоутера очереди работ. Сериализует промоушен
+// между параллельными раннерами, чтобы «нет активного PROMOTED на сервис» проверялось
+// по зафиксированным строкам, а не в гонке (иначе два раннера завели бы двух детей на
+// один сервис). Отдельный ключ от claim'а программиста (CLAUDE_CLAIM_LOCK_KEY).
+const WORK_STACK_LOCK_KEY = 911_018;
+
+/**
+ * WORK-STACK-001 — промоутер+реконсайлер очереди работ (work_stack). Тикается в
+ * advanceAutomatedTasks ПЕРЕД advanceDecompositionParents. Обе фазы идемпотентны и
+ * выполняются в одной транзакции под advisory-локом (сериализация раннеров):
+ *
+ *  (1) reconcile: PROMOTED-элемент, чья дочерняя задача стала терминальной, переводится
+ *      в зеркальный терминал (DONE | FAILED | CANCELLED). Это снимает замок сервиса и
+ *      разрешает промоутнуть следующий PENDING-элемент того же сервиса тем же тиком.
+ *      Источник истины по успеху/провалу — статус дочерней задачи (BLOCKED/FAILED→FAILED).
+ *
+ *  (2) promote: для каждого сервиса, у которого есть PENDING-элемент и НЕТ активного
+ *      PROMOTED-элемента (замок сервиса) и НЕТ незавершённой дочерней задачи на этот
+ *      сервис, берём PENDING с наименьшим seq и заводим дочернюю CODING-задачу
+ *      (task_kind='service', created_by='work-stack', БЕЗ messageFingerprint — иммунна к
+ *      дедупу), линкуем зависимостью к эпику, элемент → PROMOTED. Claim программиста
+ *      (PROGRAMMER-WORKTREE-PER-SERVICE) дальше держит один активный CODING на сервис.
+ *
+ * Возвращает { reconciled, promoted }.
+ */
+export async function advanceWorkStack(c) {
+  await c.query('BEGIN');
+  try {
+    await c.query('SELECT pg_advisory_xact_lock($1)', [WORK_STACK_LOCK_KEY]);
+
+    // (1) Reconcile: промоутнутые элементы, чьи задачи терминальны. Идемпотентно —
+    // guard status='PROMOTED'. BLOCKED дочерней задачи считаем провалом элемента.
+    const rec = await c.query(
+      `UPDATE work_stack w
+          SET status = CASE t.status::text
+                         WHEN 'DONE' THEN 'DONE'
+                         WHEN 'CANCELLED' THEN 'CANCELLED'
+                         ELSE 'FAILED' END,
+              updated_at = now()
+         FROM tasks t
+        WHERE t.id = w.promoted_task_id
+          AND w.status = 'PROMOTED'
+          AND t.status IN ('DONE','CANCELLED','FAILED','BLOCKED')`,
+    );
+    const reconciled = rec.rowCount;
+
+    // (2) Promote: по одному PENDING-элементу на каждый свободный сервис.
+    const roleRow = await c.query(`SELECT id FROM roles WHERE code = 'PROGRAMMER'`);
+    const programmerRoleId = roleRow.rows[0]?.id ?? null;
+    const pending = await c.query(
+      `SELECT DISTINCT ON (w.project_id, w.service_id)
+              w.id, w.epic_task_id, w.project_id, w.service_id, w.title, w.description,
+              w.data_card, w.target_status, w.target_role_id, w.target_stage_key
+         FROM work_stack w
+        WHERE w.status = 'PENDING'
+          -- замок сервиса: нет активного промоутнутого элемента на этот сервис
+          AND NOT EXISTS (
+            SELECT 1 FROM work_stack w2
+             WHERE w2.project_id = w.project_id AND w2.service_id = w.service_id
+               AND w2.status = 'PROMOTED')
+          -- страховка: нет незавершённой дочерней задачи эпика на этот сервис
+          AND NOT EXISTS (
+            SELECT 1 FROM tasks t2
+             WHERE t2.project_id = w.project_id AND t2.service_id = w.service_id
+               AND t2.parent_task_id = w.epic_task_id
+               AND t2.status NOT IN ('DONE','CANCELLED','FAILED'))
+        ORDER BY w.project_id, w.service_id, w.seq, w.created_at`,
+    );
+    let promoted = 0;
+    for (const item of pending.rows) {
+      const roleId = item.target_role_id ?? programmerRoleId;
+      const child = await c.query(
+        `INSERT INTO tasks (project_id, service_id, parent_task_id, task_kind, title, description,
+                            status, current_role_id, current_stage_key, created_by, data_card)
+         VALUES ($1, $2, $3, 'service', $4, $5, $6::task_status, $7, $8, 'work-stack', $9::jsonb)
+         RETURNING id`,
+        [item.project_id, item.service_id, item.epic_task_id, item.title, item.description,
+         item.target_status, roleId, item.target_stage_key,
+         JSON.stringify(item.data_card && typeof item.data_card === 'object' ? item.data_card : {})],
+      );
+      const childId = child.rows[0].id;
+      await c.query(
+        `INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)
+         ON CONFLICT (task_id, depends_on_task_id) DO NOTHING`,
+        [item.epic_task_id, childId],
+      );
+      await c.query(
+        `UPDATE work_stack SET status = 'PROMOTED', promoted_task_id = $2, updated_at = now()
+          WHERE id = $1 AND status = 'PENDING'`,
+        [item.id, childId],
+      );
+      await c.query(
+        `INSERT INTO task_events (task_id, event_type, to_status, role_id, payload_json)
+         VALUES ($1, 'TASK_CREATED', $2::task_status, $3, $4::jsonb)`,
+        [childId, item.target_status, roleId, JSON.stringify({
+          runner: true, reason: 'work_stack_promote', epicTaskId: item.epic_task_id,
+          workStackId: item.id, serviceId: item.service_id,
+        })],
+      );
+      promoted += 1;
+    }
+    await c.query('COMMIT');
+    return { reconciled, promoted };
+  } catch (error) {
+    await c.query('ROLLBACK');
+    throw error;
+  }
+}
+
 /**
  * DECOMP-CONTRACT-001 — роллап эпиков декомпозиции. Эпик (task_kind='epic') стоит в
  * WAITING_FOR_CHILDREN, пока его задачи-на-сервис (kind='service') не станут
@@ -3705,6 +3820,13 @@ export async function advanceDecompositionParents(c) {
               SELECT 1 FROM tasks ch
                WHERE ch.parent_task_id = t.id AND ch.task_kind = 'service'
                  AND ch.status NOT IN ('DONE','CANCELLED','BLOCKED','FAILED'))
+        -- WORK-STACK-001: не сворачивать эпик, пока в очереди работ есть незакрытые
+        -- элементы (PENDING ещё не промоутнуты, PROMOTED ещё в работе) — иначе роллап
+        -- закрыл бы эпик по части сервисов, не дождавшись остальных. Легаси-эпики без
+        -- строк work_stack проходят гейт свободно (NOT EXISTS тривиально истинно).
+        AND NOT EXISTS (
+              SELECT 1 FROM work_stack w
+               WHERE w.epic_task_id = t.id AND w.status IN ('PENDING','PROMOTED'))
       FOR UPDATE OF t SKIP LOCKED`,
   );
   let advanced = 0;
@@ -5799,9 +5921,14 @@ export async function materializeArchitectSplit(c, claimed, { verdict, response,
       await c.query('ROLLBACK');
       return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: claimed.status, reason: 'already_finalized', durationMs };
     }
-    // Идемпотентность: задача уже расщеплена — финализируем прогон без дублей.
-    const hasChildren = await c.query('SELECT 1 FROM tasks WHERE parent_task_id = $1 LIMIT 1', [claimed.id]);
-    if (hasChildren.rowCount) {
+    // Идемпотентность: задача уже расщеплена (элементы стека работ ИЛИ дети) —
+    // финализируем прогон без дублей.
+    const already = await c.query(
+      `SELECT EXISTS (SELECT 1 FROM work_stack WHERE epic_task_id = $1)
+           OR EXISTS (SELECT 1 FROM tasks WHERE parent_task_id = $1) AS dup`,
+      [claimed.id],
+    );
+    if (already.rows[0].dup) {
       const kpiSet0 = runKpiSet(kpi, 2);
       await c.query(
         `UPDATE agent_runs SET status = 'SUCCESS', finished_at = now(), output_json = $2::jsonb${kpiSet0.sql} WHERE id = $1`,
@@ -5826,62 +5953,39 @@ export async function materializeArchitectSplit(c, claimed, { verdict, response,
       : null;
     const childStageKey = resolved.nextStageKey ?? null;
 
+    // WORK-STACK-001: вместо материализации детей прямо в tasks кладём разбивку в
+    // очередь work_stack (по одному элементу на сервис, статус PENDING). Дочерние
+    // CODING-задачи заводит ленивый промоутер advanceWorkStack по одному на свободный
+    // микросервис. Элемент стека — НЕ задача: его нельзя ни задедупить с эпиком, ни
+    // вернуть Архитектору на повторное расщепление, поэтому split-time дедуп по
+    // fingerprint здесь больше не нужен (он и был источником bogus-дедупа ребёнка).
     let serviceCount = 0;
     const createdServices = [];
+    let seq = 0;
     for (const svc of services) {
-      // Карточка ребёнка — карточка родителя (+ поля вердикта Архитектора) с
-      // work_items/affected_files, отфильтрованными по ЭТОМУ сервису.
-      const childCard = filterCardForService(card, byCode, svc.serviceId);
+      // Карточка элемента — карточка эпика (+ поля вердикта Архитектора), отфильтрованная
+      // по ЭТОМУ сервису. messageFingerprint НЕ проставляем: будущая дочерняя задача не
+      // должна попадать в дедуп по отпечатку (WORK-STACK-001).
+      const itemCard = filterCardForService(card, byCode, svc.serviceId);
+      delete itemCard.messageFingerprint;
       const filesText = svc.files
         .map((f) => (f.path ? `- ${f.path}${f.what ? ` — ${f.what}` : ''}` : (f.what ? `- ${f.what}` : '')))
         .filter(Boolean)
         .join('\n');
-      const childDescription = `${claimed.description ?? ''}\n\n## Задание для сервиса ${svc.serviceCode}\n${filesText || svc.title}`
+      const itemDescription = `${claimed.description ?? ''}\n\n## Задание для сервиса ${svc.serviceCode}\n${filesText || svc.title}`
         .trim()
         .slice(0, 20000);
-      const childFingerprint = messageFingerprint(`${svc.title}\n${childDescription}`);
-      if (childFingerprint) childCard.messageFingerprint = childFingerprint;
-      const duplicate = await findDuplicateTaskTx(c, {
-        projectId: claimed.project_id,
-        serviceId: svc.serviceId,
-        fingerprint: childFingerprint,
-      });
-      if (duplicate) {
-        serviceCount += 1;
-        createdServices.push({ id: duplicate.id, serviceCode: svc.serviceCode, duplicate: true });
-        await c.query(
-          `INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)
-           ON CONFLICT (task_id, depends_on_task_id) DO NOTHING`,
-          [claimed.id, duplicate.id],
-        );
-        await c.query(
-          `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
-           VALUES ($1, 'TASK_UPDATED', $2::task_status, $2::task_status, $3, $4::jsonb)`,
-          [claimed.id, claimed.status, claimed.role_id, JSON.stringify({
-            runner: true, ai: true, reason: 'architect_service_split_duplicate',
-            serviceCode: svc.serviceCode, duplicateOf: duplicate.id,
-          })],
-        );
-        continue;
-      }
-      const child = await c.query(
-        `INSERT INTO tasks (project_id, service_id, parent_task_id, task_kind, title, description,
-                            status, current_role_id, current_stage_key, created_by, data_card)
-         VALUES ($1, $2, $3, 'service', $4, $5, $6::task_status, $7, $8::uuid, 'architect', $9::jsonb)
-         RETURNING id`,
-        [claimed.project_id, svc.serviceId, claimed.id, svc.title, childDescription,
-         resolved.toStatus, childRoleId, childStageKey, JSON.stringify(childCard)],
-      );
-      const childId = child.rows[0].id;
-      serviceCount += 1;
-      createdServices.push({ id: childId, serviceCode: svc.serviceCode });
-      // Эпик зависит от ребёнка (единица приёмки) — как в materializeDecomposition.
-      // Дети друг от друга НЕ зависят: каждый идёт по конвейеру независимо.
       await c.query(
-        `INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)
-         ON CONFLICT (task_id, depends_on_task_id) DO NOTHING`,
-        [claimed.id, childId],
+        `INSERT INTO work_stack (epic_task_id, project_id, service_id, service_code, seq,
+                                 title, description, data_card, target_status, target_role_id, target_stage_key)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11)`,
+        [claimed.id, claimed.project_id, svc.serviceId, svc.serviceCode, seq,
+         svc.title, itemDescription, JSON.stringify(itemCard),
+         resolved.toStatus, childRoleId, childStageKey],
       );
+      seq += 1;
+      serviceCount += 1;
+      createdServices.push({ serviceCode: svc.serviceCode, service_id: svc.serviceId });
     }
 
     // JOIN-PLANNED-COVERAGE-001: фиксируем целевой список сервисов эпика в data_card —
