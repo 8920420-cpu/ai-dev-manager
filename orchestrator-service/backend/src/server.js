@@ -250,8 +250,9 @@ async function serveStatic(res, pathname) {
   res.end(await readFile(file));
 }
 
-// Разбор путей /api/projects/:projectId[/(stages|task-statistics|status)].
-// Без суффикса → item (GET :id / PUT :id / DELETE :id).
+// Разбор путей /api/projects/:projectId[/(task-statistics|status|scanner|route-health)].
+// Без суффикса → item (GET :id / PUT :id / DELETE :id). Этапы отдаются внутри
+// карточки проекта (mapProjectRow), отдельного /stages-суффикса нет.
 function matchProjectRoute(pathname) {
   const m = pathname.match(/^\/api\/projects\/([^/]+)(?:\/(task-statistics|status|scanner|route-health))?$/);
   if (!m) return null;

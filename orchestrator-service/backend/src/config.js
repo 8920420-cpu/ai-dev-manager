@@ -45,11 +45,6 @@ export function parseConnectionString(url) {
   };
 }
 
-export function toConnectionString(s) {
-  const pw = s.password ? `:${encodeURIComponent(s.password)}` : '';
-  return `postgresql://${encodeURIComponent(s.user)}${pw}@${s.host}:${s.port}/${s.database}`;
-}
-
 // Версия настроек без секрета — только её можно отдавать клиенту по сети.
 // Пароль никогда не покидает сервер; вместо него передаём флаг hasPassword.
 export function redactSettings(s) {

@@ -125,6 +125,3 @@ export function __resetClockGuard() {
 export function __setBaselineForTest(b) {
   baseline = b;
 }
-export function __getBaselineForTest() {
-  return baseline;
-}

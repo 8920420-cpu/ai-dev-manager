@@ -56,12 +56,7 @@ export const STAGE_ERROR = {
   CONTROL_ROLE_REQUIRED: 'stage_control_role_required',
 };
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpError } from './httpError.js';
 
 /**
  * Синтаксическая проверка абсолютного пути (кросс-платформенно): путь может
@@ -327,14 +322,6 @@ export async function readStages(c, projectDbId) {
     [stages.rows.map((s) => s.id)],
   );
   return stages.rows.map((row) => stageContract(row, roles.rows));
-}
-
-/** GET — прочитать этапы проекта. enabled в БД — NOT NULL boolean (явный). */
-export async function getProjectStages(s, projectId) {
-  return withClient(clientConfig(s), async (c) => {
-    const projectDbId = await resolveProjectId(c, projectId);
-    return { projectId: projectDbId, stages: await readStages(c, projectDbId) };
-  });
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;

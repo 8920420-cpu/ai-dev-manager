@@ -4,18 +4,13 @@
 //
 // LEGACY-BUSINESS-STORAGE-API-001: модуль расширен rich-CRUD проекта (status,
 // database_ref, этапы, глобальные роли, optimistic concurrency по updated_at).
-// Существующие экспортируемые функции (upsertProjectByPath/listProjects и helpers)
-// СОХРАНЕНЫ — их зовёт server.js и монитор задач.
+// Основной вход — createOrUpsertProject / listProjectsRich (их зовёт server.js);
+// минимальные upsertProjectByPath/listProjects/mapProject удалены как неиспользуемые.
 import { withClient, clientConfig } from './db.js';
 import { resolveProjectId, readStages } from './stages.js';
 import { applySchemeToProject } from './developmentScheme.js';
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpError } from './httpError.js';
 
 // Допустимые статусы жизненного цикла проекта (как в CHECK-ограничении 0008).
 export const PROJECT_STATUSES = ['active', 'paused', 'draft', 'archived'];
@@ -102,12 +97,6 @@ export function mapProjectRow(row, { stages = [], roles = [] } = {}) {
   };
 }
 
-// Минимальный контракт (как раньше: id, code, name, rootPath) — для совместимости
-// там, где rich-данные не нужны/не подгружены.
-function mapProject(row) {
-  return { id: row.id, code: row.code, name: row.name, rootPath: row.root_path ?? null };
-}
-
 // --- DB-слой ----------------------------------------------------------------
 
 const PROJECT_COLUMNS =
@@ -150,62 +139,6 @@ async function buildRich(c, row) {
     loadGlobalRoles(c),
   ]);
   return mapProjectRow(row, { stages, roles });
-}
-
-/**
- * Зарегистрировать/получить проект по папке. Если проект с таким root_path уже
- * есть — вернуть его (имя обновляем, если передано). Иначе создать с авто-кодом.
- * СОХРАНЕНА для обратной совместимости (минимальный контракт { id, code, name,
- * rootPath }). Rich-вход/выход обслуживает createOrUpsertProject.
- */
-export async function upsertProjectByPath(s, input) {
-  const rootPath = normalizeRootPath(input?.path ?? input?.rootPath);
-  if (!rootPath) throw httpError(422, 'project_path_required', { code: 'project_path_required' });
-  const name = String(input?.name ?? '').trim() || basename(rootPath) || rootPath;
-  return withClient(clientConfig(s), async (c) => {
-    const existing = await c.query(
-      'SELECT id, code, name, root_path FROM projects WHERE root_path = $1', [rootPath],
-    );
-    if (existing.rowCount) {
-      const row = existing.rows[0];
-      if (input?.name && name !== row.name) {
-        const upd = await c.query(
-          'UPDATE projects SET name = $2 WHERE id = $1 RETURNING id, code, name, root_path',
-          [row.id, name],
-        );
-        return mapProject(upd.rows[0]);
-      }
-      return mapProject(row);
-    }
-    const code = await uniqueCode(c, name);
-    try {
-      const ins = await c.query(
-        `INSERT INTO projects (code, name, root_path) VALUES ($1, $2, $3)
-         RETURNING id, code, name, root_path`,
-        [code, name, rootPath],
-      );
-      return mapProject(ins.rows[0]);
-    } catch (e) {
-      // Гонка: параллельная регистрация той же папки/кода — вернуть существующий.
-      if (e.code === '23505') {
-        const again = await c.query(
-          'SELECT id, code, name, root_path FROM projects WHERE root_path = $1', [rootPath],
-        );
-        if (again.rowCount) return mapProject(again.rows[0]);
-      }
-      throw e;
-    }
-  });
-}
-
-// Список проектов БД (минимальный контракт) — оставлен как был (диагностика).
-export async function listProjects(s) {
-  return withClient(clientConfig(s), async (c) => {
-    const r = await c.query(
-      'SELECT id, code, name, root_path FROM projects ORDER BY created_at',
-    );
-    return { projects: r.rows.map(mapProject) };
-  });
 }
 
 /** GET /api/projects (rich) — список проектов с path и rootPath-алиасом. */

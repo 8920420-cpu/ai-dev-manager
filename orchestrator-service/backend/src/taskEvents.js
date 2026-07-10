@@ -45,7 +45,3 @@ export function publishTaskChange(reason, data = {}) {
     writeEvent(client.res, 'tasks_changed', payload);
   }
 }
-
-export function taskEventsClientCount() {
-  return clients.size;
-}
