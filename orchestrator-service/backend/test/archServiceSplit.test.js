@@ -267,7 +267,7 @@ test('роллап: эпик Архитектора с детьми-сервис
     { re: /FROM tasks t\s+WHERE t.task_kind = 'epic'/, reply: { rowCount: 1, rows: [
       { id: 'epic1', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rArch' },
     ] } },
-    { re: /task_kind = 'service' AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
+    { re: /task_kind IN \('service','epic'\) AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
   ]);
   const n = await advanceDecompositionParents(c);
   assert.equal(n, 1, 'эпик нового пути подхвачен роллапом');
@@ -282,12 +282,50 @@ test('роллап: есть упавший ребёнок-сервис → эп
     { re: /FROM tasks t\s+WHERE t.task_kind = 'epic'/, reply: { rowCount: 1, rows: [
       { id: 'epic1', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rArch' },
     ] } },
-    { re: /task_kind = 'service' AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 1 }] } },
+    { re: /task_kind IN \('service','epic'\) AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 1 }] } },
   ]);
   const n = await advanceDecompositionParents(c);
   assert.equal(n, 1);
   const upd = c.calls.find((q) => /UPDATE tasks SET status = \$2::task_status/.test(q.sql));
   assert.equal(upd.params[1], 'BLOCKED');
+});
+
+// NESTED-EPIC-ROLLUP-001: эпик с ребёнком-ЭПИКОМ (остаток рекурсии эпик→эпик→сервис).
+// Роллап должен считать вложенный эпик полноценным ребёнком: его service_id покрывает
+// сервис, а терминальный статус снимает барьер. Проверяем, что запросы включают
+// task_kind IN ('service','epic') и вложенный эпик даёт покрытие (эпик → DONE).
+test('роллап: вложенный эпик-ребёнок покрывает сервис → родитель DONE', async () => {
+  const c = fakeClient([
+    { re: /FROM tasks t\s+WHERE t.task_kind = 'epic'/, reply: { rowCount: 1, rows: [
+      { id: 'top', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rArch',
+        data_card: { planned_services: ['orchestrator-service', 'frontend'] } },
+    ] } },
+    { re: /task_kind IN \('service','epic'\) AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
+    // Покрытие: frontend (service-ребёнок) + orchestrator-service (эпик-ребёнок).
+    { re: /SELECT DISTINCT lower\(s.service_code\)/, reply: { rowCount: 2, rows: [
+      { code: 'orchestrator-service' }, { code: 'frontend' },
+    ] } },
+  ]);
+  const n = await advanceDecompositionParents(c);
+  assert.equal(n, 1);
+  const cov = c.calls.find((q) => /SELECT DISTINCT lower\(s.service_code\)/.test(q.sql));
+  assert.match(cov.sql, /task_kind IN \('service','epic'\)/, 'покрытие учитывает эпик-детей');
+  const upd = c.calls.find((q) => /UPDATE tasks SET status = \$2::task_status/.test(q.sql));
+  assert.equal(upd.params[1], 'DONE', 'все сервисы покрыты (в т.ч. эпиком-ребёнком) → DONE');
+});
+
+test('роллап: эпик только с эпиками-детьми (f732045a-случай) подхватывается (EXISTS учитывает эпик-детей)', async () => {
+  const c = fakeClient([
+    { re: /FROM tasks t\s+WHERE t.task_kind = 'epic'/, reply: { rowCount: 1, rows: [
+      { id: 'top', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rArch', data_card: {} },
+    ] } },
+    { re: /task_kind IN \('service','epic'\) AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
+  ]);
+  const n = await advanceDecompositionParents(c);
+  assert.equal(n, 1, 'эпик без service-детей, но с эпиками-детьми, тоже сворачивается');
+  const pick = c.calls.find((q) => /FROM tasks t\s+WHERE t.task_kind = 'epic'/.test(q.sql));
+  assert.match(pick.sql, /EXISTS \(SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id AND ch.task_kind IN \('service','epic'\)\)/,
+    'EXISTS-гейт учитывает эпик-детей');
 });
 
 test('роллап: гейт по work_stack присутствует в выборке эпиков (не сворачиваем при незакрытом стеке)', async () => {

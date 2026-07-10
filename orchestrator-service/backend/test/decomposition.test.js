@@ -171,7 +171,7 @@ test('advanceDecompositionParents: все сервисы DONE → эпик DONE'
     { re: /FROM tasks t\s+WHERE t.task_kind = 'epic'/, reply: { rowCount: 1, rows: [
       { id: 'epic1', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rD' },
     ] } },
-    { re: /task_kind = 'service' AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
+    { re: /task_kind IN \('service','epic'\) AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
   ]);
   const n = await advanceDecompositionParents(c);
   assert.equal(n, 1);
@@ -186,7 +186,7 @@ test('advanceDecompositionParents: упавший сервис → эпик BLOC
     { re: /FROM tasks t\s+WHERE t.task_kind = 'epic'/, reply: { rowCount: 1, rows: [
       { id: 'epic1', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rD' },
     ] } },
-    { re: /task_kind = 'service' AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 1 }] } },
+    { re: /task_kind IN \('service','epic'\) AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 1 }] } },
   ]);
   const n = await advanceDecompositionParents(c);
   assert.equal(n, 1);
@@ -255,7 +255,7 @@ test('advanceDecompositionParents: planned_services=4, покрыто 2 → эп
       { id: 'epic1', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rD',
         data_card: { planned_services: ['WEBSTORE', 'Smeta', 'IAM_Service', 'FastTable'] } },
     ] } },
-    { re: /task_kind = 'service' AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
+    { re: /task_kind IN \('service','epic'\) AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
     { re: /FROM tasks ch JOIN services s ON s.id = ch.service_id/, reply: { rowCount: 2, rows: [
       { code: 'webstore' }, { code: 'iam_service' },
     ] } },
@@ -277,7 +277,7 @@ test('advanceDecompositionParents: planned_services полностью покр�
       { id: 'epic1', status: 'WAITING_FOR_CHILDREN', current_role_id: 'rD',
         data_card: { planned_services: ['SvcA', 'SvcB'] } },
     ] } },
-    { re: /task_kind = 'service' AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
+    { re: /task_kind IN \('service','epic'\) AND status IN \('BLOCKED','FAILED'\)/, reply: { rowCount: 1, rows: [{ n: 0 }] } },
     { re: /FROM tasks ch JOIN services s ON s.id = ch.service_id/, reply: { rowCount: 2, rows: [
       { code: 'svca' }, { code: 'svcb' },
     ] } },

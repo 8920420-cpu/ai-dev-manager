@@ -3803,10 +3803,18 @@ export async function advanceWorkStack(c) {
 
 /**
  * DECOMP-CONTRACT-001 — роллап эпиков декомпозиции. Эпик (task_kind='epic') стоит в
- * WAITING_FOR_CHILDREN, пока его задачи-на-сервис (kind='service') не станут
- * терминальными. Когда все терминальны: если хоть одна BLOCKED/FAILED → эпик
- * BLOCKED; иначе → DONE. Линейный аналог join-барьера (без графа fork/join).
- * Идемпотентно, по одному txn на эпик, FOR UPDATE SKIP LOCKED.
+ * WAITING_FOR_CHILDREN, пока его дети-декомпозиции не станут терминальными. Когда все
+ * терминальны: если хоть один BLOCKED/FAILED → эпик BLOCKED; иначе → DONE. Линейный
+ * аналог join-барьера (без графа fork/join). Идемпотентно, по одному txn на эпик,
+ * FOR UPDATE SKIP LOCKED.
+ *
+ * NESTED-EPIC-ROLLUP-001: дети считаются `task_kind IN ('service','epic')`, а не только
+ * 'service'. Остаток старой рекурсии расщепления ([[architect-split-recursion]]) оставил
+ * эпики с ДЕТЬМИ-ЭПИКАМИ (эпик→эпик→сервис). Раньше роллап видел только service-детей,
+ * поэтому эпик с эпиком-ребёнком не закрывался никогда (без service-детей — вечный WFC;
+ * со смесью — сервис под эпиком-ребёнком «числился непокрытым» → вечный epic_missing_services).
+ * Вложенный эпик несёт свой service_id и, завершившись, покрывает сервис и считается в
+ * bad-подсчёте наравне с service-ребёнком. Каскад идёт снизу вверх по тикам.
  */
 export async function advanceDecompositionParents(c) {
   const parents = await c.query(
@@ -3815,10 +3823,10 @@ export async function advanceDecompositionParents(c) {
       WHERE t.task_kind = 'epic'
         AND t.status = 'WAITING_FOR_CHILDREN'
         AND t.assigned_agent_id IS NULL
-        AND EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id AND ch.task_kind = 'service')
+        AND EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id AND ch.task_kind IN ('service','epic'))
         AND NOT EXISTS (
               SELECT 1 FROM tasks ch
-               WHERE ch.parent_task_id = t.id AND ch.task_kind = 'service'
+               WHERE ch.parent_task_id = t.id AND ch.task_kind IN ('service','epic')
                  AND ch.status NOT IN ('DONE','CANCELLED','BLOCKED','FAILED'))
         -- WORK-STACK-001: не сворачивать эпик, пока в очереди работ есть незакрытые
         -- элементы (PENDING ещё не промоутнуты, PROMOTED ещё в работе) — иначе роллап
@@ -3835,7 +3843,7 @@ export async function advanceDecompositionParents(c) {
     try {
       const bad = await c.query(
         `SELECT count(*)::int AS n FROM tasks
-          WHERE parent_task_id = $1 AND task_kind = 'service' AND status IN ('BLOCKED','FAILED')`,
+          WHERE parent_task_id = $1 AND task_kind IN ('service','epic') AND status IN ('BLOCKED','FAILED')`,
         [p.id],
       );
       // JOIN-PLANNED-COVERAGE-001: сверяем ФАКТИЧЕСКИХ детей с целевым списком
@@ -3853,7 +3861,7 @@ export async function advanceDecompositionParents(c) {
         const cov = await c.query(
           `SELECT DISTINCT lower(s.service_code) AS code
              FROM tasks ch JOIN services s ON s.id = ch.service_id
-            WHERE ch.parent_task_id = $1 AND ch.task_kind = 'service' AND ch.status <> 'CANCELLED'`,
+            WHERE ch.parent_task_id = $1 AND ch.task_kind IN ('service','epic') AND ch.status <> 'CANCELLED'`,
           [p.id],
         );
         const covered = new Set(cov.rows.map((r) => r.code));
