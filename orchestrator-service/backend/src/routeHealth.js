@@ -18,6 +18,7 @@ import { withClient, clientConfig } from './db.js';
 import { readStages, resolveProjectId, CONTROL_KINDS, normalizeKind } from './stages.js';
 import { LLM_ROLE_CODES, HOST_ROLE_CODES } from './roleEngine.js';
 import { AUTO_ROLE_CODES } from './rolePipeline.js';
+import { asObject } from './dataCard.js';
 
 // LLM/reasoning-провайдеры: назначение такого коннектора host-роли — ошибка типа.
 export const LLM_CONNECTOR_PROVIDERS = new Set(['codex', 'claude_code', 'deepseek']);
@@ -43,7 +44,7 @@ export function buildRouteHealthReport(stages, connectorsByRole = {}, deps = {})
   const controlKinds = deps.controlKinds ?? CONTROL_KINDS;
   const kindOf = deps.normalizeKind ?? normalizeKind;
   const llmProviders = deps.llmProviders ?? LLM_CONNECTOR_PROVIDERS;
-  const connectors = connectorsByRole && typeof connectorsByRole === 'object' ? connectorsByRole : {};
+  const connectors = asObject(connectorsByRole);
 
   const problems = [];
   const add = (code, severity, stage, roleCode, message, recommendation) => {

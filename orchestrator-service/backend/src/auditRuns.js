@@ -6,12 +6,7 @@
 // ИИ сам — только ведёт учёт в таблице audit_runs (см. миграцию 0033).
 import { withClient, clientConfig } from './db.js';
 
-function httpError(statusCode, message) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  error.code = message;
-  return error;
-}
+import { httpCodedError as httpError } from './httpError.js';
 
 const MAX_LIST = 50;
 

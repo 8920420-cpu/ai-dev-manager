@@ -12,12 +12,7 @@ import { LLM_ROLE_CODES } from './roleEngine.js';
 // UPPER/TRIM для устойчивого сравнения с кодом из запроса.
 const REASONING_ROLE_CODES = new Set(LLM_ROLE_CODES.map((c) => String(c).trim().toUpperCase()));
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpError } from './httpError.js';
 
 function toIso(value) {
   if (value == null) return null;

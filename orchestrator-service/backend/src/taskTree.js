@@ -5,6 +5,7 @@
 // «подтягиваются» к ближайшей задаче-родителю верхнего уровня, чтобы дерево
 // всегда оставалось трёхуровневым. Endpoint ничего не изменяет.
 import { withClient, clientConfig } from './db.js';
+import { asObject, parseDataCard } from './dataCard.js';
 
 /**
  * GET /api/tasks/tree — все проекты с их задачами и подзадачами.
@@ -169,7 +170,7 @@ export async function getTaskHistory(s, taskId) {
     // TASK_CREATED исключаем: событие создания тоже несёт result/changedFiles
     // (исходный запрос сканера), но это не работа программиста.
     const actorOf = (payload, eventType) => {
-      const p = payload && typeof payload === 'object' ? payload : {};
+      const p = asObject(payload);
       if (typeof p.role === 'string' && p.role) return p.role;
       // Программист пишет result/changedFiles, своей роли в payload не указывает.
       if (eventType !== 'TASK_CREATED' && (p.result !== undefined || p.changedFiles !== undefined)) {
@@ -222,69 +223,89 @@ export async function getTaskTree(s) {
          FROM tasks
         ORDER BY created_at`,
     );
-
-    // Узлы задач по id (для связывания родитель → подзадача).
-    const nodeById = new Map();
-    for (const r of tasksRes.rows) {
-      // DOCS-DEBT-001: непогашенный документационный долг (status==='open') —
-      // отдаём его в дерево для бейджа/счётчика в UI. Погашенный (resolved) не
-      // показываем. data_card может быть null/не-объектом — защищаемся.
-      const card = r.data_card && typeof r.data_card === 'object' ? r.data_card : {};
-      const debt = card.docs_debt;
-      const docsDebt = debt && typeof debt === 'object' && debt.status === 'open' ? debt : null;
-      nodeById.set(r.id, {
-        id: r.id,
-        title: r.title,
-        status: r.status,
-        priority: r.priority,
-        projectId: r.project_id,
-        parentId: r.parent_task_id,
-        docsDebt,
-        subtasks: [],
-      });
-    }
-
-    // Поиск задачи-родителя ВЕРХНЕГО уровня (для нормализации к 3 уровням):
-    // если родитель сам подзадача — поднимаемся выше, пока не дойдём до
-    // задачи без родителя (с защитой от циклов).
-    const topLevelAncestor = (node) => {
-      let cur = node;
-      const seen = new Set();
-      while (cur.parentId && nodeById.has(cur.parentId) && !seen.has(cur.id)) {
-        seen.add(cur.id);
-        cur = nodeById.get(cur.parentId);
-      }
-      return cur;
-    };
-
-    const projects = projectsRes.rows.map((p) => ({
-      id: p.id,
-      name: p.name,
-      code: p.code ?? null,
-      tasks: [],
-    }));
-    const projectById = new Map(projects.map((p) => [p.id, p]));
-
-    for (const node of nodeById.values()) {
-      const isTopLevel = !node.parentId || !nodeById.has(node.parentId);
-      if (isTopLevel) {
-        const proj = projectById.get(node.projectId);
-        if (proj) proj.tasks.push(stripNode(node));
-        continue;
-      }
-      // Подзадача: цепляем к задаче верхнего уровня (третий уровень дерева).
-      const ancestor = topLevelAncestor(node);
-      if (ancestor && ancestor.id !== node.id) {
-        ancestor.subtasks.push(stripNode(node, /* leaf */ true));
-      }
-    }
-
-    for (const proj of projects) {
-      proj.taskCount = proj.tasks.length;
-    }
-
-    return { projects };
+    return buildTaskTree(projectsRes.rows, tasksRes.rows);
   });
+}
+
+/**
+ * Чистая (без pg) деривация трёхуровневого дерева из строк БД — вынесена для
+ * прямого юнит-тестирования.
+ *   projectRows: [{ id, name, code }]
+ *   taskRows:    [{ id, project_id, parent_task_id, title, status, priority, data_card }]
+ * Возвращает { projects: [...] } в том же формате, что и getTaskTree
+ * (Проект → Задача → Подзадача; узлы глубже 3-го уровня поднимаются к ближайшему
+ * предку верхнего уровня). Формат JSON /api/tasks/tree не меняется.
+ *
+ * КОНТРАКТ docsDebt (DOCS-DEBT-001) — форма data_card.docs_debt:
+ *   { role:string, reason:string, status:'open'|'resolved', at:ISOstring }.
+ * В дерево отдаётся ТОЛЬКО status==='open'; 'resolved'/отсутствие/не-объект →
+ * docsDebt не выставляется (undefined).
+ */
+export function buildTaskTree(projectRows, taskRows) {
+  const projectList = Array.isArray(projectRows) ? projectRows : [];
+  const taskList = Array.isArray(taskRows) ? taskRows : [];
+
+  // Узлы задач по id (для связывания родитель → подзадача).
+  const nodeById = new Map();
+  for (const r of taskList) {
+    // DOCS-DEBT-001: непогашенный документационный долг (status==='open') —
+    // отдаём его в дерево для бейджа/счётчика в UI. Погашенный (resolved) не
+    // показываем. data_card может быть null/не-объектом — защищаемся.
+    const card = parseDataCard(r);
+    const debt = card.docs_debt;
+    const docsDebt = debt && typeof debt === 'object' && debt.status === 'open' ? debt : null;
+    nodeById.set(r.id, {
+      id: r.id,
+      title: r.title,
+      status: r.status,
+      priority: r.priority,
+      projectId: r.project_id,
+      parentId: r.parent_task_id,
+      docsDebt,
+      subtasks: [],
+    });
+  }
+
+  // Поиск задачи-родителя ВЕРХНЕГО уровня (для нормализации к 3 уровням):
+  // если родитель сам подзадача — поднимаемся выше, пока не дойдём до
+  // задачи без родителя (с защитой от циклов).
+  const topLevelAncestor = (node) => {
+    let cur = node;
+    const seen = new Set();
+    while (cur.parentId && nodeById.has(cur.parentId) && !seen.has(cur.id)) {
+      seen.add(cur.id);
+      cur = nodeById.get(cur.parentId);
+    }
+    return cur;
+  };
+
+  const projects = projectList.map((p) => ({
+    id: p.id,
+    name: p.name,
+    code: p.code ?? null,
+    tasks: [],
+  }));
+  const projectById = new Map(projects.map((p) => [p.id, p]));
+
+  for (const node of nodeById.values()) {
+    const isTopLevel = !node.parentId || !nodeById.has(node.parentId);
+    if (isTopLevel) {
+      const proj = projectById.get(node.projectId);
+      if (proj) proj.tasks.push(stripNode(node));
+      continue;
+    }
+    // Подзадача: цепляем к задаче верхнего уровня (третий уровень дерева).
+    const ancestor = topLevelAncestor(node);
+    if (ancestor && ancestor.id !== node.id) {
+      ancestor.subtasks.push(stripNode(node, /* leaf */ true));
+    }
+  }
+
+  for (const proj of projects) {
+    proj.taskCount = proj.tasks.length;
+  }
+
+  return { projects };
 }
 
 // Узел без служебных полей (projectId/parentId не нужны клиенту).

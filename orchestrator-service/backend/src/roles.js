@@ -38,13 +38,7 @@ export const ROLE_FIELD_LIMITS = {
 // Предел размера содержимого skill-файла, загружаемого с ПК (символы).
 export const SKILL_UPLOAD_LIMIT = 500000;
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  error.code = message;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpCodedError as httpError } from './httpError.js';
 
 // --- Чистые функции (без БД и сети) — покрыты юнит-тестами -------------------
 

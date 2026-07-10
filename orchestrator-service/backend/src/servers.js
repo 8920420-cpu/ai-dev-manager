@@ -78,12 +78,7 @@ const MANAGED_SERVERS = [
   },
 ];
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpError } from './httpError.js';
 
 function runDocker(args, { allowFailure = false } = {}) {
   return new Promise((resolve, reject) => {

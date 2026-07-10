@@ -18,12 +18,7 @@ export const MEMORY_DOCUMENTS = [
 
 const MEMORY_KEY_SET = new Set(MEMORY_DOCUMENTS.map((d) => d.key));
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpError } from './httpError.js';
 
 function checksum(content) {
   return createHash('sha256').update(content, 'utf8').digest('hex');

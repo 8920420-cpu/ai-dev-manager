@@ -127,11 +127,7 @@ export function computeTaskRows({ tasks, eventsByTask }, generatedAtMs) {
 
 // --- DB-слой ---------------------------------------------------------------
 
-function httpError(statusCode, message) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  return error;
-}
+import { httpError } from './httpError.js';
 
 async function resolveProjectId(c, projectId) {
   const ref = String(projectId ?? '').trim();

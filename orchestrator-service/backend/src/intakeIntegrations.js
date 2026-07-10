@@ -14,6 +14,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import pg from 'pg';
 import { loadSettings } from './config.js';
+import { asObject } from './dataCard.js';
 
 const { Client } = pg;
 
@@ -24,11 +25,7 @@ export function __setClientFactoryForTest(factory) {
   createClient = factory ?? ((cfg) => new Client(cfg));
 }
 
-function httpError(statusCode, message) {
-  const e = new Error(message);
-  e.statusCode = statusCode;
-  return e;
-}
+import { httpError } from './httpError.js';
 
 function clientConfig(s) {
   return { host: s.host, port: s.port, user: s.user, password: s.password, database: s.database };
@@ -112,7 +109,7 @@ function clampInt(value, { def, min = 0, max = 1000000 }) {
 // поля. Токен здесь НЕ задаётся: он выпускается генератором при создании/ротации.
 export function normalizeIntegrationInput(input, { partial = false } = {}) {
   const out = {};
-  const src = input && typeof input === 'object' ? input : {};
+  const src = asObject(input);
   if (!partial || src.name !== undefined) out.name = String(src.name ?? '').trim();
   if (!partial || src.enabled !== undefined) out.enabled = src.enabled !== false;
   if (!partial || src.rateLimitPerMin !== undefined) {

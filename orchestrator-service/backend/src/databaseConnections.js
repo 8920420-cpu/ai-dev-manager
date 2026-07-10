@@ -10,13 +10,7 @@ import { withClient, clientConfig } from './db.js';
 
 const { Client } = pg;
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  error.code = message;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpCodedError as httpError } from './httpError.js';
 
 const COLUMNS =
   'id, name, dbms_type, host, port, database, db_user, ssl_mode, secret, created_at, updated_at';

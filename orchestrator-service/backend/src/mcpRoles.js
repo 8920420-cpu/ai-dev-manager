@@ -16,13 +16,7 @@
 // Идентичность роли — её `code` (уникальный, неизменяемый после создания).
 import { withClient, clientConfig } from './db.js';
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  error.code = message;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpCodedError as httpError } from './httpError.js';
 
 // Лимиты полей карточки MCP-роли (защита от раздувания и мусора).
 export const MCP_ROLE_LIMITS = {

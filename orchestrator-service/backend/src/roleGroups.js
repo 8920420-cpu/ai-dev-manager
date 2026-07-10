@@ -13,13 +13,7 @@ export const ROLE_GROUP_LIMITS = {
   name: 120,
 };
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  error.code = message;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpCodedError as httpError } from './httpError.js';
 
 // --- Чистые функции (без БД) — покрыты юнит-тестами -------------------------
 

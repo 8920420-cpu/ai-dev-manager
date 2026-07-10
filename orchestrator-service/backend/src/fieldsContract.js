@@ -10,6 +10,8 @@
 // кумулятивна) либо начальное поле карточки (seed: title/description). Иначе
 // схему сохранить нельзя.
 
+import { asObject } from './dataCard.js';
+
 // Начальные поля карточки, доступные с создания задачи (до первой роли).
 export const SEED_FIELDS = ['title', 'description'];
 
@@ -74,7 +76,7 @@ export function validateFieldConsistency(route, contractsByRole, { seedFields = 
  */
 export function extractOutputs(source, outputs) {
   const { outputs: outs } = normContract({ outputs });
-  const src = source && typeof source === 'object' ? source : {};
+  const src = asObject(source);
   const values = {};
   const missingRequired = [];
   for (const out of outs) {
@@ -92,7 +94,7 @@ export function extractOutputs(source, outputs) {
  */
 export function missingRequiredInputs(card, inputs, { seedFields = SEED_FIELDS } = {}) {
   const { inputs: ins } = normContract({ inputs });
-  const data = card && typeof card === 'object' ? card : {};
+  const data = asObject(card);
   const missing = [];
   for (const inp of ins) {
     if (!inp.required) continue;

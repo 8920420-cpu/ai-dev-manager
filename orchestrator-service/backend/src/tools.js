@@ -3,13 +3,7 @@
 // Tools — отдельная от skills сущность. builtin исполняет микросервис tools-service
 // (function-calling рассуждающих ролей), mcp прокидывается Claude Code (PROGRAMMER).
 import { withClient, clientConfig } from './db.js';
-
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpError } from './httpError.js';
 
 export const VALID_TOOL_KINDS = new Set(['builtin', 'mcp']);
 

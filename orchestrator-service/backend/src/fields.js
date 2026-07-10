@@ -9,13 +9,7 @@
 // (status='paused' + pause_reason) — требуется пересогласование полей этапов.
 import { withClient, clientConfig } from './db.js';
 
-function httpError(statusCode, message, extra) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  error.code = message;
-  if (extra) Object.assign(error, extra);
-  return error;
-}
+import { httpCodedError as httpError } from './httpError.js';
 
 export const FIELD_VALUE_TYPES = ['text', 'number', 'boolean', 'list', 'json'];
 const KEY_RE = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/;

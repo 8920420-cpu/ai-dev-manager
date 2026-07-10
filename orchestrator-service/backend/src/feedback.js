@@ -17,6 +17,7 @@ import { dirname, resolve, join, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { acceptIntakeReport } from './db.js';
 import { ensureIntegrationWithToken, generateToken } from './intakeIntegrations.js';
+import { asObject } from './dataCard.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -50,7 +51,7 @@ export function __resetTokenCacheForTest() {
 // Собираем вход acceptIntakeReport из FeedbackPayload. service жёстко фиксируем на
 // канал UI-виджета (контракт), не доверяя вводу; токен подставляет сервер.
 function buildIntakeInput(payload, token) {
-  const p = payload && typeof payload === 'object' ? payload : {};
+  const p = asObject(payload);
   return {
     token,
     externalId: p.externalId,
@@ -66,7 +67,7 @@ function buildIntakeInput(payload, token) {
 
 // Ответ acceptIntakeReport → FeedbackResult (контракт фронтенда).
 function toFeedbackResult(result, externalId) {
-  const r = result && typeof result === 'object' ? result : {};
+  const r = asObject(result);
   return {
     accepted: Boolean(r.accepted),
     duplicate: Boolean(r.duplicate),

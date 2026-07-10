@@ -53,11 +53,7 @@ function endpointForProvider(provider) {
   return ep;
 }
 
-function httpError(statusCode, message) {
-  const e = new Error(message);
-  e.statusCode = statusCode;
-  return e;
-}
+import { httpError } from './httpError.js';
 
 function clientConfig(s) {
   return { host: s.host, port: s.port, user: s.user, password: s.password, database: s.database };
