@@ -53,6 +53,7 @@ export const STAGE_ERROR = {
   // ROLE-NO-EXECUTOR-001: во включённый этап поставлена роль без исполнителя
   // (нет в ROLE_FLOW/HOST_ROLES/reasoning-ролях) — задачу никто не подхватит.
   ROLE_NO_EXECUTOR: 'stage_role_no_executor',
+  CONTROL_ROLE_REQUIRED: 'stage_control_role_required',
 };
 
 function httpError(statusCode, message, extra) {
@@ -124,6 +125,14 @@ export function validateStages(stages, { requireScannerWatch = true } = {}) {
       errors.push({ stageId, code: STAGE_ERROR.ENABLED_REQUIRED, message: 'Передайте enabled как true или false.' });
     }
 
+    if (enabled && kind === 'condition' && (!Array.isArray(stage?.roleCodes) || stage.roleCodes.length === 0)) {
+      errors.push({
+        stageId,
+        code: STAGE_ERROR.CONTROL_ROLE_REQUIRED,
+        message: 'Condition-этап должен иметь исполнимую роль; иначе задача станет невидимой для runner.',
+      });
+    }
+
     if (isScannerStage(stage)) {
       // Формат статуса проверяем всегда (даже у отключённого), чтобы в БД не
       // попало значение вне enum task_status.
@@ -185,7 +194,7 @@ export function validateStages(stages, { requireScannerWatch = true } = {}) {
       // никто не подхватит. Исполнимость определяет roleHasExecutor (роль ∈
       // ROLE_FLOW). Управляющие узлы несут gate-роли (FORK_GATE/JOIN_GATE),
       // которыми владеют подметатели, а не runner — их не проверяем.
-      if (!CONTROL_KINDS.has(kind)) {
+      if (!CONTROL_KINDS.has(kind) || kind === 'condition') {
         for (const roleCode of stage.roleCodes) {
           if (!roleHasExecutor(roleCode)) {
             errors.push({

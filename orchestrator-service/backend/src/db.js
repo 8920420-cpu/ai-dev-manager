@@ -337,7 +337,10 @@ export async function acceptScannerCompletionTx(c, payload) {
       let nextRoleId = task.reviewer_role_id;
       let nextRoleCode = 'TASK_REVIEWER';
       if (routeIsUsable(route)) {
-        const resolved = resolveTransition(route, fromRole, { outcome: 'FORWARD' });
+        const resolved = resolveTransition(route, fromRole, { outcome: 'FORWARD' }, {
+          currentStatus: task.status,
+          currentStageKey: task.current_stage_key,
+        });
         toStatus = resolved.toStatus;
         nextRoleCode = resolved.nextRole;
         nextRoleId = resolved.done || !resolved.nextRole
@@ -1189,7 +1192,10 @@ export async function advanceTaskTx(c, taskId) {
     const decision = { outcome: 'FORWARD' };
     const resolved = task.current_stage_key
       ? await resolveGraphTransition(c, task, decision)
-      : resolveTransition(route, task.role_code, decision);
+      : resolveTransition(route, task.role_code, decision, {
+        currentStatus: task.status,
+        currentStageKey: task.current_stage_key,
+      });
 
     const nextRoleId = resolved.done || !resolved.nextRole
       ? null
@@ -1633,7 +1639,7 @@ export function normalizeScannerIntake(input) {
 // SELECT задачи в форме, нужной диспетчеру Scanner (FOR UPDATE — блокируем строку).
 const SCANNER_TASK_SELECT = `SELECT t.id, t.status::text AS status, p.id AS project_id,
         p.code AS project_code, s.service_code, rr.id AS reviewer_role_id,
-        t.current_role_id, cr.code AS current_role_code,
+        t.current_role_id, t.current_stage_key, cr.code AS current_role_code,
         t.task_kind, t.parent_task_id
    FROM tasks t
    JOIN projects p ON p.id = t.project_id
@@ -2222,6 +2228,7 @@ export async function claimNextHostTask(s, roleCode) {
                   JOIN project_stage_roles psr ON psr.stage_id = ps.id
                  WHERE ps.project_id = t.project_id AND ps.enabled = true
                    AND psr.role_id = r.id AND ps.task_status::text = t.status::text
+                   AND (t.current_stage_key IS NULL OR ps.stage_key = t.current_stage_key)
               )
               OR (
                 NOT EXISTS (
@@ -2443,7 +2450,10 @@ export async function completeHostTaskTx(c, input) {
       };
       const resolveHost = (decision) => (t.current_stage_key
         ? resolveGraphTransition(c, claimedLike, decision)
-        : resolveTransition(route, roleCode, decision));
+        : resolveTransition(route, roleCode, decision, {
+          currentStatus: t.status,
+          currentStageKey: t.current_stage_key,
+        }));
       let resolved;
       if (roleCode === 'PIPELINE_SERVICE') {
         await c.query(
@@ -2479,6 +2489,34 @@ export async function completeHostTaskTx(c, input) {
       const nextRoleId = !nextRole
         ? null
         : (await c.query('SELECT id FROM roles WHERE code = $1', [nextRole])).rows[0]?.id ?? null;
+      if (nextRole && !nextRoleId) {
+        const reason = `next_role_missing:${nextRole}`;
+        await c.query(
+          `UPDATE tasks SET status = 'BLOCKED', current_role_id = NULL, assigned_agent_id = NULL,
+                  data_card = data_card || $2::jsonb
+            WHERE id = $1`,
+          [taskId, JSON.stringify({ orchestration_error: reason, ...hostCardValues })],
+        );
+        const failureText = reason.slice(0, HOST_FAILURE_TEXT_MAX);
+        await c.query(
+          `UPDATE agent_runs
+              SET status = 'FAILED', finished_at = COALESCE(finished_at, now()), error_text = $2,
+                  output_json = COALESCE(output_json, '{}'::jsonb) || $3::jsonb
+            WHERE task_id = $1 AND role_id = $4
+              AND status IN ('RUNNING','TIMEOUT')`,
+          [taskId, failureText, JSON.stringify({ reason, output }), t.current_role_id],
+        );
+        await c.query(
+          `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+           VALUES ($1, 'TASK_BLOCKED', $2::task_status, 'BLOCKED', $3, $4::jsonb)`,
+          [taskId, t.status, t.current_role_id, JSON.stringify({
+            runner: true, host: true, role: roleCode, reason, missingRole: nextRole,
+            outcome: 'BLOCK', via: resolved.via,
+          })],
+        );
+        await c.query('COMMIT');
+        return { taskId, role: roleCode, success: false, toStatus: 'BLOCKED', nextRole: null, reason };
+      }
 
       // FORK-JOIN-001: в граф-режиме переносим текущий узел на следующий (напр. на
       // узел fork после успеха Pipeline Service); в линейном режиме остаётся NULL.
@@ -2898,7 +2936,7 @@ console.log(`programmer release backoff schedule (ms)=${JSON.stringify(PROGRAMME
 async function loadProjectRoute(c, projectId) {
   if (!projectId) return [];
   const stages = await c.query(
-    `SELECT id, position, enabled, task_status::text AS task_status
+    `SELECT id, position, enabled, task_status::text AS task_status, stage_key
        FROM project_stages WHERE project_id = $1 ORDER BY position`,
     [projectId],
   );
@@ -2919,6 +2957,7 @@ async function loadProjectRoute(c, projectId) {
       position: s.position,
       enabled: s.enabled,
       taskStatus: s.task_status,
+      stageKey: s.stage_key,
       roleCodes: byStage.get(s.id) ?? [],
     })),
   );
@@ -2988,7 +3027,10 @@ async function resolveGraphTransition(c, claimed, decision) {
   if (!loaded) {
     // Рёбра исчезли (схему переписали в линейную) — фолбэк на позиционный резолвер.
     const route = await loadProjectRoute(c, claimed.project_id);
-    return { ...resolveTransition(route, claimed.role_code, decision), nextStageKey: null };
+    return { ...resolveTransition(route, claimed.role_code, decision, {
+      currentStatus: claimed.status,
+      currentStageKey: claimed.current_stage_key,
+    }), nextStageKey: null };
   }
   // FA-REWORK-ROUTE-001: доработка (напр. диагност сбоя вернул задачу) идёт НАЗАД к
   // ближайшему исполнителю по рёбрам графа, а не вперёд по маршруту — иначе вердикт
@@ -3005,7 +3047,10 @@ async function resolveGraphTransition(c, claimed, decision) {
       };
     }
     const route = await loadProjectRoute(c, claimed.project_id);
-    return { ...resolveTransition(route, claimed.role_code, decision), nextStageKey: null };
+    return { ...resolveTransition(route, claimed.role_code, decision, {
+      currentStatus: claimed.status,
+      currentStageKey: claimed.current_stage_key,
+    }), nextStageKey: null };
   }
   const nextKey = nextNodeKey(loaded.graph, claimed.current_stage_key, decision);
   if (!nextKey) {
@@ -4421,6 +4466,7 @@ async function claimLlmRoleTask(c, roleCode = null) {
                   JOIN project_stage_roles psr ON psr.stage_id = ps.id
                  WHERE ps.project_id = t.project_id AND ps.enabled = true
                    AND psr.role_id = r.id AND ps.task_status::text = t.status::text
+                   AND (t.current_stage_key IS NULL OR ps.stage_key = t.current_stage_key)
               )
               OR (
                 NOT EXISTS (
@@ -4901,7 +4947,10 @@ async function maybeSkipFailureAnalyst(c, claimed, route) {
   const decision = { outcome: 'FORWARD', agentRunStatus: 'SUCCESS', reason: 'tests_passed_skip' };
   const resolved = claimed.current_stage_key
     ? await resolveGraphTransition(c, claimed, decision)
-    : resolveTransition(route, claimed.role_code, decision);
+    : resolveTransition(route, claimed.role_code, decision, {
+      currentStatus: claimed.status,
+      currentStageKey: claimed.current_stage_key,
+    });
   return finalizeRole(c, claimed, {
     verdict, response: '', exchangeId: null, durationMs: 0, decision, resolved, cardValues: {}, kpi: null,
   });
@@ -5248,7 +5297,10 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
   // без него — прежняя позиционная маршрутизация (линейные схемы не затронуты).
   const resolved = claimed.current_stage_key
     ? await resolveGraphTransition(c, claimed, decision)
-    : resolveTransition(route, claimed.role_code, decision);
+    : resolveTransition(route, claimed.role_code, decision, {
+      currentStatus: claimed.status,
+      currentStageKey: claimed.current_stage_key,
+    });
   return finalizeRole(c, claimed, {
     verdict, response, exchangeId, durationMs, decision, resolved, cardValues, kpi, setServiceId, setDescription, setTitle, setPriority,
   });
@@ -5756,7 +5808,10 @@ export async function materializeArchitectSplit(c, claimed, { verdict, response,
     // PROGRAMMER). Дети наследуют этот целевой этап/статус/роль.
     const resolved = claimed.current_stage_key
       ? await resolveGraphTransition(c, claimed, decision)
-      : resolveTransition(route, claimed.role_code, decision);
+      : resolveTransition(route, claimed.role_code, decision, {
+        currentStatus: claimed.status,
+        currentStageKey: claimed.current_stage_key,
+      });
     const childRoleId = resolved.nextRole
       ? (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null
       : null;
@@ -5883,6 +5938,50 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
     const nextRoleId = resolved.done || !resolved.nextRole
       ? null
       : (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null;
+
+    if (resolved.nextRole && !nextRoleId) {
+      const reason = `next_role_missing:${resolved.nextRole}`;
+      await c.query(
+        `UPDATE tasks SET status = 'BLOCKED', assigned_agent_id = NULL,
+                data_card = data_card || $2::jsonb
+          WHERE id = $1`,
+        [claimed.id, JSON.stringify({ orchestration_error: reason })],
+      );
+      const kpiSet = runKpiSet(kpi, 3);
+      await c.query(
+        `UPDATE agent_runs SET status = 'FAILED', finished_at = now(), error_text = $2,
+                output_json = $3::jsonb${kpiSet.sql}
+          WHERE id = $1`,
+        [claimed.agentRunId, reason, JSON.stringify({
+          status: 'BLOCKED',
+          summary: reason,
+          reason,
+          outcome: 'BLOCK',
+          via: resolved.via,
+          fields: cardValues,
+        }), ...kpiSet.params],
+      );
+      await c.query(
+        `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+         VALUES ($1, 'TASK_BLOCKED', $2::task_status, 'BLOCKED', $3, $4::jsonb)`,
+        [claimed.id, claimed.status, claimed.role_id, JSON.stringify({
+          runner: true, ai: true, role: claimed.role_code, reason,
+          missingRole: resolved.nextRole, outcome: 'BLOCK', via: resolved.via, exchangeId,
+        })],
+      );
+      await c.query('COMMIT');
+      return {
+        taskId: claimed.id,
+        fromRole: claimed.role_code,
+        fromStatus: claimed.status,
+        toStatus: 'BLOCKED',
+        nextRole: null,
+        verdict: 'BLOCKED',
+        durationMs,
+        blocked: true,
+        reason,
+      };
+    }
 
     // FORK-JOIN-001: в граф-режиме переносим текущий узел; в линейном — остаётся NULL.
     // DECOMPOSER-REMOVE-001: опционально проставляем service_id (Архитектор) и/или

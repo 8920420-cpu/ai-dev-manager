@@ -13,6 +13,7 @@ import {
   LLM_ROLE_CODES,
   capToolArgs,
   compactToolResult,
+  pickAssignedConnectorRow,
 } from '../src/roleEngine.js';
 
 test('parseVerdict: чистый JSON', () => {
@@ -407,4 +408,17 @@ test('LLM_ROLE_CODES покрывает 7 рассуждающих ролей (�
     'ARCHITECT', 'DECOMPOSER', 'DOCUMENTATION_AUDITOR',
     'DOCUMENTATION_KEEPER', 'FAILURE_ANALYST', 'TASK_INTAKE_OFFICER', 'TASK_REVIEWER',
   ]);
+});
+
+test('pickAssignedConnectorRow: deterministic ORDER BY for multiple role connectors', async () => {
+  const calls = [];
+  const client = {
+    async query(sql, params) {
+      calls.push({ sql, params });
+      return { rows: [], rowCount: 0 };
+    },
+  };
+  await pickAssignedConnectorRow(client, 'ARCHITECT');
+  assert.match(calls[0].sql, /ORDER BY cn\.priority ASC, lower\(cn\.name\) ASC, cn\.id ASC/);
+  assert.deepEqual(calls[0].params, ['ARCHITECT']);
 });

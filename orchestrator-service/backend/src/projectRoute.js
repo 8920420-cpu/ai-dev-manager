@@ -33,6 +33,7 @@ export function buildRoute(stages = []) {
       route.push({
         roleCode,
         status,
+        stageKey: stage.stageKey ?? stage.stage_key ?? null,
         stageEnabled: stage.enabled === true,
         stagePosition: stage.position ?? 0,
         index: index++,
@@ -58,7 +59,18 @@ export function firstStep(route = []) {
 }
 
 // Индекс ПЕРВОГО вхождения роли в маршрут (по любому этапу). -1, если нет.
-function indexOfRole(route, roleCode) {
+function indexOfRole(route, roleCode, { currentStatus = null, currentStageKey = null } = {}) {
+  const status = normalizeStatus(currentStatus);
+  if (currentStageKey) {
+    for (const e of route) {
+      if (e.roleCode === roleCode && e.stageKey === currentStageKey) return e.index;
+    }
+  }
+  if (status) {
+    for (const e of route) {
+      if (e.roleCode === roleCode && e.status === status) return e.index;
+    }
+  }
   for (const e of route) if (e.roleCode === roleCode) return e.index;
   return -1;
 }
@@ -82,8 +94,8 @@ function nextEnabledAfter(route, idx) {
  * Возвращает запись маршрута или null (конец маршрута — задача завершается).
  * Если роли нет в маршруте — null (вызывающий применит канонический фолбэк).
  */
-export function forwardFrom(route, roleCode) {
-  const idx = indexOfRole(route, roleCode);
+export function forwardFrom(route, roleCode, current = {}) {
+  const idx = indexOfRole(route, roleCode, current);
   if (idx === -1) return undefined; // нет в маршруте → фолбэк
   return nextEnabledAfter(route, idx);
 }
@@ -106,8 +118,8 @@ function findEnabledByKind(route, kind, { before } = {}) {
  * роль-исполнитель (kind=executor); если её нет — ближайшая проектная роль
  * (design) перед текущей; иначе — первая включённая роль маршрута.
  */
-export function reworkTarget(route, roleCode) {
-  const idx = indexOfRole(route, roleCode);
+export function reworkTarget(route, roleCode, current = {}) {
+  const idx = indexOfRole(route, roleCode, current);
   const before = idx === -1 ? Infinity : idx;
   // Идём с конца к началу среди записей до текущей.
   const prior = route.filter((e) => e.stageEnabled && e.status && e.index < before);
@@ -143,7 +155,7 @@ export function canonicalForward(roleCode) {
  * Возвращает { nextRole, toStatus, done, blocked, via } где via — источник
  * решения ('route' | 'canonical') для диагностики.
  */
-export function resolveTransition(route, roleCode, decision) {
+export function resolveTransition(route, roleCode, decision, current = {}) {
   const usable = routeIsUsable(route);
 
   if (decision.outcome === 'BLOCK') {
@@ -159,35 +171,35 @@ export function resolveTransition(route, roleCode, decision) {
       (decision.branchKind && findEnabledByKind(route, decision.branchKind)) ||
       null;
     if (target) {
-      return { nextRole: target.roleCode, toStatus: target.status, done: false, blocked: false, via: 'route' };
+      return { nextRole: target.roleCode, toStatus: target.status, done: false, blocked: false, via: 'route', nextStageKey: target.stageKey ?? null };
     }
     // Ветки нет в маршруте проекта — деградируем по branchFallback:
     //   'rework' (провал гейта без аналитика) — на доработку исполнителю;
     //   иначе — движение вперёд по маршруту.
     if (decision.branchFallback === 'rework') {
-      const rt = reworkTarget(route, roleCode);
-      if (rt) return { nextRole: rt.roleCode, toStatus: rt.status, done: false, blocked: false, via: 'route' };
+      const rt = reworkTarget(route, roleCode, current);
+      if (rt) return { nextRole: rt.roleCode, toStatus: rt.status, done: false, blocked: false, via: 'route', nextStageKey: rt.stageKey ?? null };
     }
-    return forwardOrFallback(route, roleCode);
+    return forwardOrFallback(route, roleCode, current);
   }
 
   if (decision.outcome === 'REWORK') {
-    const target = reworkTarget(route, roleCode);
+    const target = reworkTarget(route, roleCode, current);
     if (target) {
-      return { nextRole: target.roleCode, toStatus: target.status, done: false, blocked: false, via: 'route' };
+      return { nextRole: target.roleCode, toStatus: target.status, done: false, blocked: false, via: 'route', nextStageKey: target.stageKey ?? null };
     }
     return applyCanonical(roleCode);
   }
 
   // FORWARD (по умолчанию).
-  return forwardOrFallback(route, roleCode);
+  return forwardOrFallback(route, roleCode, current);
 }
 
-function forwardOrFallback(route, roleCode) {
-  const fwd = forwardFrom(route, roleCode);
+function forwardOrFallback(route, roleCode, current = {}) {
+  const fwd = forwardFrom(route, roleCode, current);
   if (fwd === undefined) return applyCanonical(roleCode); // роли нет в маршруте
   if (fwd === null) return { nextRole: null, toStatus: 'DONE', done: true, blocked: false, via: 'route' };
-  return { nextRole: fwd.roleCode, toStatus: fwd.status, done: false, blocked: false, via: 'route' };
+  return { nextRole: fwd.roleCode, toStatus: fwd.status, done: false, blocked: false, via: 'route', nextStageKey: fwd.stageKey ?? null };
 }
 
 // Безопасный фолбэк, когда роли нет в маршруте проекта (частично настроенный

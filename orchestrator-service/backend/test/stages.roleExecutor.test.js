@@ -53,3 +53,19 @@ test('validateStages: управляющие узлы fork/join не падаю�
   assert.ok(Array.isArray(errors));
   assert.equal(executorErrors(errors).length, 0);
 });
+
+test('validateStages: condition without role is rejected before it becomes invisible to runner', () => {
+  const errors = validateStages([
+    { id: 'c', name: 'Condition', enabled: true, kind: 'condition', roleCodes: [], taskStatus: 'TESTING' },
+  ]);
+  assert.equal(errors.some((e) => e.code === STAGE_ERROR.CONTROL_ROLE_REQUIRED), true);
+});
+
+test('validateStages: condition with non-executable role reports stage_role_no_executor', () => {
+  const errors = validateStages([
+    { id: 'c', name: 'Condition', enabled: true, kind: 'condition', roleCodes: ['FORK_GATE'], taskStatus: 'TESTING' },
+  ]);
+  const noExec = executorErrors(errors);
+  assert.equal(noExec.length, 1);
+  assert.equal(noExec[0].stageId, 'c');
+});

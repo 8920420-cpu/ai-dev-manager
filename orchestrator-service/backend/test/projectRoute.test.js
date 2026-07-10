@@ -216,3 +216,18 @@ test('decideOutcome max_rework → BLOCK', () => {
   assert.equal(d.outcome, 'BLOCK');
   assert.equal(d.reason, 'max_rework_exceeded');
 });
+
+test('resolveTransition: repeated role uses current status or stage key, not first role occurrence', () => {
+  const route = buildRoute([
+    { position: 0, stageKey: 'A', enabled: true, taskStatus: 'REVIEW', roleCodes: ['TASK_REVIEWER'] },
+    { position: 1, stageKey: 'B', enabled: true, taskStatus: 'TESTING', roleCodes: ['PIPELINE_SERVICE'] },
+    { position: 2, stageKey: 'C', enabled: true, taskStatus: 'COMMIT', roleCodes: ['TASK_REVIEWER'] },
+    { position: 3, stageKey: 'D', enabled: true, taskStatus: 'DONE', roleCodes: ['GIT_INTEGRATOR'] },
+  ]);
+
+  const byStatus = resolveTransition(route, 'TASK_REVIEWER', { outcome: 'FORWARD' }, { currentStatus: 'COMMIT' });
+  assert.deepEqual([byStatus.nextRole, byStatus.toStatus, byStatus.nextStageKey], ['GIT_INTEGRATOR', 'DONE', 'D']);
+
+  const byStage = resolveTransition(route, 'TASK_REVIEWER', { outcome: 'FORWARD' }, { currentStageKey: 'A' });
+  assert.deepEqual([byStage.nextRole, byStage.toStatus, byStage.nextStageKey], ['PIPELINE_SERVICE', 'TESTING', 'B']);
+});

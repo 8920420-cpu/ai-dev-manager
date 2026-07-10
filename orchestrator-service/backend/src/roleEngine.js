@@ -660,6 +660,8 @@ export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = 
 // Чистое решение о переходе по вердикту. Не трогает БД.
 // reworkCount — сколько раз задача уже возвращалась в CODING (защита от цикла).
 // Возвращает { toStatus, nextRole, done, blocked, agentRunStatus, reason }.
+// Legacy canonical resolver kept for old fallback tests and compatibility.
+// New task movement must use decideOutcome(...) + projectRoute.resolveTransition(...).
 export function decideTransition(roleCode, verdict, { reworkCount = 0, maxRework = MAX_REWORK } = {}) {
   const flow = ROLE_FLOW[roleCode];
   if (!flow) return { blocked: true, agentRunStatus: 'FAILED', reason: 'unknown_role' };
@@ -750,9 +752,10 @@ export async function pickAssignedConnectorRow(client, roleCode) {
   const r = await client.query(
     `SELECT cn.id, cn.name, cn.provider, cn.endpoint, cn.access_token, cn.model,
             cn.consumer_service, cn.priority
-       FROM role_connectors rc
-       JOIN connectors cn ON cn.id = rc.connector_id
+      FROM role_connectors rc
+      JOIN connectors cn ON cn.id = rc.connector_id
       WHERE rc.role_code = $1 AND cn.is_enabled = true AND cn.access_token <> ''
+      ORDER BY cn.priority ASC, lower(cn.name) ASC, cn.id ASC
       LIMIT 1`,
     [roleCode],
   );
