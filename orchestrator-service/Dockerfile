@@ -23,6 +23,7 @@ RUN cd backend && npm install --omit=dev --no-audit --no-fund
 
 # Исходники бэкенда (включая db/migrations, db/seed)
 COPY orchestrator-service/backend ./backend
+COPY shared /shared
 
 # React-сборка вместо прежней plain-HTML страницы.
 # backend раздаёт ../../frontend (см. FRONTEND_DIR в src/server.js) с SPA-фолбэком.

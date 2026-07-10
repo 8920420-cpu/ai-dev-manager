@@ -19,8 +19,6 @@ const debounceMs = Number(process.env.SCANNER_DEBOUNCE_MS || 150);
 const fallbackMs = Number(process.env.SCANNER_FALLBACK_MS ?? 5000);
 const clearOnDispatch = process.env.SCANNER_CLEAR_ON_DISPATCH !== 'false';
 
-// Режим строго из нового контракта (api/snapshot). Legacy single-watcher удалён:
-// устаревшие переменные окружения игнорируются с диагностикой.
 let runtime;
 try {
   runtime = resolveScannerRuntime(process.env);
@@ -31,13 +29,7 @@ try {
   }
   throw error;
 }
-const { mode, apiBase, orchestratorBase, legacyEnvIgnored } = runtime;
-if (legacyEnvIgnored.length) {
-  console.warn(
-    `Ignored unsupported legacy scanner env: ${legacyEnvIgnored.join(', ')}. ` +
-      'Use SCANNER_API_BASE (api) or SCANNER_SNAPSHOT + ORCHESTRATOR_API_BASE (snapshot).',
-  );
-}
+const { mode, apiBase, orchestratorBase } = runtime;
 const snapshotPath = mode === 'snapshot' ? resolve(process.env.SCANNER_SNAPSHOT) : null;
 const taskCompletedEndpoint = `${orchestratorBase}/api/scanner/task-completed`;
 

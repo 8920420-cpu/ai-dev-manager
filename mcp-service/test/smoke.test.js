@@ -49,9 +49,26 @@ test('/mcp без токена при заданном ORCHESTRATOR_API_TOKEN �
   }
 });
 
+test('/mcp with empty ORCHESTRATOR_API_TOKEN is 401 by default', async () => {
+  const config = loadConfig({ MCP_SERVICE_PORT: '0' });
+  const server = startHttp(config, { logger: () => {} });
+  await new Promise((r) => server.once('listening', r));
+  const port = server.address().port;
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/mcp`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',
+    });
+    assert.equal(res.status, 401);
+  } finally {
+    await new Promise((r) => server.close(r));
+  }
+});
+
 test('/mcp с превышением лимита тела → 413', async () => {
   // Лимит floor'ится до минимума 1024 байт; шлём заведомо больше, чтобы сработал 413.
-  const config = loadConfig({ MCP_SERVICE_PORT: '0', MCP_BODY_LIMIT_BYTES: '1024' });
+  const config = loadConfig({ MCP_SERVICE_PORT: '0', MCP_BODY_LIMIT_BYTES: '1024', ALLOW_INSECURE_LOCAL: '1' });
   const server = startHttp(config, { logger: () => {} });
   await new Promise((r) => server.once('listening', r));
   const port = server.address().port;

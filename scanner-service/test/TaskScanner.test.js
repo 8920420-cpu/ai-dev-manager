@@ -1,17 +1,19 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { TaskScanner, parseDocument } from '../src/TaskScanner.js';
 
-async function fixture(t, tasks) {
+const RM_RETRY = { recursive: true, force: true, maxRetries: 5, retryDelay: 20 };
+
+async function fixture(t, tasks, { autoCleanup = true } = {}) {
   const dir = await mkdtemp(join(tmpdir(), 'scanner-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  if (autoCleanup) t.after(() => rm(dir, RM_RETRY));
   const documentPath = join(dir, 'tasks.json');
   const statePath = join(dir, 'state.json');
   await writeFile(documentPath, JSON.stringify({ version: 1, tasks }), 'utf8');
-  return { documentPath, statePath };
+  return { watchDirectory: dir, documentName: 'tasks.json', documentPath, statePath };
 }
 
 test('передаёт выполненную задачу с проектом и сервисом', async (t) => {
@@ -94,7 +96,7 @@ test('валидирует версию и уникальность id', () => {
 });
 
 test('start() реагирует на изменение файла через fs.watch', async (t) => {
-  const paths = await fixture(t, []);
+  const paths = await fixture(t, [], { autoCleanup: false });
   const received = [];
   const scanner = new TaskScanner({
     ...paths,
@@ -103,7 +105,10 @@ test('start() реагирует на изменение файла через f
     dispatch: async (p) => received.push(p),
   });
   scanner.start();
-  t.after(() => scanner.stop());
+  t.after(async () => {
+    scanner.stop();
+    await rm(dirname(paths.documentPath), RM_RETRY);
+  });
 
   await writeFile(paths.documentPath, JSON.stringify({
     version: 1,
@@ -125,7 +130,7 @@ async function waitFor(predicate, { timeoutMs = 2000, stepMs = 25 } = {}) {
 
 test('watchDirectory-режим: документ резолвится внутри каталога', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'scanner-wd-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, RM_RETRY));
   const scanner = new TaskScanner({
     watchDirectory: dir,
     documentName: 'claude-tasks.json',
@@ -140,7 +145,7 @@ test('watchDirectory-режим: документ резолвится внут�
 
 test('watchDirectory-режим: traversal-имя документа отклоняется в конструкторе', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'scanner-tr-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, RM_RETRY));
   assert.throws(
     () => new TaskScanner({ watchDirectory: dir, documentName: '../escape.json', dispatch: async () => ({}) }),
     (e) => e.code === 'scanner_document_path_escape',
@@ -149,7 +154,7 @@ test('watchDirectory-режим: traversal-имя документа откло�
 
 test('ensureReady: ok для существующего каталога, error для отсутствующего', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'scanner-er-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, RM_RETRY));
   const ok = new TaskScanner({ watchDirectory: dir, dispatch: async () => ({}) });
   assert.deepEqual(await ok.ensureReady(), { ok: true });
 
@@ -162,7 +167,6 @@ test('ensureReady: ok для существующего каталога, error 
 
 test('startChecked: запускает watcher при доступной папке', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'scanner-sc-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
   const received = [];
   const scanner = new TaskScanner({
     watchDirectory: dir,
@@ -174,6 +178,7 @@ test('startChecked: запускает watcher при доступной пап�
   });
   const started = await scanner.startChecked();
   t.after(() => scanner.stop());
+  t.after(() => rm(dir, RM_RETRY));
   assert.equal(started.ok, true);
   assert.equal(scanner.readiness().state, 'watching');
 
@@ -188,7 +193,7 @@ test('startChecked: запускает watcher при доступной пап�
 
 test('startChecked: недоступная папка не запускает watcher', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'scanner-scf-'));
-  t.after(() => rm(dir, { recursive: true, force: true }));
+  t.after(() => rm(dir, RM_RETRY));
   const scanner = new TaskScanner({ watchDirectory: join(dir, 'absent'), dispatch: async () => ({}) });
   const started = await scanner.startChecked();
   assert.equal(started.ok, false);

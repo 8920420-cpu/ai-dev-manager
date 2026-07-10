@@ -25,6 +25,7 @@ export function loadConfig(env = process.env) {
     orchestratorUrl: trimUrl(env.ORCHESTRATOR_URL, 'http://localhost:4186'),
     toolsServiceUrl: trimUrl(env.TOOLS_SERVICE_URL, 'http://localhost:4188'),
     orchestratorToken: String(env.ORCHESTRATOR_API_TOKEN || '').trim(),
+    allowInsecureLocal: truthy(env.ALLOW_INSECURE_LOCAL),
     port: Number(env.MCP_SERVICE_PORT || 4190),
     requestTimeoutMs: Math.max(1000, Number(env.MCP_REQUEST_TIMEOUT_MS || 30000)),
     // Лимит тела входящего POST /mcp (защита от DoS большим запросом). 1 МБ.

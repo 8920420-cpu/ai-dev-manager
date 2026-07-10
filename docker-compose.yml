@@ -49,8 +49,11 @@ services:
       # дефолт совпадает с db.js/.env (2400000 ≈ 40 мин) и БОЛЬШЕ RUNNER_ROLE_TIMEOUT_MS,
       # иначе живой прогон срежется посреди build. См. CONFIG_AUDIT.md.
       RUNNER_HOST_TIMEOUT_MS: "${RUNNER_HOST_TIMEOUT_MS:-2400000}"
-      # Задайте токен, чтобы закрыть /api/* при сетевом доступе (пусто = выключено).
+      # Задайте токен для доступа к /api/*. Пусто = закрыто, кроме явного ALLOW_INSECURE_LOCAL=1.
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      # Fail-closed by default: empty ORCHESTRATOR_API_TOKEN closes /api/*.
+      # Set ALLOW_INSECURE_LOCAL=1 only for explicit local development.
+      ALLOW_INSECURE_LOCAL: "${ALLOW_INSECURE_LOCAL:-0}"
       # Микросервис инструментов (builtin-чтение проекта + MCP для Claude Code).
       TOOLS_SERVICE_URL: "http://tools-service:4188"
       # PROJECT-PATH-MAP-001: трансляция host root_path → путь внутри tools-service.
@@ -99,9 +102,10 @@ services:
     environment:
       TOOLS_SERVICE_PORT: "4188"
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      ALLOW_INSECURE_LOCAL: "${ALLOW_INSECURE_LOCAL:-0}"
       # SECURITY: allowlist серверных корней. /execute принимает root от клиента —
       # без allowlist любой root в смонтированных томах доступен на чтение/запись.
-      # Список разделяется ':' (как PATH); пусто = allowlist выключен (только dev).
+      # Список разделяется ':' (как PATH); пусто = /execute закрыт, кроме явного ALLOW_INSECURE_LOCAL=1.
       TOOLS_ALLOWED_ROOTS: "${TOOLS_ALLOWED_ROOTS:-/projects:/app/ai-dev-manager}"
     volumes:
       # Корни проектов для builtin-инструментов. Проект ai-dev-manager имеет
@@ -124,8 +128,8 @@ services:
 
   mcp-service:
     build:
-      context: ./mcp-service
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: mcp-service/Dockerfile
     image: mcp-service:latest
     container_name: mcp-service
     ports:
@@ -144,6 +148,7 @@ services:
       ORCHESTRATOR_URL: "http://orchestrator-service"
       TOOLS_SERVICE_URL: "http://tools-service:4188"
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      ALLOW_INSECURE_LOCAL: "${ALLOW_INSECURE_LOCAL:-0}"
       # SECURITY: мутации (запись/удаление файлов, мутации оркестратора) выключены
       # по умолчанию. Включайте осознанно в .env (MCP_ENABLE_WRITE=1 и т.д.) — и
       # только вместе с непустым ORCHESTRATOR_API_TOKEN, иначе публичный /mcp

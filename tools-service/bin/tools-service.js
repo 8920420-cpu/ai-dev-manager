@@ -4,12 +4,14 @@ import process from 'node:process';
 import { createServer } from 'node:http';
 import { handleRoute } from '../src/server.js';
 import { parseAllowedRoots } from '../src/builtins.js';
+import { isBearerOrApiTokenAuthorized, isPublicHealthPath, readTokenAuthConfig } from '../../shared/httpAuth.js';
 
 const PORT = Number(process.env.TOOLS_SERVICE_PORT || 4188);
-const TOKEN = String(process.env.ORCHESTRATOR_API_TOKEN || '').trim();
+const AUTH = readTokenAuthConfig();
 const BODY_LIMIT = 8 << 20; // 8 МБ
 // SECURITY: allowlist серверных корней для args.root в /execute. Пусто = выключен.
 const ALLOWED_ROOTS = parseAllowedRoots(process.env.TOOLS_ALLOWED_ROOTS);
+const MUTATING_TOOLS = new Set(['edit_file', 'write_file', 'delete_file']);
 
 function send(res, status, body) {
   const json = JSON.stringify(body);
@@ -31,12 +33,20 @@ async function readBody(req) {
   return JSON.parse(raw);
 }
 
-// Опциональная защита токеном (как у остальных сервисов). /health всегда открыт.
 function authorized(req, path) {
-  if (!TOKEN) return true;
-  if (path === '/health' || path === '/readiness') return true;
-  const h = String(req.headers.authorization || '');
-  return h === `Bearer ${TOKEN}`;
+  return isPublicHealthPath(path) || isBearerOrApiTokenAuthorized(req, AUTH);
+}
+
+function validateExecutionPolicy(body) {
+  const tool = String(body?.tool ?? '').trim();
+  if (!tool) return null;
+  if (ALLOWED_ROOTS.length === 0 && !AUTH.allowInsecureLocal && process.env.NODE_ENV !== 'test') {
+    return { status: 403, body: { ok: false, error: 'allowed_roots_required' } };
+  }
+  if (MUTATING_TOOLS.has(tool) && !AUTH.token && !AUTH.allowInsecureLocal) {
+    return { status: 403, body: { ok: false, tool, error: 'token_required_for_mutation' } };
+  }
+  return null;
 }
 
 const server = createServer(async (req, res) => {
@@ -50,6 +60,10 @@ const server = createServer(async (req, res) => {
       } catch (e) {
         return send(res, 400, { ok: false, error: e.message === 'body_too_large' ? 'body_too_large' : 'invalid_json' });
       }
+    }
+    if (path === '/execute') {
+      const policy = validateExecutionPolicy(body);
+      if (policy) return send(res, policy.status, policy.body);
     }
     const { status, body: out } = await handleRoute(req.method, path, body, { allowedRoots: ALLOWED_ROOTS });
     send(res, status, out);

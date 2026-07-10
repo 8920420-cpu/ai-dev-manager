@@ -45,6 +45,7 @@ export class CommandExecutor {
         timer = setTimeout(() => {
           timedOut = true;
           killTree(child);
+          finalize(null, 'SIGKILL', null);
         }, timeoutMs);
       }
 
@@ -86,6 +87,11 @@ function killTree(child) {
   const pid = child.pid;
   if (!pid) return;
   if (process.platform === 'win32') {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      /* process may already be gone */
+    }
     // taskkill /T убивает всё дерево процессов.
     spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
   } else {

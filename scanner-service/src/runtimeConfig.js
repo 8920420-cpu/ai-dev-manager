@@ -7,22 +7,6 @@
 //   snapshot — папки наблюдения берутся из локального файла-снимка
 //              (SCANNER_SNAPSHOT) + URL оркестратора из ORCHESTRATOR_API_BASE.
 //
-// Legacy single-watcher/feeder (SCANNER_DOCUMENT + TaskFeeder + FEEDER_*) удалён.
-// Его переменные окружения больше НЕ определяют режим: при их наличии выдаётся
-// диагностическое предупреждение, а сами они игнорируются.
-
-// Переменные снятого legacy single-watcher/feeder режима. Их наличие — признак
-// устаревшей конфигурации; режим из них не выводится.
-export const LEGACY_SCANNER_ENV = [
-  'SCANNER_DOCUMENT',
-  'SCANNER_STATE',
-  'SCANNER_ENDPOINT',
-  'FEEDER_ENABLED',
-  'FEEDER_INTERVAL_MS',
-  'FEEDER_NEXT_ENDPOINT',
-  'FEEDER_RELEASE_ENDPOINT',
-];
-
 // Ошибка неподдерживаемой конфигурации режима со стабильным машинным кодом.
 export class ScannerModeError extends Error {
   constructor(message) {
@@ -39,25 +23,19 @@ function stripTrailingSlash(value) {
 /**
  * Определить режим и базовые параметры запуска Scanner.
  * @param {Record<string,string|undefined>} env — окружение (process.env или объект в тесте).
- * @returns {{ mode:'api'|'snapshot', apiBase:string, orchestratorBase:string,
- *            snapshot:string, legacyEnvIgnored:string[] }}
+ * @returns {{ mode:'api'|'snapshot', apiBase:string, orchestratorBase:string, snapshot:string }}
  * @throws {ScannerModeError} если режим не задан явно или snapshot без URL оркестратора.
  */
 export function resolveScannerRuntime(env = {}) {
   const apiBase = stripTrailingSlash(env.SCANNER_API_BASE);
   const orchestratorFallback = stripTrailingSlash(env.ORCHESTRATOR_API_BASE);
   const snapshot = String(env.SCANNER_SNAPSHOT ?? '').trim();
-  const legacyEnvIgnored = LEGACY_SCANNER_ENV.filter(
-    (k) => env[k] !== undefined && String(env[k]).length > 0,
-  );
 
   // Режим определяется ТОЛЬКО явными переменными нового контракта.
   const mode = apiBase ? 'api' : snapshot ? 'snapshot' : null;
   if (!mode) {
     throw new ScannerModeError(
-      'Scanner requires SCANNER_API_BASE (api mode) or SCANNER_SNAPSHOT (snapshot mode); ' +
-        'legacy single-watcher mode was removed' +
-        (legacyEnvIgnored.length ? ` (ignored legacy env: ${legacyEnvIgnored.join(', ')})` : ''),
+      'Scanner requires SCANNER_API_BASE (api mode) or SCANNER_SNAPSHOT (snapshot mode)',
     );
   }
 
@@ -70,5 +48,5 @@ export function resolveScannerRuntime(env = {}) {
     );
   }
 
-  return { mode, apiBase, orchestratorBase, snapshot, legacyEnvIgnored };
+  return { mode, apiBase, orchestratorBase, snapshot };
 }

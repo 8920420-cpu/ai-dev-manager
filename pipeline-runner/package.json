@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Universal, language-agnostic pipeline runner driven entirely by .pipeline.json",
   "type": "module",
+  "main": "src/index.js",
   "bin": {
     "pipeline-runner": "bin/pipeline-runner.js"
   },

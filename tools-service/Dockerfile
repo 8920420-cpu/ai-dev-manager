@@ -3,5 +3,6 @@ WORKDIR /app
 COPY tools-service/package.json ./
 COPY tools-service/src ./src
 COPY tools-service/bin ./bin
+COPY shared /shared
 EXPOSE 4188
 CMD ["node", "bin/tools-service.js"]

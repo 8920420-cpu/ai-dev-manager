@@ -10,6 +10,7 @@ import { loadConfig } from './config.js';
 import { createToolsClient } from './toolsClient.js';
 import { createOrchestratorClient } from './orchestratorClient.js';
 import { registerTools } from './tools.js';
+import { isBearerOrApiTokenAuthorized } from '../../shared/httpAuth.js';
 
 export const SERVICE_NAME = 'ai-dev-manager';
 export const SERVICE_VERSION = '1.0.0';
@@ -85,19 +86,6 @@ async function readJsonBody(req, limitBytes = 1048576) {
 }
 
 /**
- * Авторизация входа на /mcp. Если в конфиге задан токен — требуем совпадение по
- * Authorization: Bearer <token> или заголовку x-api-token. Пустой токен (локальная
- * разработка) пропускает всех. /health авторизацию не проверяет.
- */
-function isMcpAuthorized(req, token) {
-  if (!token) return true;
-  const auth = String(req.headers['authorization'] || '');
-  if (auth === `Bearer ${token}`) return true;
-  if (req.headers['x-api-token'] === token) return true;
-  return false;
-}
-
-/**
  * Запустить HTTP-режим (Streamable HTTP MCP в stateless-режиме + health).
  *   GET  /health, /healthz → проверка живости (для Docker healthcheck);
  *   POST /mcp              → MCP Streamable HTTP (на запрос — свежий server+transport).
@@ -116,7 +104,10 @@ export function startHttp(config = loadConfig(), { logger = console.error } = {}
     if (path === '/mcp') {
       // SECURITY: вход на /mcp под токеном (если задан). /mcp выдаёт инструменты
       // записи/удаления файлов и мутаций оркестратора — без auth публиковать нельзя.
-      if (!isMcpAuthorized(req, config.orchestratorToken)) {
+      if (!isBearerOrApiTokenAuthorized(req, {
+        token: config.orchestratorToken,
+        allowInsecureLocal: config.allowInsecureLocal,
+      })) {
         res.writeHead(401, { 'content-type': 'application/json; charset=utf-8' });
         return res.end(JSON.stringify({ jsonrpc: '2.0', error: { code: -32001, message: 'unauthorized' }, id: null }));
       }

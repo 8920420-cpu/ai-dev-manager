@@ -3,7 +3,7 @@ import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
 
-import { runPipeline } from 'pipeline-runner';
+import { runPipeline } from '../../pipeline-runner/src/index.js';
 
 /**
  * TesterService — ядро роли «Тестировщик (Pipeline Service)».

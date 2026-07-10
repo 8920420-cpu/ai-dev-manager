@@ -12,11 +12,10 @@ const COMPLETED_STATUSES = new Set(['выполнено', 'done', 'completed']);
  *
  * Адресация: один watcher отвечает за один документ одного `projectId+stageId`.
  * `watchDirectory` — корень наблюдения, `documentName` — относительное имя
- * (default `claude-tasks.json`). Legacy-режим принимает готовый `documentPath`.
+ * (default `claude-tasks.json`).
  */
 export class TaskScanner {
   constructor({
-    documentPath,
     watchDirectory,
     documentName = 'claude-tasks.json',
     statePath,
@@ -29,19 +28,11 @@ export class TaskScanner {
     stageId = null,
   } = {}) {
     if (typeof dispatch !== 'function') throw new Error('dispatch must be a function');
-    if (documentPath) {
-      // Legacy/одиночный режим: каталог наблюдения — родитель документа.
-      this.documentPath = resolve(documentPath);
-      this.watchDirectory = dirname(this.documentPath);
-    } else if (watchDirectory) {
-      // Канонический режим: безопасный резолв документа внутри watchDirectory
-      // (бросает ScannerConfigError на traversal/абсолютную подстановку).
-      const resolved = resolveDocumentPath(watchDirectory, documentName);
-      this.watchDirectory = resolved.watchDirectory;
-      this.documentPath = resolved.documentPath;
-    } else {
-      throw new Error('documentPath or watchDirectory is required');
-    }
+    // Канонический режим: безопасный резолв документа внутри watchDirectory
+    // (бросает ScannerConfigError на traversal/абсолютную подстановку).
+    const resolved = resolveDocumentPath(watchDirectory, documentName);
+    this.watchDirectory = resolved.watchDirectory;
+    this.documentPath = resolved.documentPath;
     this.documentName = basename(this.documentPath);
     this.projectId = projectId;
     this.stageId = stageId;
@@ -152,6 +143,7 @@ export class TaskScanner {
       if (filename && basename(String(filename)) !== this.documentName) return;
       this.#schedule();
     });
+    this.watcher.unref?.();
     this.watcher.on('error', (error) => this.log.error?.('Scanner watch failed', { error: error.message }));
     // Редкий резервный проход — scanOnce идемпотентен, лишних отправок не будет.
     if (this.fallbackMs > 0) {

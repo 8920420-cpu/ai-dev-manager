@@ -2,8 +2,9 @@
 import { createServer } from 'node:http';
 import { readFile } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
-import { dirname, resolve, join, extname, normalize } from 'node:path';
+import { dirname, resolve, join, extname, normalize, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isBearerOrApiTokenAuthorized, readTokenAuthConfig } from '../../../shared/httpAuth.js';
 import { loadSettings, saveSettings, resolveSettings, redactSettings } from './config.js';
 import { getAppSettings, updateAppSettings } from './appSettings.js';
 import { stats as connectorCapacity, allStats as connectorCapacityBuckets } from './connectorLimiter.js';
@@ -138,20 +139,10 @@ const FRONTEND_DIR =
   ) ||
   resolve(__dirname, '../../frontend');
 
-// Необязательная защита API. Если задан ORCHESTRATOR_API_TOKEN, все /api/*
-// требуют заголовок Authorization: Bearer <token> (или X-Api-Token: <token>).
-// По умолчанию выключено, чтобы не ломать локальную разработку, но в любом
-// сетевом развёртывании токен обязателен — API создаёт БД и меняет настройки.
-const API_TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
+const API_AUTH = readTokenAuthConfig();
 
 function isAuthorized(req, { allowQueryToken = false } = {}) {
-  if (!API_TOKEN) return true;
-  const auth = req.headers['authorization'];
-  const url = new URL(req.url || '/', 'http://localhost');
-  if (auth && auth.startsWith('Bearer ') && auth.slice(7) === API_TOKEN) return true;
-  if (req.headers['x-api-token'] === API_TOKEN) return true;
-  if (allowQueryToken && url.searchParams.get('token') === API_TOKEN) return true;
-  return false;
+  return isBearerOrApiTokenAuthorized(req, { ...API_AUTH, allowQueryToken });
 }
 
 const MIME = {
@@ -234,10 +225,12 @@ export function readBody(req, { maxBytes = BODY_LIMIT_BYTES } = {}) {
 async function serveStatic(res, pathname) {
   let rel = pathname === '/' ? '/index.html' : pathname;
   rel = normalize(rel).replace(/^(\.\.[/\\])+/, ''); // защита от path traversal
-  const file = join(FRONTEND_DIR, rel);
-  if (!file.startsWith(FRONTEND_DIR) || !existsSync(file)) {
+  const base = resolve(FRONTEND_DIR);
+  const file = resolve(join(base, rel));
+  const fileRel = relative(base, file);
+  if (fileRel.startsWith('..') || fileRel === '..' || fileRel.includes(`..${sep}`) || resolve(file) === base || !existsSync(file)) {
     // SPA-фолбэк на index.html
-    const index = join(FRONTEND_DIR, 'index.html');
+    const index = join(base, 'index.html');
     if (existsSync(index)) {
       res.writeHead(200, { 'Content-Type': MIME['.html'] });
       return res.end(await readFile(index));
