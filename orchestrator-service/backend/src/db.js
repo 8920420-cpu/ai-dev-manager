@@ -4,7 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ROLE_FLOW, fastForwardHiddenRoles } from './rolePipeline.js';
-import { runReasoningRole, decideTransition, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict, renderProjectMaps, isMissingArtifactComplaint } from './roleEngine.js';
+import { runReasoningRole, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict, renderProjectMaps, isMissingArtifactComplaint } from './roleEngine.js';
 import { buildRoute, resolveTransition, forwardFrom, routeIsUsable, TERMINAL_STATUSES } from './projectRoute.js';
 import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey, reworkNodeKey } from './graphRoute.js';
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
@@ -13,6 +13,7 @@ import { deriveServicePathFromFiles, resolveServiceRepoPath } from './serviceRep
 import { reconcileClockSkew } from './clockGuard.js';
 import { isDbConnectionError, noteDbConnectionFailure, claimGraceActive } from './bootClaimGuard.js';
 import { resolveDuration, resolveInt, logEffectiveConfig, parseDurationMs } from './envConfig.js';
+import { asObject, parseDataCard } from './dataCard.js';
 import { isDriverProvider } from './connectors.js';
 import { hashToken, messageFingerprint } from './intakeIntegrations.js';
 
@@ -91,6 +92,14 @@ export async function withClient(cfg, fn) {
       console.error(`[orchestrator-service] DB client.end() error (игнор): ${endErr.message}`);
     }
   }
+}
+
+// Резолв id роли по её коду. Инлайн-форма
+//   (await c.query('SELECT id FROM roles WHERE code = $1', [x])).rows[0]?.id ?? null
+// повторялась в advanceOne/host/reasoning-путях — сведена в один хелпер.
+// Нет роли с таким кодом → null (вызывающий сам решает, что делать).
+async function roleIdByCode(c, code) {
+  return (await c.query('SELECT id FROM roles WHERE code = $1', [code])).rows[0]?.id ?? null;
 }
 
 // Проверка подключения к серверу + существует ли целевая БД.
@@ -345,7 +354,7 @@ export async function acceptScannerCompletionTx(c, payload) {
         nextRoleCode = resolved.nextRole;
         nextRoleId = resolved.done || !resolved.nextRole
           ? null
-          : (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null;
+          : await roleIdByCode(c, resolved.nextRole);
       }
 
       // Поля Programmer → кумулятивная карточка задачи.
@@ -643,7 +652,7 @@ async function insertDuplicateClosedTaskTx(c, {
   title, description, roleId = null, dataCard, duplicateOf, source,
 }) {
   const card = {
-    ...(dataCard && typeof dataCard === 'object' ? dataCard : {}),
+    ...asObject(dataCard),
     duplicateOf,
     duplicateNote: `Дубль живой задачи ${duplicateOf} (совпал отпечаток текста): закрыт автоматически`,
   };
@@ -745,7 +754,7 @@ export async function acceptScannerIntake(s, input) {
         ? {
             project: project.code,
             projectPath: project.root_path,
-            ...(payload.card && typeof payload.card === 'object' ? payload.card : {}),
+            ...asObject(payload.card),
           }
         : { requestedProject: payload.project || null };
       // TASK-DUPLICATE-CLOSE-001: отпечаток текста — по нему ловится повторная
@@ -1199,7 +1208,7 @@ export async function advanceTaskTx(c, taskId) {
 
     const nextRoleId = resolved.done || !resolved.nextRole
       ? null
-      : (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null;
+      : await roleIdByCode(c, resolved.nextRole);
 
     // Человекочитаемое имя целевого этапа (для аудита, как targetStage в moveTask):
     // в граф-режиме берём имя по nextStageKey, иначе деградируем до кода роли/DONE.
@@ -2475,9 +2484,14 @@ export async function completeHostTaskTx(c, input) {
           : { outcome: 'BRANCH', branchKind: 'analyst', branchRole: 'FAILURE_ANALYST', branchFallback: 'rework' });
       } else {
         // GIT_INTEGRATOR: успех завершает маршрут, провал — стоп.
+        // GI-BLOCK-KEEP-STAGE-001: при провале СОХРАНЯЕМ current_stage_key (nextStageKey
+        // = текущий узел), иначе общий UPDATE ниже (current_stage_key = nextStageKey ??
+        // null) обнулял позицию в графе, и ручной разблок (bulk_unblock_refeed) не мог
+        // возобновить граф-задачу с нужного узла COMMIT. Ср. ветку next_role_missing,
+        // которая current_stage_key не трогает.
         resolved = success
           ? await resolveHost({ outcome: 'FORWARD' })
-          : { nextRole: null, toStatus: 'BLOCKED', done: false, blocked: true, via: t.current_stage_key ? 'graph' : 'route' };
+          : { nextRole: null, toStatus: 'BLOCKED', done: false, blocked: true, nextStageKey: t.current_stage_key, via: t.current_stage_key ? 'graph' : 'route' };
       }
       const toStatus = resolved.toStatus;
       const nextRole = resolved.nextRole;
@@ -2488,7 +2502,7 @@ export async function completeHostTaskTx(c, input) {
 
       const nextRoleId = !nextRole
         ? null
-        : (await c.query('SELECT id FROM roles WHERE code = $1', [nextRole])).rows[0]?.id ?? null;
+        : await roleIdByCode(c, nextRole);
       if (nextRole && !nextRoleId) {
         const reason = `next_role_missing:${nextRole}`;
         await c.query(
@@ -2627,7 +2641,7 @@ export async function claimNextReasoningTask(s, engineParam = null, roleParam = 
     // Входной гейт полей (ROLE-FIELD-CONTRACT-001) — как в processClaimedRole:
     // нет обязательного входящего поля → BLOCKED, задачу Codex не отдаём.
     const contract = await loadRoleContract(c, claimed.role_code);
-    const card = claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {};
+    const card = parseDataCard(claimed);
     const missingIn = missingRequiredInputs(card, contract.inputs);
     if (missingIn.length) {
       await blockClaimedForFields(c, claimed, missingIn);
@@ -3437,7 +3451,7 @@ async function advanceSkippedStageRoles(c) {
     const nextRoleCode = done ? null : fwd.roleCode;
     const nextRoleId = !nextRoleCode
       ? null
-      : (await c.query('SELECT id FROM roles WHERE code = $1', [nextRoleCode])).rows[0]?.id ?? null;
+      : await roleIdByCode(c, nextRoleCode);
     await c.query('BEGIN');
     try {
       const upd = await c.query(
@@ -3507,7 +3521,7 @@ export async function advanceForkNodes(c) {
     if (!branches.length) continue;
     const joinGate = await c.query(`SELECT id FROM roles WHERE code = 'JOIN_GATE'`);
     const joinGateId = joinGate.rows[0]?.id ?? null;
-    const card = p.data_card && typeof p.data_card === 'object' ? p.data_card : {};
+    const card = parseDataCard(p);
     await c.query('BEGIN');
     try {
       const childIds = [];
@@ -3637,9 +3651,9 @@ export async function advanceJoinNodes(c) {
         continue;
       }
       // Слить карточки детей в родителя (накопительная карточка).
-      let merged = p.data_card && typeof p.data_card === 'object' ? { ...p.data_card } : {};
+      let merged = { ...parseDataCard(p) };
       for (const ch of childRows.rows) {
-        if (ch.data_card && typeof ch.data_card === 'object') merged = { ...merged, ...ch.data_card };
+        merged = { ...merged, ...parseDataCard(ch) };
       }
       // DOC-COMMIT-ON-JOIN-001: агрегируем changedFiles детей (правки Doc Keeper лежат
       // на СОСЕДНЕЙ ветке — их нет в цепочке предков родителя, поэтому
@@ -3770,7 +3784,7 @@ export async function advanceWorkStack(c) {
          RETURNING id`,
         [item.project_id, item.service_id, item.epic_task_id, item.title, item.description,
          item.target_status, roleId, item.target_stage_key,
-         JSON.stringify(item.data_card && typeof item.data_card === 'object' ? item.data_card : {})],
+         JSON.stringify(parseDataCard(item))],
       );
       const childId = child.rows[0].id;
       await c.query(
@@ -3854,7 +3868,7 @@ export async function advanceDecompositionParents(c) {
       // покрытым, если у него есть хотя бы один НЕ отменённый ребёнок task_kind='service'
       // (сверяем по коду сервиса, а не по числу детей). Недостача приоритетно понижает
       // DONE→BLOCKED с перечнем недостающих сервисов (возврат Архитектору).
-      const dc = p.data_card && typeof p.data_card === 'object' ? p.data_card : {};
+      const dc = parseDataCard(p);
       const planned = jsonArray(dc.planned_services).map((x) => String(x).trim()).filter(Boolean);
       let missing = [];
       if (planned.length) {
@@ -4496,7 +4510,7 @@ export async function advanceStuckDocumentationBranches(c, maxAttempts = MAX_REW
     });
     const nextRoleId = resolved.done || !resolved.nextRole
       ? null
-      : (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null;
+      : await roleIdByCode(c, resolved.nextRole);
     await c.query('BEGIN');
     try {
       const upd = await c.query(
@@ -5167,7 +5181,7 @@ async function processClaimedRole(c, claimed, cfg) {
     if (skipped) return skipped;
   }
   const contract = await loadRoleContract(c, claimed.role_code);
-  const card = claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {};
+  const card = parseDataCard(claimed);
 
   const missingIn = missingRequiredInputs(card, contract.inputs);
   if (missingIn.length) {
@@ -5553,8 +5567,8 @@ async function ensureArchitectService(c, claimed, verdictFields, cardValues) {
   if (cur.rows[0]?.service_id) return { serviceId: undefined, resolvedServiceId: cur.rows[0].service_id };
 
   const card = {
-    ...(claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {}),
-    ...(verdictFields && typeof verdictFields === 'object' ? verdictFields : {}),
+    ...(parseDataCard(claimed)),
+    ...(asObject(verdictFields)),
     ...(cardValues || {}),
   };
   const plan = normalizeWorkItems(card); // [{ serviceCode, ... }] из work_items/affected_files
@@ -5617,8 +5631,8 @@ export async function preflightServiceRepoPath(c, serviceId) {
 // сливаются (файлы объединяются, заголовок берём первый). Только чтение services.
 export async function resolveArchitectSplit(c, claimed, verdictFields, cardValues) {
   const card = {
-    ...(claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {}),
-    ...(verdictFields && typeof verdictFields === 'object' ? verdictFields : {}),
+    ...(parseDataCard(claimed)),
+    ...(asObject(verdictFields)),
     ...(cardValues || {}),
   };
   const plan = normalizeWorkItems(card);
@@ -5767,7 +5781,7 @@ export function computePlannedServices(card, canonicalByCode) {
 // удалось получить ни одного зарегистрированного сервиса — эпик уходит в BLOCKED с
 // диагностикой (не молча зависает).
 export async function materializeDecomposition(c, claimed, { verdict, response, exchangeId, durationMs, decision, cardValues, route, kpi = null }) {
-  const card = { ...(claimed.data_card && typeof claimed.data_card === 'object' ? claimed.data_card : {}), ...(cardValues || {}) };
+  const card = { ...(parseDataCard(claimed)), ...(cardValues || {}) };
   const plan = normalizeWorkItems(card);
 
   await c.query('BEGIN');
@@ -5957,7 +5971,7 @@ export async function materializeArchitectSplit(c, claimed, { verdict, response,
         currentStageKey: claimed.current_stage_key,
       });
     const childRoleId = resolved.nextRole
-      ? (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null
+      ? await roleIdByCode(c, resolved.nextRole)
       : null;
     const childStageKey = resolved.nextStageKey ?? null;
 
@@ -6058,7 +6072,7 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
     }
     const nextRoleId = resolved.done || !resolved.nextRole
       ? null
-      : (await c.query('SELECT id FROM roles WHERE code = $1', [resolved.nextRole])).rows[0]?.id ?? null;
+      : await roleIdByCode(c, resolved.nextRole);
 
     if (resolved.nextRole && !nextRoleId) {
       const reason = `next_role_missing:${resolved.nextRole}`;

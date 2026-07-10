@@ -160,6 +160,26 @@ test('isMissingArtifactComplaint: пустой вердикт → false', () => 
   assert.equal(isMissingArtifactComplaint({ summary: '', findings: [] }), false);
 });
 
+// FA-CYRILLIC-REGEX-001 — раньше \b и \w в regex не покрывали кириллицу, поэтому
+// «нет лога»/«нет данных» через границы слов НЕ распознавались (правило было мертво
+// для русского). Явно фиксируем реальные формулировки жалоб через границы слов.
+test('isMissingArtifactComplaint: кириллические жалобы через границы слов → true', () => {
+  for (const summary of [
+    'нет лога упавшей команды',
+    'В контексте нет данных о сбое.',
+    'Не предоставлен лог упавшей команды.',
+    'Не хватает строк лога и кода возврата.',
+  ]) {
+    assert.equal(isMissingArtifactComplaint({ summary }), true, `должна распознаться жалоба: ${summary}`);
+  }
+});
+
+test('isMissingArtifactComplaint: «нет логики»/«логика верная» — НЕ жалоба (нет артефакта) → false', () => {
+  // negation срабатывает («нет»), но «логика» не должна засчитаться как артефакт «лог».
+  assert.equal(isMissingArtifactComplaint({ summary: 'нет логики в коде, нужен рефакторинг' }), false);
+  assert.equal(isMissingArtifactComplaint({ summary: 'код работает, логика верная' }), false);
+});
+
 // ── decideOutcome (анти-петля): две жалобы подряд → BLOCKED (missing_artifact) ──
 test('decideOutcome FA: повтор жалобы «нет артефакта» (priorMissingArtifact) → BLOCK missing_artifact', () => {
   const verdict = { ok: true, status: 'DIAGNOSED', summary: 'Артефакт провала отсутствует: нет лога и кода возврата.', findings: [] };

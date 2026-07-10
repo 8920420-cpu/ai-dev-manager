@@ -10,6 +10,7 @@
 import { ROLE_FLOW } from './rolePipeline.js';
 import { invoke as llmInvoke, invokeChat } from './llmConnector.js';
 import { resolveInt, resolveDuration } from './envConfig.js';
+import { asObject } from './dataCard.js';
 
 // CONFIG-AUDIT-001: единый разбор числовых env (диапазон, безопасный фолбэк).
 // Прежний паттерн Math.max(1000, Number(env || 12000)) при мусоре давал NaN
@@ -59,7 +60,7 @@ export function parseTextToolCalls(content) {
 }
 
 export function capToolArgs(name, args = {}) {
-  const out = { ...(args && typeof args === 'object' ? args : {}) };
+  const out = { ...asObject(args) };
   if (name === 'read_file') {
     const requested = Number(out.maxBytes);
     out.maxBytes = Number.isFinite(requested)
@@ -82,6 +83,10 @@ export function compactToolResult(value, { maxChars = TOOL_RESULT_MAX_CHARS } = 
   } catch {
     text = String(value);
   }
+  // JSON.stringify(undefined|function|symbol) === undefined — не строка. Без этого
+  // text.length ниже падал бы TypeError, и внешний catch подменял бы успешный
+  // вызов инструмента фейковой ошибкой {error, code:'tool_error'}.
+  if (typeof text !== 'string') text = '';
   if (text.length <= maxChars) return text;
   return JSON.stringify({
     truncated: true,
@@ -265,8 +270,12 @@ export function isMissingArtifactComplaint(verdict) {
   if (Array.isArray(verdict?.findings)) parts.push(...verdict.findings);
   const text = parts.filter((s) => typeof s === 'string').join(' ').toLowerCase();
   if (!text) return false;
-  const negation = /(отсутств\w*|\bнет\b|не\s+предоставл\w*|не\s+хватает|не\s+приложен\w*|не\s+содержит|\bmissing\b|\bno\b)/;
-  const artifact = /(артефакт\w*|\bлог\b|\bлога\b|\bлогах\b|\bлоги\b|строк\w*\s+лог\w*|хвост\w*\s+лог\w*|упавш\w*\s+команд\w*|кода?\s+возврат\w*|exit\s*code|данн\w*\s+о\s+(сбое|провале|падени\w*)|artifact|traceback)/;
+  // FA-CYRILLIC-REGEX-001: у JS-регэкспов \b и \w НЕ покрывают кириллицу (без
+  // флага /u и \p{L}), поэтому \bнет\b/упавш\w* по русскому тексту не матчились
+  // НИКОГДА — правило анти-петли было мертво для русских вердиктов. Флаг u +
+  // \p{L} вместо \w и unicode-границы (?<![\p{L}\p{N}_])…(?![\p{L}\p{N}_]) вместо \b.
+  const negation = /(отсутств\p{L}*|(?<![\p{L}\p{N}_])нет(?![\p{L}\p{N}_])|не\s+предоставл\p{L}*|не\s+хватает|не\s+приложен\p{L}*|не\s+содержит|\bmissing\b|\bno\b)/u;
+  const artifact = /(артефакт\p{L}*|(?<![\p{L}\p{N}_])лог(?:а|ах|и|ов|ами|е|у)?(?![\p{L}\p{N}_])|строк\p{L}*\s+лог\p{L}*|хвост\p{L}*\s+лог\p{L}*|упавш\p{L}*\s+команд\p{L}*|кода?\s+возврат\p{L}*|exit\s*code|данн\p{L}*\s+о\s+(сбое|провале|падени\p{L}*)|artifact|traceback)/u;
   return negation.test(text) && artifact.test(text);
 }
 
@@ -387,7 +396,7 @@ export function renderProjectMaps(maps) {
 // PROMPT-CACHE-001: includeMap=false — карту НЕ кладём в user-payload (её выносят в
 // кэшируемый system-префикс для claude_code, чтобы не переоплачивать на каждый вызов).
 export function buildUserPayload(roleCode, context, outputFields = [], { includeMap = true } = {}) {
-  const { projectMaps, ...rest } = context && typeof context === 'object' ? context : {};
+  const { projectMaps, ...rest } = asObject(context);
   const mapBlock = includeMap ? renderProjectMaps(projectMaps) : '';
   const sections = [];
   if (mapBlock) sections.push(mapBlock, '');
@@ -660,8 +669,10 @@ export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = 
 // Чистое решение о переходе по вердикту. Не трогает БД.
 // reworkCount — сколько раз задача уже возвращалась в CODING (защита от цикла).
 // Возвращает { toStatus, nextRole, done, blocked, agentRunStatus, reason }.
-// Legacy canonical resolver kept for old fallback tests and compatibility.
-// New task movement must use decideOutcome(...) + projectRoute.resolveTransition(...).
+// Эталонная спецификация переходов по вердикту, покрытая юнит-тестами
+// (test/roleEngine.test.js) — НЕ удалять: тесты фиксируют матрицу решений ролей.
+// В ПРОДЕ движение задач идёт через decideOutcome(...) + projectRoute.resolveTransition(...)
+// (анти-петля missing_artifact и динамический маршрут), а не через эту функцию.
 export function decideTransition(roleCode, verdict, { reworkCount = 0, maxRework = MAX_REWORK } = {}) {
   const flow = ROLE_FLOW[roleCode];
   if (!flow) return { blocked: true, agentRunStatus: 'FAILED', reason: 'unknown_role' };

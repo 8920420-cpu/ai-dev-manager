@@ -403,6 +403,14 @@ test('compactToolResult: режет длинный результат перед
   assert.equal(parsed.content.length, 20);
 });
 
+// Регрессия: JSON.stringify(undefined) === undefined (не строка). Раньше text.length
+// падал TypeError, и внешний catch подменял успешный вызов инструмента фейковой
+// ошибкой. Теперь undefined-результат → пустая строка без падения.
+test('compactToolResult: undefined-результат инструмента → пустая строка, не падение', () => {
+  assert.equal(compactToolResult(undefined), '');
+  assert.equal(compactToolResult({ ok: true, result: undefined }.result), '');
+});
+
 test('LLM_ROLE_CODES покрывает 7 рассуждающих ролей (вкл. Приёмщика задач)', () => {
   assert.deepEqual([...LLM_ROLE_CODES].sort(), [
     'ARCHITECT', 'DECOMPOSER', 'DOCUMENTATION_AUDITOR',

@@ -54,17 +54,7 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
   return withClient(clientConfig(s), async (c) => {
     const generatedAt = new Date();
 
-    let projectDbId = null;
-    if (projectId != null && String(projectId).trim() !== '') {
-      const ref = String(projectId).trim();
-      const pr = await c.query(
-        `SELECT id FROM projects
-          WHERE id::text = $1 OR code = $1 OR root_path = $1 OR name = $1
-          ORDER BY created_at LIMIT 1`,
-        [ref],
-      );
-      if (pr.rowCount) projectDbId = pr.rows[0].id;
-    }
+    const projectDbId = await resolveProjectId(c, projectId);
     const taskWhere = projectDbId ? 'WHERE project_id = $1' : '';
     const taskParams = projectDbId ? [projectDbId] : [];
 
@@ -437,10 +427,14 @@ export function buildRoleLoadTaskTotals(row = {}) {
 // Направленность показателей вида «Средние на задачу». lowerIsBetter=true → рост =
 // ухудшение (красная стрелка). Нейтральные счётчики (runs/tasks/running) здесь НЕ
 // перечислены — для них дельта не считается и не показывается (решение архитектора).
+// rate:true — СЫРОЙ счётчик за период: сравнивать дельтой между периодами разной
+// длины (текущий [маркер; now] растёт, период сравнения фиксирован) можно только
+// после нормировки на длительность периода (см. attachRoleLoadDeltas). Средние
+// (avg*) длина-независимы и нормировки не требуют.
 export const ROLE_LOAD_METRICS = [
-  { key: 'success', lowerIsBetter: false },
-  { key: 'failed', lowerIsBetter: true },
-  { key: 'timeout', lowerIsBetter: true },
+  { key: 'success', lowerIsBetter: false, rate: true },
+  { key: 'failed', lowerIsBetter: true, rate: true },
+  { key: 'timeout', lowerIsBetter: true, rate: true },
   { key: 'avgDurationMs', lowerIsBetter: true },
   { key: 'avgTokensInPerTask', lowerIsBetter: true },
   { key: 'avgTokensOutPerTask', lowerIsBetter: true },
@@ -489,15 +483,25 @@ export function computeMetricDelta(current, previous, lowerIsBetter) {
  * @param {Array<Object>|null} previousRows строки периода сравнения или null
  * @returns {Array<Object>} те же строки + поле delta
  */
-export function attachRoleLoadDeltas(currentRows = [], previousRows = null) {
+export function attachRoleLoadDeltas(currentRows = [], previousRows = null, periods = null) {
   const prevByCode = new Map();
   if (previousRows) for (const r of previousRows) prevByCode.set(r.roleCode, r);
+  // ROLE-LOAD-RATE-DELTA-001: сырые счётчики (rate:true) нормируем на длительность
+  // периода, иначе дельта врёт (роль с постоянной частотой провалов показывает
+  // «−80% провалов» просто потому, что текущее окно после деплоя короче предыдущего).
+  // Длительности переданы — нормируем; нет (юнит-тест без периодов) — как раньше.
+  const curMs = Number(periods?.currentDurationMs);
+  const prevMs = Number(periods?.previousDurationMs);
+  const canRate = Number.isFinite(curMs) && curMs > 0 && Number.isFinite(prevMs) && prevMs > 0;
   return currentRows.map((row) => {
     const prev = previousRows ? prevByCode.get(row.roleCode) : null;
     if (!prev) return { ...row, delta: null };
     const delta = {};
-    for (const { key, lowerIsBetter } of ROLE_LOAD_METRICS) {
-      delta[key] = computeMetricDelta(row[key], prev[key], lowerIsBetter);
+    for (const { key, lowerIsBetter, rate } of ROLE_LOAD_METRICS) {
+      const [curV, prevV] = rate && canRate
+        ? [row[key] / curMs, prev[key] / prevMs]
+        : [row[key], prev[key]];
+      delta[key] = computeMetricDelta(curV, prevV, lowerIsBetter);
     }
     return { ...row, delta };
   });
@@ -689,8 +693,14 @@ async function deriveRoleLoadBlock(c, nowISO) {
     previous = { start: prevISO, end: lastISO };
   }
 
+  // Длительности периодов для нормировки сырых счётчиков (см. attachRoleLoadDeltas).
+  const currentDurationMs = new Date(nowISO).getTime() - new Date(lastISO).getTime();
+  const previousDurationMs = previous
+    ? new Date(previous.end).getTime() - new Date(previous.start).getTime()
+    : null;
+
   return {
-    roleLoad: attachRoleLoadDeltas(curRoleLoad, prevRoleLoad),
+    roleLoad: attachRoleLoadDeltas(curRoleLoad, prevRoleLoad, { currentDurationMs, previousDurationMs }),
     roleLoadWindow: {
       stale: false, staleHours: 0,
       windowStart: lastISO, windowEnd: nowISO, lastActivityAt: null,
@@ -755,11 +765,6 @@ export async function getRoleLoadTotals(s, { period } = {}) {
       roles: buildRoleLoadTotals(r.rows),
     };
   });
-}
-
-// Признак терминального статуса (экспорт для согласованности с taskStats).
-export function isTerminal(status) {
-  return TERMINAL.has(status);
 }
 
 // =====================================================================
@@ -1144,8 +1149,10 @@ export function buildDailyModelStats(rows = []) {
  * угадывает модель по роли — берёт фактический снимок из agent_runs.snapshot_*.
  */
 export async function getDailyModelStats(s, { projectId, windowDays } = {}) {
+  // Дробный windowDays в (0;1) проходил guard > 0, но Math.trunc давал 0 → SQL
+  // now() - 0*interval = now() → пустое окно. Нижняя граница — минимум 1 день.
   const days = Number.isFinite(Number(windowDays)) && Number(windowDays) > 0
-    ? Math.min(365, Math.trunc(Number(windowDays))) : 7;
+    ? Math.min(365, Math.max(1, Math.trunc(Number(windowDays)))) : 7;
   return withClient(clientConfig(s), async (c) => {
     const projectDbId = await resolveProjectId(c, projectId);
     const params = [days];
