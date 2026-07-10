@@ -11,9 +11,11 @@ import { IntegrationsPage } from './features/integrations/IntegrationsPage';
 import { PerformanceMonitorPage } from './features/monitor/PerformanceMonitorPage';
 import { McpRolesPage } from './features/settings/McpRolesPage';
 import { RolesPage } from './features/settings/RolesPage';
+import { DatabasesPage } from './features/settings/DatabasesPage';
 import { ToolsPage } from './features/settings/ToolsPage';
 import { ExecutionPage } from './features/settings/ExecutionPage';
 import { FeedbackWidget } from './features/feedback/FeedbackWidget';
+import { ApiTokenGate } from './features/auth/ApiTokenGate';
 
 function CurrentPage() {
   const { route } = useRouter();
@@ -36,6 +38,8 @@ function CurrentPage() {
       return <ServersPage />;
     case 'settings-roles':
       return <RolesPage />;
+    case 'settings-databases':
+      return <DatabasesPage />;
     case 'settings-tools':
       return <ToolsPage />;
     case 'settings-execution':
@@ -54,6 +58,7 @@ export function App() {
           <AppShell>
             <CurrentPage />
             <FeedbackWidget />
+            <ApiTokenGate />
           </AppShell>
         </RouterProvider>
       </ToastProvider>

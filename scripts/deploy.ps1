@@ -1,4 +1,4 @@
-﻿# VERSION-KPI-TRACKING-001 — пересборка и перезапуск orchestrator-service с
+# VERSION-KPI-TRACKING-001 — пересборка и перезапуск orchestrator-service с
 # проставлением версии кода в образ (APP_CODE_VERSION = git-SHA) для авто-метки
 # деплоя. Запуск из любого места: скрипт сам переходит в корень репозитория.
 #

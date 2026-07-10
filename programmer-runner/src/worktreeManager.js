@@ -20,6 +20,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdirSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { withRepoWorktreeLock } from '../../shared/repoWorktreeLock.js';
 
 function git(cwd, args, opts = {}) {
   return execFileSync('git', ['-C', cwd, ...args], {
@@ -137,10 +138,15 @@ export class WorktreeManager {
   // пересоздание worktree разных сервисов → шторм worktree_ensure_failed увёл 8 задач
   // в BLOCKED (programmer_release_loop). Лок держится только на короткий шаг
   // ensureWorktree; дорогой шаг агента и слияние в main остаются параллельными.
+  // WORKTREE-CROSSPROC-LOCK-001: два уровня. (1) Внутрипроцессный мьютекс по repoCwd —
+  // разводит структурные worktree-операции РАЗНЫХ сервисов в ЭТОМ процессе. (2) Межпроцессный
+  // файловый лок (shared/repoWorktreeLock) — координирует с host-runner (Git Integrator),
+  // который делает cherry-pick/stash/reset на ТОМ ЖЕ репо: без него `worktree prune` GI
+  // сносил admin-запись полусозданного worktree программиста → worktree_ensure_failed.
   withRepoLock(repoCwd, fn) {
     const key = String(repoCwd);
     const prev = this.repoLocks.get(key) || Promise.resolve();
-    const run = prev.then(() => fn());
+    const run = prev.then(() => withRepoWorktreeLock(repoCwd, fn, { log: this.log }));
     this.repoLocks.set(key, run.then(() => {}, () => {}));
     return run;
   }

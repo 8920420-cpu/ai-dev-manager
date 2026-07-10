@@ -1,4 +1,4 @@
-﻿# stop-runners.ps1
+# stop-runners.ps1
 # Останавливает фоновых демонов host-runner, programmer-runner и codex-runner.
 $ErrorActionPreference = 'Stop'
 

@@ -17,12 +17,48 @@ export class ApiError extends Error {
 }
 
 /** Опциональный токен API (ORCHESTRATOR_API_TOKEN на backend). */
-let apiToken: string | null = null;
+export const API_UNAUTHORIZED_EVENT = 'adm-api-unauthorized';
+export const API_TOKEN_STORAGE_KEY = 'adm.apiToken';
+
+function readStoredApiToken(): string | null {
+  try {
+    return sessionStorage.getItem(API_TOKEN_STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+let apiToken: string | null = readStoredApiToken();
+let bootstrapPromise: Promise<void> | null = null;
+
 export function setApiToken(token: string | null): void {
-  apiToken = token;
+  const next = token && token.trim() ? token.trim() : null;
+  apiToken = next;
+  try {
+    if (next) sessionStorage.setItem(API_TOKEN_STORAGE_KEY, next);
+    else sessionStorage.removeItem(API_TOKEN_STORAGE_KEY);
+  } catch {
+    // sessionStorage может быть недоступен; токен всё равно работает в памяти вкладки.
+  }
 }
 export function getApiToken(): string | null {
   return apiToken;
+}
+
+export async function ensureApiToken(): Promise<void> {
+  if (apiToken) return;
+  if (!bootstrapPromise) {
+    bootstrapPromise = fetch('/api/client-auth')
+      .then(async (res) => {
+        if (!res.ok) return;
+        const data = (await res.json()) as { token?: unknown };
+        if (typeof data.token === 'string' && data.token.trim()) {
+          setApiToken(data.token);
+        }
+      })
+      .catch(() => undefined);
+  }
+  await bootstrapPromise;
 }
 
 interface RequestOptions {
@@ -181,6 +217,7 @@ async function request<T>(
   body?: unknown,
   opts?: RequestOptions,
 ): Promise<T> {
+  await ensureApiToken();
   const headers: Record<string, string> = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (apiToken) headers['Authorization'] = `Bearer ${apiToken}`;
@@ -228,6 +265,9 @@ async function request<T>(
         (data as { error?: string; message?: string } | undefined)?.error ||
         (data as { message?: string } | undefined)?.message ||
         `Ошибка сервера (${res.status})`;
+      if (res.status === 401 && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent(API_UNAUTHORIZED_EVENT));
+      }
       throw new ApiError(humanizeErrorMessage(msg, res.status), res.status, data);
     }
 

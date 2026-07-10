@@ -351,6 +351,14 @@ No route files detected
 - Framework: Vitest
 
 ## Code Style Notes
+- Text files must be saved as UTF-8 without BOM. This includes `.md`, `.env`,
+  `.js`, `.ts`, `.json`, `.yml`, `.yaml`, `.sql`, `.conf`, `.ps1`, and `.sh`.
+- Do not paste Windows console mojibake back into source files. Verify Cyrillic by
+  reading file bytes/UTF-8 content, because PowerShell output can corrupt display
+  even when the file is valid.
+- When generating files from PowerShell, set UTF-8 explicitly (`Set-Content
+  -Encoding utf8` in PowerShell 7, or `System.IO.File.WriteAllText` with
+  `UTF8Encoding($false)` for Windows PowerShell compatibility).
 
 ---
 
@@ -368,6 +376,11 @@ No route files detected
 ## Environment Notes
 - .env.example exists — copy to .env and fill in values
 
+## Encoding
+- Keep all text files in UTF-8 without BOM.
+- Windows PowerShell output can display valid UTF-8 Cyrillic as mojibake. Do not
+  "fix" text based only on console output; verify with a UTF-8 read or byte-level
+  check first.
+- Legacy Windows-1251 files should be converted to UTF-8 before editing.
+
 ---
-
-

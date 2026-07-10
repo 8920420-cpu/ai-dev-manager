@@ -1,4 +1,4 @@
-﻿# unregister-autostart.ps1
+# unregister-autostart.ps1
 # Снимает host-runner + programmer-runner с автозапуска (удаляет задачу планировщика).
 # Уже запущенные демоны при этом не останавливаются — для этого stop-runners.ps1.
 $ErrorActionPreference = 'Stop'

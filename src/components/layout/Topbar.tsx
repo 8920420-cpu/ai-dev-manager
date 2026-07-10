@@ -14,6 +14,7 @@ const TITLES: Record<RouteKey, string> = {
   servers: 'Серверы',
   integrations: 'Интеграции',
   'settings-roles': 'Настройки · Роли',
+  'settings-databases': 'Настройки · Базы данных',
   'settings-tools': 'Настройки · Инструменты',
   'settings-execution': 'Настройки · Выполнение',
 };

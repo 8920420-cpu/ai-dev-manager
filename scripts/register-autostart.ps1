@@ -1,4 +1,4 @@
-﻿# register-autostart.ps1
+# register-autostart.ps1
 # Регистрирует автозапуск host-runner + programmer-runner через Планировщик задач
 # Windows: задача «при входе в систему» текущего пользователя.
 #

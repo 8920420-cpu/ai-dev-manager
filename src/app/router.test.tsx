@@ -27,11 +27,17 @@ vi.mock('../features/monitor/PerformanceMonitorPage', () => ({
 vi.mock('../features/settings/RolesPage', () => ({
   RolesPage: () => <div data-testid="page-roles">RolesPage</div>,
 }));
+vi.mock('../features/settings/DatabasesPage', () => ({
+  DatabasesPage: () => <div data-testid="page-databases">DatabasesPage</div>,
+}));
 vi.mock('../features/settings/ToolsPage', () => ({
   ToolsPage: () => <div data-testid="page-tools">ToolsPage</div>,
 }));
 vi.mock('../features/settings/ExecutionPage', () => ({
   ExecutionPage: () => <div data-testid="page-execution">ExecutionPage</div>,
+}));
+vi.mock('../features/auth/ApiTokenGate', () => ({
+  ApiTokenGate: () => null,
 }));
 
 beforeEach(() => {

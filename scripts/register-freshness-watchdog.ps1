@@ -1,4 +1,4 @@
-﻿# register-freshness-watchdog.ps1
+# register-freshness-watchdog.ps1
 # RUNNER-FRESHNESS-001 — регистрирует Scheduled Task, который каждые 10 минут
 # запускает scripts/ensure-fresh-runners.ps1: демон, чей код новее процесса,
 # перезапускается автоматически (см. комментарий в ensure-fresh-runners.ps1).

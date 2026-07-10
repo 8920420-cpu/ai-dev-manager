@@ -11,3 +11,10 @@
 
 ## Environment Notes
 - .env.example exists — copy to .env and fill in values
+
+## Encoding
+- Keep all text files in UTF-8 without BOM.
+- Windows PowerShell output can display valid UTF-8 Cyrillic as mojibake. Do not
+  "fix" text based only on console output; verify with a UTF-8 read or byte-level
+  check first.
+- Legacy Windows-1251 files should be converted to UTF-8 before editing.

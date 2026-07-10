@@ -146,6 +146,7 @@ const FRONTEND_DIR =
   resolve(__dirname, '../../frontend');
 
 const API_AUTH = readTokenAuthConfig();
+const UI_BOOTSTRAP_API_TOKEN = process.env.UI_BOOTSTRAP_API_TOKEN === '1';
 
 function isAuthorized(req, { allowQueryToken = false } = {}) {
   return isBearerOrApiTokenAuthorized(req, { ...API_AUTH, allowQueryToken });
@@ -370,6 +371,13 @@ export function createApp() {
       // --- API ---
       if (p.startsWith('/api/') || p === '/health') {
         if (req.method === 'GET' && p === '/health') return sendJson(res, 200, { status: 'ok' });
+
+        if (req.method === 'GET' && p === '/api/client-auth') {
+          if (UI_BOOTSTRAP_API_TOKEN && API_AUTH.token) {
+            return sendJson(res, 200, { token: API_AUTH.token });
+          }
+          return sendJson(res, 200, { token: null });
+        }
 
         // Healthcheck версии: версия сервиса + сводка применённых миграций.
         // Открыт (как /health) — нужен мониторингу/деплою без токена для быстрой

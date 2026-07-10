@@ -49,3 +49,17 @@ powershell -File scripts/start-runners.ps1 -Restart -Only host-runner
 - Консоль Windows калечит кириллицу в выводе node/psql: результаты запросов писать
   в файл и читать Read'ом; к БД ходить Node+`pg` из `orchestrator-service/backend`
   (host 127.0.0.1:5432, haproxy).
+
+## Кодировка файлов
+
+- Все текстовые файлы проекта (`.md`, `.env`, `.js`, `.ts`, `.json`, `.yml`, `.yaml`,
+  `.sql`, `.conf`, `.ps1`, `.sh`) хранить в UTF-8 без BOM.
+- Не сохранять новые файлы в Windows-1251/CP866 и не копировать в исходники
+  mojibake из консоли (например, двойные UTF-8/Windows-1251 последовательности
+  или серии символов U+FFFD).
+- Перед исправлением кириллицы проверять реальные байты файла, а не только вывод
+  PowerShell: Windows-консоль может искажать нормальный UTF-8 при печати.
+- Если PowerShell пишет файл с кириллицей, явно задавать UTF-8: в PowerShell 7
+  использовать `Set-Content -Encoding utf8`, для совместимости с Windows PowerShell
+  предпочтительно писать через `[System.IO.File]::WriteAllText($path, $text,
+  [System.Text.UTF8Encoding]::new($false))`.

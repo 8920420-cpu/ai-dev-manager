@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import { runServicePipeline } from '../../pipeline-runner/src/index.js';
 import { runAutodeploy } from './autodeploy.js';
+import { withRepoWorktreeLock } from '../../shared/repoWorktreeLock.js';
 
 const pexec = promisify(execFile);
 
@@ -371,9 +372,13 @@ export async function runGitAction(task, opts = {}) {
   // Репозиторий может быть ещё не создан — инициализируем автоматически.
   const repo = await ensureRepo(repoRoot);
 
-  const res = worktreeBranch
-    ? await integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredCommit, taskId: task.id })
-    : await integrateChangedFiles(repoRoot, task, files);
+  // WORKTREE-CROSSPROC-LOCK-001: структурные git-операции интеграции (stash/cherry-pick/
+  // reset/commit) на repoRoot гоняются с `git worktree add/prune` программиста на том же
+  // репозитории (разные процессы) → worktree_ensure_failed / index.lock ENOENT. Берём
+  // общий межпроцессный лок (тот же ключ, что WorktreeManager.withRepoLock программиста).
+  const res = await withRepoWorktreeLock(repoRoot, () => (worktreeBranch
+    ? integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredCommit, taskId: task.id })
+    : integrateChangedFiles(repoRoot, task, files)), { log: opts.log });
 
   // Явная ошибка интеграции (конфликт cherry-pick, сбой commit, нет ref) — провал.
   if (res.error) {

@@ -51,6 +51,7 @@ services:
       RUNNER_HOST_TIMEOUT_MS: "${RUNNER_HOST_TIMEOUT_MS:-2400000}"
       # Задайте токен для доступа к /api/*. Пусто = закрыто, кроме явного ALLOW_INSECURE_LOCAL=1.
       ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      UI_BOOTSTRAP_API_TOKEN: "${UI_BOOTSTRAP_API_TOKEN:-0}"
       # Fail-closed by default: empty ORCHESTRATOR_API_TOKEN closes /api/*.
       # Set ALLOW_INSECURE_LOCAL=1 only for explicit local development.
       ALLOW_INSECURE_LOCAL: "${ALLOW_INSECURE_LOCAL:-0}"

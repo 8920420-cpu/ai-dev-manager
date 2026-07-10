@@ -5199,7 +5199,16 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
     // идёт по конвейеру отдельно), а эпик паркуем в WAITING_FOR_CHILDREN. Иначе —
     // прежнее поведение: одна задача (ensureArchitectService; 0 сервисов → BLOCKED).
     const split = await resolveArchitectSplit(c, claimed, verdict.fields, cardValues);
-    if (split.services.length >= 2) {
+    // ARCH-SPLIT-NO-RECURSION-001: расщепляем на независимые per-service задачи ТОЛЬКО
+    // задачу верхнего уровня (parent_task_id IS NULL). Split-ребёнок (parent задан, создан
+    // прежним расщеплением со своим service_id) при возврате к Архитектору по REWORK снова
+    // выглядит «мультисервисным» — его карточка/описание всё ещё упоминают соседние сервисы,
+    // — и прежде порождал новый эпик с детьми, те по REWORK расщеплялись опять: бесконечная
+    // цепочка эпик→эпик→эпик (WAITING_FOR_CHILDREN, ничего не доходит до листа; инцидент
+    // 10.07 — кластер quick_reply_id в PROJECT_2, ~17 вложенных эпиков). Такой ребёнок уже
+    // сфокусирован на ОДНОМ сервисе — ведём его дальше одиночным путём (ensureArchitectService
+    // резолвит его же service_id и форвардит к Programmer), а не расщепляем повторно.
+    if (split.services.length >= 2 && !claimed.parent_task_id) {
       // SERVICE-REPO-PATH-PREFLIGHT-001: ту же проверку repository_path, что и на
       // одиночном пути (ensureArchitectService ниже), прогоняем по КАЖДОМУ сервису
       // split ДО материализации детей. Дочерние service-задачи создаются сразу в

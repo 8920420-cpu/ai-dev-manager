@@ -49,6 +49,7 @@ export const NAV_ITEMS: NavItem[] = [
     icon: Settings,
     children: [
       { label: 'Роли', route: 'settings-roles' },
+      { label: 'Базы данных', route: 'settings-databases' },
       { label: 'Инструменты', route: 'settings-tools' },
       { label: 'Выполнение', route: 'settings-execution' },
     ],
