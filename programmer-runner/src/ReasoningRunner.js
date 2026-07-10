@@ -74,8 +74,11 @@ export class ReasoningRunner {
   // которые штатно переигрываются на INTERVAL_MS.
   static isProviderLimit(reason) {
     // Разделитель между словами — пробел/подчёркивание/дефис: провайдеры пишут и
-    // «usage limit», и «rate_limit_error», и «too-many-requests».
-    return /usage[\s_-]?limit|rate[\s_-]?limit|too[\s_-]?many[\s_-]?requests|\b429\b|\b529\b|quota|insufficient|overloaded|try again (at|later|in)/i.test(
+    // «usage limit», и «rate_limit_error», и «too-many-requests». Набор синхронизирован
+    // с ProgrammerRunner.isProviderLimit (канон): +«hit your session limit»/403/«resets HH:MM».
+    // claude_code при исчерпании подписки пишет «You've hit your session limit · resets 6:50am» —
+    // без этих паттернов пауза PROVIDER-LIMIT-COOLDOWN-002 не срабатывала (churn 10.07).
+    return /hit your session limit|usage[\s_-]?limit|rate[\s_-]?limit|too[\s_-]?many[\s_-]?requests|\b403\b|\b429\b|\b529\b|quota|insufficient|overloaded|try again (at|later|in)|resets?\s+\d/i.test(
       String(reason || ''),
     );
   }

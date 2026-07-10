@@ -99,6 +99,9 @@ test('isProviderLimit: распознаёт лимит/квоту/перегру
   assert.equal(ReasoningRunner.isProviderLimit('rate limit exceeded'), true);
   assert.equal(ReasoningRunner.isProviderLimit('HTTP 429 Too Many Requests'), true);
   assert.equal(ReasoningRunner.isProviderLimit('overloaded_error (529)'), true);
+  // claude_code session-limit (синхронизация с ProgrammerRunner, 10.07) — раньше не ловилось.
+  assert.equal(ReasoningRunner.isProviderLimit("You've hit your session limit · resets 6:50am (Europe/Moscow)"), true);
+  assert.equal(ReasoningRunner.isProviderLimit('Failed to authenticate. API Error: 403 Request not allowed'), true);
   assert.equal(ReasoningRunner.isProviderLimit('boom'), false);
   assert.equal(ReasoningRunner.isProviderLimit('agent_timeout'), false);
 });
