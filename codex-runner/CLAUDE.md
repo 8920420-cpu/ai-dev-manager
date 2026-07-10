@@ -1,13 +1,13 @@
-# programmer-runner — Claude Memory
-> Last analyzed: 2026-07-10 (updated)
+# codex-runner — Claude Memory
+> Last analyzed: 2026-07-10
 > Re-analysis needed: NO — read .claude/rules/ files instead of source files
 
 ## What this project is
-Автоматический исполнитель роли PROGRAMMER (стадия CODING): опрашивает оркестратор, запускает headless Claude Code (Agent SDK) на задаче в репозитории проекта и сдаёт результат. Закрывает разрыв, из-за которого CODING двигался только живой Claude-сессией.
+Автоматический исполнитель рассуждающих ролей (Приёмщик/Архитектор/Декомпозитор и пр.), делегированных Codex: опрашивает оркестратор, запускает headless `codex exec` на готовом промпте роли в корне проекта и сдаёт вердикт. Аналог programmer-runner, но для reasoning-ролей и на подписке ChatGPT через локальный Codex CLI.
 
 ## Quick reference
 - **Stack**: JavaScript
-- **Dev**: `node bin/programmer-runner.js`
+- **Dev**: `node bin/codex-runner.js`
 - **Test**: `node --test`
 - **Build**: `N/A`
 

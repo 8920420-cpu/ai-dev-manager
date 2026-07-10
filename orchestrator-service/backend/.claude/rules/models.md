@@ -71,3 +71,9 @@
 
 ## Migration notes
 - No migrations detected
+
+## New Models (added 2026-07-10)
+- `db/migrations/0058_infrastructure_department.sql`
+
+## New Models (added 2026-07-10)
+- `db/migrations/0059_infrastructure_pipeline.sql`

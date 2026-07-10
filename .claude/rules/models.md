@@ -99,3 +99,9 @@
 - `src/types/server.ts`
 - `src/types/settings.ts`
 - `src/types/taskStats.ts`
+
+## New Models (added 2026-07-10)
+- `orchestrator-service/backend/db/migrations/0058_infrastructure_department.sql`
+
+## New Models (added 2026-07-10)
+- `orchestrator-service/backend/db/migrations/0059_infrastructure_pipeline.sql`

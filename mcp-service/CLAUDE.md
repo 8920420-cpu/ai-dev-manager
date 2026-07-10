@@ -1,13 +1,13 @@
-# programmer-runner — Claude Memory
-> Last analyzed: 2026-07-10 (updated)
+# mcp-service — Claude Memory
+> Last analyzed: 2026-07-10
 > Re-analysis needed: NO — read .claude/rules/ files instead of source files
 
 ## What this project is
-Автоматический исполнитель роли PROGRAMMER (стадия CODING): опрашивает оркестратор, запускает headless Claude Code (Agent SDK) на задаче в репозитории проекта и сдаёт результат. Закрывает разрыв, из-за которого CODING двигался только живой Claude-сессией.
+MCP-сервер AI Dev Manager: тонкий адаптер MCP → HTTP API поверх tools-service и orchestrator-service (stdio + опциональный HTTP/SSE).
 
 ## Quick reference
-- **Stack**: JavaScript
-- **Dev**: `node bin/programmer-runner.js`
+- **Stack**: JavaScript + Docker
+- **Dev**: `node bin/mcp-service.js`
 - **Test**: `node --test`
 - **Build**: `N/A`
 
