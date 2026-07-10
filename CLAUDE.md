@@ -15,6 +15,23 @@
 
 Если память выглядит устаревшей, проверяй исходники и обновляй память через `codebase-memory.cmd update .`.
 
+### ПРАВИЛО: Codebase Memory MCP — по умолчанию, без напоминаний
+
+При любой задаче, где нужна ориентация в кодовой базе (что где лежит, архитектура,
+модули, модели, API, соглашения, gotchas), **сначала по умолчанию** сверяйся с
+Codebase Memory через MCP — без отдельной просьбы пользователя:
+
+- `orchestrator_list_codebase_memory` (projectId=`PROJECT` для ai-dev-manager или
+  `PROJECT_2`/… для других) — увидеть список доступных документов памяти;
+- `orchestrator_get_codebase_memory` (key: `architecture|stack|modules|models|api|
+  conventions|gotchas|changelog|claude`) — прочитать нужный документ.
+
+Это тот же контент, что и `.claude/rules/*.md`, но зеркалированный в PostgreSQL и
+доступный по всем проектам оркестратора (не только по текущему рабочему дереву).
+MCP-инструменты бьют в защищённые эндпоинты `/api/projects/:id/codebase-memory*` и
+требуют `ORCHESTRATOR_API_TOKEN` (см. `.mcp.json` → `${ORCHESTRATOR_API_TOKEN}`);
+без токена вызовы вернут `401`.
+
 ## ЖЕЛЕЗНОЕ ПРАВИЛО: после правки кода раннеров — рестарт демона
 
 Хостовые демоны (`host-runner`, `programmer-runner`, `codex-runner`,

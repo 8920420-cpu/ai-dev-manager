@@ -43,6 +43,29 @@ cd mcp-service && npm install
 - `tools-service` в Docker (mount `./:/app/ai-dev-manager`) → `PROJECT_ROOT=ai-dev-manager`;
 - `tools-service` на хосте → `PROJECT_ROOT` = абсолютный путь к корню репозитория.
 
+## Авторизация (`ORCHESTRATOR_API_TOKEN`)
+
+Если сервисы подняты с непустым `ORCHESTRATOR_API_TOKEN` (см. `.env`), защищённые
+эндпоинты `/api/*` требуют тот же Bearer-токен у MCP-клиента — иначе оркестраторные
+read-инструменты (`orchestrator_list_projects`, `orchestrator_list_codebase_memory`,
+`orchestrator_get_codebase_memory`, …) и постановка задач вернут `401`. Публичные
+`orchestrator_health` и `orchestrator_version` работают без токена и проблему НЕ
+показывают.
+
+Секрет **не храните в закоммиченном** `.mcp.json`. Передавайте его ссылкой на
+переменную окружения — `"ORCHESTRATOR_API_TOKEN": "${ORCHESTRATOR_API_TOKEN:-}"`
+(форма `${VAR:-}` не ломает парсинг конфига, если переменная не задана). Само
+значение задаётся в окружении, из которого **запускается** клиент:
+
+- **Windows (Claude Code):** постоянная пользовательская переменная —
+  `[Environment]::SetEnvironmentVariable('ORCHESTRATOR_API_TOKEN', '<токен из .env>', 'User')`,
+  затем **перезапустить Claude Code** (переменная читается на старте процесса).
+- **Linux/macOS:** `export ORCHESTRATOR_API_TOKEN=<токен>` в профиле шелла.
+
+Токен должен совпадать со значением `ORCHESTRATOR_API_TOKEN` в `.env` (им подняты
+сервисы). Локальная работа без токена возможна только при `ALLOW_INSECURE_LOCAL=1`
+у сервисов (по умолчанию fail-closed — `/api/*` закрыт).
+
 ## Claude Code
 
 Проектный файл [`.mcp.json`](../.mcp.json) уже в корне репозитория:
@@ -57,6 +80,7 @@ cd mcp-service && npm install
         "PROJECT_ROOT": "ai-dev-manager",
         "ORCHESTRATOR_URL": "http://localhost:4186",
         "TOOLS_SERVICE_URL": "http://localhost:4188",
+        "ORCHESTRATOR_API_TOKEN": "${ORCHESTRATOR_API_TOKEN:-}",
         "MCP_ENABLE_WRITE": "1",
         "MCP_ENABLE_DELETE": "1",
         "MCP_ENABLE_ORCHESTRATOR_MUTATIONS": "1"
@@ -127,6 +151,10 @@ node mcp-service/bin/mcp-service.js --http-only
 `project_read_file`, `project_search_text`, `orchestrator_health`,
 `orchestrator_list_projects`. Write/delete/mutation-инструменты появляются только
 при соответствующих флагах `MCP_ENABLE_*`.
+
+Если `orchestrator_list_projects` / `orchestrator_list_codebase_memory` отвечают
+`401`, а `orchestrator_health` — ОК, значит не передан `ORCHESTRATOR_API_TOKEN`
+(см. «Авторизация» выше).
 
 Постановка задачи: при `MCP_ENABLE_ORCHESTRATOR_MUTATIONS=1` доступен
 `orchestrator_create_task` — заводит новую задачу под ролью «Приёмщик задач»

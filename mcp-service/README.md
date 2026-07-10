@@ -96,3 +96,10 @@ npm test
 
 См. [docs/MCP_SETUP.md](../docs/MCP_SETUP.md) — настройка Claude Code (`.mcp.json`),
 VS Code (`.vscode/mcp.json`) и Codex (`~/.codex/config.toml`).
+
+> **Авторизация:** если сервисы подняты с `ORCHESTRATOR_API_TOKEN`, тот же токен
+> нужен MCP-клиенту — иначе оркестраторные read-инструменты и codebase-memory дают
+> `401` (при этом `orchestrator_health`/`orchestrator_version` публичны и проблему
+> прячут). Передавайте токен ссылкой `"ORCHESTRATOR_API_TOKEN": "${ORCHESTRATOR_API_TOKEN:-}"`
+> в `.mcp.json`, а само значение — переменной окружения клиента (секрет в git не
+> коммитим). Подробности и настройка под Windows — в [MCP_SETUP.md](../docs/MCP_SETUP.md).
