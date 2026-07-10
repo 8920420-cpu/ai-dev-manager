@@ -2,4 +2,4 @@
 
 ## 2026-07-10 — Initial analysis
 - Full codebase analyzed and memory files written
-- 5 modules mapped, 0 endpoints documented, 63 models captured
+- 3 modules mapped, 0 endpoints documented, 0 models captured

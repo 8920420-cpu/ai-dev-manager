@@ -1,13 +1,13 @@
-# orchestrator-service-backend — Claude Memory
+# host-runner — Claude Memory
 > Last analyzed: 2026-07-10
 > Re-analysis needed: NO — read .claude/rules/ files instead of source files
 
 ## What this project is
-Бэкенд AI Orchestrator: автосоздание БД orchestrator_db, миграции, API настроек подключения.
+Нативный исполнитель host-ролей (PIPELINE_SERVICE/GIT_INTEGRATOR): docker/git на хосте по заданиям оркестратора.
 
 ## Quick reference
 - **Stack**: JavaScript
-- **Dev**: `node bin/server.js`
+- **Dev**: `node bin/host-runner.js`
 - **Test**: `node --test`
 - **Build**: `N/A`
 
