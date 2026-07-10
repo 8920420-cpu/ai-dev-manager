@@ -13,7 +13,9 @@
     "test": "vitest run",
     "test:services": "npm --prefix orchestrator-service/backend test && npm --prefix tools-service test && npm --prefix mcp-service test && npm --prefix scanner-service test && npm --prefix tester-service test && npm --prefix pipeline-runner test && npm --prefix host-runner test && npm --prefix programmer-runner test && npm --prefix codex-runner test",
     "test:all": "npm test && npm run test:services",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "memory:sync:pg": "node scripts/sync-codebase-memory-to-postgres.js",
+    "memory:sync:pg:all": "node scripts/sync-codebase-memory-to-postgres.js --all-projects"
   },
   "dependencies": {
     "@chakra-ui/react": "3.36.0",

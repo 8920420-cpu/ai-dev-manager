@@ -47,7 +47,7 @@ test('по умолчанию (без флагов) write/delete/mutation-инс
   const server = fakeServer();
   const names = registerTools(server, { config: baseConfig(), ...stubClients });
   // read-инструменты есть всегда:
-  for (const n of ['project_list_dir', 'project_read_file', 'project_search_text', 'orchestrator_health', 'orchestrator_list_projects', 'orchestrator_claim_next_claude_task']) {
+  for (const n of ['project_list_dir', 'project_read_file', 'project_search_text', 'orchestrator_health', 'orchestrator_list_projects', 'orchestrator_list_codebase_memory', 'orchestrator_get_codebase_memory', 'orchestrator_claim_next_claude_task']) {
     assert.ok(names.includes(n), `есть ${n}`);
   }
   // закрытые флагами — отсутствуют:
@@ -233,4 +233,30 @@ test('orchestrator_get_project_stages извлекает stages из карто�
   assert.equal(seenPath, '/api/projects/p1');
   const parsed = JSON.parse(out.content[0].text);
   assert.deepEqual(parsed.data.stages, [{ code: 'CODING' }]);
+});
+
+test('Codebase Memory MCP tools route to project memory API', async () => {
+  const seen = [];
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig(),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async (path, options) => {
+        seen.push({ path, options });
+        return { ok: true, status: 200, data: { documents: [{ key: 'architecture' }] } };
+      },
+      post: async () => ({}),
+    },
+  });
+
+  assert.ok(server.handlers.has('orchestrator_list_codebase_memory'));
+  assert.ok(server.handlers.has('orchestrator_get_codebase_memory'));
+
+  await server.handlers.get('orchestrator_list_codebase_memory')({ projectId: 'PROJECT', includeContent: true });
+  await server.handlers.get('orchestrator_get_codebase_memory')({ projectId: 'PROJECT', key: 'architecture' });
+
+  assert.equal(seen[0].path, '/api/projects/PROJECT/codebase-memory');
+  assert.deepEqual(seen[0].options, { query: { includeContent: 1 } });
+  assert.equal(seen[1].path, '/api/projects/PROJECT/codebase-memory/architecture');
 });

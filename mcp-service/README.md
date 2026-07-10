@@ -67,6 +67,8 @@ npm test
 
 `orchestrator_health` (`GET /health`), `orchestrator_version` (`GET /api/version`),
 `orchestrator_list_projects` (`GET /api/projects`),
+`orchestrator_list_codebase_memory` (`GET /api/projects/:id/codebase-memory`),
+`orchestrator_get_codebase_memory` (`GET /api/projects/:id/codebase-memory/:key`),
 `orchestrator_get_project_stages` (этапы из `GET /api/projects/:id`),
 `orchestrator_get_task_statistics` (`GET /api/projects/:id/task-statistics`),
 `orchestrator_list_roles` (`GET /api/roles`),

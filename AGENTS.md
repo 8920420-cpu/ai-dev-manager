@@ -1,8 +1,8 @@
-# ai-dev-manager — правила для Claude
+# ai-dev-manager — правила для Codex
 
 ## Codebase Memory
 
-Память проекта сгенерирована `codebase-memory` 2026-07-10. Для первичной ориентации сначала читай:
+Память проекта сгенерирована `codebase-memory` 2026-07-10. Для первичной ориентации сначала используй:
 
 - `.claude/rules/architecture.md` — карта папок, entry points, data flow
 - `.claude/rules/stack.md` — стек, версии, команды
@@ -12,33 +12,32 @@
 - `.claude/rules/conventions.md` — naming, patterns, testing
 - `.claude/rules/gotchas.md` — quirks, workarounds, do-not-touch
 - `.claude/rules/changelog.md` — что менялось и когда
+- `CONVENTIONS.md` — сгенерированные project conventions для инструментов без Claude Memory
 
-Если память выглядит устаревшей, проверяй исходники и обновляй память через `codebase-memory.cmd update .`.
+Если память выглядит устаревшей, проверяй исходники и обновляй её:
+
+```powershell
+$env:HOME=$HOME; codebase-memory.cmd update .
+```
+
+PowerShell может блокировать `codebase-memory.ps1`, поэтому на Windows используй `codebase-memory.cmd`.
 
 ## ЖЕЛЕЗНОЕ ПРАВИЛО: после правки кода раннеров — рестарт демона
 
 Хостовые демоны (`host-runner`, `programmer-runner`, `codex-runner`,
 `claude-reasoning-runner`) — долгоживущие node-процессы. Правка их кода
-(включая `pipeline-runner/src`, который импортирует host-runner) **не подхватывается
-сама** — процесс продолжает крутить старый код. Это дважды приводило к инцидентам
-(05.07 — заглушка-самотесты; 08.07 — GI без авто-stash уронил 8 задач в BLOCKED).
+(включая `pipeline-runner/src`, который импортирует host-runner) не подхватывается
+сама — процесс продолжает крутить старый код.
 
-После ЛЮБОЙ правки/коммита/вливания кода раннера:
+После любой правки/коммита/вливания кода раннера:
 
 ```powershell
-powershell -File scripts/start-runners.ps1 -Restart -Only host-runner   # или другой демон
+powershell -File scripts/start-runners.ps1 -Restart -Only host-runner
 ```
 
 Проверка на подозрение «крутится старьё»: сравни `CreationDate` процесса
 (`Get-CimInstance Win32_Process -Filter "Name='node.exe'"`) с датой последней
-правки исходников — процесс старше кода означает устаревший демон.
-
-Автоматика (RUNNER-FRESHNESS-001), которая это подстраховывает, но не отменяет правило:
-- `scripts/ensure-fresh-runners.ps1` — вотчдог: демон старше кода → точечный рестарт;
-- Scheduled Task `ai-dev-manager runner freshness` — вотчдог каждые 10 минут
-  (регистрация: `scripts/register-freshness-watchdog.ps1`);
-- git-хуки `post-commit`/`post-merge` — зовут вотчдог сразу после коммита/pull,
-  тронувшего каталоги раннеров (hooksPath = `scripts/git-hooks`).
+правки исходников.
 
 ## Прочее важное
 
@@ -47,8 +46,6 @@ powershell -File scripts/start-runners.ps1 -Restart -Only host-runner   # или
 - Авто-доставка в k3s (TASK-AUTODEPLOY-K3S-001): Git Integrator после вливания дельты
   читает карту `deploy/autodeploy.json` целевого репозитория и сам делает
   build → push → rollout; провал доставки = провал роли (`autodeploy_failed`).
-  Повторный прогон GI по уже влитой дельте — штатный ретрай доставки
-  (`already_integrated_content`), не ошибка.
 - Консоль Windows калечит кириллицу в выводе node/psql: результаты запросов писать
   в файл и читать Read'ом; к БД ходить Node+`pg` из `orchestrator-service/backend`
   (host 127.0.0.1:5432, haproxy).

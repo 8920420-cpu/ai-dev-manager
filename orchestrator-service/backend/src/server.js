@@ -92,6 +92,12 @@ import {
   deleteMcpRole,
 } from './mcpRoles.js';
 import {
+  listCodebaseMemoryDocuments,
+  getCodebaseMemoryDocument,
+  upsertCodebaseMemoryDocument,
+  syncCodebaseMemoryDocuments,
+} from './codebaseMemory.js';
+import {
   listFields,
   createField,
   updateField,
@@ -249,6 +255,12 @@ function matchProjectRoute(pathname) {
   const m = pathname.match(/^\/api\/projects\/([^/]+)(?:\/(task-statistics|status|scanner|route-health))?$/);
   if (!m) return null;
   return { id: decodeURIComponent(m[1]), kind: m[2] || 'item' };
+}
+
+function matchCodebaseMemoryRoute(pathname) {
+  const m = pathname.match(/^\/api\/projects\/([^/]+)\/codebase-memory(?:\/([^/]+))?$/);
+  if (!m) return null;
+  return { projectId: decodeURIComponent(m[1]), key: m[2] ? decodeURIComponent(m[2]) : null };
 }
 
 // Разбор путей /api/database-connections[/:id[/test]] — единая модель подключений.
@@ -434,6 +446,46 @@ export function createApp() {
 
         if (req.method === 'GET' && p === '/api/tasks/events') {
           return openTaskEventsStream(req, res);
+        }
+
+        // CODEBASE-MEMORY-PG-001: Postgres-backed mirror of generated memory files.
+        const codebaseMemoryRoute = matchCodebaseMemoryRoute(p);
+        if (codebaseMemoryRoute) {
+          if (req.method === 'GET') {
+            if (codebaseMemoryRoute.key) {
+              return sendJson(
+                res,
+                200,
+                await getCodebaseMemoryDocument(await loadSettings(), codebaseMemoryRoute.projectId, codebaseMemoryRoute.key),
+              );
+            }
+            return sendJson(
+              res,
+              200,
+              await listCodebaseMemoryDocuments(await loadSettings(), codebaseMemoryRoute.projectId, {
+                includeContent: url.searchParams.get('includeContent') === '1',
+              }),
+            );
+          }
+          if (req.method === 'PUT' && codebaseMemoryRoute.key) {
+            return sendJson(
+              res,
+              200,
+              await upsertCodebaseMemoryDocument(await loadSettings(), codebaseMemoryRoute.projectId, {
+                ...(await readBody(req)),
+                key: codebaseMemoryRoute.key,
+              }),
+            );
+          }
+          if (req.method === 'POST' && !codebaseMemoryRoute.key) {
+            const body = await readBody(req);
+            return sendJson(
+              res,
+              200,
+              await syncCodebaseMemoryDocuments(await loadSettings(), codebaseMemoryRoute.projectId, body.documents),
+            );
+          }
+          return sendJson(res, 405, { error: 'method_not_allowed' });
         }
 
         // Рантайм-настройки приложения (APP-SETTINGS-001): параллельность runner и пр.

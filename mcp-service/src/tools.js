@@ -150,6 +150,53 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
   );
 
   tool(
+    'orchestrator_list_codebase_memory',
+    {
+      title: 'Codebase Memory index',
+      description:
+        'GET /api/projects/:id/codebase-memory. List generated Codebase Memory documents saved for a project. ' +
+        'Use this before role work to pick the relevant memory documents.',
+      inputSchema: {
+        projectId: z.string().describe('Project UUID, code, root_path, or name.'),
+        includeContent: z.boolean().optional().describe('Set true only when the full memory text is needed.'),
+      },
+    },
+    ({ projectId, includeContent }) =>
+      run(() =>
+        orchestratorClient.get(`/api/projects/${encodeURIComponent(projectId)}/codebase-memory`, {
+          query: { includeContent: includeContent ? 1 : undefined },
+        }),
+      ),
+  );
+
+  tool(
+    'orchestrator_get_codebase_memory',
+    {
+      title: 'Codebase Memory document',
+      description:
+        'GET /api/projects/:id/codebase-memory/:key. Read one saved Codebase Memory document for a project, ' +
+        'for example architecture, stack, modules, models, api, conventions, gotchas, or changelog.',
+      inputSchema: {
+        projectId: z.string().describe('Project UUID, code, root_path, or name.'),
+        key: z.enum([
+          'claude',
+          'architecture',
+          'stack',
+          'modules',
+          'models',
+          'api',
+          'conventions',
+          'gotchas',
+          'changelog',
+          'conventions_doc',
+        ]),
+      },
+    },
+    ({ projectId, key }) =>
+      run(() => orchestratorClient.get(`/api/projects/${encodeURIComponent(projectId)}/codebase-memory/${encodeURIComponent(key)}`)),
+  );
+
+  tool(
     'orchestrator_get_project_stages',
     {
       title: 'Этапы проекта',
