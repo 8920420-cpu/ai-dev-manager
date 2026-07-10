@@ -7,6 +7,7 @@ import { ProgrammerRunner } from '../src/ProgrammerRunner.js';
 import { makeClaudeRunAgent } from '../src/claudeAgent.js';
 import { ensureClaudeToken } from '../src/loadToken.js';
 import { resolveDuration, logEffectiveConfig } from '../src/envConfig.js';
+import { beat } from '../../shared/heartbeat.js';
 
 const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');
 const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
@@ -129,6 +130,7 @@ async function refreshConcurrency() {
 // claim берёт строку FOR UPDATE SKIP LOCKED, двойной выдачи не будет.
 async function worker(id) {
   while (!stopping) {
+    beat(); // RUNNER-HEARTBEAT-001: отметка живости для вотчдога свежести
     let out;
     try {
       out = await runner.tick();

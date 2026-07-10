@@ -8,6 +8,7 @@ import { HostRunner } from '../src/HostRunner.js';
 import { runPipelineAction, runGitAction } from '../src/actions.js';
 import { pickFolder } from '../src/folderPicker.js';
 import { setupClaudeToken } from '../src/claudeToken.js';
+import { beat } from '../../shared/heartbeat.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -149,6 +150,7 @@ console.log('host-runner: roles PIPELINE_SERVICE, GIT_INTEGRATOR');
 let stopping = false;
 async function loop() {
   while (!stopping) {
+    beat(); // RUNNER-HEARTBEAT-001: отметка живости для вотчдога свежести
     try {
       // Fire-and-forget: роли опрашиваются независимо, tick не ждёт долгих
       // действий. Логирование завершений — в асинхронном пути pollRole

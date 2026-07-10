@@ -11,6 +11,7 @@ import { ReasoningRunner } from '../src/ReasoningRunner.js';
 import { makeClaudeReasoningRunAgent } from '../src/claudeReasoningAgent.js';
 import { ensureClaudeToken } from '../src/loadToken.js';
 import { resolveDuration, resolveInt, logEffectiveConfig } from '../src/envConfig.js';
+import { beat } from '../../shared/heartbeat.js';
 
 const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');
 const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
@@ -95,6 +96,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function worker(id) {
   while (!stopping) {
+    beat(); // RUNNER-HEARTBEAT-001: отметка живости для вотчдога свежести
     let out;
     try {
       out = await runner.tick();

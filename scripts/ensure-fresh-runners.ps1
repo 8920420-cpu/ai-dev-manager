@@ -24,12 +24,22 @@ $LogFile  = Join-Path $RepoRoot 'logs\runner-freshness.log'
 # Демон → { Leaf: подстрока командной строки; Watch: каталоги исходников,
 # правка которых требует рестарта }. host-runner дополнительно тянет код
 # pipeline-runner (import из ../../pipeline-runner/src) — он тоже в Watch.
+# Watch включает 'shared' у всех: раннеры импортируют shared/*.js (heartbeat,
+# repoWorktreeLock, httpAuth) — правка общего модуля тоже требует их рестарта.
 $Runners = @(
-  @{ Name = 'host-runner';             Leaf = 'host-runner.js';             Watch = @('host-runner\bin', 'host-runner\src', 'pipeline-runner\src') }
-  @{ Name = 'programmer-runner';       Leaf = 'programmer-runner.js';       Watch = @('programmer-runner\bin', 'programmer-runner\src') }
-  @{ Name = 'codex-runner';            Leaf = 'codex-runner.js';            Watch = @('codex-runner\bin', 'codex-runner\src') }
-  @{ Name = 'claude-reasoning-runner'; Leaf = 'claude-reasoning-runner.js'; Watch = @('programmer-runner\bin', 'programmer-runner\src') }
+  @{ Name = 'host-runner';             Leaf = 'host-runner.js';             Watch = @('host-runner\bin', 'host-runner\src', 'pipeline-runner\src', 'shared') }
+  @{ Name = 'programmer-runner';       Leaf = 'programmer-runner.js';       Watch = @('programmer-runner\bin', 'programmer-runner\src', 'shared') }
+  @{ Name = 'codex-runner';            Leaf = 'codex-runner.js';            Watch = @('codex-runner\bin', 'codex-runner\src', 'shared') }
+  @{ Name = 'claude-reasoning-runner'; Leaf = 'claude-reasoning-runner.js'; Watch = @('programmer-runner\bin', 'programmer-runner\src', 'shared') }
 )
+
+# RUNNER-HEARTBEAT-001: порог «застывшего» heartbeat в минутах. ДОЛЖЕН превышать самый
+# долгий ЛЕГИТИМНЫЙ таймаут одной задачи (Architect — 20 мин), иначе раннер, занятый
+# долгой задачей, получит ложный рестарт. Дефолт 30 мин; поднять — env
+# RUNNER_HEARTBEAT_STALE_MIN. Проверка применяется, только если heartbeat-файл есть
+# (старый раннер без heartbeat его не пишет — тогда полагаемся на «не запущен»/«старше
+# кода», без ложных срабатываний).
+$HeartbeatStaleMinutes = if ($env:RUNNER_HEARTBEAT_STALE_MIN) { [int]$env:RUNNER_HEARTBEAT_STALE_MIN } else { 30 }
 
 function Write-Log([string]$Message) {
   $line = "{0} {1}" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
@@ -74,6 +84,20 @@ foreach ($r in $Runners) {
     Write-Log ("{0}: устарел (процесс {1:yyyy-MM-dd HH:mm:ss} < код {2:yyyy-MM-dd HH:mm:ss}) — перезапускаю" -f $r.Name, $started, $newest)
     & powershell -NoProfile -ExecutionPolicy Bypass -File $Starter -Restart -Only $r.Name | Out-Null
     $restarted += $r.Name
+    continue
+  }
+
+  # RUNNER-HEARTBEAT-001: процесс жив и код свежий, но heartbeat застыл дольше порога →
+  # «живой, но завис» (рабочий цикл не двигается — напр. claim навсегда повис). Точечный
+  # рестарт. Проверяем только при наличии файла: старый раннер без heartbeat его не пишет.
+  $hbFile = Join-Path $RepoRoot ("logs\{0}.heartbeat" -f $r.Name)
+  if (Test-Path $hbFile) {
+    $hbAgeMin = ((Get-Date) - (Get-Item $hbFile).LastWriteTime).TotalMinutes
+    if ($hbAgeMin -gt $HeartbeatStaleMinutes) {
+      Write-Log ("{0}: завис (heartbeat застыл {1:N0} мин > порога {2} мин, процесс жив) — перезапускаю" -f $r.Name, $hbAgeMin, $HeartbeatStaleMinutes)
+      & powershell -NoProfile -ExecutionPolicy Bypass -File $Starter -Restart -Only $r.Name | Out-Null
+      $restarted += $r.Name
+    }
   }
 }
 

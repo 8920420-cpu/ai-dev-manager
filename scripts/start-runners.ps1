@@ -156,6 +156,16 @@ function Start-Runner([string]$Name, [string]$WorkDir, [string]$ScriptRel) {
     }
   }
   $log = Join-Path $LogDir "$Name.log"
+  # RUNNER-HEARTBEAT-001: путь liveness-файла демона. Раннер пишет в него на каждой
+  # итерации своего цикла (shared/heartbeat.js), а вотчдог свежести
+  # (ensure-fresh-runners.ps1) точечно рестартит демон, если файл застыл дольше порога
+  # ПРИ ЖИВОМ процессе («живой, но завис»). Start-Process наследует окружение родителя,
+  # поэтому ставим переменную прямо перед запуском.
+  $heartbeat = Join-Path $LogDir "$Name.heartbeat"
+  $env:RUNNER_HEARTBEAT_FILE = $heartbeat
+  # Свежая метка на старте: у нового процесса есть полный порог до первого beat (иначе
+  # застывший файл прежнего инстанса мог бы вызвать ложный рестарт в окне запуска).
+  try { [System.IO.File]::WriteAllText($heartbeat, [string]([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds())) } catch {}
   $proc = Start-Process -FilePath $Node.Source `
     -ArgumentList @($ScriptRel) `
     -WorkingDirectory $WorkDir `
