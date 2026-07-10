@@ -1,0 +1,25 @@
+{
+  "name": "<SERVICE_CODE>",
+  "workingDirectory": ".",
+  "timeoutMinutes": 15,
+  "stages": {
+    "build": {
+      "enabled": true,
+      "commands": [
+        "<команда сборки>"
+      ]
+    },
+    "deploy": {
+      "enabled": false,
+      "commands": [
+        "<команда деплоя>"
+      ]
+    },
+    "smoke": {
+      "enabled": false,
+      "commands": [
+        "<команда smoke-проверки>"
+      ]
+    }
+  }
+}

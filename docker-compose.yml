@@ -1,0 +1,174 @@
+services:
+  orchestrator-service:
+    build:
+      # Контекст — корень репозитория: образ собирает React-фронтенд из src/
+      # и кладёт его в backend (см. orchestrator-service/Dockerfile).
+      context: .
+      dockerfile: orchestrator-service/Dockerfile
+      args:
+        # VERSION-KPI-TRACKING-001: git-SHA сборки → авто-метка деплоя на старте
+        # (kpi_markers type=deploy). scripts/deploy.ps1 проставляет APP_CODE_VERSION сам.
+        APP_CODE_VERSION: "${APP_CODE_VERSION:-}"
+    image: orchestrator-service:latest
+    container_name: orchestrator-service
+    ports:
+      - "4186:80"
+    environment:
+      # Общая точка входа в БД. По умолчанию — Postgres на shared-network
+      # (infra-postgres-1:5432). Если в окружении есть PgBouncer -> HAProxy ->
+      # Patroni leader, переопределите PGHOST/PGPORT через .env (pgbouncer:6432).
+      PGHOST: "${PGHOST:-infra-postgres-1}"
+      PGPORT: "${PGPORT:-5432}"
+      PGUSER: "${PGUSER:-postgres}"
+      # Не храните секреты в репозитории: задайте PGPASSWORD в .env или окружении.
+      PGPASSWORD: "${PGPASSWORD:-postgres}"
+      PGDATABASE: orchestrator_db
+      AUTO_INIT: "true"
+      # Фоновый runner продвигает автоматические роли по БД (false — выключить).
+      RUNNER_ENABLED: "true"
+      RUNNER_INTERVAL_MS: "3000"
+      # Таймаут захвата РАССУЖДАЮЩЕЙ роли: прогон без завершения дольше порога →
+      # TIMEOUT, слот свободен. CONFIG-AUDIT-001: дефолт ВЫРОВНЕН до 10 мин (600000)
+      # с db.js и .env — прежде здесь было 3 мин (180000), а в db.js 15 мин: один
+      # параметр имел три разных дефолта, и эффективное значение зависело от способа
+      # запуска. Почему именно 10 мин: рассуждающие роли Architect/Decomposer переведены
+      # на Claude Code (агентный tool-loop: ~21с холодный старт + многоходовое чтение)
+      # и в прежние 3 мин не влезали → agent_aborted по кругу. КОНТРАКТ: значение должно
+      # быть БОЛЬШЕ hard-timeout раннеров (start-runners.ps1 = 540000 ≈ 9 мин), иначе
+      # реапер освободит захват раньше раннера. Ложные TIMEOUT от скачков часов Docker-VM
+      # гасит clockGuard (см. patroni-single-node-flapping, clock-guard-timeout-skew).
+      # ВНИМАНИЕ: программист НЕ наследует это значение — см. RUNNER_CLAUDE_TIMEOUT_MS.
+      RUNNER_ROLE_TIMEOUT_MS: "${RUNNER_ROLE_TIMEOUT_MS:-600000}"
+      # Таймаут захвата ПРОГРАММИСТА (claude_programmer/CODING) — отдельно от
+      # рассуждающих ролей: CODING идёт 10–20 мин, поэтому НЕ наследует короткий
+      # RUNNER_ROLE_TIMEOUT_MS (иначе claude-захват реапится посреди написания кода).
+      RUNNER_CLAUDE_TIMEOUT_MS: "${RUNNER_CLAUDE_TIMEOUT_MS:-1500000}"
+      # Орфан-таймаут HOST-ролей (PIPELINE_SERVICE/GIT_INTEGRATOR) — отдельно от
+      # рассуждающих: docker compose build / коммит идут дольше ROLE_TIMEOUT_MS, и
+      # если host-runner умер посреди сборки, release-host-task не приходит. КОНТРАКТ:
+      # дефолт совпадает с db.js/.env (2400000 ≈ 40 мин) и БОЛЬШЕ RUNNER_ROLE_TIMEOUT_MS,
+      # иначе живой прогон срежется посреди build. См. CONFIG_AUDIT.md.
+      RUNNER_HOST_TIMEOUT_MS: "${RUNNER_HOST_TIMEOUT_MS:-2400000}"
+      # Задайте токен, чтобы закрыть /api/* при сетевом доступе (пусто = выключено).
+      ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      # Микросервис инструментов (builtin-чтение проекта + MCP для Claude Code).
+      TOOLS_SERVICE_URL: "http://tools-service:4188"
+      # PROJECT-PATH-MAP-001: трансляция host root_path → путь внутри tools-service.
+      # root_path в БД — путь хоста (Windows), а tools-service монтирует родитель
+      # проектов в /projects. Префикс берём из PROJECTS_HOST_ROOT (.env).
+      TOOLS_PROJECT_PATH_MAP: "${PROJECTS_HOST_ROOT:-F:\\git}=>/projects"
+      # Задачи ставит Codex чётко → роли не тратят много токенов на вывод.
+      # Меньше max_tokens = быстрее генерация и ниже нагрузка на провайдера.
+      CONNECTOR_LLM_MAX_TOKENS: "${CONNECTOR_LLM_MAX_TOKENS:-2048}"
+      # CONNECTOR-LIMITER-001: глобальный адаптивный лимитер вызовов DeepSeek.
+      # Старт с 6 одновременных, нащупывает потолок (AIMD) до MAX, при троттлинге
+      # откатывается до MIN. TPM_BUDGET>0 включает мягкий гейт по токенам/мин.
+      CONNECTOR_LIMIT_START: "${CONNECTOR_LIMIT_START:-6}"
+      CONNECTOR_LIMIT_MIN: "${CONNECTOR_LIMIT_MIN:-2}"
+      CONNECTOR_LIMIT_MAX: "${CONNECTOR_LIMIT_MAX:-32}"
+      CONNECTOR_LIMIT_PROBE_AFTER: "${CONNECTOR_LIMIT_PROBE_AFTER:-15}"
+      CONNECTOR_TPM_BUDGET: "${CONNECTOR_TPM_BUDGET:-0}"
+      CONNECTOR_RETRY_MAX: "${CONNECTOR_RETRY_MAX:-1}"
+    networks:
+      - default
+      - shared-network
+    restart: unless-stopped
+    healthcheck:
+      # 127.0.0.1, а не localhost: в alpine localhost резолвится в IPv6 ::1,
+      # а сервер слушает IPv4 0.0.0.0 — иначе healthcheck даёт Connection refused.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  tools-service:
+    build:
+      context: .
+      dockerfile: tools-service/Dockerfile
+    image: tools-service:latest
+    container_name: tools-service
+    ports:
+      # Публикуем 4188 ТОЛЬКО на loopback хоста (127.0.0.1): локальный MCP-клиент
+      # (Claude Code/VS Code через .mcp.json) обращается к builtin-инструментам, а
+      # внешняя сеть к ним не достучится. /execute умеет читать/писать/удалять файлы,
+      # поэтому наружу порт открывать опасно. Чтобы открыть для LAN — переопределите
+      # TOOLS_BIND_HOST=0.0.0.0 в .env (явный opt-in) и обязательно задайте
+      # ORCHESTRATOR_API_TOKEN + TOOLS_ALLOWED_ROOTS.
+      - "${TOOLS_BIND_HOST:-127.0.0.1}:4188:4188"
+    environment:
+      TOOLS_SERVICE_PORT: "4188"
+      ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      # SECURITY: allowlist серверных корней. /execute принимает root от клиента —
+      # без allowlist любой root в смонтированных томах доступен на чтение/запись.
+      # Список разделяется ':' (как PATH); пусто = allowlist выключен (только dev).
+      TOOLS_ALLOWED_ROOTS: "${TOOLS_ALLOWED_ROOTS:-/projects:/app/ai-dev-manager}"
+    volumes:
+      # Корни проектов для builtin-инструментов. Проект ai-dev-manager имеет
+      # root_path "ai-dev-manager" → внутри контейнера он резолвится в
+      # /app/ai-dev-manager (WORKDIR /app). rw — чтобы работали write/edit/delete
+      # (для read-only ролей запись недоступна по уровню доступа).
+      - ./:/app/ai-dev-manager:rw
+      # PROJECT-PATH-MAP-001: родитель ВСЕХ проектов (PS, ai-dev-manager, …) на
+      # /projects. Оркестратор транслирует host root_path в этот путь (см.
+      # TOOLS_PROJECT_PATH_MAP), иначе роли не могут читать чужие проекты и валят
+      # задачу в BLOCKED. «../» от каталога compose = родитель репозитория.
+      - ../:/projects:rw
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4188/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+  mcp-service:
+    build:
+      context: ./mcp-service
+      dockerfile: Dockerfile
+    image: mcp-service:latest
+    container_name: mcp-service
+    ports:
+      # HTTP/SSE-режим MCP: health на /health и Streamable MCP на /mcp.
+      # Публикуем ТОЛЬКО на loopback хоста: /mcp даёт инструменты записи/удаления
+      # файлов и мутаций оркестратора. Для LAN — opt-in MCP_BIND_HOST=0.0.0.0 в .env
+      # вместе с непустым ORCHESTRATOR_API_TOKEN (вход на /mcp проверяет токен).
+      - "${MCP_BIND_HOST:-127.0.0.1}:4190:4190"
+    environment:
+      MCP_SERVICE_PORT: "4190"
+      # PROJECT_ROOT — это корень, который mcp-service ПЕРЕДАЁТ в tools-service как
+      # `root`; tools-service резолвит его в своём контейнере (mount ./:/app/ai-dev-manager).
+      # Поэтому путь должен совпадать с тем, что видит tools-service, а не mcp-service.
+      PROJECT_ROOT: "/app/ai-dev-manager"
+      # orchestrator-service внутри сети слушает порт 80 (ports 4186:80).
+      ORCHESTRATOR_URL: "http://orchestrator-service"
+      TOOLS_SERVICE_URL: "http://tools-service:4188"
+      ORCHESTRATOR_API_TOKEN: "${ORCHESTRATOR_API_TOKEN:-}"
+      # SECURITY: мутации (запись/удаление файлов, мутации оркестратора) выключены
+      # по умолчанию. Включайте осознанно в .env (MCP_ENABLE_WRITE=1 и т.д.) — и
+      # только вместе с непустым ORCHESTRATOR_API_TOKEN, иначе публичный /mcp
+      # получит инструменты записи/удаления без авторизации.
+      MCP_ENABLE_WRITE: "${MCP_ENABLE_WRITE:-0}"
+      MCP_ENABLE_DELETE: "${MCP_ENABLE_DELETE:-0}"
+      MCP_ENABLE_ORCHESTRATOR_MUTATIONS: "${MCP_ENABLE_ORCHESTRATOR_MUTATIONS:-0}"
+    volumes:
+      # Зарезервировано на будущее (прямой доступ к файлам). Сейчас файловые
+      # операции выполняет tools-service; путь совпадает с его mount.
+      - ./:/app/ai-dev-manager:ro
+    depends_on:
+      orchestrator-service:
+        condition: service_healthy
+      tools-service:
+        condition: service_started
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4190/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  shared-network:
+    name: shared-network
+    external: true

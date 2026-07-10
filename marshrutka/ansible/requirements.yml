@@ -1,0 +1,5 @@
+# Semaphore ставит коллекции из этого файла автоматически перед запуском задач
+collections:
+  - name: community.routeros
+  - name: ansible.netcommon
+  - name: ansible.utils

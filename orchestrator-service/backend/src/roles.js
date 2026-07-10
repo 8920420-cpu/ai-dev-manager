@@ -1,0 +1,635 @@
+// ROLE-CONFIGURATION-001 (ORCHESTRATOR-P1.5) — серверная карточка роли.
+//
+// Расширяет модель роли полями description, prompt, skills и hidden и даёт:
+//   * CRUD-чтение/обновление карточки роли (GET/PUT /api/roles[/:code]);
+//   * список доступных skill-файлов (GET /api/skills) строго внутри
+//     настроенного каталога skills (path traversal запрещён);
+//   * сборку рабочего system-промта роли = prompt (из БД) + содержимое
+//     подключённых skills в зафиксированном порядке.
+//
+// Идентичность роли — её `code`. hidden — глобальная настройка роли (не удаляет
+// роль из этапов). Пропуск скрытых ролей в маршруте реализован в db.js на основе
+// чистого fastForwardHiddenRoles из rolePipeline.js.
+import { readFile, readdir, writeFile, mkdir } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { dirname, resolve, join, relative, sep, extname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { withClient, clientConfig } from './db.js';
+
+const __dirname = dirname(fileURLToPath(import.meta.url));
+
+// Каталог доступных skill-файлов. По умолчанию — skills/ в корне репозитория
+// (в Docker — /app/skills через ENV). Отсутствие каталога не ошибка: список пуст.
+export const SKILLS_DIR =
+  process.env.ORCHESTRATOR_SKILLS_DIR || resolve(__dirname, '../../../skills');
+
+// Разрешённые расширения skill-файлов.
+const SKILL_EXTENSIONS = new Set(['.md', '.txt']);
+
+// Лимиты полей карточки роли (защита от раздувания и мусора).
+export const ROLE_FIELD_LIMITS = {
+  description: 2000,
+  prompt: 100000,
+  skillPath: 512,
+  skillsCount: 50,
+};
+
+// Предел размера содержимого skill-файла, загружаемого с ПК (символы).
+export const SKILL_UPLOAD_LIMIT = 500000;
+
+function httpError(statusCode, message, extra) {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  error.code = message;
+  if (extra) Object.assign(error, extra);
+  return error;
+}
+
+// --- Чистые функции (без БД и сети) — покрыты юнит-тестами -------------------
+
+/**
+ * Привести относительный skill-путь к каноническому виду с прямыми слэшами.
+ * Возвращает '' для пустого/недопустимого значения.
+ */
+export function canonicalSkillId(rawPath) {
+  const raw = String(rawPath ?? '').trim().replace(/\\/g, '/');
+  if (!raw) return '';
+  // Срезаем ведущие './' и слэши; '..' недопустим (см. isSkillPathAllowed).
+  return raw.replace(/^\.\//, '').replace(/^\/+/, '');
+}
+
+/**
+ * Безопасен ли skill-путь: относительный, без выхода за каталог skills, с
+ * разрешённым расширением. Не обращается к ФС (проверка существования — отдельно).
+ */
+export function isSkillPathAllowed(rawPath) {
+  const id = canonicalSkillId(rawPath);
+  if (!id) return false;
+  if (id.length > ROLE_FIELD_LIMITS.skillPath) return false;
+  if (id.includes('\0')) return false;
+  // Запрет абсолютных путей и traversal.
+  if (/^[a-zA-Z]:/.test(id) || id.startsWith('/')) return false;
+  const segments = id.split('/');
+  if (segments.some((s) => s === '..' || s === '')) return false;
+  if (!SKILL_EXTENSIONS.has(extname(id).toLowerCase())) return false;
+  return true;
+}
+
+/**
+ * Абсолютный путь к skill внутри SKILLS_DIR или null, если путь недопустим/
+ * выходит за каталог. dir переопределяется в тестах.
+ */
+export function resolveSkillPath(rawPath, { dir = SKILLS_DIR } = {}) {
+  if (!isSkillPathAllowed(rawPath)) return null;
+  const id = canonicalSkillId(rawPath);
+  const abs = resolve(dir, id);
+  const base = resolve(dir);
+  // Должен лежать строго внутри каталога skills.
+  if (abs !== base && !abs.startsWith(base + sep)) return null;
+  return abs;
+}
+
+/**
+ * Зафиксированный порядок объединения промта роли и подключённых skills:
+ * сначала базовый промт роли, затем каждый skill в порядке position, каждый —
+ * под заголовком-разделителем со своим стабильным идентификатором.
+ * skills: [{ path, content }]. Возвращает единый текст system-промта.
+ */
+export function mergePromptAndSkills(basePrompt, skills = []) {
+  const parts = [String(basePrompt ?? '').trim()];
+  for (const skill of skills) {
+    const id = canonicalSkillId(skill?.path);
+    const content = String(skill?.content ?? '').trim();
+    if (!content) continue;
+    parts.push(`\n\n# Skill: ${id}\n\n${content}`);
+  }
+  return parts.filter((p) => p && p.trim() !== '').join('').trim();
+}
+
+/**
+ * ЧИСТАЯ валидация + нормализация PUT-обновления карточки роли.
+ * Вход (частичный): { description, prompt, hidden, skills:[path|{path}] }.
+ * validSkillPaths — Set допустимых id (из listAvailableSkills) либо null
+ * (тогда проверяется только формат пути). Бросает httpError(422,...).
+ * Возвращает нормализованный patch только с переданными полями.
+ */
+export function normalizeRoleUpdate(input, { validSkillPaths = null } = {}) {
+  const patch = {};
+  if (input == null || typeof input !== 'object') {
+    throw httpError(422, 'role_update_invalid_body');
+  }
+
+  if ('description' in input) {
+    const description = input.description == null ? '' : String(input.description);
+    if (description.length > ROLE_FIELD_LIMITS.description) {
+      throw httpError(422, 'role_description_too_long');
+    }
+    patch.description = description;
+  }
+
+  if ('prompt' in input) {
+    const prompt = input.prompt == null ? '' : String(input.prompt);
+    if (prompt.length > ROLE_FIELD_LIMITS.prompt) {
+      throw httpError(422, 'role_prompt_too_long');
+    }
+    // Пустой промт сохраняем как NULL → файловый fallback.
+    patch.prompt = prompt.trim() === '' ? null : prompt;
+  }
+
+  if ('hidden' in input) {
+    if (typeof input.hidden !== 'boolean') throw httpError(422, 'role_hidden_must_be_boolean');
+    patch.hidden = input.hidden;
+  }
+
+  if ('groupId' in input) {
+    // null / '' → открепить от группы («Прочее»). Иначе — uuid группы (наличие
+    // проверяется в updateRole перед записью).
+    if (input.groupId === null || input.groupId === '') {
+      patch.groupId = null;
+    } else if (typeof input.groupId === 'string' && input.groupId.trim()) {
+      patch.groupId = input.groupId.trim();
+    } else {
+      throw httpError(422, 'role_group_invalid');
+    }
+  }
+
+  if ('skills' in input) {
+    const list = Array.isArray(input.skills) ? input.skills : null;
+    if (!list) throw httpError(422, 'role_skills_must_be_array');
+    const seen = new Set();
+    const skills = [];
+    for (const item of list) {
+      const id = canonicalSkillId(typeof item === 'string' ? item : item?.path);
+      if (!id) throw httpError(422, 'role_skill_invalid_path');
+      if (!isSkillPathAllowed(id)) throw httpError(422, 'role_skill_invalid_path', { skill: id });
+      if (validSkillPaths && !validSkillPaths.has(id)) {
+        throw httpError(422, 'role_skill_unknown', { skill: id });
+      }
+      if (seen.has(id)) throw httpError(422, 'role_skill_duplicate', { skill: id });
+      seen.add(id);
+      skills.push(id);
+    }
+    if (skills.length > ROLE_FIELD_LIMITS.skillsCount) {
+      throw httpError(422, 'role_skills_too_many');
+    }
+    patch.skills = skills;
+  }
+
+  return patch;
+}
+
+// --- Доступ к ФС: список skills ---------------------------------------------
+
+/**
+ * Рекурсивный список доступных skill-файлов внутри SKILLS_DIR.
+ * Возвращает [{ id, name }] со стабильными относительными id (POSIX-слэши).
+ * Если каталог не существует — пустой список (не ошибка).
+ */
+export async function listAvailableSkills({ dir = SKILLS_DIR } = {}) {
+  const base = resolve(dir);
+  if (!existsSync(base)) return { skills: [] };
+  const out = [];
+  async function walk(current) {
+    const entries = await readdir(current, { withFileTypes: true });
+    for (const entry of entries) {
+      if (entry.name.startsWith('.')) continue;
+      const full = join(current, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile() && SKILL_EXTENSIONS.has(extname(entry.name).toLowerCase())) {
+        const id = relative(base, full).split(sep).join('/');
+        out.push({ id, name: entry.name });
+      }
+    }
+  }
+  await walk(base);
+  out.sort((a, b) => a.id.localeCompare(b.id));
+  return { skills: out };
+}
+
+/**
+ * ЧИСТАЯ валидация загрузки skill-файла с ПК пользователя.
+ * Вход: { name, content }. Имя приводится к одному файлу (без каталогов и
+ * traversal), расширение — только из SKILL_EXTENSIONS, содержимое непустое и в
+ * пределах SKILL_UPLOAD_LIMIT. Возвращает { name, content }; бросает httpError(422).
+ */
+export function normalizeSkillUpload(input) {
+  if (input == null || typeof input !== 'object') throw httpError(422, 'skill_upload_invalid_body');
+  const rawName = String(input.name ?? '').trim().replace(/\\/g, '/');
+  // Только базовое имя файла — каталоги и '..' отбрасываем.
+  const name = rawName.includes('/') ? rawName.slice(rawName.lastIndexOf('/') + 1) : rawName;
+  if (!name || name.startsWith('.')) throw httpError(422, 'skill_name_invalid');
+  if (name.length > ROLE_FIELD_LIMITS.skillPath) throw httpError(422, 'skill_name_too_long');
+  if (name.includes('\0') || /[<>:"|?*]/.test(name)) throw httpError(422, 'skill_name_invalid');
+  if (!SKILL_EXTENSIONS.has(extname(name).toLowerCase())) throw httpError(422, 'skill_extension_invalid');
+  const content = input.content == null ? '' : String(input.content);
+  if (content.trim() === '') throw httpError(422, 'skill_content_empty');
+  if (content.length > SKILL_UPLOAD_LIMIT) throw httpError(422, 'skill_content_too_long');
+  return { name, content };
+}
+
+/**
+ * POST /api/skills — записать загруженный с ПК skill-файл в каталог skills и
+ * вернуть его стабильный id (как в listAvailableSkills). Файл с тем же именем
+ * перезаписывается (обновление содержимого). Каталог создаётся при отсутствии.
+ * Путь строго внутри SKILLS_DIR (без traversal). dir переопределяется в тестах.
+ */
+export async function uploadSkill(input, { dir = SKILLS_DIR } = {}) {
+  const { name, content } = normalizeSkillUpload(input);
+  const base = resolve(dir);
+  const abs = resolve(base, name);
+  if (abs !== base && !abs.startsWith(base + sep)) throw httpError(422, 'skill_name_invalid');
+  await mkdir(base, { recursive: true });
+  await writeFile(abs, content, 'utf8');
+  const id = relative(base, abs).split(sep).join('/');
+  return { id, name };
+}
+
+// Безопасное чтение содержимого skill по id (для сборки промта). Недопустимый/
+// несуществующий путь → null (пропускаем, не валим сборку роли).
+async function readSkillContent(id, { dir = SKILLS_DIR } = {}) {
+  const abs = resolveSkillPath(id, { dir });
+  if (!abs || !existsSync(abs)) return null;
+  try {
+    return await readFile(abs, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+// --- DB: карточки ролей ------------------------------------------------------
+
+function mapRoleCard(row, skills) {
+  return {
+    code: row.code,
+    name: row.name,
+    description: row.description ?? '',
+    prompt: row.prompt ?? '',
+    hidden: row.hidden === true,
+    // Смысловая группа экрана ролей (ROLE-GROUPS-001); null = «Прочее».
+    groupId: row.group_id ?? null,
+    skills,
+  };
+}
+
+async function fetchRoleSkillIds(c, roleId) {
+  const r = await c.query(
+    'SELECT skill_path FROM role_skills WHERE role_id = $1 ORDER BY position, skill_path',
+    [roleId],
+  );
+  return r.rows.map((row) => row.skill_path);
+}
+
+export async function listRoles(s) {
+  return withClient(clientConfig(s), async (c) => {
+    const roles = await c.query(
+      'SELECT id, code, name, description, prompt, hidden, group_id FROM roles ORDER BY sort_order, code',
+    );
+    const skills = await c.query(
+      'SELECT role_id, skill_path FROM role_skills ORDER BY position, skill_path',
+    );
+    const byRole = new Map();
+    for (const row of skills.rows) {
+      if (!byRole.has(row.role_id)) byRole.set(row.role_id, []);
+      byRole.get(row.role_id).push(row.skill_path);
+    }
+    return { roles: roles.rows.map((row) => mapRoleCard(row, byRole.get(row.id) ?? [])) };
+  });
+}
+
+export async function getRole(s, code) {
+  const roleCode = String(code ?? '').trim();
+  if (!roleCode) throw httpError(422, 'role_code_required');
+  return withClient(clientConfig(s), async (c) => {
+    const r = await c.query(
+      'SELECT id, code, name, description, prompt, hidden, group_id FROM roles WHERE code = $1',
+      [roleCode],
+    );
+    if (!r.rowCount) throw httpError(404, 'role_not_found');
+    const skills = await fetchRoleSkillIds(c, r.rows[0].id);
+    return mapRoleCard(r.rows[0], skills);
+  });
+}
+
+/**
+ * PUT /api/roles/:code — обновление карточки роли. Меняет только переданные поля
+ * (description/prompt/hidden/skills). skills заменяются целиком (replace-set).
+ * Имя/код роли не меняются. Возвращает актуальную карточку.
+ */
+export async function updateRole(s, code, input) {
+  const roleCode = String(code ?? '').trim();
+  if (!roleCode) throw httpError(422, 'role_code_required');
+  const available = await listAvailableSkills();
+  const validSkillPaths = new Set(available.skills.map((x) => x.id));
+  const patch = normalizeRoleUpdate(input, { validSkillPaths });
+
+  return withClient(clientConfig(s), async (c) => {
+    await c.query('BEGIN');
+    try {
+      const role = await c.query('SELECT id FROM roles WHERE code = $1 FOR UPDATE', [roleCode]);
+      if (!role.rowCount) throw httpError(404, 'role_not_found');
+      const roleId = role.rows[0].id;
+
+      // Смена группы: проверяем существование до записи (понятная 422 вместо
+      // нечитаемой ошибки FK). null = открепить (разрешено всегда).
+      if ('groupId' in patch && patch.groupId !== null) {
+        const g = await c.query('SELECT 1 FROM role_groups WHERE id = $1', [patch.groupId]);
+        if (!g.rowCount) throw httpError(422, 'role_group_not_found', { groupId: patch.groupId });
+      }
+
+      const sets = [];
+      const params = [roleId];
+      for (const field of ['description', 'prompt', 'hidden']) {
+        if (field in patch) {
+          params.push(patch[field]);
+          sets.push(`${field} = $${params.length}`);
+        }
+      }
+      if ('groupId' in patch) {
+        params.push(patch.groupId);
+        sets.push(`group_id = $${params.length}`);
+      }
+      if (sets.length) {
+        await c.query(`UPDATE roles SET ${sets.join(', ')} WHERE id = $1`, params);
+      }
+
+      // VERSION-KPI-TRACKING-001: правка промта роли фиксируется как новая версия в
+      // таблице prompts (дедуп по хешу — косметика/повтор версию не плодят). Новая
+      // версия = метка на оси времени KPI (kpi_markers), чтобы привязать скачок
+      // показателей к причине. roles.prompt остаётся кэшем активного текста.
+      if ('prompt' in patch) {
+        const label = typeof input?.promptLabel === 'string' && input.promptLabel.trim()
+          ? input.promptLabel.trim().slice(0, 200) : null;
+        const author = typeof input?.author === 'string' && input.author.trim()
+          ? input.author.trim().slice(0, 120) : null;
+        const v = await recordPromptVersion(c, roleId, patch.prompt ?? '', { label, author });
+        if (v.created) {
+          await c.query(
+            `INSERT INTO kpi_markers (role_id, marker_type, ref, description)
+             VALUES ($1, 'prompt_version', $2, $3)`,
+            [roleId, String(v.version), label || `Промт роли ${roleCode} → v${v.version}`],
+          );
+        }
+      }
+
+      if ('skills' in patch) {
+        await c.query('DELETE FROM role_skills WHERE role_id = $1', [roleId]);
+        for (let i = 0; i < patch.skills.length; i += 1) {
+          await c.query(
+            'INSERT INTO role_skills (role_id, skill_path, position) VALUES ($1, $2, $3)',
+            [roleId, patch.skills[i], i],
+          );
+        }
+      }
+
+      const r = await c.query(
+        'SELECT id, code, name, description, prompt, hidden, group_id FROM roles WHERE id = $1',
+        [roleId],
+      );
+      const skills = await fetchRoleSkillIds(c, roleId);
+      await c.query('COMMIT');
+      return mapRoleCard(r.rows[0], skills);
+    } catch (error) {
+      await c.query('ROLLBACK');
+      throw error;
+    }
+  });
+}
+
+// --- Сборка рабочего промта роли (используется roleEngine.runReasoningRole) ---
+
+// Конфиг промта роли из БД: { prompt, hidden } или null, если роли нет.
+export async function getRolePromptConfig(c, roleCode) {
+  const r = await c.query('SELECT prompt, hidden FROM roles WHERE code = $1', [roleCode]);
+  if (!r.rowCount) return null;
+  return { prompt: r.rows[0].prompt ?? '', hidden: r.rows[0].hidden === true };
+}
+
+// VERSION-KPI-TRACKING-001 — sha256 текста промта (нормализуем перевод строки и
+// хвостовые пробелы, чтобы косметика не плодила версии). Один источник правды для
+// дедупа версий и сравнения с content_hash в БД.
+export function promptHash(text) {
+  const normalized = String(text ?? '').replace(/\r\n/g, '\n').replace(/[ \t]+$/gm, '');
+  return createHash('sha256').update(normalized).digest('hex');
+}
+
+// VERSION-KPI-TRACKING-001 — зафиксировать версию промта роли в таблице prompts.
+// Дедуп по хешу: если активная версия уже хранит ровно этот текст — новую НЕ
+// создаём (сохранение без правок не плодит версии). Иначе деактивируем прежние,
+// заводим version = max+1 (is_active). Вызывается ВНУТРИ транзакции updateRole.
+// Возвращает { version, created } — created=false при дедупе/первичном сиде.
+export async function recordPromptVersion(c, roleId, text, { label = null, author = null } = {}) {
+  const body = String(text ?? '');
+  const hash = promptHash(body);
+  const active = await c.query(
+    'SELECT version, prompt_text FROM prompts WHERE role_id = $1 AND is_active = true LIMIT 1',
+    [roleId],
+  );
+  // Дедуп считаем по ТЕКСТУ активной версии (хешируем здесь же тем же нормализатором),
+  // а не по хранимому content_hash — так результат не зависит от того, чем хеш считал
+  // сид миграции (там «сырой» sha256 без нормализации).
+  if (active.rowCount && promptHash(active.rows[0].prompt_text) === hash) {
+    return { version: active.rows[0].version, created: false };
+  }
+  const maxV = await c.query('SELECT COALESCE(max(version), 0)::int AS v FROM prompts WHERE role_id = $1', [roleId]);
+  const nextVersion = maxV.rows[0].v + 1;
+  await c.query('UPDATE prompts SET is_active = false WHERE role_id = $1 AND is_active = true', [roleId]);
+  await c.query(
+    `INSERT INTO prompts (role_id, version, prompt_text, is_active, content_hash, label, author)
+     VALUES ($1, $2, $3, true, $4, $5, $6)`,
+    [roleId, nextVersion, body, hash, label, author],
+  );
+  return { version: nextVersion, created: true };
+}
+
+// VERSION-KPI-TRACKING-001 — активная версия промта роли (для штампа agent_runs.
+// prompt_version при захвате). null, если у роли нет ни одной зафиксированной
+// версии (роль без промта в БД, например программист).
+export async function getActivePromptVersion(c, roleCode) {
+  const r = await c.query(
+    `SELECT p.version FROM prompts p JOIN roles r ON r.id = p.role_id
+      WHERE r.code = $1 AND p.is_active = true LIMIT 1`,
+    [roleCode],
+  );
+  return r.rowCount ? r.rows[0].version : null;
+}
+
+// Содержимое подключённых к роли skills в порядке position: [{ path, content }].
+export async function loadRoleSkillContents(c, roleCode, { dir = SKILLS_DIR } = {}) {
+  const r = await c.query(
+    `SELECT rs.skill_path
+       FROM role_skills rs JOIN roles ro ON ro.id = rs.role_id
+      WHERE ro.code = $1 ORDER BY rs.position, rs.skill_path`,
+    [roleCode],
+  );
+  const out = [];
+  for (const row of r.rows) {
+    const content = await readSkillContent(row.skill_path, { dir });
+    if (content != null) out.push({ path: row.skill_path, content });
+  }
+  return out;
+}
+
+// DATA-DISCIPLINE-001 — жёсткое глобальное правило для ВСЕХ ролей: работать только
+// с реальными данными, ничего не выдумывать. Дописывается к системному промту
+// каждой роли, поэтому действует единообразно и поверх любого текста промта.
+export const DATA_DISCIPLINE_RULE = `## ОБЯЗАТЕЛЬНОЕ ПРАВИЛО ДАННЫХ (приоритетнее всего остального)
+
+Работай ТОЛЬКО с реальными данными: переданный контекст задачи, выводы предыдущих
+ролей и факты реального проекта (его карта, файлы, сервисы, API, БД). Источник правды —
+реальный проект, а не твои догадки.
+
+ЗАПРЕЩЕНО выдумывать: имена и пути файлов, эндпоинты API, поля и таблицы БД, названия
+сервисов/компонентов/проектов, версии, конфигурацию и любые детали, которых нет в
+предоставленных данных. Не подставляй «правдоподобные» значения по памяти.
+
+Если нужных данных нет в контексте — НЕ домысливай. Сделай одно из:
+1) верни \`unknown\` для соответствующего поля;
+2) задай уточняющий вопрос (blocking_questions);
+3) запроси конкретный недостающий артефакт (какой файл/карту/данные нужно прочитать).
+
+Любое предположение помечай ЯВНО как предположение (assumptions), не выдавай за факт.
+Лучше честно сказать «недостаточно данных», чем сочинить ответ.`;
+
+// RESEARCH-BUDGET-001 — роли, ведущие разведку по коду проекта. Им подаём карту
+// проекта инлайн (см. projectMap.js) и дисциплину разведки: иначе первичное
+// исследование Архитектора/Декомпозитора раздувается на десятки проходов
+// широкими Grep/Glob-свипами. Остальные роли (исполнители/мосты) карту не
+// исследуют — им правило не нужно и токены на него не тратим.
+export const RESEARCH_ROLES = new Set([
+  'ARCHITECT', 'DECOMPOSER', 'TASK_REVIEWER', 'FAILURE_ANALYST',
+]);
+
+// DECOMPOSER-REMOVE-001 — роли, которым карта проекта подаётся ИНЛАЙН в контекст
+// (см. buildRoleContext). Это НЕ то же самое, что RESEARCH_ROLES: последним, кроме
+// карты, дописывается правило БЮДЖЕТА РАЗВЕДКИ (они читают файлы через tool-loop).
+// Приёмщик файлы не читает — ему нужна только карта для точной классификации
+// проекта/сервиса/компонента и структурированного описания, но БЕЗ правила бюджета.
+export const MAP_ROLES = new Set([...RESEARCH_ROLES, 'TASK_INTAKE_OFFICER']);
+
+// ARCHITECT-TURN-CAP-001 — персональный кап ходов рассуждающей роли. Драйвер
+// claude_code берёт maxTurns из ЗАДАЧИ (task.maxTurns), если оркестратор его задал,
+// иначе — свой глобальный дефолт (12). Зачем персонально: Архитектор — исследующая
+// роль с самым длинным tool-loop (в пике до 121 хода), и именно её «хвост» 40–121
+// ход раздувает входящие токены (каждый ход перечитывает весь диалог из кэша).
+// Кап здесь — РУНАВЕЙ-ГАРД: ставим его ЗАМЕТНО выше нормального рабочего диапазона
+// роли (обычные прогоны Архитектора укладываются в ~12–25 ходов), чтобы срезать
+// патологический хвост, но НЕ рубить нормальный анализ на полуслове (иначе
+// error_max_turns → повторный прогон, а это дороже). Значение переопределяется env
+// `${ROLE}_MAX_TURNS` (напр. ARCHITECT_MAX_TURNS=20). Реальное СНИЖЕНИЕ числа ходов
+// даёт не этот кап, а богаче инлайн-карта (RESEARCH-BUDGET-001) — меньше открытий
+// файлов. null → драйвер использует свой дефолт.
+export const ROLE_MAX_TURNS_DEFAULTS = { ARCHITECT: 24 };
+
+// ARCHITECT-BUDGET-SCALE-001 — размер эпика масштабирует кап ходов Архитектора.
+// Мега-эпик (раскатка на N сервисов/фронтов с пофайловыми инструкциями на каждый)
+// не укладывается в фиксированный кап 24 хода за один прогон. Сигнал размера на
+// КЛЕЙМЕ доступен только из описания задачи (work_items ещё не созданы — их
+// ПРОИЗВОДИТ Архитектор): берём (а) явное число сервисов/фронтов, названное в
+// описании («раскатка на 14 фронтов»), и (б) длину описания как прокси объёма.
+// Кап растёт линейно от базового, но жёстко ограничен потолком (рунавей-гард
+// сохраняется). Значения — настройка (ARCHITECT_TURN_SCALE_* можно переопределить
+// в будущем; сейчас — консервативные дефолты).
+export const ARCHITECT_TURN_SCALE = {
+  perService: 3,   // +ходов на каждый сервис/фронт сверх базовых двух
+  perKChars: 2,    // +ходов на каждую 1000 знаков описания сверх baseChars
+  baseServices: 2, // до 2 сервисов надбавки нет (одиночная/парная задача)
+  baseChars: 2000, // до 2000 знаков описания надбавки нет
+  max: 60,         // жёсткий потолок ходов Архитектора
+};
+
+// Оценить размер эпика по описанию: максимум явно НАЗВАННОГО числа сервисов/фронтов
+// (например «14 фронтов», «на 14 сервисов», «14-сервисном эпике»). 0 — если в
+// описании нет такого явного числа. Регистронезависимо, допускает дефис-разделитель.
+export function estimateEpicServiceCount(text) {
+  const s = String(text ?? '');
+  if (!s) return 0;
+  const re = /(\d{1,3})[\s-]*(?:фронт|сервис|микросервис|services|service|fronts|front)/giu;
+  let max = 0;
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const n = Number(m[1]);
+    if (Number.isFinite(n) && n > max) max = n;
+  }
+  return max;
+}
+
+// Масштабировать базовый кап ходов Архитектора по размеру эпика (из описания).
+// Берём СИЛЬНЕЙШИЙ из двух сигналов (число сервисов ИЛИ длина описания), надбавку
+// ограничиваем потолком. Явно заданный env-кап ВЫШЕ потолка не понижаем.
+function scaleArchitectMaxTurns(base, sizeCtx) {
+  const cfg = ARCHITECT_TURN_SCALE;
+  const desc = typeof sizeCtx === 'string' ? sizeCtx : String(sizeCtx?.description ?? '');
+  if (!desc) return base;
+  const services = estimateEpicServiceCount(desc);
+  const extraServices = Math.max(0, services - cfg.baseServices) * cfg.perService;
+  const extraChars = Math.floor(Math.max(0, desc.length - cfg.baseChars) / 1000) * cfg.perKChars;
+  const extra = Math.max(0, extraServices, extraChars);
+  const scaled = base + extra;
+  return scaled <= cfg.max ? scaled : Math.max(base, cfg.max);
+}
+
+// resolveRoleMaxTurns(roleCode, sizeCtx?) — кап ходов роли. Без sizeCtx (совместимость)
+// возвращает прежнее фиксированное значение. С sizeCtx (объект { description } или
+// строка описания) ARCHITECT-BUDGET-SCALE-001 масштабирует ТОЛЬКО кап Архитектора по
+// размеру эпика; прочие роли не масштабируются.
+export function resolveRoleMaxTurns(roleCode, sizeCtx = null) {
+  const code = String(roleCode ?? '').trim();
+  if (!code) return null;
+  const raw = process.env[`${code}_MAX_TURNS`];
+  const envN = Number(raw);
+  let base;
+  if (raw != null && String(raw).trim() !== '' && Number.isFinite(envN) && envN > 0) {
+    base = Math.trunc(envN);
+  } else {
+    const def = ROLE_MAX_TURNS_DEFAULTS[code];
+    base = Number.isFinite(def) && def > 0 ? Math.trunc(def) : null;
+  }
+  if (base == null) return null;
+  if (code !== 'ARCHITECT' || !sizeCtx) return base;
+  return scaleArchitectMaxTurns(base, sizeCtx);
+}
+
+// RESEARCH-BUDGET-001 — жёсткий бюджет разведки для исследующих ролей. Дописывается
+// к их системному промту поверх любого текста. Опирается на то, что карта проекта
+// и карта микросервиса уже поданы инлайн в контекст задачи (projectMap.js).
+export const RESEARCH_DISCIPLINE_RULE = `## БЮДЖЕТ РАЗВЕДКИ (приоритетнее обязанностей роли по объёму чтения)
+
+Карта проекта, карта микросервиса и авто-индекс структуры репозитория (каталог
+верхнего уровня = каталог сервисов для монорепо) уже даны тебе в контексте задачи
+(раздел «Карта проекта»). Это твой первичный источник структуры — НЕ переоткрывай
+устройство проекта широкими поисками.
+
+Дисциплина чтения (держись жёстко):
+1. Сначала опирайся на готовые карты (проект → сервис) и авто-индекс каталогов: они
+   заменяют разведку структуры. Отнести задачу к сервису/каталогу можно ПО ИНДЕКСУ,
+   без Glob по корню репозитория.
+2. Затем читай ТОЛЬКО файлы, напрямую относящиеся к задаче — по путям из карт и из
+   вывода предыдущих ролей (affected_files/scope). Точечный Read и Grep по конкретному
+   символу — допустимо; широкие Grep/Glob-свипы по всему дереву «чтобы осмотреться» — нет.
+3. Бюджет: ~2 прохода на карты + не более 3–5 целевых файлов. Если кажется, что нужно
+   больше — ты, скорее всего, выходишь за scope: сузь вопрос либо верни BLOCKED с
+   конкретным недостающим артефактом, а не обходи весь репозиторий.
+4. Не открывай один файл повторно и не дублируй уже выполненный поиск.
+
+Цель — вынести вердикт за минимум проходов. Сплошная разведка всего репозитория
+запрещена: она жжёт ходы и токены, не повышая качества решения.`;
+
+/**
+ * Итоговый system-промт роли: сохранённый в БД prompt роли + содержимое
+ * подключённых skills в зафиксированном порядке + глобальное правило данных
+ * (DATA-DISCIPLINE-001) + для исследующих ролей — бюджет разведки
+ * (RESEARCH-BUDGET-001). БД — единственный источник промта; пустой prompt роли —
+ * ошибка конфигурации (422).
+ */
+export async function composeRoleSystemPrompt(c, roleCode, { skillsDir = SKILLS_DIR } = {}) {
+  const cfg = await getRolePromptConfig(c, roleCode);
+  const base = cfg?.prompt?.trim() ? cfg.prompt : '';
+  if (!base) throw httpError(422, 'role_prompt_missing', { role: roleCode });
+  const skills = await loadRoleSkillContents(c, roleCode, { dir: skillsDir });
+  const tail = RESEARCH_ROLES.has(roleCode)
+    ? `${DATA_DISCIPLINE_RULE}\n\n${RESEARCH_DISCIPLINE_RULE}`
+    : DATA_DISCIPLINE_RULE;
+  return `${mergePromptAndSkills(base, skills)}\n\n${tail}`;
+}

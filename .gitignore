@@ -1,0 +1,35 @@
+# Зависимости
+node_modules/
+
+# Сборка фронтенда (генерируется npm run build / Docker frontend stage)
+dist/
+*.tsbuildinfo
+
+# Временные артефакты прогонов (pipeline-runner, тесты)
+.tmp/
+**/.tmp/
+*.log
+*.out
+
+# Сгенерированные картинки блок-схемы (скрипты рендера схемы) — не для репозитория
+output/
+**/output/*.png
+
+# Структурные журналы оркестратора (Structure Keeper) — отслеживаются в репозитории
+!**/.orchestrator/migrations.log
+
+# Локальные настройки Claude Code (не для репозитория)
+.claude/settings.local.json
+
+# Локальное окружение (секреты БД и пути хоста) — не для репозитория
+.env
+
+# Логи хост-раннеров
+logs/
+
+# Server PXE local artifacts: ISO images, extracted installers, iPXE binaries and netboot cache.
+server/data/
+server/tftp/*
+!server/tftp/README.md
+server/www/ubuntu/*/*
+!server/www/ubuntu/*/README.md

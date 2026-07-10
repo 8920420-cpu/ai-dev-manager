@@ -1,0 +1,181 @@
+/*
+ * Дизайн-токены AI Dev Manager.
+ * Стиль: строгий developer-tool — нейтральный slate + синий primary,
+ * семантические success / warning / error. Светлая и тёмная темы.
+ * Палитра основана на рекомендации ui-ux-pro-max (Developer Tool / IDE,
+ * SaaS blue), приведена к контрасту WCAG AA.
+ */
+
+:root {
+  /* ---- Примитивы: типографика ---- */
+  --font-sans: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, Arial,
+    sans-serif;
+  --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", "Cascadia Code",
+    Menlo, Consolas, "Liberation Mono", monospace;
+
+  --text-xs: 0.75rem; /* 12 */
+  --text-sm: 0.8125rem; /* 13 */
+  --text-base: 0.875rem; /* 14 — базовый размер UI dev-инструмента */
+  --text-md: 0.9375rem; /* 15 */
+  --text-lg: 1.0625rem; /* 17 */
+  --text-xl: 1.25rem; /* 20 */
+  --text-2xl: 1.5rem; /* 24 */
+  --text-3xl: 1.875rem; /* 30 */
+
+  --leading-tight: 1.25;
+  --leading-normal: 1.5;
+  --leading-relaxed: 1.65;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* ---- Сетка отступов (шаг 4px) ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  /* ---- Радиусы ---- */
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --radius-full: 999px;
+
+  /* ---- Размеры элементов управления ---- */
+  --control-h-sm: 32px;
+  --control-h-md: 38px;
+  --control-h-lg: 44px; /* минимальная зона касания на мобильных */
+  --control-pad-x: 12px;
+
+  /* ---- Слои (z-index) ---- */
+  --z-base: 0;
+  --z-sticky: 20;
+  --z-sidebar: 40;
+  --z-dropdown: 60;
+  --z-overlay: 100;
+  --z-modal: 110;
+  --z-toast: 1000;
+
+  /* ---- Длительности анимаций ---- */
+  --dur-fast: 120ms;
+  --dur-base: 180ms;
+  --dur-slow: 240ms;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* ---- Семантические бренд-токены (не зависят от темы) ---- */
+  --brand-500: #2563eb;
+  --brand-600: #1d4ed8;
+  --brand-700: #1e40af;
+  --brand-300: #93c5fd;
+}
+
+/* ============ Светлая тема ============ */
+:root,
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg: #f1f5f9; /* фон приложения */
+  --bg-subtle: #e9eef5; /* секции/полоски */
+  --surface: #ffffff; /* карточки, панели */
+  --surface-2: #f8fafc; /* вложенные блоки */
+  --surface-hover: #f1f5f9;
+  --overlay-scrim: rgba(15, 23, 42, 0.45);
+
+  --text: #0f172a; /* основной текст */
+  --text-secondary: #475569; /* вторичный текст */
+  --text-muted: #64748b; /* подписи/плейсхолдеры */
+  --text-inverse: #f8fafc;
+
+  --border: #e2e8f0;
+  --border-strong: #cbd5e1;
+  --border-focus: var(--brand-500);
+
+  --primary: var(--brand-500);
+  --primary-hover: var(--brand-600);
+  --primary-active: var(--brand-700);
+  --on-primary: #ffffff;
+  --primary-soft: #eff4ff; /* мягкий фон под акцент */
+  --primary-soft-border: #c7dbff;
+
+  --success: #16a34a;
+  --success-soft: #e7f6ec;
+  --success-text: #15803d;
+  --warning: #b45309;
+  --warning-soft: #fbf0db;
+  --warning-text: #92400e;
+  --danger: #dc2626;
+  --danger-hover: #b91c1c;
+  --danger-soft: #fdecec;
+  --danger-text: #b91c1c;
+  --info: #0891b2;
+  --info-soft: #e2f4f8;
+  --info-text: #0e7490;
+
+  --ring: rgba(37, 99, 235, 0.45);
+
+  --shadow-xs: 0 1px 2px rgba(15, 23, 42, 0.06);
+  --shadow-sm: 0 1px 3px rgba(15, 23, 42, 0.08), 0 1px 2px rgba(15, 23, 42, 0.04);
+  --shadow-md: 0 4px 12px rgba(15, 23, 42, 0.1), 0 2px 4px rgba(15, 23, 42, 0.06);
+  --shadow-lg: 0 12px 32px rgba(15, 23, 42, 0.16);
+  --shadow-popover: 0 8px 24px rgba(15, 23, 42, 0.14);
+}
+
+/* ============ Тёмная тема ============ */
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg: #0b1120;
+  --bg-subtle: #0f172a;
+  --surface: #111827;
+  --surface-2: #161f2f;
+  --surface-hover: #1c2636;
+  --overlay-scrim: rgba(2, 6, 23, 0.62);
+
+  --text: #e8eef7;
+  --text-secondary: #aab6c8;
+  --text-muted: #8593a8;
+  --text-inverse: #0b1120;
+
+  --border: #25324a;
+  --border-strong: #334155;
+  --border-focus: #3b82f6;
+
+  --primary: #3b82f6;
+  --primary-hover: #60a5fa;
+  --primary-active: #2563eb;
+  --on-primary: #07112a;
+  --primary-soft: #15233f;
+  --primary-soft-border: #1e3a68;
+
+  --success: #34d399;
+  --success-soft: #0f2a22;
+  --success-text: #6ee7b7;
+  --warning: #fbbf24;
+  --warning-soft: #2a2310;
+  --warning-text: #fcd34d;
+  --danger: #f87171;
+  --danger-hover: #ef4444;
+  --danger-soft: #2d1717;
+  --danger-text: #fca5a5;
+  --info: #38bdf8;
+  --info-soft: #102633;
+  --info-text: #7dd3fc;
+
+  --ring: rgba(96, 165, 250, 0.5);
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.5);
+  --shadow-md: 0 6px 16px rgba(0, 0, 0, 0.55);
+  --shadow-lg: 0 16px 40px rgba(0, 0, 0, 0.6);
+  --shadow-popover: 0 10px 28px rgba(0, 0, 0, 0.6);
+}

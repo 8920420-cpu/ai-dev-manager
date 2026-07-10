@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "dependencies": {
+    "ORCHESTRATOR": [],
+    "FRONTEND": ["ORCHESTRATOR"],
+    "PIPELINE_RUNNER": ["ORCHESTRATOR"],
+    "SCANNER": ["ORCHESTRATOR"],
+    "TESTER": ["ORCHESTRATOR", "PIPELINE_RUNNER"]
+  }
+}

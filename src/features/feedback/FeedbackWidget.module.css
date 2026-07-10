@@ -1,0 +1,182 @@
+/* Плавающая кнопка «Обратная связь» — справа внизу, поверх контента на всех страницах. */
+.fab {
+  position: fixed;
+  right: var(--space-5);
+  bottom: var(--space-5);
+  z-index: var(--z-overlay);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  height: var(--control-h-lg);
+  padding: 0 var(--space-4);
+  border-radius: var(--radius-full);
+  background: var(--primary);
+  color: var(--on-primary);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  box-shadow: var(--shadow-lg);
+  transition: background var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+.fab:hover {
+  background: var(--primary-hover);
+}
+.fab:active {
+  transform: translateY(1px);
+}
+.fabLabel {
+  white-space: nowrap;
+}
+
+/* ---- Шаг 1: выбор категории ---- */
+.categoryFieldset {
+  border: none;
+  padding: 0;
+  margin: var(--space-4) 0 0;
+}
+.legend {
+  padding: 0;
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--text-secondary);
+}
+.categoryGrid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: var(--space-3);
+}
+.categoryOption {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+  cursor: pointer;
+  transition: border-color var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+.categoryOption:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-hover);
+}
+.categoryOption[data-selected] {
+  border-color: var(--primary);
+  background: var(--primary-soft);
+}
+/* Радио прячем визуально, но оставляем доступным (фокус ловит .categoryOption). */
+.categoryRadio {
+  position: absolute;
+  opacity: 0;
+  width: 1px;
+  height: 1px;
+  margin: 0;
+}
+.categoryOption:focus-within {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+.categoryEmoji {
+  font-size: 1.25rem;
+  line-height: 1;
+}
+.categoryLabel {
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/* ---- Шаг 2: сообщение + опции ---- */
+.stepBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+.checkboxRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text);
+  cursor: pointer;
+}
+.checkboxRow input {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--primary);
+}
+
+/* ---- Шаг 3: проверка ---- */
+.reviewIntro {
+  margin-bottom: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+.reviewList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+}
+.reviewRow {
+  display: grid;
+  grid-template-columns: 120px 1fr;
+  gap: var(--space-3);
+  padding: var(--space-2) 0;
+  border-bottom: 1px solid var(--border);
+  font-size: var(--text-sm);
+}
+.reviewRow:last-child {
+  border-bottom: none;
+}
+.reviewRow dt {
+  color: var(--text-muted);
+}
+.reviewRow dd {
+  margin: 0;
+  color: var(--text);
+}
+.reviewMessage {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ---- Финальный шаг: номер заявки ---- */
+.doneBody {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  text-align: center;
+  gap: var(--space-2);
+  padding: var(--space-6) var(--space-4);
+}
+.doneEmoji {
+  font-size: 2.5rem;
+  line-height: 1;
+}
+.doneTitle {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+.doneHint {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  max-width: 32ch;
+}
+
+@media (max-width: 640px) {
+  .fab {
+    right: var(--space-3);
+    bottom: var(--space-3);
+  }
+  .categoryGrid {
+    grid-template-columns: 1fr;
+  }
+  .reviewRow {
+    grid-template-columns: 100px 1fr;
+  }
+}

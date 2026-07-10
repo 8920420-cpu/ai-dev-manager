@@ -1,0 +1,21 @@
+{
+  "name": "programmer-runner",
+  "version": "0.1.0",
+  "description": "Автоматический исполнитель роли PROGRAMMER (стадия CODING): опрашивает оркестратор, запускает headless Claude Code (Agent SDK) на задаче в репозитории проекта и сдаёт результат. Закрывает разрыв, из-за которого CODING двигался только живой Claude-сессией.",
+  "type": "module",
+  "bin": {
+    "programmer-runner": "bin/programmer-runner.js",
+    "claude-reasoning-runner": "bin/claude-reasoning-runner.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/programmer-runner.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.3.195"
+  },
+  "license": "MIT"
+}

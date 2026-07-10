@@ -1,0 +1,241 @@
+/* PERFORMANCE-MONITOR-001 — стили раздела «Монитор производительности». */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.generatedAt {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+/* Сетка карточек-метрик. */
+.metricGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: var(--space-3);
+}
+
+.metric {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-4);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.metricValue {
+  font-size: var(--text-2xl, 1.6rem);
+  font-weight: 600;
+  line-height: 1.1;
+  color: var(--text-primary);
+}
+
+.metricLabel {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.metricHint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+.metricValue.warn {
+  color: var(--warning, #d08700);
+}
+
+.metricValue.danger {
+  color: var(--danger, #d92d20);
+}
+
+/* Таблица нагрузки по ролям / коннекторам. */
+/* TABLE-SCROLL-001 — обёртка для широких таблиц монитора: если таблица шире
+   контейнера (например «Нагрузка по ролям» с 13 колонками), прокручивается сама
+   таблица внутри блока, а не растягивается вся страница. */
+.tableScroll {
+  overflow-x: auto;
+  max-width: 100%;
+}
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--text-sm);
+}
+
+.table th,
+.table td {
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.table th {
+  color: var(--text-muted);
+  font-weight: 500;
+}
+
+.table td.num,
+.table th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ROLE-LOAD-TOTALS-FOOTER — строка «Итого» блока «Нагрузка по ролям»:
+   выделяем полужирным и отделяющей верхней границей от строк ролей. */
+.totalRow td {
+  font-weight: 600;
+  color: var(--text-primary);
+  border-top: 2px solid var(--border);
+  background: var(--surface-2);
+}
+
+.statusRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.statusChip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full, 999px);
+  font-size: var(--text-sm);
+}
+
+.statusChip b {
+  font-variant-numeric: tabular-nums;
+}
+
+.muted {
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+/* TOKEN-SPLIT-001 — деление входящих токенов (свежий / кэш-запись / кэш-чтение)
+   под основным числом «Токены вх». Мелкой строкой, чтобы не раздувать таблицу. */
+.tokenSplit {
+  display: block;
+  margin-top: 2px;
+  font-size: 0.72rem;
+  line-height: 1.25;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* ROLE-LOAD-LAST-DATA-001 — вкладки блока «Нагрузка по ролям» (средние/суммы,
+   переключатель периода). Лёгкие кнопки-переключатели без отдельной библиотеки. */
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-3);
+}
+
+.tabBtn {
+  padding: var(--space-1) var(--space-3);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full, 999px);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.tabBtn:hover {
+  color: var(--text-primary);
+}
+
+.tabActive {
+  background: var(--accent, #2563eb);
+  border-color: var(--accent, #2563eb);
+  color: #fff;
+}
+
+/* VERSION-KPI-TRACKING-001 — управление и дельты раздела «Версии». */
+.versionControls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.versionControls label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.versionControls select {
+  padding: var(--space-1) var(--space-2);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 6px);
+  color: inherit;
+  font-size: var(--text-sm);
+}
+
+.delta {
+  font-size: var(--text-xs, 0.75rem);
+  font-variant-numeric: tabular-nums;
+  margin-left: var(--space-1);
+  white-space: nowrap;
+}
+
+.delta.good {
+  color: var(--success, #14804a);
+}
+
+.delta.bad {
+  color: var(--danger, #d92d20);
+}
+
+.delta.neutral {
+  color: var(--text-muted);
+}
+
+.regressionRow td {
+  background: color-mix(in srgb, var(--danger, #d92d20) 8%, transparent);
+}
+
+.regBadge {
+  display: inline-block;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-full, 999px);
+  background: var(--danger, #d92d20);
+  color: #fff;
+  font-size: var(--text-xs, 0.7rem);
+  margin-left: var(--space-2);
+}
+
+.versionTag {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.versionTag small {
+  color: var(--text-muted);
+  font-family: var(--font-mono, monospace);
+}

@@ -1,0 +1,35 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - 00-namespace.yaml
+  - 10-ingress-nginx.yaml
+  - 20-cnpg-operator.yaml
+  - 30-postgres-cluster.yaml
+  - 40-orchestrator.yaml
+  - 41-tools-service.yaml
+  - 42-mcp-service.yaml
+  - 50-ingress.yaml
+
+# Секрет с общим API-токеном (обязателен: на него ссылаются все три сервиса).
+# Значение задаётся при деплое: см. deploy/k8s/README.md.
+secretGenerator:
+  - name: orchestrator-secrets
+    namespace: ai-prod
+    literals:
+      - apiToken=CHANGE_ME
+    options:
+      disableNameSuffixHash: true
+
+# Образы переписываются на локальный registry PXE-хоста (ноды доверяют ему
+# через registries.yaml, который прописывает provision-k3s.sh).
+images:
+  - name: orchestrator-service
+    newName: 192.168.1.211:5000/orchestrator-service
+    newTag: prod
+  - name: tools-service
+    newName: 192.168.1.211:5000/tools-service
+    newTag: prod
+  - name: mcp-service
+    newName: 192.168.1.211:5000/mcp-service
+    newTag: prod

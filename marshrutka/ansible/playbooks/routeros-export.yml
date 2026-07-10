@@ -1,0 +1,18 @@
+---
+# Пример для MikroTik RouterOS: снять текстовый экспорт конфигурации по требованию
+# (регулярные бэкапы делает Oxidized, это ручной срез).
+- name: Экспорт конфигурации RouterOS
+  hosts: routers
+  gather_facts: false
+  tasks:
+    - name: /export
+      community.routeros.command:
+        commands:
+          - /export show-sensitive
+      register: cfg
+
+    - name: Сохранить локально
+      ansible.builtin.copy:
+        content: "{{ cfg.stdout[0] }}"
+        dest: "/tmp/{{ inventory_hostname }}.rsc"
+      delegate_to: localhost

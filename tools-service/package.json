@@ -1,0 +1,18 @@
+{
+  "name": "tools-service",
+  "version": "1.0.0",
+  "description": "Микросервис инструментов: builtin-чтение проекта (read_file/list_dir/search) и сборка MCP-конфигурации для Claude Code.",
+  "type": "module",
+  "main": "bin/tools-service.js",
+  "bin": {
+    "tools-service": "bin/tools-service.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/tools-service.js",
+    "test": "node --test"
+  },
+  "license": "MIT"
+}

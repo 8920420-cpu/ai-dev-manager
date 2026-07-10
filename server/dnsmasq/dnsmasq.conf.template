@@ -1,0 +1,27 @@
+port=0
+log-dhcp
+dhcp-authoritative
+enable-tftp
+tftp-root=/srv/tftp
+
+dhcp-range=${PXE_DHCP_RANGE}
+dhcp-option=option:router,${PXE_ROUTER}
+dhcp-option=option:dns-server,${PXE_DNS}
+dhcp-option=66,${PXE_SERVER_IP}
+
+dhcp-userclass=set:ipxe,iPXE
+dhcp-match=set:efi-x86_64,option:client-arch,7
+dhcp-match=set:efi-x86_64,option:client-arch,9
+dhcp-match=set:efi-x86,option:client-arch,6
+dhcp-match=set:efi-arm64,option:client-arch,11
+
+dhcp-boot=tag:ipxe,http://${PXE_SERVER_IP}:${PXE_HTTP_PORT}/boot.ipxe
+dhcp-boot=tag:efi-arm64,ipxe-arm64.efi,,${PXE_SERVER_IP}
+dhcp-boot=tag:efi-x86_64,ipxe.efi,,${PXE_SERVER_IP}
+dhcp-boot=tag:efi-x86,ipxe.efi,,${PXE_SERVER_IP}
+dhcp-boot=undionly.kpxe,,${PXE_SERVER_IP}
+
+pxe-service=tag:efi-x86_64,BC_EFI,"Boot iPXE UEFI x86_64",ipxe.efi
+pxe-service=tag:efi-x86,X86-64_EFI,"Boot iPXE UEFI x86",ipxe.efi
+pxe-service=tag:efi-arm64,ARM64_EFI,"Boot iPXE UEFI ARM64",ipxe-arm64.efi
+pxe-service=X86PC,"Boot iPXE BIOS",undionly.kpxe

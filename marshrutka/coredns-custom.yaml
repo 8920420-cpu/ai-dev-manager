@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: coredns-custom
+  namespace: kube-system
+data:
+  lb-domains.server: |
+    # Домены ПС и лендингов -> LB Timeweb (186.246.1.150).
+    # Нужно, пока апстрим-резолверы держат старый A (195.98.86.63, TTL 86400):
+    # без этого self-check HTTP-01 cert-manager уходит на старый nginx-146 и получает 404.
+    xn--e1afafwccicckkbb.xn--p1ai xn----8sb7bih2a.xn--p1ai clear36.ru happypartyvrn.ru {
+        hosts {
+            186.246.1.150 xn--e1afafwccicckkbb.xn--p1ai
+            186.246.1.150 www.xn--e1afafwccicckkbb.xn--p1ai
+            186.246.1.150 xn----8sb7bih2a.xn--p1ai
+            186.246.1.150 www.xn----8sb7bih2a.xn--p1ai
+            186.246.1.150 clear36.ru
+            186.246.1.150 www.clear36.ru
+            186.246.1.150 happypartyvrn.ru
+            186.246.1.150 www.happypartyvrn.ru
+            fallthrough
+        }
+        forward . /etc/resolv.conf
+    }

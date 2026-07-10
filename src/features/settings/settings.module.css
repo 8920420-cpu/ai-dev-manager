@@ -1,0 +1,193 @@
+/* Общие стили раздела «Настройки». */
+
+.page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-8);
+}
+
+/* Строка-переключатель boolean-настройки (TASK-AUTO-ACCEPT-001 и т.п.). */
+.toggleRow {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface-2);
+  cursor: pointer;
+}
+
+.checkbox {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  margin-top: 2px;
+  accent-color: var(--primary);
+  cursor: pointer;
+}
+
+.toggleText {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.toggleTitle {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-semibold);
+  color: var(--text);
+}
+
+.toggleHint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+}
+
+/* ───────────────────────── Роли и подключения ───────────────────────── */
+
+.rolesWrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.rolesList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.roleRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 1.2fr) auto auto;
+  align-items: start;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.roleStatus {
+  display: flex;
+  align-items: center;
+  min-height: var(--control-h-md);
+  padding-top: var(--space-6);
+}
+
+.roleRemove {
+  display: flex;
+  align-items: center;
+  min-height: var(--control-h-md);
+  padding-top: var(--space-6);
+}
+
+.rolesActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding-top: var(--space-2);
+}
+
+.rolesActionsRight {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* ───────────────────────── Адаптив ───────────────────────── */
+
+@media (max-width: 860px) {
+  .roleRow {
+    grid-template-columns: 1fr auto;
+    grid-template-areas:
+      'role remove'
+      'integration integration'
+      'status status';
+  }
+
+  .roleName {
+    grid-area: role;
+  }
+
+  .roleIntegration {
+    grid-area: integration;
+  }
+
+  .roleStatus {
+    grid-area: status;
+    min-height: 0;
+    padding-top: 0;
+  }
+
+  .roleRemove {
+    grid-area: remove;
+    justify-content: flex-end;
+    min-height: 0;
+    padding-top: var(--space-6);
+  }
+}
+
+
+/* ───────────────────────── Инструменты (Tools) ───────────────────────── */
+
+.toolList {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.toolRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+}
+
+.toolBadge {
+  margin-left: var(--space-2);
+  padding: 0 var(--space-2);
+  font-size: var(--text-xs);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-full, 999px);
+  color: var(--text-secondary);
+}
+
+.toolDesc {
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+}
+
+.toolActions {
+  display: flex;
+  gap: var(--space-2);
+  flex: none;
+}
+
+.toolForm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.executionForm {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  align-items: flex-start;
+  max-width: 420px;
+}

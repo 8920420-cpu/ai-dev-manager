@@ -1,0 +1,176 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1800" height="1280" viewBox="0 0 1800 1280" role="img" aria-labelledby="title desc">
+  <title id="title">Схема работы Kubernetes-кластера</title>
+  <desc id="desc">Схема от Cloudflare и ingress-nginx до orchestrator-service, tools-service, PostgreSQL CNPG и реальной базы orchestrator_db.</desc>
+  <defs>
+    <style>
+      .bg { fill: #f6f8fb; }
+      .panel { fill: #ffffff; stroke: #d4dce8; stroke-width: 2; rx: 14; }
+      .panel-title { font: 700 24px Arial, sans-serif; fill: #1b2737; }
+      .box { fill: #ffffff; stroke: #8da2bf; stroke-width: 2; rx: 10; }
+      .box-blue { fill: #edf5ff; stroke: #4d82bd; }
+      .box-green { fill: #eef8f1; stroke: #4f9c65; }
+      .box-amber { fill: #fff6df; stroke: #c7902a; }
+      .box-red { fill: #fff0f0; stroke: #c75d5d; }
+      .box-purple { fill: #f4efff; stroke: #7c61bd; }
+      .db { fill: #f8fbff; stroke: #4d82bd; stroke-width: 2; }
+      .text { font: 20px Arial, sans-serif; fill: #1b2737; }
+      .small { font: 17px Arial, sans-serif; fill: #3d4b5f; }
+      .tiny { font: 15px Arial, sans-serif; fill: #56657a; }
+      .metric { font: 700 18px Arial, sans-serif; fill: #1b2737; }
+      .line { stroke: #52677f; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .line-soft { stroke: #8a99aa; stroke-width: 2.5; fill: none; stroke-dasharray: 8 8; marker-end: url(#arrowSoft); }
+      .replica { stroke: #4f9c65; stroke-width: 2.5; fill: none; stroke-dasharray: 8 8; marker-end: url(#arrowGreen); }
+    </style>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#52677f"/>
+    </marker>
+    <marker id="arrowSoft" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8a99aa"/>
+    </marker>
+    <marker id="arrowGreen" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="10" markerHeight="10" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4f9c65"/>
+    </marker>
+  </defs>
+
+  <rect class="bg" x="0" y="0" width="1800" height="1280"/>
+
+  <text x="60" y="58" class="panel-title">Схема работы Kubernetes-кластера от балансировщика</text>
+  <text x="60" y="88" class="small">Данные сервиса взяты из реальной БД orchestrator_db, внешний k8s-контур - из deploy/k8s.</text>
+
+  <rect class="panel" x="40" y="125" width="480" height="290"/>
+  <text x="70" y="165" class="panel-title">Внешний вход</text>
+  <rect class="box box-blue" x="80" y="205" width="360" height="70"/>
+  <text x="110" y="233" class="text">Пользователь / клиент</text>
+  <text x="110" y="257" class="small">HTTPS-запрос</text>
+  <rect class="box box-blue" x="80" y="315" width="360" height="70"/>
+  <text x="110" y="343" class="text">Cloudflare / балансировщик</text>
+  <text x="110" y="367" class="small">health-check и маршрутизация на ноды</text>
+
+  <rect class="panel" x="570" y="125" width="1170" height="730"/>
+  <text x="600" y="165" class="panel-title">Kubernetes k3s cluster: namespace ai-prod</text>
+
+  <rect class="box box-amber" x="610" y="205" width="330" height="100"/>
+  <text x="635" y="235" class="text">Нода 1</text>
+  <text x="635" y="263" class="small">ingress-nginx DaemonSet</text>
+  <text x="635" y="287" class="small">hostPort 80/443</text>
+
+  <rect class="box box-amber" x="980" y="205" width="330" height="100"/>
+  <text x="1005" y="235" class="text">Нода 2</text>
+  <text x="1005" y="263" class="small">ingress-nginx DaemonSet</text>
+  <text x="1005" y="287" class="small">hostPort 80/443</text>
+
+  <rect class="box box-amber" x="1350" y="205" width="330" height="100"/>
+  <text x="1375" y="235" class="text">Нода 3</text>
+  <text x="1375" y="263" class="small">ingress-nginx DaemonSet</text>
+  <text x="1375" y="287" class="small">hostPort 80/443</text>
+
+  <rect class="box box-purple" x="845" y="360" width="550" height="86"/>
+  <text x="875" y="390" class="text">Ingress ai-prod</text>
+  <text x="875" y="418" class="small">host: orchestrator.example.com, TLS: origin-ca-tls</text>
+
+  <rect class="box box-blue" x="735" y="500" width="360" height="90"/>
+  <text x="760" y="530" class="text">Service orchestrator-service:80</text>
+  <text x="760" y="558" class="small">ClusterIP для backend + frontend</text>
+
+  <rect class="box box-blue" x="1195" y="500" width="360" height="90"/>
+  <text x="1220" y="530" class="text">Deployment orchestrator-service</text>
+  <text x="1220" y="558" class="small">replicas: 1, RUNNER_ENABLED=true</text>
+
+  <rect class="box box-green" x="735" y="650" width="360" height="90"/>
+  <text x="760" y="680" class="text">Service tools-service:4188</text>
+  <text x="760" y="708" class="small">внутренний сервис инструментов</text>
+
+  <rect class="box box-green" x="1195" y="650" width="360" height="90"/>
+  <text x="1220" y="680" class="text">Deployment tools-service</text>
+  <text x="1220" y="708" class="small">hostPath /srv/projects -> /projects</text>
+
+  <rect class="panel" x="570" y="895" width="640" height="310"/>
+  <text x="600" y="935" class="panel-title">PostgreSQL в k8s</text>
+  <rect class="box box-green" x="610" y="970" width="250" height="68"/>
+  <text x="635" y="999" class="text">pg-main-rw:5432</text>
+  <text x="635" y="1023" class="small">primary / write</text>
+  <rect class="box box-green" x="910" y="970" width="250" height="68"/>
+  <text x="935" y="999" class="text">pg-main-ro:5432</text>
+  <text x="935" y="1023" class="small">read replicas</text>
+  <rect class="box box-green" x="680" y="1080" width="420" height="90"/>
+  <text x="705" y="1110" class="text">CNPG Cluster pg-main</text>
+  <text x="705" y="1137" class="small">instances: 3, DB: orchestrator_db</text>
+  <text x="705" y="1161" class="small">storage: local-path 20Gi</text>
+
+  <rect class="panel" x="1240" y="895" width="500" height="310"/>
+  <text x="1270" y="935" class="panel-title">Реальная БД-источник</text>
+  <rect class="box box-red" x="1280" y="970" width="420" height="70"/>
+  <text x="1305" y="999" class="text">infra-haproxy-1:5000</text>
+  <text x="1305" y="1023" class="small">локально 127.0.0.1:5432/6432</text>
+  <rect class="box box-red" x="1280" y="1065" width="420" height="50"/>
+  <text x="1305" y="1097" class="text">infra-pgbouncer-1:5432</text>
+  <rect class="box box-red" x="1280" y="1140" width="420" height="50"/>
+  <text x="1305" y="1172" class="text">infra-patroni1-1 / PostgreSQL 16</text>
+
+  <ellipse class="db" cx="1490" cy="1240" rx="155" ry="38"/>
+  <text x="1400" y="1247" class="text">orchestrator_db</text>
+
+  <rect class="panel" x="40" y="455" width="480" height="750"/>
+  <text x="70" y="495" class="panel-title">Факты из orchestrator_db</text>
+
+  <rect class="box" x="80" y="535" width="380" height="92"/>
+  <text x="105" y="565" class="text">projects</text>
+  <text x="105" y="592" class="small">2 активных проекта:</text>
+  <text x="105" y="616" class="small">PROJECT Оркестратор, PROJECT_2 ПС</text>
+
+  <rect class="box" x="80" y="655" width="380" height="78"/>
+  <text x="105" y="685" class="text">services</text>
+  <text x="105" y="712" class="metric">45 сервисных записей</text>
+
+  <rect class="box" x="80" y="760" width="380" height="104"/>
+  <text x="105" y="790" class="text">tasks</text>
+  <text x="105" y="817" class="small">13 638 всего, 340 активных</text>
+  <text x="105" y="841" class="small">PROJECT: 154 активных</text>
+  <text x="105" y="865" class="small">PROJECT_2: 186 активных</text>
+
+  <rect class="box" x="80" y="890" width="380" height="92"/>
+  <text x="105" y="920" class="text">roles / connectors</text>
+  <text x="105" y="947" class="small">19 ролей, 1 MCP-роль</text>
+  <text x="105" y="971" class="small">5 включенных коннекторов</text>
+
+  <rect class="box" x="80" y="1010" width="380" height="130"/>
+  <text x="105" y="1040" class="text">service_dependencies</text>
+  <text x="105" y="1068" class="small">Catalog_Service -> IAM_Service GRPC</text>
+  <text x="105" y="1092" class="small">Chat_Service -> Connector_Service REST</text>
+  <text x="105" y="1116" class="small">Chat_Service -> IAM_Service GRPC</text>
+
+  <text x="80" y="1175" class="tiny">deployments в БД: 0 записей</text>
+
+  <path class="line" d="M260 275 L260 315"/>
+  <path class="line" d="M440 350 C510 350 535 255 610 255"/>
+  <path class="line" d="M440 350 C650 350 760 255 980 255"/>
+  <path class="line" d="M440 350 C830 350 980 255 1350 255"/>
+
+  <path class="line" d="M775 305 L930 360"/>
+  <path class="line" d="M1145 305 L1130 360"/>
+  <path class="line" d="M1515 305 L1310 360"/>
+  <path class="line" d="M1120 446 L935 500"/>
+  <path class="line" d="M1095 545 L1195 545"/>
+  <path class="line" d="M1375 590 L1375 650"/>
+  <path class="line" d="M1195 695 L1095 695"/>
+  <path class="line" d="M1375 590 C1190 770 1030 860 860 970"/>
+  <path class="line" d="M1375 590 C1320 790 1340 900 1280 1005"/>
+
+  <path class="line-soft" d="M735 545 C585 545 520 580 460 580"/>
+  <path class="line-soft" d="M735 545 C590 545 520 695 460 695"/>
+  <path class="line-soft" d="M735 545 C590 545 520 810 460 810"/>
+  <path class="line-soft" d="M735 545 C595 560 525 940 460 940"/>
+  <path class="line-soft" d="M735 545 C590 570 525 1080 460 1080"/>
+
+  <path class="line" d="M860 1004 L910 1004"/>
+  <path class="line" d="M735 1038 L820 1080"/>
+  <path class="line" d="M1035 1038 L960 1080"/>
+  <path class="replica" d="M820 1170 C820 1210 960 1210 960 1170"/>
+
+  <path class="line" d="M1490 1040 L1490 1065"/>
+  <path class="line" d="M1490 1115 L1490 1140"/>
+  <path class="line" d="M1490 1190 L1490 1202"/>
+
+  <text x="610" y="835" class="tiny">Поток: Cloudflare -> ingress-nginx на любой ноде -> Ingress -> Service -> pod orchestrator-service.</text>
+  <text x="610" y="1240" class="tiny">Примечание: отдельные k8s-объекты не хранятся в БД; они взяты из deploy/k8s, а факты сервисного слоя - из orchestrator_db.</text>
+</svg>

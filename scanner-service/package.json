@@ -1,0 +1,14 @@
+{
+  "name": "ai-dev-manager-scanner-service",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "start": "node bin/scanner-service.js",
+    "scan": "node bin/scanner-service.js --once",
+    "test": "node --test"
+  }
+}

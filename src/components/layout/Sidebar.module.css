@@ -1,0 +1,183 @@
+.sidebar {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: var(--sidebar-w, 256px);
+  background: var(--surface);
+  border-right: 1px solid var(--border);
+}
+.collapsed {
+  --sidebar-w: 72px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  height: var(--topbar-h, 60px);
+  padding: 0 var(--space-4);
+  border-bottom: 1px solid var(--border);
+}
+.collapsed .brand {
+  justify-content: center;
+  padding: 0;
+}
+
+.nav {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-4) var(--space-3);
+}
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.itemRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.item {
+  display: flex;
+  flex: 1 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-3);
+  height: var(--control-h-lg);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--text-secondary);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  transition:
+    background-color var(--dur-fast) var(--ease-in-out),
+    color var(--dur-fast) var(--ease-in-out);
+}
+
+/* Кнопка-disclosure (шеврон) для сворачивания/раскрытия категории. */
+.disclosure {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  width: var(--control-h-lg);
+  height: var(--control-h-lg);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  transition:
+    background-color var(--dur-fast) var(--ease-in-out),
+    color var(--dur-fast) var(--ease-in-out);
+}
+.disclosure:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.item:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+  text-decoration: none;
+}
+.item.active {
+  background: var(--primary-soft);
+  color: var(--primary-active);
+}
+.item.active .itemIcon {
+  color: var(--primary);
+}
+/* акцентная полоса активного пункта */
+.item.active {
+  position: relative;
+}
+.item.active::before {
+  content: '';
+  position: absolute;
+  left: calc(-1 * var(--space-3));
+  top: 50%;
+  transform: translateY(-50%);
+  width: 3px;
+  height: 60%;
+  border-radius: var(--radius-full);
+  background: var(--primary);
+}
+.itemIcon {
+  display: inline-flex;
+  flex: none;
+  color: var(--text-muted);
+}
+.itemLabel {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.collapsed .item {
+  justify-content: center;
+  padding: 0;
+}
+.collapsed .itemLabel {
+  display: none;
+}
+
+.sublist {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  margin: var(--space-1) 0 var(--space-1) calc(var(--space-3) + 18px + var(--space-3));
+  padding-left: var(--space-3);
+  border-left: 1px solid var(--border);
+}
+.subitem {
+  display: block;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  text-decoration: none;
+}
+.subitem:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+  text-decoration: none;
+}
+.subactive {
+  color: var(--primary-active);
+  font-weight: var(--weight-medium);
+}
+
+.subempty {
+  color: var(--text-muted);
+  font-style: italic;
+  cursor: default;
+}
+
+.subempty:hover {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.collapseBtn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  height: var(--control-h-lg);
+  margin: var(--space-2) var(--space-3);
+  padding: 0 var(--space-3);
+  border-radius: var(--radius-md);
+  color: var(--text-muted);
+  border-top: 1px solid transparent;
+}
+.collapseBtn:hover {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.collapsed .collapseBtn {
+  justify-content: center;
+  padding: 0;
+}
+.collapsed .collapseLabel {
+  display: none;
+}
