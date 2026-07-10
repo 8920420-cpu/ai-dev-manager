@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 
@@ -177,4 +178,73 @@ test('контракта нет → диагностируемый провал 
   assert.equal(result.success, false);
   assert.equal(result.output.summary.error.code, 'pipeline_contract_missing');
   assert.equal(executor.calls.length, 0);
+});
+
+// ── Изоляция TESTING на ветке сдачи (WORKTREE-ISOLATE-DELIVERY-001) ────────────
+
+function gitIn(cwd, args) {
+  return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+}
+
+test('worktree-сдача → TESTING в ИЗОЛИРОВАННОМ checkout доставленного коммита, общее дерево чистое', async (t) => {
+  const root = tmpDir(t);
+  // Реальный git-репо: base commit с .pipeline.json сервиса (стадия build).
+  gitIn(root, ['init', '--quiet']);
+  gitIn(root, ['config', 'user.email', 'test@local']);
+  gitIn(root, ['config', 'user.name', 'test']);
+  gitIn(root, ['config', 'commit.gpgsign', 'false']);
+  gitIn(root, ['config', 'core.autocrlf', 'false']);
+  writeServiceConfig(root, 'svc', { build: { commands: ['docker compose build'], enabled: true } });
+  gitIn(root, ['add', '-A']);
+  gitIn(root, ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '--quiet', '-m', 'init']);
+
+  // Ветка сервиса с дельтой (маркер DELTA.txt, которого НЕТ в main) — коммитим её
+  // через отдельный worktree, не переключая основную ветку общего дерева.
+  const branch = 'programmer/PROJECT/svc';
+  const bwt = path.join(os.tmpdir(), `bwt-${process.pid}-${Date.now()}`);
+  t.after(() => rmSync(bwt, { recursive: true, force: true }));
+  gitIn(root, ['worktree', 'add', '--quiet', '-b', branch, bwt, 'HEAD']);
+  writeFileSync(path.join(bwt, 'svc', 'DELTA.txt'), 'delta-only\n');
+  gitIn(bwt, ['add', '-A']);
+  gitIn(bwt, ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '--quiet', '-m', 'programmer: task delta']);
+  const deliveredCommit = gitIn(bwt, ['rev-parse', 'HEAD']).trim();
+  gitIn(root, ['worktree', 'remove', '--force', bwt]);
+
+  // Исполнитель фиксирует cwd и наличие дельты в МОМЕНТ запуска (worktree ещё жив).
+  let seen = null;
+  const executor = {
+    calls: [],
+    async run(command, opts = {}) {
+      seen = { cwd: opts.cwd, deltaPresent: existsSync(path.join(opts.cwd, 'DELTA.txt')) };
+      this.calls.push({ command, opts });
+      return { command, exitCode: 0, signal: null, stdout: '', stderr: '', timedOut: false, error: null, durationSeconds: 0.01 };
+    },
+  };
+
+  const task = claimTask({ root, serviceRel: 'svc', serviceCode: 'svc' });
+  task.worktreeBranch = branch;
+  task.deliveredCommit = deliveredCommit;
+
+  const result = await runPipelineAction(task, { runnerDeps: runnerDeps(executor) });
+  assert.equal(result.success, true);
+  assert.ok(seen, 'команда сервиса выполнялась');
+  // cwd НЕ в общем дереве root/svc, а во временном изолированном worktree.
+  assert.notEqual(path.resolve(seen.cwd), path.resolve(root, 'svc'), 'TESTING не в общем дереве');
+  assert.equal(seen.deltaPresent, true, 'изолированный checkout несёт доставленную дельту');
+  // Общее дерево репозитория осталось чистым (его Программист/Pipeline не трогали).
+  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '', 'общее дерево чистое');
+  // Эфемерный worktree снесён после прогона.
+  assert.equal(existsSync(seen.cwd), false, 'эфемерный worktree убран');
+});
+
+test('worktree-сдача без deliveredCommit/ветки → фолбэк на общее дерево (совместимость)', async (t) => {
+  const root = tmpDir(t);
+  const svcDir = writeServiceConfig(root, 'svc', { build: { commands: ['docker compose build'], enabled: true } });
+  const executor = new FakeExecutor();
+  // Ни worktreeBranch, ни deliveredCommit — legacy-сдача: гоняем в общем дереве.
+  const result = await runPipelineAction(claimTask({ root, serviceRel: 'svc', serviceCode: 'svc' }), {
+    runnerDeps: runnerDeps(executor),
+  });
+  assert.equal(result.success, true);
+  assert.equal(path.resolve(executor.calls[0].opts.cwd), path.resolve(svcDir), 'фолбэк — общее дерево сервиса');
 });

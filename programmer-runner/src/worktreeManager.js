@@ -10,12 +10,24 @@
 //     влита (иначе база протухает и дельты перестают ложиться на main);
 //   • задачи одного сервиса сериализуются на его worktree (mutex по ключу сервиса);
 //   • разные сервисы работают в своих worktree параллельно;
-//   • каждая задача коммитит в ветку сервиса и применяет в main ТОЛЬКО свою дельту
-//     (diff последнего коммита), а шаг «применить в main» сериализуется глобально.
+//   • каждая задача коммитит СВОЮ дельту в ветку сервиса и БОЛЬШЕ НИЧЕГО не пишет
+//     в общее рабочее дерево репозитория (WORKTREE-ISOLATE-DELIVERY-001, см. ниже).
 //
-// Дорогой шаг (LLM) идёт параллельно по сервисам, дешёвый «слить в main» — по одному.
-// Это «грязный край» (реальные git-эффекты): юнит-тестами покрыт инъектируемый
-// ProgrammerRunner, а сам менеджер — git-смоуком.
+// WORKTREE-ISOLATE-DELIVERY-001: раньше дельта, помимо коммита в ветку, ещё и
+// НАКАТЫВАЛАСЬ незакоммиченной в общее дерево (`git apply` в repoCwd) — чтобы
+// следующая стадия TESTING (Pipeline Service) видела новый код в общем дереве. Но
+// если задача не доходила до Git Integrator (BLOCKED / release-петля), этот
+// незакоммиченный накат оставался в общем дереве, копился по многим задачам и
+// сервисам, перемешивался и терялся при reset/рестарте (рецидив «код Программиста
+// в дереве PS не закоммичен → работа копится незакоммиченной»). Теперь Программист
+// НИКОГДА не трогает общее дерево: дельта живёт только коммитом в изолированной
+// ветке сервиса; TESTING гоняется на изолированном checkout этой ветки
+// (host-runner runPipelineAction), а в main её вливает ЕДИНСТВЕННЫЙ писатель —
+// Git Integrator (cherry-pick ветки). Общее дерево от Программиста всегда чистое.
+//
+// Дорогой шаг (LLM) идёт параллельно по сервисам. Это «грязный край» (реальные
+// git-эффекты): юнит-тестами покрыт инъектируемый ProgrammerRunner, а сам
+// менеджер — git-смоуком.
 import { execFileSync } from 'node:child_process';
 import { mkdirSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -28,40 +40,6 @@ function git(cwd, args, opts = {}) {
     maxBuffer: 64 * 1024 * 1024,
     ...opts,
   });
-}
-
-// Применить патч (дельту задачи) к рабочему дереву repoCwd. Бросает при неудаче;
-// git apply атомарен — на ошибке дерево остаётся нетронутым.
-function applyPatch(repoCwd, patch) {
-  execFileSync('git', ['-C', repoCwd, 'apply', '--binary', '--whitespace=nowarn', '-'], {
-    input: patch, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
-  });
-}
-
-// Ляжет ли патч на дерево repoCwd начисто (без модификации дерева, git apply --check).
-// reverse=true проверяет ОБРАТИМОСТЬ: патч уже применён и содержимое совпадает
-// (тогда прямой apply дал бы 'already exists', а обратный проходит начисто).
-function applyChecks(repoCwd, patch, { reverse = false } = {}) {
-  const args = ['-C', repoCwd, 'apply', '--binary', '--whitespace=nowarn', '--check'];
-  if (reverse) args.push('--reverse');
-  args.push('-');
-  try {
-    execFileSync('git', args, {
-      input: patch, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
-    });
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Глобальная сериализация шага «применить дельту в main»: два сервиса не должны
-// накатывать патч в основное дерево одновременно (гонка индекса/рабочей копии).
-let mainLock = Promise.resolve();
-function withMainLock(fn) {
-  const run = mainLock.then(() => fn());
-  mainLock = run.then(() => {}, () => {}); // одно упавшее звено не рвёт цепочку
-  return run;
 }
 
 const sanitize = (s) => String(s ?? '').replace(/[^A-Za-z0-9_.-]/g, '_') || '_';
@@ -262,11 +240,12 @@ export class WorktreeManager {
   }
 
   /**
-   * Выполнить задачу сервиса в его worktree (сериализованно), затем применить
-   * дельту в main. agentFn(worktreeCwd) → { ok, error?, result? }.
+   * Выполнить задачу сервиса в его worktree (сериализованно) и закоммитить дельту
+   * в ветку сервиса. Общее дерево репозитория НЕ трогается (WORKTREE-ISOLATE-
+   * DELIVERY-001). agentFn(worktreeCwd) → { ok, error?, result? }.
    * branch — ветка worktree сервиса (`programmer/<project>/<service>`), commit —
    * SHA коммита дельты 'programmer: task delta' (null, если дельта пустая): по ним
-   * GIT_INTEGRATION вливает ветку в main, когда changedFiles в сдаче не хватает.
+   * TESTING гоняется на checkout ветки, а GIT_INTEGRATION вливает ветку в main.
    * @returns {Promise<{ok:boolean, error?:string, changedFiles:string[], result?:object, branch:string, commit:(string|null)}>}
    */
   runForService(repoCwd, serviceKey, agentFn) {
@@ -305,18 +284,19 @@ export class WorktreeManager {
           commit: null,
         };
       }
-      return this._commitAndIntegrate(repoCwd, handle, agentOut);
+      return this._commitDelta(handle, agentOut);
     });
   }
 
-  // Зафиксировать правки задачи коммитом в ветке сервиса, вычислить дельту
-  // (последний коммит) и применить её в main под глобальным локом.
-  async _commitAndIntegrate(repoCwd, handle, agentOut) {
+  // Зафиксировать правки задачи коммитом в ветке сервиса и вернуть дельту для
+  // доставки. Общее дерево репозитория НЕ трогаем: TESTING гоняется на checkout
+  // ветки, а в main дельту вливает Git Integrator (WORKTREE-ISOLATE-DELIVERY-001).
+  _commitDelta(handle, agentOut) {
     const wt = handle.worktreeCwd;
     git(wt, ['add', '-A']);
     let staged = git(wt, ['diff', '--cached', '--name-only']).split('\n').map((s) => s.trim()).filter(Boolean);
     // PROGRAMMER-DELTA-DENYLIST-001: убрать из индекса артефакты сборки/генерации,
-    // чтобы они не попали в коммит-дельту и не порождали ложный integrate_conflict.
+    // чтобы они не попали в коммит-дельту и не порождали ложный конфликт при вливании.
     const denied = staged.filter((f) => matchesDeny(f, this.denyGlobs));
     if (denied.length) {
       try {
@@ -341,95 +321,37 @@ export class WorktreeManager {
       '-c', 'user.name=programmer-runner', '-c', 'user.email=programmer-runner@local',
       'commit', '--quiet', '--no-verify', '-m', 'programmer: task delta',
     ]);
-    // SHA коммита дельты в ветке сервиса — именно его GIT_INTEGRATION вливает в main
-    // (merge/cherry-pick), когда changedFiles в сдаче не хватает.
+    // SHA коммита дельты в ветке сервиса — по нему Pipeline Service поднимает
+    // изолированный checkout для TESTING, а GIT_INTEGRATION вливает его в main.
     const commit = git(wt, ['rev-parse', 'HEAD']).trim();
-    const patch = git(wt, ['diff', '--binary', 'HEAD~1', 'HEAD']);
     const changedFiles = git(wt, ['diff', '--name-only', 'HEAD~1', 'HEAD'])
       .split('\n').map((s) => s.trim()).filter(Boolean);
-
-    return withMainLock(() => {
-      // Быстрый путь (обычная, не REWORK, сдача): весь патч ложится одним apply.
-      try {
-        applyPatch(repoCwd, patch);
-        return { ok: true, changedFiles, result: agentOut.result, branch: handle.branch, commit };
-      } catch (firstErr) {
-        // Патч не лёг целиком. Ожидаемо при REWORK-заходе: файлы прошлого прогона
-        // уже лежат в основном дереве (untracked ?? packages/), и creation-hunks
-        // падают 'already exists in working directory'. Делаем интеграцию
-        // идемпотентной: разбираем дельту по файлам и классифицируем каждый —
-        //   • ложится начисто          → применить;
-        //   • уже донесён (то же содержимое, reverse-check проходит) → пропустить;
-        //   • содержимое расходится     → честный конфликт.
-        let classes;
-        try {
-          classes = this._classifyPatchFiles(wt, repoCwd, changedFiles);
-        } catch (e) {
-          // Не смогли разобрать по файлам — отдаём исходную ошибку apply как есть.
-          this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, error: firstErr.message });
-          return { ok: false, conflict: true, error: `integrate_conflict: ${firstErr.message}`, changedFiles, branch: handle.branch, commit };
-        }
-        const conflicts = classes.filter((c) => c.state === 'conflict').map((c) => c.file);
-        if (conflicts.length) {
-          // Реальный конфликт: содержимое в основном дереве отличается от патча.
-          // Дерево НЕ трогаем (git apply атомарен, ничего не применяли) — внятное
-          // сообщение вместо сырого stderr git apply.
-          const msg = `integrate_conflict: содержимое в основном дереве расходится с патчем ветки ${handle.branch}`
-            + ` — файлы: ${conflicts.join(', ')}`;
-          this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, conflicts });
-          return { ok: false, conflict: true, error: msg, changedFiles, conflictingFiles: conflicts, branch: handle.branch, commit };
-        }
-        // Конфликтов нет: применяем недостающие файлы, уже донесённые пропускаем.
-        const toApply = classes.filter((c) => c.state === 'apply');
-        try {
-          for (const c of toApply) applyPatch(repoCwd, c.patch);
-        } catch (e) {
-          this.log.warn?.('integrate conflict, requeue', { branch: handle.branch, error: e.message });
-          return { ok: false, conflict: true, error: `integrate_conflict: ${e.message}`, changedFiles, branch: handle.branch, commit };
-        }
-        const skipped = classes.filter((c) => c.state === 'applied').map((c) => c.file);
-        if (skipped.length) {
-          // changedFiles всё равно отдаём целиком: незакоммиченные артефакты
-          // (?? packages/) должен подобрать Git Integrator после разблокировки.
-          this.log.info?.('integrate: файлы уже в основном дереве, пропущены (идемпотентно)',
-            { branch: handle.branch, skipped });
-        }
-        return {
-          ok: true,
-          changedFiles,
-          result: agentOut.result,
-          alreadyApplied: toApply.length === 0,
-          branch: handle.branch,
-          commit,
-        };
-      }
-    });
+    return { ok: true, changedFiles, result: agentOut.result, branch: handle.branch, commit };
   }
 
-  // Классифицировать файлы дельты относительно текущего состояния основного дерева.
-  // Для каждого файла берём его персональный кусок патча (git diff HEAD~1 HEAD -- file)
-  // и проверяем применимость без модификации дерева:
-  //   'apply'    — ложится начисто (файла нет / содержимое совпадает с «до»);
-  //   'applied'  — уже донесён прошлым прогоном (reverse-check проходит начисто);
-  //   'conflict' — содержимое расходится (ни прямой, ни обратный check не проходят);
-  //   'noop'     — пустой diff (на всякий случай, не влияет на исход).
-  _classifyPatchFiles(wt, repoCwd, files) {
-    return files.map((file) => {
-      const patch = git(wt, ['diff', '--binary', 'HEAD~1', 'HEAD', '--', file]);
-      if (!patch.trim()) return { file, state: 'noop', patch };
-      if (applyChecks(repoCwd, patch)) return { file, state: 'apply', patch };
-      if (applyChecks(repoCwd, patch, { reverse: true })) return { file, state: 'applied', patch };
-      return { file, state: 'conflict', patch };
-    });
-  }
-
-  // Снести все worktree сервисов (на остановке процесса). Идемпотентно.
+  // Снести worktree сервисов (на остановке процесса). Идемпотентно.
+  //
+  // WORKTREE-ISOLATE-DELIVERY-001: ветка сервиса — ЕДИНСТВЕННАЯ копия дельты
+  // (в общее дерево мы больше ничего не накатываем), поэтому НЕВЛИТУЮ ветку удалять
+  // НЕЛЬЗЯ — force `branch -D` на остановке терял бы сданную, но ещё не влитую GI
+  // работу. Каталог worktree убираем всегда (переподнимется по ветке при рестарте,
+  // см. _reattachWorktree), а ветку сносим ТОЛЬКО если она полностью влита в main
+  // (`merge-base --is-ancestor <branch> HEAD`); иначе оставляем её жить до вливания.
   cleanupAll(repoByService = new Map()) {
     for (const [serviceKey, handle] of this.services) {
       const repoCwd = repoByService.get(serviceKey);
       if (!repoCwd) continue;
       try { git(repoCwd, ['worktree', 'remove', '--force', handle.worktreeCwd]); } catch { /* ок */ }
-      try { git(repoCwd, ['branch', '-D', handle.branch]); } catch { /* ок */ }
+      let merged = false;
+      try {
+        git(repoCwd, ['merge-base', '--is-ancestor', handle.branch, 'HEAD']);
+        merged = true; // exit 0 → все коммиты ветки уже в main
+      } catch { merged = false; } // exit 1 → есть невлитые коммиты (или ветки нет)
+      if (merged) {
+        try { git(repoCwd, ['branch', '-D', handle.branch]); } catch { /* ок */ }
+      } else {
+        this.log.info?.('cleanup: ветка с невлитой дельтой сохранена (не удаляем)', { branch: handle.branch });
+      }
     }
     this.services.clear();
   }

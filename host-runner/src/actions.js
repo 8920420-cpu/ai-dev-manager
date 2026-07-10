@@ -2,11 +2,15 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
+import os from 'node:os';
+import { rm } from 'node:fs/promises';
 import { runServicePipeline } from '../../pipeline-runner/src/index.js';
 import { runAutodeploy } from './autodeploy.js';
 import { withRepoWorktreeLock } from '../../shared/repoWorktreeLock.js';
 
 const pexec = promisify(execFile);
+
+const sanitizeSeg = (s) => String(s ?? '').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 60) || '_';
 
 /**
  * PIPELINE_SERVICE: реальный прогон pipeline сервиса задачи через pipeline-runner.
@@ -30,22 +34,73 @@ const pexec = promisify(execFile);
 export async function runPipelineAction(task, opts = {}) {
   const pipeline = task?.pipeline && typeof task.pipeline === 'object' ? task.pipeline : null;
   const serviceTask = pipeline ? { ...task, pipeline: { ...pipeline, projectRoot: '.' } } : task;
-  const projectsRoot = opts.projectsRoot ?? String(pipeline?.projectRoot ?? '').trim();
+  const baseProjectsRoot = opts.projectsRoot ?? String(pipeline?.projectRoot ?? '').trim();
 
-  const servicePipelineOpts = { projectsRoot };
-  if (opts.configFilename) servicePipelineOpts.configFilename = opts.configFilename;
-  if (opts.createRunner) servicePipelineOpts.createRunner = opts.createRunner;
-  if (opts.runnerDeps) servicePipelineOpts.runnerDeps = opts.runnerDeps;
+  // Прогон pipeline в заданном корне проекта (projectsRoot). Вынесено в замыкание,
+  // чтобы withPipelineWorktree мог подменить корень на изолированный checkout.
+  const runIn = async (projectsRoot) => {
+    const servicePipelineOpts = { projectsRoot };
+    if (opts.configFilename) servicePipelineOpts.configFilename = opts.configFilename;
+    if (opts.createRunner) servicePipelineOpts.createRunner = opts.createRunner;
+    if (opts.runnerDeps) servicePipelineOpts.runnerDeps = opts.runnerDeps;
 
-  const result = await runServicePipeline(serviceTask, servicePipelineOpts);
+    const result = await runServicePipeline(serviceTask, servicePipelineOpts);
 
-  // Результат сервисного слоя уже совместим с host-task-completed
-  // (output.summary/failedStage/startedAt/logPath). Дополнительно поднимаем runId
-  // на верхний уровень output для обратной совместимости прежнего контракта.
-  return {
-    success: result.success === true,
-    output: { ...result.output, runId: result.output?.summary?.runId ?? null },
+    // Результат сервисного слоя уже совместим с host-task-completed
+    // (output.summary/failedStage/startedAt/logPath). Дополнительно поднимаем runId
+    // на верхний уровень output для обратной совместимости прежнего контракта.
+    return {
+      success: result.success === true,
+      output: { ...result.output, runId: result.output?.summary?.runId ?? null },
+    };
   };
+
+  // WORKTREE-ISOLATE-DELIVERY-001: TESTING гоняется на изолированном checkout
+  // доставленной ветки сервиса (общее дерево Программист больше не пишет). Нет
+  // baseProjectsRoot / нет worktree-сдачи → фолбэк на общее дерево (см. функцию).
+  if (!baseProjectsRoot) return runIn(baseProjectsRoot);
+  return withPipelineWorktree(baseProjectsRoot, task, runIn);
+}
+
+// WORKTREE-ISOLATE-DELIVERY-001: поднять эфемерный worktree на доставленном коммите
+// (detached), прогнать в нём `run(projectsRoot)` и снести worktree. Так тесты видят
+// ровно доставленный код в ИЗОЛЯЦИИ, а общее дерево репозитория остаётся чистым (его
+// пишет только Git Integrator). Ссылку резолвим в самом репозитории: deliveredCommit
+// приоритетнее (точный SHA дельты), иначе tip ветки. Любой сбой (не git-репо, ссылка
+// не резолвится, worktree add упал) → БЕЗОПАСНЫЙ фолбэк на общее дерево (прежнее
+// поведение, совместимость с legacy-сдачей без worktree).
+async function withPipelineWorktree(repoRoot, task, run) {
+  const branch = typeof task?.worktreeBranch === 'string' && task.worktreeBranch.trim() ? task.worktreeBranch.trim() : '';
+  const commit = typeof task?.deliveredCommit === 'string' && task.deliveredCommit.trim() ? task.deliveredCommit.trim() : '';
+  const ref = commit || branch;
+  if (!ref) return run(repoRoot); // legacy-сдача без worktree → общее дерево
+
+  // Репозиторий должен резолвить ссылку локально, иначе изолировать нечего.
+  const isRepo = await git(repoRoot, ['rev-parse', '--is-inside-work-tree']).then(() => true).catch(() => false);
+  const resolved = isRepo
+    ? await git(repoRoot, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).then((r) => r.stdout.trim()).catch(() => '')
+    : '';
+  if (!resolved) return run(repoRoot); // не git-репо / ссылка не резолвится → фолбэк
+
+  const dir = path.join(os.tmpdir(), 'ai-dev-pipeline-worktrees', `${sanitizeSeg(task?.id)}-${process.pid}-${Date.now()}`);
+  // worktree add/remove — структурные операции .git: сериализуем межпроцессно с
+  // programmer-runner (worktree add) и Git Integrator (cherry-pick) на том же репо
+  // (тот же лок, что и в WorktreeManager.withRepoLock / integrateWorktreeBranch).
+  try {
+    await withRepoWorktreeLock(repoRoot, () =>
+      git(repoRoot, ['worktree', 'add', '--detach', '--force', dir, resolved]));
+  } catch {
+    return run(repoRoot); // не смогли изолировать — безопасный фолбэк на общее дерево
+  }
+  try {
+    return await run(dir);
+  } finally {
+    await withRepoWorktreeLock(repoRoot, async () => {
+      await git(repoRoot, ['worktree', 'remove', '--force', dir]).catch(() => {});
+      await git(repoRoot, ['worktree', 'prune']).catch(() => {});
+    }).catch(() => {});
+    await rm(dir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 async function git(repoRoot, args) {
