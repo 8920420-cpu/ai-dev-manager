@@ -20,8 +20,10 @@ mem() {
   powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden \
     -File "$top/scripts/refresh-codebase-memory.ps1" "$@" >/dev/null 2>&1 &
 }
+# Memory-артефакты codebase-memory — их правки НЕ триггерят refresh (см. post-commit).
+mem_re='(^|/)\.claude/|(^|/)(CLAUDE|CONVENTIONS)\.md$|(^|/)\.(cursorrules|clinerules|windsurfrules|roomodes)$|(^|/)copilot-instructions\.md$'
 touched() {
-  echo "$changed" | grep -E "^$1/" | grep -qvE '(^|/)\.claude/|/CLAUDE\.md$'
+  echo "$changed" | grep -E "^$1/" | grep -qvE "$mem_re"
 }
 if [ -n "$changed" ]; then
   touched 'orchestrator-service/backend' && mem -Only 'orchestrator-service/backend'

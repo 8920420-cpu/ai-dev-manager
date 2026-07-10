@@ -21,9 +21,14 @@ mem() {
   powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden \
     -File "$dir/scripts/refresh-codebase-memory.ps1" "$@" >/dev/null 2>&1 &
 }
+# Memory-артефакты codebase-memory: их правки НЕ должны триггерить refresh (иначе
+# коммит регенерированной памяти сам себя триггерит). Это .claude/*, CLAUDE.md,
+# CONVENTIONS.md и IDE-файлы (.cursorrules/.clinerules/.windsurfrules/.roomodes,
+# .github/copilot-instructions.md).
+mem_re='(^|/)\.claude/|(^|/)(CLAUDE|CONVENTIONS)\.md$|(^|/)\.(cursorrules|clinerules|windsurfrules|roomodes)$|(^|/)copilot-instructions\.md$'
 touched() {
   # истинно, если среди изменённых есть НЕ-memory файл под префиксом $1
-  echo "$changed" | grep -E "^$1/" | grep -qvE '(^|/)\.claude/|/CLAUDE\.md$'
+  echo "$changed" | grep -E "^$1/" | grep -qvE "$mem_re"
 }
 touched 'orchestrator-service/backend' && mem -Only 'orchestrator-service/backend'
 touched 'programmer-runner'            && mem -Only 'programmer-runner'
