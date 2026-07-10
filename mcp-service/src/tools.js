@@ -32,6 +32,14 @@ async function run(fn) {
   return asText(result);
 }
 
+// INFRA-DEPARTMENT-001 — коды ролей Инфраструктурного отдела (для фильтрации инфра-инструментов).
+const INFRA_ROLE_CODES = [
+  'INFRA_ARCHITECT', 'SYSADMIN', 'DEVOPS_ENGINEER', 'NETWORK_ENGINEER', 'K8S_ENGINEER',
+  'DOCKER_ENGINEER', 'VIRTUALIZATION_ENGINEER', 'BACKUP_ENGINEER',
+  'SECURITY_ENGINEER', 'SRE_ENGINEER', 'MONITORING_ENGINEER',
+];
+const INFRA_ROLE_SET = new Set(INFRA_ROLE_CODES);
+
 /**
  * Зарегистрировать инструменты на server.
  *   server               — McpServer (или фейк с registerTool)
@@ -273,6 +281,56 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
     ({ roleCode }) => run(() => orchestratorClient.get(`/api/mcp-roles/${encodeURIComponent(roleCode)}`)),
   );
 
+  // ─────────────── Инфраструктурный отдел (read-only, всегда) ───────────────
+  // INFRA-DEPARTMENT-001 — роли и задачи Инфраструктурного отдела (инфра-архитектор,
+  // исполнители, ИБ/SRE/мониторинг). Роли берём из общего /api/mcp-roles и фильтруем
+  // по INFRA_ROLE_SET.
+
+  tool(
+    'orchestrator_list_infra_roles',
+    {
+      title: 'Роли Инфраструктурного отдела',
+      description:
+        'Список ролей Инфраструктурного отдела (инфра-архитектор, системные/DevOps/сетевые/K8s/Docker/' +
+        'виртуализация/бэкап инженеры, ИБ/SRE/мониторинг) с промтом (prompt) и требованиями (requirements). ' +
+        'GET /api/mcp-roles, отфильтрованный по кодам инфра-ролей.',
+      inputSchema: {},
+    },
+    () => run(async () => {
+      const data = await orchestratorClient.get('/api/mcp-roles');
+      const roles = Array.isArray(data) ? data : (data.roles ?? data);
+      if (!Array.isArray(roles)) return data; // напр. {ok:false,...} — вернуть как есть
+      return { roles: roles.filter((r) => INFRA_ROLE_SET.has(String(r.code ?? r.roleCode ?? '').toUpperCase())) };
+    }),
+  );
+
+  tool(
+    'orchestrator_get_infra_role',
+    {
+      title: 'Карточка инфра-роли',
+      description:
+        'GET /api/mcp-roles/:code — карточка роли Инфраструктурного отдела: промт (prompt) и требования ' +
+        '(requirements). Принимает только коды инфра-ролей; иначе вернёт not_infra_role.',
+      inputSchema: { roleCode: z.string().describe('Код инфра-роли, напр. INFRA_ARCHITECT') },
+    },
+    ({ roleCode }) => run(() => {
+      if (!INFRA_ROLE_SET.has(roleCode.trim().toUpperCase())) {
+        return { ok: false, code: 'not_infra_role', error: 'Роль не входит в Инфраструктурный отдел' };
+      }
+      return orchestratorClient.get(`/api/mcp-roles/${encodeURIComponent(roleCode)}`);
+    }),
+  );
+
+  tool(
+    'orchestrator_list_infra_tasks',
+    {
+      title: 'Задачи Инфраструктурного отдела',
+      description: 'GET /api/infra/tasks — задачи инфра-проектов (по умолчанию все инфра-проекты).',
+      inputSchema: { project: z.string().optional().describe('Код или id инфра-проекта (по умолчанию все инфра-проекты)') },
+    },
+    ({ project }) => run(() => orchestratorClient.get('/api/infra/tasks', { query: project ? { project } : {} })),
+  );
+
   tool(
     'orchestrator_db_status',
     { title: 'Статус БД', description: 'GET /api/db/status.', inputSchema: {} },
@@ -304,6 +362,23 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
       inputSchema: { role: z.string().describe('Код host-роли, например PIPELINE_SERVICE.') },
     },
     ({ role }) => run(() => orchestratorClient.get('/api/runner/next-host-task', { query: { role } })),
+  );
+
+  tool(
+    'orchestrator_claim_next_reasoning_task',
+    {
+      title: 'Взять reasoning-задачу (драйвер)',
+      description:
+        'GET /api/runner/next-reasoning-task?engine=... — захватить следующую reasoning-задачу для host-драйвера ' +
+        '(движок codex или claude_code). Покрывает роли Инфраструктурного отдела (INFRA_ARCHITECT, исполнители, ' +
+        'ИБ/SRE/мониторинг) и dev reasoning-роли. Опционально ограничить конкретной ролью.',
+      inputSchema: {
+        engine: z.enum(['codex', 'claude_code']).describe('Движок-драйвер'),
+        role: z.string().optional().describe('Ограничить конкретной ролью, напр. SECURITY_ENGINEER'),
+      },
+    },
+    ({ engine, role }) =>
+      run(() => orchestratorClient.get('/api/runner/next-reasoning-task', { query: { engine, ...(role ? { role } : {}) } })),
   );
 
   // ─────────────── Мутации оркестратора (только по флагу) ───────────────
@@ -400,6 +475,58 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
         inputSchema: { taskId: z.string() },
       },
       ({ taskId }) => run(() => orchestratorClient.post('/api/runner/release-host-task', { taskId })),
+    );
+
+    // ─────────────── Инфраструктурный отдел: мутации (по флагу) ───────────────
+    // INFRA-DEPARTMENT-001.
+
+    tool(
+      'orchestrator_create_infra_task',
+      {
+        title: 'Поставить инфра-задачу',
+        description:
+          'Завести задачу в конвейере Инфраструктурного отдела: создаётся сразу под ролью Инфра-архитектора ' +
+          '(entryRole=INFRA_ARCHITECT), проект по умолчанию INFRA. POST /api/scanner/task-intake. ' +
+          'Идемпотентно по (project, externalId). Требует MCP_ENABLE_ORCHESTRATOR_MUTATIONS=1.',
+        inputSchema: {
+          externalId: z.string().describe('Уникальный ключ задачи (идемпотентность)'),
+          title: z.string().describe('Заголовок инфра-задачи'),
+          description: z.string().optional().describe('Постановка/критерии приёмки'),
+          project: z.string().optional().describe('Код/путь инфра-проекта (по умолчанию INFRA)'),
+          projectPath: z.string().optional(),
+          card: z.record(z.any()).optional().describe('Дополнительные поля карточки'),
+        },
+      },
+      ({ project, ...rest }) => run(() => orchestratorClient.post('/api/scanner/task-intake', {
+        ...rest, project: project ?? 'INFRA', entryRole: 'INFRA_ARCHITECT',
+      })),
+    );
+
+    tool(
+      'orchestrator_complete_reasoning_task',
+      {
+        title: 'Сдать reasoning-вердикт',
+        description: 'POST /api/runner/reasoning-completed — сдать результат/вердикт reasoning-роли. Требует MCP_ENABLE_ORCHESTRATOR_MUTATIONS=1.',
+        inputSchema: {
+          taskId: z.string(),
+          status: z.string().optional(),
+          summary: z.string().optional(),
+          findings: z.array(z.string()).optional(),
+          fields: z.record(z.any()).optional(),
+        },
+      },
+      ({ taskId, status, summary, findings, fields }) =>
+        run(() => orchestratorClient.post('/api/runner/reasoning-completed', { taskId, status, summary, findings, fields })),
+    );
+
+    tool(
+      'orchestrator_release_reasoning_task',
+      {
+        title: 'Вернуть reasoning-задачу в пул',
+        description: 'POST /api/runner/release-reasoning-task — откатить захват reasoning-задачи. Требует MCP_ENABLE_ORCHESTRATOR_MUTATIONS=1.',
+        inputSchema: { taskId: z.string() },
+      },
+      ({ taskId }) => run(() => orchestratorClient.post('/api/runner/release-reasoning-task', { taskId })),
     );
   }
 

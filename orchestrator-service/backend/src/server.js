@@ -18,6 +18,7 @@ import {
   acceptScannerIntake,
   acceptIntakeReport,
   listUnassignedTasks,
+  listInfraTasks,
   assignTaskProject,
   advanceTask,
   moveTask,
@@ -759,6 +760,11 @@ export function createApp() {
         // Неразобранные задачи (project_id IS NULL) — корзина Приёмщика задач.
         if (req.method === 'GET' && p === '/api/tasks/unassigned')
           return sendJson(res, 200, await listUnassignedTasks(await loadSettings()));
+
+        // INFRA-DEPARTMENT-001 — задачи Инфраструктурного отдела с текущей ролью/этапом
+        // (read-only). Необязательный ?project=<code|id> сужает до одного инфра-проекта.
+        if (req.method === 'GET' && p === '/api/infra/tasks')
+          return sendJson(res, 200, await listInfraTasks(await loadSettings(), url.searchParams.get('project')));
 
         // Назначить неразобранной задаче проект → задача уходит по цепочке ролей.
         const assignMatch = p.match(/^\/api\/tasks\/([^/]+)\/assign-project$/);

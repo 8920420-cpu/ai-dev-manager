@@ -11,6 +11,11 @@ test('buildServer регистрирует read-инструменты на ре
   assert.ok(tools.includes('project_search_text'));
   assert.ok(tools.includes('orchestrator_health'));
   assert.ok(tools.includes('orchestrator_list_projects'));
+  // INFRA-DEPARTMENT-001 — инфра read-only и reasoning-claim регистрируются всегда:
+  assert.ok(tools.includes('orchestrator_list_infra_roles'));
+  assert.ok(tools.includes('orchestrator_get_infra_role'));
+  assert.ok(tools.includes('orchestrator_list_infra_tasks'));
+  assert.ok(tools.includes('orchestrator_claim_next_reasoning_task'));
 });
 
 test('HTTP-режим отдаёт health 200 на эфемерном порту', async () => {

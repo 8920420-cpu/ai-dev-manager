@@ -302,7 +302,7 @@ function subtaskCompletionRules(openSubtasks) {
     { re: /to_regclass\('public\.role_fields'\)/, reply: { rowCount: 1, rows: [{ t: null }] } },
     { re: /count\(\*\)::int AS n FROM tasks\s+WHERE parent_task_id = \$1 AND task_kind = 'subtask'/,
       reply: { rowCount: 1, rows: [{ n: openSubtasks }] } },
-    { re: /UPDATE tasks SET status = \$2::task_status, current_role_id = \$3, assigned_agent_id = NULL\s+WHERE id = \$1 AND status = 'WAITING_FOR_CHILDREN'/,
+    { re: /UPDATE tasks SET status = \$2::task_status, current_role_id = \$3, assigned_agent_id = NULL[\s\S]*WHERE id = \$1 AND status = 'WAITING_FOR_CHILDREN'/,
       reply: { rowCount: 1, rows: [{ status: 'WAITING_FOR_CHILDREN' }] } },
   ];
 }

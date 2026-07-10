@@ -205,6 +205,22 @@ export const LLM_ROLE_CODES = [
   'FAILURE_ANALYST',
   'DOCUMENTATION_AUDITOR',
   'DOCUMENTATION_KEEPER',
+  // INFRA-DEPARTMENT-001 — рассуждающие роли Инфраструктурного отдела. Исполняются
+  // хостовыми драйверами (claude_code для архитектора и семи доменных исполнителей,
+  // codex для гейтов ИБ/SRE и проверки мониторинга) по назначению role_connectors.
+  // Каждая ОБЯЗАНА присутствовать в ROLE_FLOW (LLM_FLOW_PAIRS читает ROLE_FLOW[code].from).
+  // Финальный commit ведёт host-роль GIT_INTEGRATOR (в HOST_ROLE_CODES, не здесь).
+  'INFRA_ARCHITECT',
+  'SYSADMIN',
+  'DEVOPS_ENGINEER',
+  'NETWORK_ENGINEER',
+  'K8S_ENGINEER',
+  'DOCKER_ENGINEER',
+  'VIRTUALIZATION_ENGINEER',
+  'BACKUP_ENGINEER',
+  'SECURITY_ENGINEER',
+  'SRE_ENGINEER',
+  'MONITORING_ENGINEER',
 ];
 
 // Роли реального действия — их выполняет host-мост (docker/git), не ИИ.
@@ -602,7 +618,12 @@ export function normalizeVerdict(roleCode, parsed) {
  *   'rework' (провал гейта без аналитика → на доработку) | 'forward' (необяз.).
  * reworkCount — сколько раз задача возвращалась в доработку (защита от цикла).
  */
-export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = MAX_REWORK, priorMissingArtifact = false } = {}) {
+export function decideOutcome(roleCode, verdict, {
+  reworkCount = 0,
+  maxRework = MAX_REWORK,
+  priorMissingArtifact = false,
+  reviewerReworkCount = 0,
+} = {}) {
   const forward = { outcome: 'FORWARD', agentRunStatus: 'SUCCESS', reason: 'ok' };
   // DOC-BRANCH-LIVENESS-001: мягкое движение вперёд с сохранением причины —
   // прогон НЕ считается упавшим (SUCCESS), но reason фиксирует, что документация
@@ -619,10 +640,24 @@ export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = 
   switch (roleCode) {
     case 'TASK_REVIEWER':
     case 'REVIEWER':
+    // INFRA-DEPARTMENT-001 — гейты и проверка Инфраструктурного отдела ведут себя
+    // как ревьюер: провал (NEEDS_FIX/REJECTED/FAIL) уводит задачу на доработку
+    // ближайшему доменному исполнителю (reworkTarget по графу), а не блокирует.
+    // Мониторинг (PASS/FAIL) — та же логика: FAIL → доработка исполнителю.
+    case 'SECURITY_ENGINEER':
+    case 'SRE_ENGINEER':
+    case 'MONITORING_ENGINEER':
       // Гейт качества: дальше только при явном APPROVED. Провал ревью — сразу
       // на доработку ближайшему исполнителю; Failure Analyst нужен для падений
       // pipeline/host-ролей, а не для обычных замечаний ревьюера.
       if (verdict.ok === true) return forward;
+      // REVIEWER-ONE-REWORK-001: Programmer -> Reviewer -> Rework -> Programmer
+      // допускается ровно один раз. Повторный отрицательный вердикт reviewer
+      // пропускаем вперёд, иначе изолированная worktree-доставка может гонять
+      // один task_id десятки раз без продвижения к Pipeline/Git Integrator.
+      if (reviewerReworkCount >= 1) {
+        return { ...forward, reason: 'review_rework_limit_forwarded' };
+      }
       if (reworkCount >= maxRework) return block('max_rework_exceeded');
       return rework('review_failed');
     case 'FAILURE_ANALYST':
@@ -641,6 +676,10 @@ export function decideOutcome(roleCode, verdict, { reworkCount = 0, maxRework = 
       return rework('diagnosed');
     case 'ARCHITECT':
     case 'DECOMPOSER':
+    // INFRA-DEPARTMENT-001 — инфраструктурный архитектор ведёт себя как проектная
+    // роль: BLOCKED-вердикт останавливает задачу на пользователя, иначе движение
+    // вперёд (в графе следующий узел — fork, порождающий параллельных исполнителей).
+    case 'INFRA_ARCHITECT':
       if (verdict.ok === false) return block(verdict.status.toLowerCase() || 'blocked');
       return forward;
     case 'DOCUMENTATION_AUDITOR':

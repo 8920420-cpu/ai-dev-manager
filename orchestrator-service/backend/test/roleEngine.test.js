@@ -171,6 +171,15 @@ test('decideTransition: TASK_REVIEWER NEEDS_FIX => CODING/PROGRAMMER', () => {
   assert.equal(d.blocked, false);
 });
 
+test('decideOutcome: TASK_REVIEWER after one reviewer rework => FORWARD', () => {
+  const d = decideOutcome('TASK_REVIEWER', { ok: false, status: 'NEEDS_FIX' }, {
+    reworkCount: 0,
+    reviewerReworkCount: 1,
+  });
+  assert.equal(d.outcome, 'FORWARD');
+  assert.equal(d.reason, 'review_rework_limit_forwarded');
+});
+
 test('decideTransition: TASK_REVIEWER неразобранный вердикт не апрувит', () => {
   const d = decideTransition('TASK_REVIEWER', { ok: null, status: '' }, { reworkCount: 0 });
   assert.equal(d.nextRole, 'PROGRAMMER');
@@ -411,11 +420,16 @@ test('compactToolResult: undefined-результат инструмента →
   assert.equal(compactToolResult({ ok: true, result: undefined }.result), '');
 });
 
-test('LLM_ROLE_CODES покрывает 7 рассуждающих ролей (вкл. Приёмщика задач)', () => {
+test('LLM_ROLE_CODES покрывает рассуждающие роли разработки и Инфраструктурного отдела', () => {
   assert.deepEqual([...LLM_ROLE_CODES].sort(), [
+    // Разработка (вкл. Приёмщика задач).
     'ARCHITECT', 'DECOMPOSER', 'DOCUMENTATION_AUDITOR',
     'DOCUMENTATION_KEEPER', 'FAILURE_ANALYST', 'TASK_INTAKE_OFFICER', 'TASK_REVIEWER',
-  ]);
+    // INFRA-DEPARTMENT-001 — Инфраструктурный отдел (архитектор + 7 исполнителей + ИБ/SRE/мониторинг).
+    'BACKUP_ENGINEER', 'DEVOPS_ENGINEER', 'DOCKER_ENGINEER', 'INFRA_ARCHITECT',
+    'K8S_ENGINEER', 'MONITORING_ENGINEER', 'NETWORK_ENGINEER', 'SECURITY_ENGINEER',
+    'SRE_ENGINEER', 'SYSADMIN', 'VIRTUALIZATION_ENGINEER',
+  ].sort());
 });
 
 test('pickAssignedConnectorRow: deterministic ORDER BY for multiple role connectors', async () => {

@@ -37,6 +37,27 @@ export const ROLE_FLOW = {
   DOCUMENTATION_AUDITOR: { auto: true,  from: ['COMMIT'],                            next: 'GIT_INTEGRATOR',        to: 'COMMIT' },
   DOCUMENTATION_KEEPER:  { auto: true,  from: ['COMMIT'],                            next: 'GIT_INTEGRATOR',        to: 'COMMIT' },
   GIT_INTEGRATOR:        { auto: true,  from: ['COMMIT'],                            next: null,                    to: 'DONE' },
+
+  // INFRA-DEPARTMENT-001 — Инфраструктурный отдел: отдельный конвейер для инфра-задач
+  // (маршрут ведёт ГРАФ project_stages инфра-проекта с fork/join). Роли исполняются
+  // теми же движками, что и разработка: reasoning-роли на драйверах claude_code/codex
+  // (auto:true, как ARCHITECT/TASK_REVIEWER — их не трогает внутренний DeepSeek-цикл,
+  // а захватывает хостовый драйвер по role_connectors), финальный commit — общий
+  // GIT_INTEGRATOR (host). Поля next/to — КАНОНИЧЕСКИЙ ФОЛБЭК (в графе их задаёт
+  // порядок/рёбра этапов). Статусы переиспользуют enum task_status без новых значений:
+  //   INFRA_ARCHITECT(ARCHITECTURE) → 7 исполнителей(CODING) → гейты(REVIEW) →
+  //   мониторинг(TESTING) → GIT_INTEGRATOR(COMMIT) → DONE.
+  INFRA_ARCHITECT:         { auto: true, from: ['ARCHITECTURE'], next: 'SYSADMIN',            to: 'CODING' },
+  SYSADMIN:                { auto: true, from: ['CODING'],       next: 'SECURITY_ENGINEER',   to: 'REVIEW' },
+  DEVOPS_ENGINEER:         { auto: true, from: ['CODING'],       next: 'SECURITY_ENGINEER',   to: 'REVIEW' },
+  NETWORK_ENGINEER:        { auto: true, from: ['CODING'],       next: 'SECURITY_ENGINEER',   to: 'REVIEW' },
+  K8S_ENGINEER:            { auto: true, from: ['CODING'],       next: 'SECURITY_ENGINEER',   to: 'REVIEW' },
+  DOCKER_ENGINEER:         { auto: true, from: ['CODING'],       next: 'SECURITY_ENGINEER',   to: 'REVIEW' },
+  VIRTUALIZATION_ENGINEER: { auto: true, from: ['CODING'],       next: 'SECURITY_ENGINEER',   to: 'REVIEW' },
+  BACKUP_ENGINEER:         { auto: true, from: ['CODING'],       next: 'SECURITY_ENGINEER',   to: 'REVIEW' },
+  SECURITY_ENGINEER:       { auto: true, from: ['REVIEW'],       next: 'SRE_ENGINEER',        to: 'REVIEW' },
+  SRE_ENGINEER:            { auto: true, from: ['REVIEW'],       next: 'MONITORING_ENGINEER', to: 'TESTING' },
+  MONITORING_ENGINEER:     { auto: true, from: ['TESTING'],      next: 'GIT_INTEGRATOR',      to: 'COMMIT' },
 };
 
 // Роли, которые продвигает фоновый runner внутри БД.
@@ -92,6 +113,23 @@ export const ROLE_KINDS = {
   // а не runner (роли скрыты, hidden=true → claimLlmRoleTask их не клеймит).
   FORK_GATE:             'gate',
   JOIN_GATE:             'gate',
+
+  // INFRA-DEPARTMENT-001 — типы ролей Инфраструктурного отдела (для ветвления
+  // динамического резолвера в инфра-графе): архитектор — проектная роль (design),
+  // семь доменных исполнителей — executor (к ним возвращается REWORK гейтов),
+  // ИБ/SRE — гейты качества (провал → доработка исполнителю), мониторинг — проверка
+  // (pipeline, как TESTER). Финальный commit ведёт общий GIT_INTEGRATOR (integrator).
+  INFRA_ARCHITECT:         'design',
+  SYSADMIN:                'executor',
+  DEVOPS_ENGINEER:         'executor',
+  NETWORK_ENGINEER:        'executor',
+  K8S_ENGINEER:            'executor',
+  DOCKER_ENGINEER:         'executor',
+  VIRTUALIZATION_ENGINEER: 'executor',
+  BACKUP_ENGINEER:         'executor',
+  SECURITY_ENGINEER:       'gate',
+  SRE_ENGINEER:            'gate',
+  MONITORING_ENGINEER:     'pipeline',
 };
 
 // Тип роли по коду ('' — неизвестная роль).

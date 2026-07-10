@@ -281,6 +281,45 @@ function roleFromCompletionKey(key) {
   return String(key ?? '').startsWith('programmer-') ? 'PROGRAMMER' : null;
 }
 
+// REVIEWER-ONE-REWORK-001: считаем только реальные возвраты reviewer на Programmer.
+// Общий reworkCount исторически считает FAILURE_ANALYSIS и не защищает эту петлю.
+async function countTaskReviewerReworks(c, taskId) {
+  const r = await c.query(
+    `SELECT count(*)::int AS n
+       FROM task_events e
+       JOIN roles r ON r.id = e.role_id
+      WHERE e.task_id = $1
+        AND r.code = 'TASK_REVIEWER'
+        AND e.from_status = 'REVIEW'
+        AND e.to_status = 'CODING'
+        AND e.payload_json->>'outcome' = 'REWORK'`,
+    [taskId],
+  );
+  return Number(r.rows[0]?.n) || 0;
+}
+
+async function resolveAfterSkippedReviewer(c, route, task, currentStatus, currentStageKey) {
+  if (routeIsUsable(route)) {
+    const resolved = resolveTransition(route, 'TASK_REVIEWER', { outcome: 'FORWARD' }, {
+      currentStatus,
+      currentStageKey,
+    });
+    return {
+      toStatus: resolved.toStatus,
+      nextRoleCode: resolved.nextRole,
+      nextStageKey: resolved.nextStageKey ?? null,
+      nextRoleId: resolved.done || !resolved.nextRole ? null : await roleIdByCode(c, resolved.nextRole),
+    };
+  }
+  const flow = ROLE_FLOW.TASK_REVIEWER;
+  return {
+    toStatus: flow.to,
+    nextRoleCode: flow.next,
+    nextStageKey: null,
+    nextRoleId: flow.next ? await roleIdByCode(c, flow.next) : null,
+  };
+}
+
 /**
  * Принять завершение от файлового Scanner bridge и передать задачу Task Reviewer.
  * scanner_dispatches и транзакция обеспечивают exactly-once переход на стороне БД.
@@ -345,6 +384,16 @@ export async function acceptScannerCompletionTx(c, payload) {
       let toStatus = 'REVIEW';
       let nextRoleId = task.reviewer_role_id;
       let nextRoleCode = 'TASK_REVIEWER';
+      // FORK-JOIN-STAGEKEY-001: при продвижении Programmer'а переносим и ПОЗИЦИЮ в
+      // графе (current_stage_key), а не только status/role. Иначе задача с непустым
+      // stage_key (graph-режим — её порождают Архитектор/work_stack) уходила в REVIEW,
+      // но stage_key застревал на узле Programmer, и guard захвата claimLlmRoleTask
+      // (ps.stage_key = current_stage_key) для этапа ревьюера не совпадал — задачу не
+      // брал ни один движок и она зависала в REVIEW. Зеркалим host-путь
+      // (completeHostTaskTx: current_stage_key = resolved.nextStageKey ?? null).
+      // Линейный/канонический маршрут (route не usable) оставляет NULL — guard
+      // трактует NULL как wildcard, поэтому такие задачи claim'ятся как раньше.
+      let nextStageKey = null;
       if (routeIsUsable(route)) {
         const resolved = resolveTransition(route, fromRole, { outcome: 'FORWARD' }, {
           currentStatus: task.status,
@@ -352,9 +401,19 @@ export async function acceptScannerCompletionTx(c, payload) {
         });
         toStatus = resolved.toStatus;
         nextRoleCode = resolved.nextRole;
+        nextStageKey = resolved.nextStageKey ?? null;
         nextRoleId = resolved.done || !resolved.nextRole
           ? null
           : await roleIdByCode(c, resolved.nextRole);
+      }
+      let skippedReviewer = false;
+      if (nextRoleCode === 'TASK_REVIEWER' && (await countTaskReviewerReworks(c, payload.taskId)) >= 1) {
+        const skipped = await resolveAfterSkippedReviewer(c, route, task, toStatus, nextStageKey);
+        toStatus = skipped.toStatus;
+        nextRoleCode = skipped.nextRoleCode;
+        nextStageKey = skipped.nextStageKey;
+        nextRoleId = skipped.nextRoleId;
+        skippedReviewer = true;
       }
 
       // Поля Programmer → кумулятивная карточка задачи.
@@ -409,10 +468,11 @@ export async function acceptScannerCompletionTx(c, payload) {
           );
           if (open.rows[0].n === 0) {
             const parent = await c.query(
-              `UPDATE tasks SET status = $2::task_status, current_role_id = $3, assigned_agent_id = NULL
+              `UPDATE tasks SET status = $2::task_status, current_role_id = $3, assigned_agent_id = NULL,
+                      current_stage_key = $4::uuid
                 WHERE id = $1 AND status = 'WAITING_FOR_CHILDREN'
                 RETURNING status`,
-              [task.parent_task_id, toStatus, nextRoleId],
+              [task.parent_task_id, toStatus, nextRoleId, nextStageKey],
             );
             if (parent.rowCount) {
               parentPromoted = true;
@@ -422,6 +482,7 @@ export async function acceptScannerCompletionTx(c, payload) {
                  VALUES ($1, 'STATUS_CHANGED', 'WAITING_FOR_CHILDREN', $4::task_status, $2, $3::jsonb)`,
                 [task.parent_task_id, nextRoleId, JSON.stringify({
                   source: 'scanner', reason: 'all_subtasks_done', nextRole: nextRoleCode, kind: 'service',
+                  skippedReviewer,
                 }), toStatus],
               );
             }
@@ -441,9 +502,9 @@ export async function acceptScannerCompletionTx(c, payload) {
       await c.query(
         `UPDATE tasks
          SET status = $2::task_status, current_role_id = $3, assigned_agent_id = NULL,
-             data_card = data_card || $4::jsonb
+             data_card = data_card || $4::jsonb, current_stage_key = $5::uuid
          WHERE id = $1`,
-        [payload.taskId, toStatus, nextRoleId, JSON.stringify(progCardValues || {})],
+        [payload.taskId, toStatus, nextRoleId, JSON.stringify(progCardValues || {}), nextStageKey],
       );
       await c.query(
         `INSERT INTO task_events
@@ -458,6 +519,8 @@ export async function acceptScannerCompletionTx(c, payload) {
           worktreeBranch: payload.worktreeBranch,
           deliveredCommit: payload.deliveredCommit,
           nextRole: nextRoleCode,
+          skippedReviewer,
+          skipReason: skippedReviewer ? 'review_rework_limit_forwarded' : undefined,
           fields: progCardValues,
           passes: payload.numTurns,
           codeVersion: payload.codeVersion,
@@ -2616,6 +2679,37 @@ export async function releaseHostTask(s, taskId) {
 // захватить одну задачу роли, назначенной ЭТОМУ движку, и вернуть ГОТОВЫЙ промпт +
 // JSON-схему вердикта. Раннер «тупой»: сборка промпта и схема остаются здесь.
 // Возвращает { task: null }, если брать нечего или движок/роль не сходятся.
+// INFRA-DEPARTMENT-001 — read-only список задач Инфраструктурного отдела (проекты
+// pipeline_kind='infrastructure') с текущей ролью и этапом графа. Обслуживает
+// MCP-инструмент статуса инфра-задач. projectRef — необязательный фильтр по коду/id
+// проекта (внутри инфра-конвейера может быть несколько проектов).
+export async function listInfraTasks(s, projectRef = null) {
+  return withClient(clientConfig(s), async (c) => {
+    const ref = String(projectRef ?? '').trim();
+    const params = [];
+    let projFilter = "p.pipeline_kind = 'infrastructure'";
+    if (ref) {
+      params.push(ref);
+      projFilter += ` AND (p.code = $${params.length} OR p.id::text = $${params.length})`;
+    }
+    const r = await c.query(
+      `SELECT t.id, t.title, t.status::text AS status, t.priority::text AS priority,
+              t.parent_task_id, t.created_at, t.updated_at, p.code AS project_code,
+              cr.code AS current_role_code, cr.name AS current_role_name,
+              ps.name AS current_stage_name, ps.kind AS current_stage_kind
+         FROM tasks t
+         JOIN projects p ON p.id = t.project_id AND ${projFilter}
+         LEFT JOIN roles cr ON cr.id = t.current_role_id
+         LEFT JOIN project_stages ps
+           ON ps.project_id = t.project_id AND ps.stage_key = t.current_stage_key
+        ORDER BY t.created_at DESC
+        LIMIT 200`,
+      params,
+    );
+    return { tasks: r.rows };
+  });
+}
+
 export async function claimNextReasoningTask(s, engineParam = null, roleParam = null) {
   const engine = String(engineParam ?? '').trim().toLowerCase();
   const role = String(roleParam ?? '').trim() || null;
@@ -5300,10 +5394,14 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
   const priorMissingArtifact = claimed.role_code === 'FAILURE_ANALYST'
     && isMissingArtifactComplaint(verdict)
     && await priorFailureAnalystMissedArtifact(c, claimed.id, claimed.agentRunId);
+  const reviewerReworkCount = claimed.role_code === 'TASK_REVIEWER'
+    ? await countTaskReviewerReworks(c, claimed.id)
+    : 0;
   let decision = decideOutcome(claimed.role_code, verdict, {
     reworkCount: claimed.reworkCount,
     maxRework: MAX_REWORK,
     priorMissingArtifact,
+    reviewerReworkCount,
   });
   if (missingOut.length && decision.outcome !== 'BLOCK') {
     // MISSING-OUTPUTS-CAP-001: недобор обязательных выходов → REWORK, но КАПЛЕННЫЙ.

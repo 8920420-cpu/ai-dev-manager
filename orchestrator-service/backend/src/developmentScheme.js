@@ -188,6 +188,12 @@ export async function applyEdgesToProject(c, projectDbId) {
  * (создание/обновление проекта, сохранение схемы).
  */
 export async function applySchemeToProject(c, projectDbId, watchPath) {
+  // INFRA-DEPARTMENT-001 — изоляция инфра-конвейера. Проекты Инфраструктурного отдела
+  // (pipeline_kind='infrastructure') имеют СВОЙ граф этапов (infraScheme.js) и НЕ
+  // материализуются из единой дев-схемы: иначе сохранение дев-схемы или обновление
+  // папок проекта затёрли бы инфра-граф. Единственная точка guard'а — покрывает всех
+  // вызывающих (createOrUpsertProject/updateProject/applySchemeToAllProjects).
+  if (await isInfraProject(c, projectDbId)) return;
   const scheme = await readGlobalStageRows(c);
   const docs = watchPath ? String(watchPath).trim() || null : null;
   // FORK-JOIN-001: gate-роли узлов fork/join инжектируются при материализации,
@@ -223,11 +229,23 @@ export async function applySchemeToProject(c, projectDbId, watchPath) {
   await applyEdgesToProject(c, projectDbId);
 }
 
+// INFRA-DEPARTMENT-001 — является ли проект инфраструктурным (свой граф этапов).
+// pipeline_kind добавлен миграцией 0059; запрос выполняется после bootstrap-миграций,
+// поэтому колонка всегда есть. NULL/любое иное значение → обычный (дев) проект.
+async function isInfraProject(c, projectDbId) {
+  const r = await c.query('SELECT pipeline_kind FROM projects WHERE id = $1', [projectDbId]);
+  return String(r.rows[0]?.pipeline_kind ?? '').toLowerCase() === 'infrastructure';
+}
+
 // Переприменить схему ко всем проектам (после сохранения схемы). У каждого
 // проекта своя папка приёма задач → своя папка Scanner: приоритет — tasks_path,
-// откат на docs_path, если папка задач не задана.
+// откат на docs_path, если папка задач не задана. Инфра-проекты пропускает guard
+// в applySchemeToProject (их граф материализует infraScheme.js), поэтому дополнительно
+// фильтровать здесь не нужно — но для наглядности исключаем их из выборки.
 export async function applySchemeToAllProjects(c) {
-  const projects = await c.query('SELECT id, docs_path, tasks_path FROM projects');
+  const projects = await c.query(
+    "SELECT id, docs_path, tasks_path FROM projects WHERE pipeline_kind IS DISTINCT FROM 'infrastructure'",
+  );
   for (const p of projects.rows) {
     await applySchemeToProject(c, p.id, p.tasks_path ?? p.docs_path);
   }

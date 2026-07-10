@@ -260,3 +260,214 @@ test('Codebase Memory MCP tools route to project memory API', async () => {
   assert.deepEqual(seen[0].options, { query: { includeContent: 1 } });
   assert.equal(seen[1].path, '/api/projects/PROJECT/codebase-memory/architecture');
 });
+
+// ─────────────── Инфраструктурный отдел (INFRA-DEPARTMENT-001) ───────────────
+
+test('инфра read-only и reasoning-claim инструменты регистрируются всегда', () => {
+  const names = registerTools(fakeServer(), { config: baseConfig(), ...stubClients });
+  for (const n of [
+    'orchestrator_list_infra_roles', 'orchestrator_get_infra_role',
+    'orchestrator_list_infra_tasks', 'orchestrator_claim_next_reasoning_task',
+  ]) {
+    assert.ok(names.includes(n), `есть ${n}`);
+  }
+  // инфра-мутации закрыты флагом:
+  for (const n of ['orchestrator_create_infra_task', 'orchestrator_complete_reasoning_task', 'orchestrator_release_reasoning_task']) {
+    assert.ok(!names.includes(n), `нет ${n}`);
+  }
+});
+
+test('orchestrator_list_infra_roles фильтрует /api/mcp-roles до инфра-кодов', async () => {
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig(),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => [
+        { code: 'PROGRAMMER' },
+        { code: 'INFRA_ARCHITECT' },
+        { code: 'security_engineer' }, // нижний регистр — тоже инфра
+        { code: 'ARCHITECT' },
+        { code: 'K8S_ENGINEER' },
+      ],
+      post: async () => ({}),
+    },
+  });
+  const out = await server.handlers.get('orchestrator_list_infra_roles')({});
+  const parsed = JSON.parse(out.content[0].text);
+  const codes = parsed.roles.map((r) => r.code);
+  assert.deepEqual(codes, ['INFRA_ARCHITECT', 'security_engineer', 'K8S_ENGINEER']);
+  assert.ok(!out.isError);
+});
+
+test('orchestrator_list_infra_roles принимает форму { roles: [...] }', async () => {
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig(),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => ({ roles: [{ roleCode: 'DEVOPS_ENGINEER' }, { roleCode: 'PROGRAMMER' }] }),
+      post: async () => ({}),
+    },
+  });
+  const out = await server.handlers.get('orchestrator_list_infra_roles')({});
+  const parsed = JSON.parse(out.content[0].text);
+  assert.deepEqual(parsed.roles.map((r) => r.roleCode), ['DEVOPS_ENGINEER']);
+});
+
+test('orchestrator_get_infra_role отклоняет не-инфра роль без вызова backend', async () => {
+  let called = false;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig(),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => { called = true; return { ok: true, status: 200, data: {} }; },
+      post: async () => ({}),
+    },
+  });
+  const out = await server.handlers.get('orchestrator_get_infra_role')({ roleCode: 'PROGRAMMER' });
+  assert.equal(called, false);
+  assert.equal(out.isError, true);
+  const parsed = JSON.parse(out.content[0].text);
+  assert.equal(parsed.ok, false);
+  assert.equal(parsed.code, 'not_infra_role');
+});
+
+test('orchestrator_get_infra_role принимает INFRA_ARCHITECT и шлёт GET /api/mcp-roles/:code', async () => {
+  let seenPath;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig(),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async (path) => { seenPath = path; return { ok: true, status: 200, data: { code: 'INFRA_ARCHITECT', prompt: 'p' } }; },
+      post: async () => ({}),
+    },
+  });
+  const out = await server.handlers.get('orchestrator_get_infra_role')({ roleCode: 'INFRA_ARCHITECT' });
+  assert.equal(seenPath, '/api/mcp-roles/INFRA_ARCHITECT');
+  assert.ok(!out.isError);
+});
+
+test('orchestrator_list_infra_tasks шлёт GET /api/infra/tasks (с project и без)', async () => {
+  const seen = [];
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig(),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async (path, options) => { seen.push({ path, options }); return { ok: true, status: 200, data: { tasks: [] } }; },
+      post: async () => ({}),
+    },
+  });
+  await server.handlers.get('orchestrator_list_infra_tasks')({});
+  await server.handlers.get('orchestrator_list_infra_tasks')({ project: 'INFRA' });
+  assert.equal(seen[0].path, '/api/infra/tasks');
+  assert.deepEqual(seen[0].options, { query: {} });
+  assert.deepEqual(seen[1].options, { query: { project: 'INFRA' } });
+});
+
+test('orchestrator_claim_next_reasoning_task шлёт engine (и role при наличии)', async () => {
+  const seen = [];
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig(),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async (path, options) => { seen.push({ path, options }); return { ok: true, status: 200, data: {} }; },
+      post: async () => ({}),
+    },
+  });
+  await server.handlers.get('orchestrator_claim_next_reasoning_task')({ engine: 'codex' });
+  await server.handlers.get('orchestrator_claim_next_reasoning_task')({ engine: 'claude_code', role: 'SECURITY_ENGINEER' });
+  assert.equal(seen[0].path, '/api/runner/next-reasoning-task');
+  assert.deepEqual(seen[0].options, { query: { engine: 'codex' } });
+  assert.deepEqual(seen[1].options, { query: { engine: 'claude_code', role: 'SECURITY_ENGINEER' } });
+});
+
+test('MCP_ENABLE_ORCHESTRATOR_MUTATIONS добавляет инфра/reasoning мутации', () => {
+  const names = registerTools(fakeServer(), { config: baseConfig({ enableOrchestratorMutations: true }), ...stubClients });
+  for (const n of ['orchestrator_create_infra_task', 'orchestrator_complete_reasoning_task', 'orchestrator_release_reasoning_task']) {
+    assert.ok(names.includes(n), `есть ${n}`);
+  }
+});
+
+test('orchestrator_create_infra_task постит task-intake с entryRole=INFRA_ARCHITECT и project=INFRA по умолчанию', async () => {
+  let seen;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig({ enableOrchestratorMutations: true }),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => ({ ok: true, status: 200, data: {} }),
+      post: async (path, body) => { seen = { path, body }; return { ok: true, status: 200, data: { accepted: true, taskId: 'i1' } }; },
+    },
+  });
+  const out = await server.handlers.get('orchestrator_create_infra_task')({ externalId: 'infra-1', title: 'Поднять мониторинг' });
+  assert.equal(seen.path, '/api/scanner/task-intake');
+  assert.equal(seen.body.entryRole, 'INFRA_ARCHITECT');
+  assert.equal(seen.body.project, 'INFRA');
+  assert.equal(seen.body.externalId, 'infra-1');
+  const parsed = JSON.parse(out.content[0].text);
+  assert.equal(parsed.data.taskId, 'i1');
+  assert.ok(!out.isError);
+});
+
+test('orchestrator_create_infra_task уважает переданный project', async () => {
+  let seen;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig({ enableOrchestratorMutations: true }),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => ({ ok: true, status: 200, data: {} }),
+      post: async (path, body) => { seen = { path, body }; return { ok: true, status: 200, data: {} }; },
+    },
+  });
+  await server.handlers.get('orchestrator_create_infra_task')({ externalId: 'infra-2', title: 'T', project: 'INFRA_STAGING' });
+  assert.equal(seen.body.project, 'INFRA_STAGING');
+  assert.equal(seen.body.entryRole, 'INFRA_ARCHITECT');
+});
+
+test('orchestrator_create_infra_task без mutation-флага НЕ регистрируется', () => {
+  const names = registerTools(fakeServer(), { config: baseConfig(), ...stubClients });
+  assert.ok(!names.includes('orchestrator_create_infra_task'));
+});
+
+test('orchestrator_complete_reasoning_task постит /api/runner/reasoning-completed', async () => {
+  let seen;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig({ enableOrchestratorMutations: true }),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => ({ ok: true, status: 200, data: {} }),
+      post: async (path, body) => { seen = { path, body }; return { ok: true, status: 200, data: {} }; },
+    },
+  });
+  await server.handlers.get('orchestrator_complete_reasoning_task')({
+    taskId: 't9', status: 'ok', summary: 's', findings: ['f1'], fields: { a: 1 },
+  });
+  assert.equal(seen.path, '/api/runner/reasoning-completed');
+  assert.equal(seen.body.taskId, 't9');
+  assert.equal(seen.body.status, 'ok');
+  assert.deepEqual(seen.body.findings, ['f1']);
+  assert.deepEqual(seen.body.fields, { a: 1 });
+});
+
+test('orchestrator_release_reasoning_task постит /api/runner/release-reasoning-task', async () => {
+  let seen;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig({ enableOrchestratorMutations: true }),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => ({ ok: true, status: 200, data: {} }),
+      post: async (path, body) => { seen = { path, body }; return { ok: true, status: 200, data: {} }; },
+    },
+  });
+  await server.handlers.get('orchestrator_release_reasoning_task')({ taskId: 't10' });
+  assert.equal(seen.path, '/api/runner/release-reasoning-task');
+  assert.deepEqual(seen.body, { taskId: 't10' });
+});
