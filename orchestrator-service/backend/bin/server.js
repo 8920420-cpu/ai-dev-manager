@@ -7,6 +7,7 @@ import { loadSettings } from '../src/config.js';
 import { bootstrap, reconcileOnStartup } from '../src/db.js';
 import { createTaskRunner } from '../src/taskRunner.js';
 import { recordDeployMarker, recordDowntimeMarker } from '../src/performance.js';
+import { ensureClickhouseSchema } from '../src/clickhouseSchema.js';
 
 const PORT = Number(process.env.PORT || 4186);
 const HOST = process.env.HOST || '0.0.0.0';
@@ -65,6 +66,17 @@ async function main() {
       console.error(`[orchestrator-service] стартовая реконсиляция не удалась (продолжаю): ${e.message}`);
     }
   }
+
+  // OBSERVABILITY-CLICKHOUSE-SCHEMA-001: оркестратор сам владеет схемой стора
+  // прогонов и накатывает её на старте (best-effort, не блокирует boot). Так стор
+  // самодостаточен и не зависит от init-скриптов infra (они гоняются только на
+  // пустом volume). Гейты: CLICKHOUSE_OBSERVABILITY_ENABLED, ..._ENSURE_SCHEMA.
+  void ensureClickhouseSchema()
+    .then((r) => {
+      if (r?.ok) console.error('[orchestrator-service] ClickHouse observability: схема готова');
+      else if (r?.ok === false) console.error(`[orchestrator-service] ClickHouse observability: схема не накатилась (продолжаю): ${r.error}`);
+    })
+    .catch((e) => console.error(`[orchestrator-service] ClickHouse observability: ensure schema error (продолжаю): ${e.message}`));
 
   createApp().listen(PORT, HOST, () => {
     console.error(`[orchestrator-service] http://localhost:${PORT}`);

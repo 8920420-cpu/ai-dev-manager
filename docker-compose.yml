@@ -86,6 +86,10 @@ services:
       CLICKHOUSE_OBSERVABILITY_MAX_QUEUE: "${CLICKHOUSE_OBSERVABILITY_MAX_QUEUE:-10000}"
       CLICKHOUSE_ASYNC_INSERT: "${CLICKHOUSE_ASYNC_INSERT:-1}"
       CLICKHOUSE_WAIT_FOR_ASYNC_INSERT: "${CLICKHOUSE_WAIT_FOR_ASYNC_INSERT:-0}"
+      # Оркестратор идемпотентно накатывает схему стора (таблица/индексы/view) на
+      # старте и лениво при ошибке «нет таблицы/колонки» — стор самолечится.
+      CLICKHOUSE_OBSERVABILITY_ENSURE_SCHEMA: "${CLICKHOUSE_OBSERVABILITY_ENSURE_SCHEMA:-1}"
+      CLICKHOUSE_DDL_TIMEOUT_MS: "${CLICKHOUSE_DDL_TIMEOUT_MS:-8000}"
     networks:
       - default
       - shared-network
