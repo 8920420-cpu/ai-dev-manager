@@ -4436,8 +4436,9 @@ export async function reattachBlockedOwnerRoles(c) {
 // такого ребёнка как duplicateOf=предок неверна по сути и вредна по последствиям:
 // возвратимый (recoverable) сбой ветки схлопывался бы в CANCELLED и делал
 // join_child_failed на родителе НЕОБРАТИМЫМ (задача-родитель залипала в BLOCKED
-// навсегда). Обход цепочки предков — тот же паттерн WITH RECURSIVE по parent_task_id,
-// что и в resolveHostTaskContext.
+// навсегда). Обход цепочки предков — WITH RECURSIVE по parent_task_id (как в
+// resolveHostTaskContext), но БЕЗ лимита глубины: исключаем предка на ЛЮБОМ уровне,
+// а от зацикливания на порченом parent_task_id страхует накопленный путь (path).
 export async function closeBlockedDuplicateTasks(c) {
   const r = await c.query(
     `WITH RECURSIVE active AS (
@@ -4464,17 +4465,22 @@ export async function closeBlockedDuplicateTasks(c) {
             SELECT 1 FROM tasks tx WHERE tx.id = active.id AND tx.assigned_agent_id IS NOT NULL
           )
      ), ancestors AS (
-       -- Цепочка предков каждого кандидата (кандидат → parent → ... по parent_task_id).
-       SELECT c0.id AS candidate_id, t.parent_task_id AS ancestor_id, 1 AS depth
+       -- Полная цепочка предков каждого кандидата (кандидат → parent → ... по
+       -- parent_task_id). Обходим ВСЮ цепочку без искусственного лимита глубины:
+       -- fork-ребёнок не может дублировать НИ ОДНОГО из своих предков, как бы далеко
+       -- тот ни стоял. От зацикливания на порченом parent_task_id страхует накопленный
+       -- путь (path) — в уже посещённого предка повторно не заходим.
+       SELECT c0.id AS candidate_id, t.parent_task_id AS ancestor_id,
+              ARRAY[c0.id, t.parent_task_id] AS path
          FROM candidates c0
          JOIN tasks t ON t.id = c0.id
         WHERE t.parent_task_id IS NOT NULL
        UNION ALL
-       SELECT a.candidate_id, p.parent_task_id, a.depth + 1
+       SELECT a.candidate_id, p.parent_task_id, a.path || p.parent_task_id
          FROM ancestors a
          JOIN tasks p ON p.id = a.ancestor_id
         WHERE p.parent_task_id IS NOT NULL
-          AND a.depth < 8
+          AND NOT (p.parent_task_id = ANY(a.path))
      ), victims AS (
        SELECT id, status, current_role_id, original_id
          FROM candidates c1
