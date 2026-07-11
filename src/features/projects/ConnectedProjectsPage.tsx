@@ -190,7 +190,6 @@ export function ConnectedProjectsPage() {
               onOpen={handleOpenProject}
               onEdit={openEdit}
               onDelete={setDeleteTarget}
-              onUpdated={handleSaved}
             />
           ))}
         </div>
