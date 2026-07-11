@@ -600,3 +600,74 @@ test('provisionDeps: пропускает каталог, где node_modules у
 
   assert.equal(installed.length, 0, 'node_modules уже есть → установка не нужна');
 });
+
+// ── No-vacuous-green: прогон без единой команды не считается успехом ───────────
+
+test('requireVerification: все стадии пропущены в изоляции → провал pipeline_no_verification', async (t) => {
+  const root = tmpDir(t);
+  const projectRoot = makeDir(root, 'PS');
+  makeDir(projectRoot, 'infra'); // сервис без тестов
+  writeFileSync(path.join(projectRoot, 'docker-compose.yml'), 'services:\n  x:\n    image: x\n');
+
+  const executor = new FakeExecutor();
+  const task = new ServicePipelineTask({
+    projectsRoot: root,
+    createRunner: fakeRunnerFactory(executor),
+    // В изоляции гасим build/deploy/smoke; тестов нет → не выполнится ни одной команды.
+    skipStages: ['build', 'deploy', 'smoke'],
+  });
+  const result = await task.run(claim({ projectRel: 'PS', serviceRel: 'infra', serviceId: 'svc-infra' }));
+
+  assert.equal(result.success, false);
+  assert.equal(result.output.summary.status, 'failed');
+  assert.equal(result.output.summary.error.code, 'pipeline_no_verification');
+  assert.equal(result.output.failedStage, 'test');
+  assert.equal(executor.calls.length, 0);
+  // Стадии остаются видимыми как SKIPPED — диагностика для Failure Analyst.
+  const byStage = Object.fromEntries(result.output.summary.actions.map((a) => [a.stage, a]));
+  assert.equal(byStage.test.status, 'SKIPPED');
+  assert.equal(byStage.build.status, 'SKIPPED');
+});
+
+test('requireVerification=false: вакуумный прогон снова success (аварийный клапан)', async (t) => {
+  const root = tmpDir(t);
+  const projectRoot = makeDir(root, 'PS');
+  makeDir(projectRoot, 'infra');
+  writeFileSync(path.join(projectRoot, 'docker-compose.yml'), 'services:\n  x:\n    image: x\n');
+
+  const executor = new FakeExecutor();
+  const task = new ServicePipelineTask({
+    projectsRoot: root,
+    createRunner: fakeRunnerFactory(executor),
+    skipStages: ['build', 'deploy', 'smoke'],
+    requireVerification: false,
+  });
+  const result = await task.run(claim({ projectRel: 'PS', serviceRel: 'infra', serviceId: 'svc-infra' }));
+
+  assert.equal(result.success, true);
+  assert.equal(executor.calls.length, 0);
+});
+
+test('вложенный тест-корень: repository_path=обёртка → npm --prefix backend test выполняется (не вакуум)', async (t) => {
+  const root = tmpDir(t);
+  const projectRoot = makeDir(root, 'PS');
+  const service = makeDir(projectRoot, 'svc'); // обёртка без package.json на верхнем уровне
+  mkdirSync(path.join(service, 'backend'), { recursive: true });
+  writeFileSync(
+    path.join(service, 'backend', 'package.json'),
+    JSON.stringify({ scripts: { test: 'node --test' } }),
+  );
+  writeFileSync(path.join(projectRoot, 'docker-compose.yml'), 'services:\n  x:\n    image: x\n');
+
+  const executor = new FakeExecutor();
+  const task = new ServicePipelineTask({
+    projectsRoot: root,
+    createRunner: fakeRunnerFactory(executor),
+    skipStages: ['build', 'deploy', 'smoke'],
+  });
+  const result = await task.run(claim({ projectRel: 'PS', serviceRel: 'svc', serviceId: 'svc-1' }));
+
+  assert.equal(result.success, true);
+  // Выполнена ровно команда вложенных тестов; deploy-стадии пропущены в изоляции.
+  assert.deepEqual(executor.calls.map((c) => c.command), ['npm --prefix "backend" test']);
+});

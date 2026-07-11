@@ -335,6 +335,50 @@ function failureErrorFromSummary(summaryDoc, failedStage) {
 }
 
 /**
+ * Сколько команд реально выполнено по summary: суммируем длину commands по всем
+ * НЕ SKIPPED-стадиям. 0 означает, что ни одна команда не запускалась (все стадии
+ * пропущены/отключены) — прогон не проверил ничего.
+ *
+ * @param {Object|null} summaryDoc summary из PipelineRunner (result.summary)
+ * @returns {number}
+ */
+export function countExecutedCommands(summaryDoc) {
+  const stages = summaryDoc && Array.isArray(summaryDoc.stages) ? summaryDoc.stages : [];
+  let n = 0;
+  for (const s of stages) {
+    if (s.status === 'SKIPPED') continue;
+    n += Array.isArray(s.commands) ? s.commands.length : 0;
+  }
+  return n;
+}
+
+/**
+ * Причина «вакуумного» провала (PIPELINE-NO-VACUOUS-GREEN-001): перечисляем стадии
+ * и их статусы/причины, чтобы Failure Analyst видел, ПОЧЕМУ ничего не выполнено
+ * (типично: test=no_tests_detected, build/deploy/smoke=skipped_in_isolation).
+ *
+ * @param {Object|null} summaryDoc
+ * @returns {{ code: string, message: string, logTail: string }}
+ */
+function vacuousVerificationError(summaryDoc) {
+  const stages = summaryDoc && Array.isArray(summaryDoc.stages) ? summaryDoc.stages : [];
+  const parts = stages.map(
+    (s) => `${s.name}=${s.status === 'SKIPPED' ? (s.reason ?? 'skipped') : s.status}`,
+  );
+  return {
+    code: 'pipeline_no_verification',
+    message: safeLogFragment(
+      'Прогон не выполнил ни одной команды — верифицировать нечем' +
+        (parts.length ? ` (${parts.join(', ')})` : '') +
+        '. «Зелёный» без проверок недопустим: добавьте тесты сервиса ' +
+        '(или .pipeline.json со стадией test).',
+      1000,
+    ),
+    logTail: '',
+  };
+}
+
+/**
  * ServicePipelineTask — исполнение этапа PIPELINE_SERVICE для одного claim.
  */
 export class ServicePipelineTask {
@@ -346,7 +390,7 @@ export class ServicePipelineTask {
    * @param {(args:{config:Object})=>{execute:Function}} [opts.createRunner] фабрика runner (для тестов)
    * @param {Object} [opts.runnerDeps] зависимости PipelineRunner (executor/logger) для тестов
    */
-  constructor({ projectsRoot, configFilename = DEFAULT_PIPELINE_CONFIG_FILENAME, configLoader, conventionBuilder, createRunner, runnerDeps, skipStages, provisionDeps, installDeps } = {}) {
+  constructor({ projectsRoot, configFilename = DEFAULT_PIPELINE_CONFIG_FILENAME, configLoader, conventionBuilder, createRunner, runnerDeps, skipStages, provisionDeps, installDeps, requireVerification } = {}) {
     this.projectsRoot = projectsRoot;
     this.configFilename = configFilename;
     this.configLoader = configLoader ?? new ConfigLoader();
@@ -362,6 +406,11 @@ export class ServicePipelineTask {
     // Ставить ли node_modules в рабочих каталогах перед прогоном (для worktree).
     this.provisionDeps = provisionDeps === true;
     this.installDeps = installDeps ?? defaultInstallDeps;
+    // PIPELINE-NO-VACUOUS-GREEN-001: требовать, чтобы «зелёный» прогон выполнил
+    // хотя бы одну команду (иначе ничего не проверено). Дефолт — включено;
+    // PIPELINE_REQUIRE_VERIFICATION=0 отключает (аварийный клапан без редеплоя).
+    this.requireVerification =
+      requireVerification ?? String(process.env.PIPELINE_REQUIRE_VERIFICATION ?? '1') !== '0';
   }
 
   /**
@@ -465,6 +514,20 @@ export class ServicePipelineTask {
       ? summaryDoc.stages.flatMap(stageToActions)
       : [];
 
+    // PIPELINE-NO-VACUOUS-GREEN-001: «зелёный» прогон, не выполнивший НИ ОДНОЙ
+    // команды (все стадии SKIPPED/disabled), — не верификация, а ложный успех
+    // (типовой кейс: тесты не обнаружены + build/deploy/smoke пропущены в
+    // изоляции). Превращаем его в диагностируемый провал (маршрут в Failure
+    // Analyst), а не выдаём за success. Отключается PIPELINE_REQUIRE_VERIFICATION=0.
+    let success = result.success === true;
+    let failedStage = result.failedStage ?? null;
+    let vacuousError = null;
+    if (success && this.requireVerification && countExecutedCommands(summaryDoc) === 0) {
+      success = false;
+      failedStage = failedStage ?? 'test';
+      vacuousError = vacuousVerificationError(summaryDoc);
+    }
+
     const output = {
       summary: {
         projectId: resolved.projectId,
@@ -473,18 +536,19 @@ export class ServicePipelineTask {
         serviceCode: resolved.serviceCode,
         serviceName: resolved.serviceName,
         workingDirectory: resolved.absWorkingDirectory,
-        status: result.success ? 'success' : 'failed',
+        status: success ? 'success' : 'failed',
         runId: result.runId ?? null,
         actions,
         // При провале дублируем причину на верхний уровень: усечённый хвост лога
         // ИМЕННО упавшей команды (без чтения файлов с хоста), чтобы Failure
         // Analyst/UI видели фактическую причину, не разбирая actions[] и не
-        // читая logPath (путь на хосте им недоступен).
-        ...(result.success
+        // читая logPath (путь на хосте им недоступен). Вакуумный провал несёт
+        // свою причину (pipeline_no_verification).
+        ...(success
           ? {}
-          : { error: failureErrorFromSummary(summaryDoc, result.failedStage ?? null) }),
+          : { error: vacuousError ?? failureErrorFromSummary(summaryDoc, result.failedStage ?? null) }),
       },
-      failedStage: result.failedStage ?? null,
+      failedStage,
       startedAt: startedAt.toISOString(),
       logPath: result.reportPath ?? null,
     };
@@ -492,7 +556,7 @@ export class ServicePipelineTask {
     return {
       taskId,
       roleCode: PIPELINE_ROLE_CODE,
-      success: result.success === true,
+      success,
       output,
     };
   }

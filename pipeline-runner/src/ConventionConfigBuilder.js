@@ -1,5 +1,5 @@
 import path from 'node:path';
-import { existsSync, statSync, readFileSync } from 'node:fs';
+import { existsSync, statSync, readFileSync, readdirSync } from 'node:fs';
 
 /**
  * ConventionConfigBuilder — ЕДИНСТВЕННОЕ место, где живут дефолты pipeline по
@@ -71,22 +71,40 @@ function isFile(absPath) {
 }
 
 /**
- * Определить стадию тестов по стеку сервиса.
- * Возвращает канонический этап { name, commands, enabled } (+ reason, если SKIPPED).
- *
- * @param {string} serviceDir абсолютный каталог сервиса
- * @returns {{name:'test', commands:string[], enabled:boolean, reason?:string}}
+ * Каталоги, в которые НЕ спускаемся при поиске вложенного тест-корня: артефакты
+ * сборки, зависимости, VCS-служебное — там пакетов сервиса нет, а обход дорогой.
+ * Скрытые каталоги (имя с ведущей точкой) отбрасываются отдельно.
  */
-export function detectTestStage(serviceDir) {
-  const abs = path.resolve(serviceDir);
+export const NESTED_SCAN_IGNORED_DIRS = Object.freeze(
+  new Set([
+    'node_modules', 'dist', 'build', 'out', 'coverage', 'vendor', 'target',
+    'tmp', '__pycache__', 'venv',
+  ]),
+);
 
-  // Go: наличие go.mod однозначно задаёт команду тестов стека.
-  if (isFile(path.join(abs, 'go.mod'))) {
-    return { name: 'test', commands: ['go test ./...'], enabled: true };
-  }
+/**
+ * Приоритет вложенных каталогов при равной глубине: конвенциональные корни
+ * (backend/server/…) идут первыми, чтобы порядок команд был стабилен и осмыслен.
+ */
+export const NESTED_ROOT_PRIORITY = Object.freeze([
+  'backend', 'server', 'api', 'app', 'service', 'src',
+]);
 
-  // Node: тесты есть только если объявлен непустой скрипт "test".
-  const pkgPath = path.join(abs, 'package.json');
+/** Максимальная глубина поиска вложенного тест-корня от каталога сервиса. */
+export const NESTED_SCAN_MAX_DEPTH = Math.max(
+  1,
+  Number(process.env.PIPELINE_NESTED_TEST_DEPTH || 3) || 3,
+);
+
+/**
+ * Тип тест-стека в ОДНОМ каталоге (без запуска):
+ *  - 'go'   — есть go.mod;
+ *  - 'node' — есть package.json с непустым скриптом "test";
+ *  - null   — тестов нет.
+ */
+function testStackAt(absDir) {
+  if (isFile(path.join(absDir, 'go.mod'))) return 'go';
+  const pkgPath = path.join(absDir, 'package.json');
   if (isFile(pkgPath)) {
     let pkg = null;
     try {
@@ -96,12 +114,118 @@ export function detectTestStage(serviceDir) {
     }
     const testScript =
       pkg && pkg.scripts && typeof pkg.scripts.test === 'string' ? pkg.scripts.test.trim() : '';
-    if (testScript) {
-      return { name: 'test', commands: ['npm test'], enabled: true };
+    if (testScript) return 'node';
+  }
+  return null;
+}
+
+/**
+ * Команда тестов для тест-корня по стеку. `rel` — POSIX-относительный путь корня
+ * от каталога сервиса ('' = сам каталог сервиса). Команды выполняются с cwd =
+ * каталог сервиса, поэтому во вложенный корень «заходим» средствами инструмента:
+ *  - node: `npm --prefix "<rel>" test` (запускает test-скрипт пакета <rel>);
+ *  - go:   `go -C "<rel>" test ./...` (`-C` меняет каталог до команды, Go ≥1.20).
+ */
+function testCommandFor(stack, rel) {
+  if (stack === 'go') return rel ? `go -C "${rel}" test ./...` : 'go test ./...';
+  return rel ? `npm --prefix "${rel}" test` : 'npm test';
+}
+
+/** Непроигнорированные подкаталоги (без скрытых и без служебных), best-effort. */
+function listScannableSubdirs(absDir) {
+  try {
+    return readdirSync(absDir, { withFileTypes: true })
+      .filter(
+        (e) =>
+          e.isDirectory() &&
+          !e.name.startsWith('.') &&
+          !NESTED_SCAN_IGNORED_DIRS.has(e.name),
+      )
+      .map((e) => e.name);
+  } catch {
+    return [];
+  }
+}
+
+/** Стабильно упорядочить вложенные корни: приоритетные имена, затем алфавит. */
+function sortNestedRoots(roots) {
+  const priorityIndex = (rel) => {
+    const i = NESTED_ROOT_PRIORITY.indexOf(rel.split('/')[0]);
+    return i === -1 ? NESTED_ROOT_PRIORITY.length : i;
+  };
+  return [...roots].sort(
+    (a, b) => priorityIndex(a.rel) - priorityIndex(b.rel) || a.rel.localeCompare(b.rel),
+  );
+}
+
+/**
+ * Найти БЛИЖАЙШИЕ вложенные тест-корни: BFS вглубь по уровням, на первом уровне,
+ * где есть хотя бы один тест-корень, возвращаем ВСЕ корни этого уровня (глубже не
+ * спускаемся — тесты пакета покрывают его поддерево). Так `repository_path`,
+ * указывающий на каталог-обёртку (напр. `orchestrator-service`), находит реальный
+ * пакет с тестами уровнем ниже (`orchestrator-service/backend`) и не выдаёт
+ * «зелёный» без единого выполненного теста.
+ *
+ * @param {string} absServiceDir абсолютный каталог сервиса
+ * @returns {Array<{stack:'go'|'node', rel:string}>}
+ */
+export function findNestedTestRoots(absServiceDir) {
+  let frontier = [absServiceDir];
+  for (let depth = 1; depth <= NESTED_SCAN_MAX_DEPTH && frontier.length; depth++) {
+    const children = [];
+    for (const dir of frontier) {
+      for (const name of listScannableSubdirs(dir)) children.push(path.join(dir, name));
     }
+    const found = [];
+    for (const childAbs of children) {
+      const stack = testStackAt(childAbs);
+      if (stack) {
+        const rel = path.relative(absServiceDir, childAbs).split(path.sep).join('/');
+        found.push({ stack, rel });
+      }
+    }
+    if (found.length) return sortNestedRoots(found).map(({ stack, rel }) => ({ stack, rel }));
+    frontier = children;
+  }
+  return [];
+}
+
+/**
+ * Определить стадию тестов по стеку сервиса.
+ * Возвращает канонический этап { name, commands, enabled } (+ reason, если SKIPPED).
+ *
+ * Порядок разрешения:
+ *  1. Сам каталог сервиса (go > node) — прежнее поведение и приоритет.
+ *  2. Ближайший вложенный тест-корень (findNestedTestRoots) — когда сервис лежит
+ *     в каталоге-обёртке, а пакет с тестами уровнем ниже. Исключает «вакуумный
+ *     зелёный» (test SKIPPED + build/deploy/smoke пропущены в изоляции = ничего
+ *     не проверено, но success). `nestedRoots` — диагностическая пометка для отчёта.
+ *  3. Тесты не обнаружены нигде → стадия SKIPPED (`no_tests_detected`).
+ *
+ * @param {string} serviceDir абсолютный каталог сервиса
+ * @returns {{name:'test', commands:string[], enabled:boolean, reason?:string, nestedRoots?:string[]}}
+ */
+export function detectTestStage(serviceDir) {
+  const abs = path.resolve(serviceDir);
+
+  // 1) Сам каталог сервиса.
+  const topStack = testStackAt(abs);
+  if (topStack) {
+    return { name: 'test', commands: [testCommandFor(topStack, '')], enabled: true };
   }
 
-  // Тесты не обнаружены → стадия пропускается с явной пометкой (не выдаётся за успех).
+  // 2) Вложенный тест-корень (каталог-обёртка).
+  const nested = findNestedTestRoots(abs);
+  if (nested.length) {
+    return {
+      name: 'test',
+      commands: nested.map((n) => testCommandFor(n.stack, n.rel)),
+      enabled: true,
+      nestedRoots: nested.map((n) => n.rel),
+    };
+  }
+
+  // 3) Тесты не обнаружены → стадия пропускается с явной пометкой (не выдаётся за успех).
   return { name: 'test', commands: [], enabled: false, reason: 'no_tests_detected' };
 }
 

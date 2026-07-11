@@ -8,6 +8,7 @@ import {
   ConventionError,
   mergeConvention,
   detectTestStage,
+  findNestedTestRoots,
   findComposeUp,
   composeHasHealthcheck,
   CONVENTION_CONFIG_MARKER,
@@ -70,6 +71,68 @@ test('detectTestStage: go.mod имеет приоритет над package.json'
   write(path.join(dir, 'go.mod'), 'module x\n');
   write(path.join(dir, 'package.json'), JSON.stringify({ scripts: { test: 'vitest' } }));
   assert.deepEqual(detectTestStage(dir).commands, ['go test ./...']);
+});
+
+// ── detectTestStage: вложенные тест-корни (каталог-обёртка) ───────────────────
+
+test('detectTestStage: пакет с тестами в подкаталоге → npm --prefix <sub> test', (t) => {
+  const dir = tmpDir(t); // сам каталог-обёртка без package.json
+  write(path.join(dir, 'backend', 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
+  const s = detectTestStage(dir);
+  assert.equal(s.enabled, true);
+  assert.deepEqual(s.commands, ['npm --prefix "backend" test']);
+  assert.deepEqual(s.nestedRoots, ['backend']);
+});
+
+test('detectTestStage: go-модуль в подкаталоге → go -C <sub> test ./...', (t) => {
+  const dir = tmpDir(t);
+  write(path.join(dir, 'server', 'go.mod'), 'module srv\n');
+  const s = detectTestStage(dir);
+  assert.equal(s.enabled, true);
+  assert.deepEqual(s.commands, ['go -C "server" test ./...']);
+});
+
+test('detectTestStage: несколько корней на одном уровне → все команды, приоритет backend', (t) => {
+  const dir = tmpDir(t);
+  write(path.join(dir, 'web', 'package.json'), JSON.stringify({ scripts: { test: 'vitest' } }));
+  write(path.join(dir, 'backend', 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
+  const s = detectTestStage(dir);
+  // backend по приоритету идёт первым, web — по алфавиту.
+  assert.deepEqual(s.commands, ['npm --prefix "backend" test', 'npm --prefix "web" test']);
+  assert.deepEqual(s.nestedRoots, ['backend', 'web']);
+});
+
+test('detectTestStage: ближайший уровень «выигрывает», глубже не спускаемся', (t) => {
+  const dir = tmpDir(t);
+  // Корень на глубине 1 (backend) и на глубине 2 (backend/sub) — берём только глубину 1.
+  write(path.join(dir, 'backend', 'package.json'), JSON.stringify({ scripts: { test: 'node --test' } }));
+  write(path.join(dir, 'backend', 'sub', 'package.json'), JSON.stringify({ scripts: { test: 'vitest' } }));
+  const s = detectTestStage(dir);
+  assert.deepEqual(s.nestedRoots, ['backend']);
+});
+
+test('detectTestStage: package.json в node_modules НЕ считается тест-корнем', (t) => {
+  const dir = tmpDir(t);
+  write(
+    path.join(dir, 'node_modules', 'dep', 'package.json'),
+    JSON.stringify({ scripts: { test: 'vitest' } }),
+  );
+  const s = detectTestStage(dir);
+  assert.equal(s.enabled, false);
+  assert.equal(s.reason, 'no_tests_detected');
+});
+
+test('detectTestStage: подкаталог с package.json без test-скрипта → SKIPPED', (t) => {
+  const dir = tmpDir(t);
+  write(path.join(dir, 'backend', 'package.json'), JSON.stringify({ scripts: { build: 'tsc' } }));
+  const s = detectTestStage(dir);
+  assert.equal(s.enabled, false);
+  assert.equal(s.reason, 'no_tests_detected');
+});
+
+test('findNestedTestRoots: пустой каталог → []', (t) => {
+  const dir = tmpDir(t);
+  assert.deepEqual(findNestedTestRoots(dir), []);
 });
 
 // ── findComposeUp ────────────────────────────────────────────────────────────
