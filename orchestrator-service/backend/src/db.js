@@ -2319,39 +2319,6 @@ export async function resolveHostTaskContext(c, taskId) {
 }
 
 /**
- * DOCROLES-GI-SERIALIZE-001 — changedFiles doc-сиблингов fork-группы для контекста
- * Git Integrator. Правки документации (Documentation Keeper, исходящее поле
- * changedFiles, миграция 0046 DOC-COMMIT-ON-JOIN-001) персистятся в data_card
- * ДОК-РЕБЁНКА — СОСЕДНЕЙ fork-ветви, а не в цепочке предков GI-ребёнка, поэтому
- * resolveHostTaskContext (идёт по предкам) их не видит. Собираем непустые changedFiles
- * ВСЕХ сиблингов (та же parent_task_id, кроме себя) в объединение с дедупом (порядок
- * первого вхождения). Нет родителя/сиблингов/правок — пустой список (прежнее
- * поведение). Эти пути уходят в контекст GI как docChangedFiles: host-runner при
- * интеграции стейджит/коммитит их ВМЕСТЕ с дельтой Программиста, а не воспринимает
- * незакоммиченную работу doc-сиблинга как чужой мусор (dirty_worktree_conflict).
- */
-export async function resolveSiblingDocChangedFiles(c, taskId, parentTaskId) {
-  if (!parentTaskId) return [];
-  const sib = await c.query(
-    `SELECT data_card FROM tasks WHERE parent_task_id = $1 AND id <> $2`,
-    [parentTaskId, taskId],
-  );
-  const seen = new Set();
-  const out = [];
-  for (const row of sib.rows) {
-    const files = row.data_card && Array.isArray(row.data_card.changedFiles)
-      ? row.data_card.changedFiles : [];
-    for (const f of files) {
-      const key = String(f);
-      if (!key || seen.has(key)) continue;
-      seen.add(key);
-      out.push(f);
-    }
-  }
-  return out;
-}
-
-/**
  * Захватить следующую задачу для host-роли. Аналог claimNextClaudeTask, но для
  * PIPELINE_SERVICE/GIT_INTEGRATOR. Помечает agent_run RUNNING и возвращает
  * контекст для исполнения на хосте (включая changedFiles сдачи программиста,
@@ -2366,7 +2333,7 @@ export async function claimNextHostTask(s, roleCode) {
     try {
       const picked = await c.query(
         `SELECT t.id, t.title, t.description, t.current_role_id, t.project_id, t.service_id,
-                t.parent_task_id, t.status::text AS status
+                t.status::text AS status
            FROM tasks t
            JOIN roles r ON r.id = t.current_role_id
            JOIN projects p ON p.id = t.project_id
@@ -2388,37 +2355,10 @@ export async function claimNextHostTask(s, roleCode) {
                 AND t.status = $2::task_status
               )
             )
-            -- DOCROLES-GI-SERIALIZE-001: fork-ребёнок Git Integrator и doc-ветвь
-            -- (Documentation Auditor/Keeper) одной fork-группы делят ОДНО рабочее дерево
-            -- сервиса. Doc-роли пишут docs/*.md (напр. README.md) в это же дерево; если
-            -- GI стартует, пока doc-сиблинг ещё стоит на doc-роли (пишет/не дошёл до
-            -- join), дерево «грязное» чужой незакоммиченной правкой → GI корректно
-            -- отказывается её затирать (dirty_worktree_conflict) и задача уходит в
-            -- BLOCKED. Сериализуем: GI-ребёнка НЕ выдаём, пока среди его fork-сиблингов
-            -- (та же parent_task_id) есть НЕтерминальный, стоящий на doc-роли. Как только
-            -- doc-ветвь дошла до join (роль сменилась на JOIN_GATE) или стала
-            -- терминальной — GI стартует и забирает changedFiles doc-сиблингов
-            -- (docChangedFiles ниже), чтобы закоммитить их вместе с дельтой. Живость
-            -- doc-ветви (DOC-BRANCH-LIVENESS-001) не страдает: зависшую ветвь
-            -- advanceStuckDocumentationBranches двигает к join, снимая гейт. Предикат
-            -- бьёт ТОЛЬКО по GI-fork-ребёнку — на PIPELINE_SERVICE и не-fork GI
-            -- (parent_task_id IS NULL) он тождественно истинен.
-            AND (
-              $1 <> 'GIT_INTEGRATOR'
-              OR t.parent_task_id IS NULL
-              OR NOT EXISTS (
-                SELECT 1 FROM tasks sib
-                  JOIN roles sr ON sr.id = sib.current_role_id
-                 WHERE sib.parent_task_id = t.parent_task_id
-                   AND sib.id <> t.id
-                   AND sib.status NOT IN ('DONE','CANCELLED','FAILED')
-                   AND sr.code = ANY($3::text[])
-              )
-            )
           ORDER BY t.priority ASC, t.created_at ASC
           FOR UPDATE OF t SKIP LOCKED
           LIMIT 1`,
-        [roleCode, role.from, DOC_BRANCH_ROLE_CODES],
+        [roleCode, role.from],
       );
       if (!picked.rowCount) {
         await c.query('COMMIT');
@@ -2458,14 +2398,6 @@ export async function claimNextHostTask(s, roleCode) {
       );
       const m = meta.rows[0] ?? {};
       const { rootTask, scan } = await resolveHostTaskContext(c, t.id);
-      // DOCROLES-GI-SERIALIZE-001: для fork-ребёнка Git Integrator собираем changedFiles
-      // doc-сиблингов той же fork-группы (правки Documentation Keeper лежат в data_card
-      // СОСЕДНЕЙ ветви, resolveHostTaskContext их не видит). К моменту старта GI гейт
-      // выборки уже дождался схода doc-веток с doc-ролей, так что список полон. Пустой —
-      // для не-GI ролей и когда doc-правок не было (прежнее поведение).
-      const docChangedFiles = roleCode === 'GIT_INTEGRATOR'
-        ? await resolveSiblingDocChangedFiles(c, t.id, t.parent_task_id)
-        : [];
 
       // PIPELINE_SERVICE — не-AI исполнитель: контракт claim фиксирует точный
       // микросервис и разрешённую рабочую директорию (без AI agent run/LLM).
@@ -2554,11 +2486,6 @@ export async function claimNextHostTask(s, roleCode) {
           // незакоммиченные файлы в основном дереве. Нет сдачи через worktree → null.
           worktreeBranch: scan?.payload_json?.worktreeBranch ?? null,
           deliveredCommit: scan?.payload_json?.deliveredCommit ?? null,
-          // DOCROLES-GI-SERIALIZE-001: пути, отредактированные doc-ветвями той же
-          // fork-группы (Documentation Keeper). host-runner стейджит/коммитит их вместе
-          // с дельтой Программиста, а не падает на них как на чужой незакоммиченной
-          // работе. Пусто для не-GI ролей и когда doc-правок не было.
-          docChangedFiles,
           agentRunId: run.rows[0].id,
           // Контракт прямого запуска pipeline (только для PIPELINE_SERVICE).
           ...(pipeline ? { pipeline } : {}),
@@ -4750,7 +4677,8 @@ async function blockExhaustedFailureAnalysis(c, maxAttempts = MAX_REWORK) {
 // сеть безопасности для таймаутов/сбоев вызова ИИ и осиротевших после ручных операций.
 export async function advanceStuckDocumentationBranches(c, maxAttempts = MAX_REWORK, maxAgeMs = DOC_BRANCH_MAX_AGE_MS) {
   // DOCROLES-GI-SERIALIZE-001: единый источник правды по ролям doc-ветви (тот же
-  // набор гейтит claim Git Integrator в claimNextHostTask).
+  // набор придерживает claim doc-роли в claimLlmRoleTask, пока git-сиблинг стоит на
+  // GIT_INTEGRATOR — GI вливает дельту Программиста в чистое дерево раньше doc-правок).
   const DOC_ROLES = DOC_BRANCH_ROLE_CODES;
   const stuck = await c.query(
     `SELECT t.id, t.project_id, t.status::text AS status, t.current_role_id,
@@ -4879,6 +4807,35 @@ async function claimLlmRoleTask(c, roleCode = null) {
     params.push(roleCode);
     roleFilter = `AND r.code = $${params.length}`;
   }
+  // DOCROLES-GI-SERIALIZE-001: сериализуем doc-ветвь ПОСЛЕ git-ветви одной fork-группы
+  // сервиса. Documentation Auditor/Keeper (DOC_BRANCH_ROLE_CODES) и fork-ребёнок Git
+  // Integrator делят ОДНО рабочее дерево repoRoot; doc-роли пишут README.md/docs/*.md
+  // в это дерево, а GI вливает дельту Программиста cherry-pick'ом. Если doc-роль пишет
+  // тот же файл, что есть в дельте Программиста, ОДНОВРЕМЕННО с GI — дерево «грязное»
+  // чужой незакоммиченной правкой, GI КОРРЕКТНО отказывается её затирать
+  // (dirty_worktree_conflict) → задача в BLOCKED. Придерживаем claim doc-роли, пока
+  // git-сиблинг той же fork-группы (та же parent_task_id) НЕтерминален и стоит на
+  // GIT_INTEGRATOR: GI отработает дельту Программиста в ЧИСТОМ дереве РАНЬШЕ doc-правок
+  // («GI раньше записи doc-ролей»). Как только git-ветвь ушла с GIT_INTEGRATOR (роль →
+  // JOIN_GATE) или стала терминальной — гейт снимается, doc-ветвь пишет поверх уже
+  // влитого кода. Живость (DOC-BRANCH-LIVENESS-001) цела: зависимость односторонняя
+  // (doc ждёт быстрый GI, а не наоборот — основной поток не блокируется). Предикат
+  // бьёт ТОЛЬКО по doc-ролям fork-ребёнка (parent_task_id IS NOT NULL); прочие ИИ-роли
+  // и не-fork документация (parent_task_id IS NULL) не гейтятся.
+  params.push(DOC_BRANCH_ROLE_CODES);
+  const docSerializeGate = `
+          AND (
+            NOT (r.code = ANY($${params.length}::text[]))
+            OR t.parent_task_id IS NULL
+            OR NOT EXISTS (
+              SELECT 1 FROM tasks sib
+                JOIN roles sr ON sr.id = sib.current_role_id
+               WHERE sib.parent_task_id = t.parent_task_id
+                 AND sib.id <> t.id
+                 AND sib.status NOT IN ('DONE','CANCELLED','FAILED')
+                 AND sr.code = 'GIT_INTEGRATOR'
+            )
+          )`;
   await c.query('BEGIN');
   try {
     const picked = await c.query(
@@ -4917,7 +4874,7 @@ async function claimLlmRoleTask(c, roleCode = null) {
             -- приложения» — Приёмщик забирает его СРАЗУ в BACKLOG. Без этой ветки
             -- INNER JOIN projects скрывал бы задачу без проекта, и обращение зависло бы.
             OR (t.project_id IS NULL AND r.code = 'TASK_INTAKE_OFFICER' AND t.status::text = 'BACKLOG')
-          )
+          )${docSerializeGate}
         ORDER BY t.priority ASC, t.created_at ASC
         FOR UPDATE OF t SKIP LOCKED
         LIMIT 1`,
