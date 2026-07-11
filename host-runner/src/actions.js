@@ -4,6 +4,7 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import os from 'node:os';
 import { rm } from 'node:fs/promises';
+import { realpathSync } from 'node:fs';
 import { runServicePipeline } from '../../pipeline-runner/src/index.js';
 import { runAutodeploy } from './autodeploy.js';
 import { withRepoWorktreeLock } from '../../shared/repoWorktreeLock.js';
@@ -11,6 +12,22 @@ import { withRepoWorktreeLock } from '../../shared/repoWorktreeLock.js';
 const pexec = promisify(execFile);
 
 const sanitizeSeg = (s) => String(s ?? '').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 60) || '_';
+
+// PIPELINE-WORKTREE-LONGPATH-001 — каноничная (длинная) база для эфемерных
+// worktree. Под кириллическим/пробельным именем пользователя os.tmpdir() отдаёт
+// 8.3-КОРОТКОЕ имя (напр. C:\Users\7272~1\AppData\Local\Temp), а vite/vitest
+// резолвят setupFiles в ДЛИННОЕ (C:\Users\Админ\...) → URL-загрузчик модулей не
+// находит файл ("Failed to load url .../src/test/setup.ts. Does the file exist?")
+// и весь фронтенд-vitest падает 37/37. Разворачиваем короткое→длинное, чтобы путь
+// worktree совпадал с тем, как его видит vite. Нужен именно realpathSync.native:
+// обычный realpathSync 8.3-короткое имя НЕ разворачивает. Фолбэк на os.tmpdir().
+function pipelineWorktreeBase() {
+  try {
+    return realpathSync.native(os.tmpdir());
+  } catch {
+    return os.tmpdir();
+  }
+}
 
 // WORKTREE-ISOLATE-DELIVERY-001: стадии, которые НЕ выполняем в изолированном
 // worktree. build/deploy/smoke трогают общий docker-стек по фиксированным
@@ -95,7 +112,7 @@ async function withPipelineWorktree(repoRoot, task, run) {
     : '';
   if (!resolved) return run(repoRoot); // не git-репо / ссылка не резолвится → фолбэк
 
-  const dir = path.join(os.tmpdir(), 'ai-dev-pipeline-worktrees', `${sanitizeSeg(task?.id)}-${process.pid}-${Date.now()}`);
+  const dir = path.join(pipelineWorktreeBase(), 'ai-dev-pipeline-worktrees', `${sanitizeSeg(task?.id)}-${process.pid}-${Date.now()}`);
   // worktree add/remove — структурные операции .git: сериализуем межпроцессно с
   // programmer-runner (worktree add) и Git Integrator (cherry-pick) на том же репо
   // (тот же лок, что и в WorktreeManager.withRepoLock / integrateWorktreeBranch).
