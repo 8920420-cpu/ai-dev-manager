@@ -14,6 +14,54 @@ tools) шлют тот же токен из своего `ORCHESTRATOR_API_TOKEN
 В сетевом развёртывании токен обязателен: без него опубликованные HTTP-порты
 дают доступ к мутациям БД, файловым инструментам tools-service и MCP.
 
+## Tasks tree
+
+### `GET /api/tasks/tree`
+
+Read-only tree for the Tasks UI. The backend reads `projects` and `tasks`
+including `tasks.data_card`, builds a three-level tree
+(project -> task -> subtask), and returns:
+
+```json
+{
+  "projects": [
+    {
+      "id": "...",
+      "name": "...",
+      "code": "PROJECT",
+      "taskCount": 1,
+      "tasks": [
+        {
+          "id": "...",
+          "title": "...",
+          "status": "CODING",
+          "priority": "P2",
+          "subtasks": [],
+          "docsDebt": {
+            "role": "DOCUMENTATION_AUDITOR",
+            "reason": "docs_blocked_forwarded",
+            "status": "open",
+            "at": "2026-07-09T00:00:00.000Z"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+`docsDebt` is emitted only when `tasks.data_card.docs_debt` is an object with
+`status: "open"`. Resolved, missing, or invalid `docs_debt` values are omitted.
+The stored `docs_debt` contract is `{ role, reason, status, at }`, where
+`status` is `"open"` or `"resolved"`. `DOCUMENTATION_AUDITOR` and
+`DOCUMENTATION_KEEPER` write an open debt on the soft documentation forward
+(`reason = "docs_blocked_forwarded"`); a later successful forward by the same
+documentation roles writes `status: "resolved"`.
+
+The Tasks UI uses `docsDebt` to show the "документационный долг" badge on task
+and subtask rows and to count visible open documentation debts in the tree
+summary.
+
 ## Scanner bridge
 
 Scanner следит за «папкой задач» проекта (`projects.tasks_path`, с откатом на
