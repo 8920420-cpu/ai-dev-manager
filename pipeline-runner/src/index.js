@@ -25,9 +25,11 @@ export {
   isServiceRelPathSafe,
   isInsideRoot,
   safeLogFragment,
+  collectDepTargets,
   PIPELINE_ROLE_CODE,
   DEFAULT_PIPELINE_CONFIG_FILENAME,
   SAFE_LOG_FRAGMENT_LIMIT,
+  WORKTREE_INSTALL_TIMEOUT_MS,
 } from './ServicePipelineTask.js';
 
 /**

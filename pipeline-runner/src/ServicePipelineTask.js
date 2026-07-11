@@ -3,6 +3,7 @@ import { existsSync, statSync } from 'node:fs';
 
 import { ConfigLoader } from './ConfigLoader.js';
 import { PipelineRunner } from './PipelineRunner.js';
+import { CommandExecutor } from './CommandExecutor.js';
 import { ConventionConfigBuilder, ConventionError, mergeConvention } from './ConventionConfigBuilder.js';
 
 /**
@@ -38,6 +39,79 @@ export const DEFAULT_PIPELINE_CONFIG_FILENAME = '.pipeline.json';
  * токены) в summary, который уходит оркестратору и сохраняется в БД.
  */
 export const SAFE_LOG_FRAGMENT_LIMIT = 2000;
+
+/**
+ * Таймаут одной установки зависимостей в изолированном worktree (мс).
+ * Переопределяется PIPELINE_WORKTREE_INSTALL_TIMEOUT_MS. Дефолт 10 минут:
+ * холодная установка большого фронтенд-дерева из тёплого npm-кэша укладывается.
+ */
+export const WORKTREE_INSTALL_TIMEOUT_MS = Number(
+  process.env.PIPELINE_WORKTREE_INSTALL_TIMEOUT_MS || 600_000,
+);
+
+/**
+ * Каталоги, которым перед прогоном тестов в ИЗОЛИРОВАННОМ worktree нужен
+ * установленный `node_modules`. Эфемерный `git worktree` — чистый checkout БЕЗ
+ * node_modules (их нет в git), а в pipeline нет стадии установки, поэтому тесты
+ * там падали на импорте (`'test failed'`×N, `vitest не найден`). Цели извлекаем
+ * из команд включённых стадий, не угадывая структуру:
+ *  - `npm --prefix <dir> …` → <dir> относительно рабочей директории стадии;
+ *  - «голый» npm/npx/pnpm/yarn/vitest/`node --test` (без --prefix) → сама рабочая
+ *    директория (там лежит package.json, по которому и ставим).
+ * Возвращает Set АБСОЛЮТНЫХ путей. Экспортируется для юнит-теста.
+ *
+ * @param {import('./ConfigLoader.js').NormalizedConfig} config
+ * @returns {Set<string>}
+ */
+export function collectDepTargets(config) {
+  const targets = new Set();
+  const wd = config.workingDirectory;
+  const prefixRe = /--prefix[=\s]+("?)([^"\s]+)\1/g;
+  const bareToolRe = /(^|&&|;|\|)\s*(npm|npx|pnpm|yarn|vitest|node\s+--test)\b/;
+  for (const stage of config.stages) {
+    if (stage.enabled === false) continue;
+    for (const cmd of stage.commands || []) {
+      const text = String(cmd);
+      let sawPrefix = false;
+      let m;
+      prefixRe.lastIndex = 0;
+      while ((m = prefixRe.exec(text)) !== null) {
+        sawPrefix = true;
+        targets.add(path.resolve(wd, m[2]));
+      }
+      if (!sawPrefix && bareToolRe.test(text)) targets.add(path.resolve(wd, '.'));
+    }
+  }
+  return targets;
+}
+
+/**
+ * Установка зависимостей в одном каталоге через ту же оболочку, что и pipeline
+ * (CommandExecutor → shell), чтобы `npm` корректно резолвился на Windows.
+ * `npm ci` при наличии package-lock.json (детерминированно), с откатом на
+ * `npm install`, если ci упал (например, lock рассинхронизирован с package.json
+ * в дельте). `--prefer-offline` использует уже тёплый npm-кэш хоста.
+ *
+ * @returns {Promise<{ok:boolean, mode:string, error?:string}>}
+ */
+async function defaultInstallDeps(dir, { hasLock } = {}) {
+  const exec = new CommandExecutor();
+  const flags = '--no-audit --no-fund --prefer-offline';
+  const runOne = async (mode) => {
+    const r = await exec.run(`npm ${mode} ${flags}`, {
+      cwd: dir,
+      timeoutMs: WORKTREE_INSTALL_TIMEOUT_MS,
+    });
+    return { ok: r.exitCode === 0 && !r.timedOut, mode, error: r.timedOut ? 'timeout' : (r.exitCode === 0 ? null : safeLogFragment(r.stderr || r.stdout, 300)) };
+  };
+  if (hasLock) {
+    const ci = await runOne('ci');
+    if (ci.ok) return ci;
+    // ci мог упасть из-за рассинхрона lock/package.json — пробуем install.
+    return runOne('install');
+  }
+  return runOne('install');
+}
 
 /** Ошибка контракта/изоляции до запуска команд (диагностируемая). */
 export class PipelineTaskError extends Error {
@@ -272,7 +346,7 @@ export class ServicePipelineTask {
    * @param {(args:{config:Object})=>{execute:Function}} [opts.createRunner] фабрика runner (для тестов)
    * @param {Object} [opts.runnerDeps] зависимости PipelineRunner (executor/logger) для тестов
    */
-  constructor({ projectsRoot, configFilename = DEFAULT_PIPELINE_CONFIG_FILENAME, configLoader, conventionBuilder, createRunner, runnerDeps } = {}) {
+  constructor({ projectsRoot, configFilename = DEFAULT_PIPELINE_CONFIG_FILENAME, configLoader, conventionBuilder, createRunner, runnerDeps, skipStages, provisionDeps, installDeps } = {}) {
     this.projectsRoot = projectsRoot;
     this.configFilename = configFilename;
     this.configLoader = configLoader ?? new ConfigLoader();
@@ -280,6 +354,14 @@ export class ServicePipelineTask {
     this.runnerDeps = runnerDeps ?? {};
     this.createRunner =
       createRunner ?? ((args) => new PipelineRunner({ ...args, ...this.runnerDeps }));
+    // Изоляция worktree (WORKTREE-ISOLATE-DELIVERY-001): имена стадий, которые в
+    // изолированном прогоне НЕ выполняем (build/deploy/smoke трогают общий
+    // docker-стек по фиксированным container_name и мутируют живой прод — их место
+    // в пост-merge автодоставке GI, а не в per-task верификации).
+    this.skipStages = new Set(Array.isArray(skipStages) ? skipStages : []);
+    // Ставить ли node_modules в рабочих каталогах перед прогоном (для worktree).
+    this.provisionDeps = provisionDeps === true;
+    this.installDeps = installDeps ?? defaultInstallDeps;
   }
 
   /**
@@ -355,6 +437,25 @@ export class ServicePipelineTask {
       });
     }
 
+    // Изоляция worktree: гасим deploy/build/smoke ДО провижининга и запуска —
+    // они не выполняются (SKIPPED, не FAILED), success определяют только тесты.
+    if (this.skipStages.size) {
+      config = {
+        ...config,
+        stages: config.stages.map((s) =>
+          this.skipStages.has(s.name) && s.enabled !== false
+            ? { ...s, enabled: false, reason: 'skipped_in_isolation' }
+            : s,
+        ),
+      };
+    }
+
+    // Провижининг зависимостей в изолированном worktree: без node_modules тесты
+    // падают на импорте. Ставим ровно те каталоги, что реально запускают тесты.
+    if (this.provisionDeps) {
+      await this.#provisionWorktreeDeps(config);
+    }
+
     // Запуск всех объявленных действий штатным PipelineRunner/StageRunner.
     const runner = this.createRunner({ config });
     const result = await runner.execute();
@@ -407,6 +508,35 @@ export class ServicePipelineTask {
       projectRoot: resolved.absProjectRoot,
       name: resolved.serviceName || resolved.serviceCode || undefined,
     });
+  }
+
+  /**
+   * Установить node_modules в каталогах, которые реально запускают тесты
+   * (collectDepTargets), если их там ещё нет. Best-effort и параллельно: провал
+   * установки одного каталога не роняет прогон — реальная стадия тестов всё равно
+   * даст диагностируемую причину. Логируем компактно в stderr (host-runner пишет
+   * это в свой лог), контракт summary не трогаем.
+   */
+  async #provisionWorktreeDeps(config) {
+    const targets = [...collectDepTargets(config)];
+    if (!targets.length) return;
+    await Promise.all(
+      targets.map(async (dir) => {
+        try {
+          if (!existsSync(path.join(dir, 'package.json'))) return;
+          if (existsSync(path.join(dir, 'node_modules'))) return;
+          const hasLock = existsSync(path.join(dir, 'package-lock.json'));
+          const res = await this.installDeps(dir, { hasLock });
+          if (res && res.ok === false) {
+            process.stderr.write(`[pipeline] provision node_modules FAILED (${dir}): ${res.error ?? 'unknown'}\n`);
+          } else {
+            process.stderr.write(`[pipeline] provision node_modules ok (${dir}, ${res?.mode ?? 'install'})\n`);
+          }
+        } catch (err) {
+          process.stderr.write(`[pipeline] provision node_modules error (${dir}): ${safeLogFragment(err?.message ?? String(err), 200)}\n`);
+        }
+      }),
+    );
   }
 
   /** Собрать failure-результат с диагностируемой причиной до/во время запуска. */

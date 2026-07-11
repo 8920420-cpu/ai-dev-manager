@@ -12,6 +12,18 @@ const pexec = promisify(execFile);
 
 const sanitizeSeg = (s) => String(s ?? '').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 60) || '_';
 
+// WORKTREE-ISOLATE-DELIVERY-001: стадии, которые НЕ выполняем в изолированном
+// worktree. build/deploy/smoke трогают общий docker-стек по фиксированным
+// container_name (конфликт с живым стеком) и мутируют прод — их место в
+// пост-merge автодоставке Git Integrator, а не в per-task верификации.
+// Переопределяется PIPELINE_ISOLATION_SKIP_STAGES (список через запятую).
+const ISOLATION_SKIP_STAGES = String(
+  process.env.PIPELINE_ISOLATION_SKIP_STAGES ?? 'build,deploy,smoke',
+)
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
 /**
  * PIPELINE_SERVICE: реальный прогон pipeline сервиса задачи через pipeline-runner.
  *
@@ -37,9 +49,10 @@ export async function runPipelineAction(task, opts = {}) {
   const baseProjectsRoot = opts.projectsRoot ?? String(pipeline?.projectRoot ?? '').trim();
 
   // Прогон pipeline в заданном корне проекта (projectsRoot). Вынесено в замыкание,
-  // чтобы withPipelineWorktree мог подменить корень на изолированный checkout.
-  const runIn = async (projectsRoot) => {
-    const servicePipelineOpts = { projectsRoot };
+  // чтобы withPipelineWorktree мог подменить корень на изолированный checkout и
+  // добавить опции изоляции (провижининг node_modules + пропуск deploy-стадий).
+  const runIn = async (projectsRoot, extraOpts = {}) => {
+    const servicePipelineOpts = { projectsRoot, ...extraOpts };
     if (opts.configFilename) servicePipelineOpts.configFilename = opts.configFilename;
     if (opts.createRunner) servicePipelineOpts.createRunner = opts.createRunner;
     if (opts.runnerDeps) servicePipelineOpts.runnerDeps = opts.runnerDeps;
@@ -93,7 +106,10 @@ async function withPipelineWorktree(repoRoot, task, run) {
     return run(repoRoot); // не смогли изолировать — безопасный фолбэк на общее дерево
   }
   try {
-    return await run(dir);
+    // В изоляции: доставить node_modules (в worktree их нет) и не гонять
+    // deploy/build/smoke против общего стека. Общее дерево (фолбэки выше) сохраняет
+    // прежнее поведение — там node_modules есть, а compose-project стабилен.
+    return await run(dir, { provisionDeps: true, skipStages: ISOLATION_SKIP_STAGES });
   } finally {
     await withRepoWorktreeLock(repoRoot, async () => {
       await git(repoRoot, ['worktree', 'remove', '--force', dir]).catch(() => {});

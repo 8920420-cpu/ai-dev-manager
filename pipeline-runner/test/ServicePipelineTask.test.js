@@ -10,6 +10,7 @@ import {
   PipelineTaskError,
   isServiceRelPathSafe,
   isInsideRoot,
+  collectDepTargets,
   SAFE_LOG_FRAGMENT_LIMIT,
 } from '../src/ServicePipelineTask.js';
 import { PipelineRunner } from '../src/PipelineRunner.js';
@@ -505,4 +506,97 @@ test('структурированный результат соответств
   for (const k of ['summary', 'failedStage', 'startedAt', 'logPath']) {
     assert.ok(k in result.output, `output должен содержать ${k}`);
   }
+});
+
+// ── Изоляция worktree: collectDepTargets / skipStages / provisionDeps ─────────
+
+test('collectDepTargets: --prefix и «голый» npm/vitest дают цели, docker/go — нет', () => {
+  const wd = path.resolve('/wt/proj');
+  const config = {
+    workingDirectory: wd,
+    stages: [
+      { name: 'unit', enabled: true, commands: [
+        'npm --prefix pipeline-runner test',
+        'npm --prefix orchestrator-service/backend test',
+        'npm test',
+      ] },
+      { name: 'vitest', enabled: true, commands: ['vitest run'] },
+      { name: 'go', enabled: true, commands: ['go test ./...'] },
+      { name: 'deploy', enabled: true, commands: ['docker compose up -d'] },
+      { name: 'off', enabled: false, commands: ['npm --prefix should-not-count test'] },
+    ],
+  };
+  const targets = collectDepTargets(config);
+  assert.ok(targets.has(path.resolve(wd, 'pipeline-runner')));
+  assert.ok(targets.has(path.resolve(wd, 'orchestrator-service/backend')));
+  assert.ok(targets.has(path.resolve(wd, '.'))); // «голый» npm test и vitest → рабочая директория
+  // Отключённая стадия и docker/go целей не дают.
+  assert.ok(!targets.has(path.resolve(wd, 'should-not-count')));
+  assert.equal([...targets].length, 3);
+});
+
+test('skipStages: build/deploy/smoke пропущены (SKIPPED), success определяют тесты', async (t) => {
+  const root = tmpDir(t);
+  writeService(root, 'PS', 'services/a', {
+    name: 'A',
+    stages: {
+      test: ['npm test'],
+      build: ['docker compose build'],
+      deploy: ['docker compose up -d'],
+    },
+  });
+  const executor = new FakeExecutor();
+  const task = new ServicePipelineTask({
+    projectsRoot: root,
+    createRunner: fakeRunnerFactory(executor),
+    skipStages: ['build', 'deploy', 'smoke'],
+  });
+  const result = await task.run(claim({ serviceRel: 'services/a', serviceId: 'svc-A' }));
+
+  assert.equal(result.success, true);
+  // Реально исполнена только стадия тестов; деплой-команды не запускались.
+  assert.deepEqual(executor.calls.map((c) => c.command), ['npm test']);
+  const byStage = Object.fromEntries(result.output.summary.actions.map((a) => [a.stage, a]));
+  assert.equal(byStage.build.status, 'SKIPPED');
+  assert.equal(byStage.build.reason, 'skipped_in_isolation');
+  assert.equal(byStage.deploy.status, 'SKIPPED');
+});
+
+test('provisionDeps: ставит node_modules там, где их нет и есть package.json', async (t) => {
+  const root = tmpDir(t);
+  const svcDir = writeService(root, 'PS', 'services/a', { name: 'A', stages: { test: ['npm test'] } });
+  writeFileSync(path.join(svcDir, 'package.json'), JSON.stringify({ name: 'a', scripts: { test: 'vitest run' } }));
+  writeFileSync(path.join(svcDir, 'package-lock.json'), JSON.stringify({ name: 'a', lockfileVersion: 3 }));
+
+  const installed = [];
+  const task = new ServicePipelineTask({
+    projectsRoot: root,
+    createRunner: fakeRunnerFactory(new FakeExecutor()),
+    provisionDeps: true,
+    installDeps: async (dir, opts) => { installed.push({ dir, opts }); return { ok: true, mode: 'ci' }; },
+  });
+  const result = await task.run(claim({ serviceRel: 'services/a', serviceId: 'svc-A' }));
+
+  assert.equal(result.success, true);
+  assert.equal(installed.length, 1);
+  assert.equal(path.resolve(installed[0].dir), path.resolve(svcDir));
+  assert.equal(installed[0].opts.hasLock, true); // есть package-lock → режим ci
+});
+
+test('provisionDeps: пропускает каталог, где node_modules уже есть', async (t) => {
+  const root = tmpDir(t);
+  const svcDir = writeService(root, 'PS', 'services/a', { name: 'A', stages: { test: ['npm test'] } });
+  writeFileSync(path.join(svcDir, 'package.json'), JSON.stringify({ name: 'a' }));
+  mkdirSync(path.join(svcDir, 'node_modules'), { recursive: true });
+
+  const installed = [];
+  const task = new ServicePipelineTask({
+    projectsRoot: root,
+    createRunner: fakeRunnerFactory(new FakeExecutor()),
+    provisionDeps: true,
+    installDeps: async (dir, opts) => { installed.push({ dir, opts }); return { ok: true }; },
+  });
+  await task.run(claim({ serviceRel: 'services/a', serviceId: 'svc-A' }));
+
+  assert.equal(installed.length, 0, 'node_modules уже есть → установка не нужна');
 });
