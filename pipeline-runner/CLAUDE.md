@@ -1,13 +1,13 @@
-# programmer-runner — Claude Memory
-> Last analyzed: 2026-07-11 (updated)
+# pipeline-runner — Claude Memory
+> Last analyzed: 2026-07-11
 > Re-analysis needed: NO — read .claude/rules/ files instead of source files
 
 ## What this project is
-Автоматический исполнитель роли PROGRAMMER (стадия CODING): опрашивает оркестратор, запускает headless Claude Code (Agent SDK) на задаче в репозитории проекта и сдаёт результат. Закрывает разрыв, из-за которого CODING двигался только живой Claude-сессией.
+Universal, language-agnostic pipeline runner driven entirely by .pipeline.json
 
 ## Quick reference
 - **Stack**: JavaScript
-- **Dev**: `node bin/programmer-runner.js`
+- **Dev**: `N/A`
 - **Test**: `node --test`
 - **Build**: `N/A`
 
