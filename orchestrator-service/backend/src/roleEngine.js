@@ -653,6 +653,19 @@ export function normalizeVerdict(roleCode, parsed) {
   return { ok, status, summary, nextRoleHint, findings, fields };
 }
 
+// DOCROLES-GI-SERIALIZE-001 — канонический набор ролей ДОКУМЕНТАЦИОННОЙ fork-ветви
+// сервиса (Documentation Auditor → Documentation Keeper). Эти роли ПИШУТ файлы
+// (docs/*.md, README.md) в ОБЩЕЕ рабочее дерево сервиса (repoRoot) — то же, куда
+// fork-ребёнок Git Integrator льёт дельту Программиста. Набор — единый источник
+// правды для сериализации: claim GI-ребёнка ждёт, пока doc-сиблинги (эти роли) не
+// сойдут с doc-роли (дойдут до join) или не станут терминальными (db.js
+// claimNextHostTask), чтобы GI не стартовал ПОСРЕДИ незакоммиченной doc-правки и не
+// упёрся в dirty_worktree_conflict. Тем же набором пользуется подметатель
+// advanceStuckDocumentationBranches. DOC-BRANCH-LIVENESS-001 сохранён: BLOCKED-вердикт
+// doc-роли по-прежнему мягко идёт вперёд (docForward), а зависшую ветвь подметатель
+// двигает к join — GI из-за мёртвой документации навсегда не заблокируется.
+export const DOC_BRANCH_ROLE_CODES = ['DOCUMENTATION_AUDITOR', 'DOCUMENTATION_KEEPER'];
+
 /**
  * PIPELINE-DYNAMIC-ROUTE-001 — АБСТРАКТНЫЙ исход роли (без знания соседей).
  * Возвращает { outcome, ... } для projectRoute.resolveTransition:
@@ -741,6 +754,11 @@ export function decideOutcome(roleCode, verdict, {
       // должен оставлять задачу-ветвь в BLOCKED — иначе join ждёт вечно и держит
       // родителя. Поэтому «блок» документации = мягкое движение вперёд по ветке
       // (к Keeper → join), с сохранением причины для наблюдаемости.
+      // DOCROLES-GI-SERIALIZE-001: этот же мягкий forward критичен для сериализации
+      // с Git Integrator — пока doc-ветвь стоит на DOCUMENTATION_AUDITOR/KEEPER
+      // (DOC_BRANCH_ROLE_CODES), claim GI-fork-ребёнка той же группы придержан
+      // (db.js). BLOCKED-вердикт, уходя вперёд к join, снимает doc-роль → отпускает
+      // GI (а не держит его вечно из-за «мёртвой» документации).
       // DOCS-DEBT-001: reason='docs_blocked_forwarded' ловит applyReasoningVerdict
       // (db.js) и фиксирует docs_debt в data_card ради наблюдаемости долга.
       if (verdict.status === 'BLOCKED') return docForward('docs_blocked_forwarded');
