@@ -5,7 +5,6 @@
 // «подтягиваются» к ближайшей задаче-родителю верхнего уровня, чтобы дерево
 // всегда оставалось трёхуровневым. Endpoint ничего не изменяет.
 import { withClient, clientConfig } from './db.js';
-import { asObject, parseDataCard } from './dataCard.js';
 
 /**
  * GET /api/tasks/tree — все проекты с их задачами и подзадачами.
@@ -170,7 +169,7 @@ export async function getTaskHistory(s, taskId) {
     // TASK_CREATED исключаем: событие создания тоже несёт result/changedFiles
     // (исходный запрос сканера), но это не работа программиста.
     const actorOf = (payload, eventType) => {
-      const p = asObject(payload);
+      const p = payload && typeof payload === 'object' ? payload : {};
       if (typeof p.role === 'string' && p.role) return p.role;
       // Программист пишет result/changedFiles, своей роли в payload не указывает.
       if (eventType !== 'TASK_CREATED' && (p.result !== undefined || p.changedFiles !== undefined)) {
@@ -251,7 +250,7 @@ export function buildTaskTree(projectRows, taskRows) {
     // DOCS-DEBT-001: непогашенный документационный долг (status==='open') —
     // отдаём его в дерево для бейджа/счётчика в UI. Погашенный (resolved) не
     // показываем. data_card может быть null/не-объектом — защищаемся.
-    const card = parseDataCard(r);
+    const card = r.data_card && typeof r.data_card === 'object' ? r.data_card : {};
     const debt = card.docs_debt;
     const docsDebt = debt && typeof debt === 'object' && debt.status === 'open' ? debt : null;
     nodeById.set(r.id, {
