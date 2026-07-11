@@ -286,8 +286,9 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
   // Диапазон дельты: merge-base(HEAD, tip)..tip — коммиты ветки после расхождения
   // с main. Если tip уже предок HEAD (merge-base === tip) — вся ветка в main.
   let range = tip;
+  let mergeBase = '';
   if (before) {
-    const mergeBase = await git(repoRoot, ['merge-base', 'HEAD', tip]).then((r) => r.stdout.trim()).catch(() => '');
+    mergeBase = await git(repoRoot, ['merge-base', 'HEAD', tip]).then((r) => r.stdout.trim()).catch(() => '');
     if (mergeBase === tip) return { integrated: false, note: 'already_integrated', tip };
     range = mergeBase ? `${mergeBase}..${tip}` : tip;
   }
@@ -361,6 +362,49 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
         const stderr = String(error.stderr || error.message || '').trim();
         return { error: `autostash failed: ${stderr.slice(0, 500)}`, note: 'autostash_failed' };
       }
+    }
+  }
+
+  // ── Предохранитель нетто-удалений (защита от реверта main стухшей веткой) ─────
+  // Переиспользованная новой задачей БЕЗ ресинка на актуальный main
+  // программистская ветка «стухает»: её merge-base — древний коммит, а файлы,
+  // которые main получил ПОСЛЕ расхождения, в её tip отсутствуют. НЕТТО-эффект
+  // интеграции относительно текущего main (`git diff <main> <tip>`) показывает
+  // такие файлы как удаление (статус D): доставка ветки ОТКАТИЛА БЫ main (реверт
+  // влитой работы — инцидент bbd7cc03: packages/app-switcher/*, ideas-board/* и
+  // т.п.). Отказываем в доставке, чей нетто-эффект удаляет пути ВНЕ заявленного
+  // changed-set задачи (affected — пути, реально затронутые коммитами дельты
+  // диапазона). Легитимное удаление файла ВНУТРИ дельты (его трогает коммит
+  // диапазона) попадает в affected и проходит штатно.
+  if (before) {
+    const netStatus = await git(repoRoot, ['diff', '--name-status', before, tip])
+      .then((r) => r.stdout).catch(() => '');
+    const deletedOutsideChangedSet = netStatus
+      .split('\n').map((s) => s.trim()).filter(Boolean)
+      .map((line) => line.split('\t'))
+      .filter((parts) => parts[0] && parts[0][0] === 'D')
+      .map((parts) => parts[parts.length - 1].trim())
+      .filter((p) => p && !affected.has(p));
+    if (deletedOutsideChangedSet.length > 0) {
+      // Проверка ПРЕДПОЛЁТНАЯ: cherry-pick ещё не начинался, HEAD не двигался (уже
+      // на before). cherry-pick --abort — защитный no-op на случай остаточного
+      // состояния. autostash (дубль дельты / doc-работа fork-сиблинга) НЕ дропаем:
+      // сохраняем для ресинка ветки и ручного разбора, отдаём ref в диагностике.
+      await git(repoRoot, ['cherry-pick', '--abort']).catch(() => {});
+      return {
+        error:
+          `stale branch net-diff reverts main: доставка ветки ${worktreeBranch} удалила бы ` +
+          `файлы вне changed-set задачи (${deletedOutsideChangedSet.join(', ')}) — ветку нужно ` +
+          `пересинкать на актуальный main перед доставкой`,
+        note: 'stale_branch_reverts_main',
+        extra: {
+          deletedOutsideChangedSet,
+          worktreeBranch,
+          mergeBase: mergeBase || null,
+          tip,
+          ...(autostashRef ? { autostash: autostashRef } : {}),
+        },
+      };
     }
   }
 
