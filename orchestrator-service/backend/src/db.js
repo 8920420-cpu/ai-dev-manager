@@ -4355,9 +4355,19 @@ export async function reattachBlockedOwnerRoles(c) {
 // очередь до дедупа intake/split. Закрываем только безопасный класс: BLOCKED без
 // активного назначения, с одинаковым project + service + messageFingerprint.
 // WAITING_FOR_CHILDREN/RUNNING не трогаем, чтобы не сиротить дочерние ветки.
+//
+// FORK-JOIN-DEDUP-ANCESTRY-001 — НЕ закрываем как дубликат fork-подзадачу, чьим
+// original_id оказался её собственный предок (parent_task_id или выше по цепочке).
+// fork-ребёнок наследует messageFingerprint своего join-родителя и создаётся ПОЗЖЕ
+// него, поэтому родитель (самый ранний в партиции) попадает в original_id. Отмена
+// такого ребёнка как duplicateOf=предок неверна по сути и вредна по последствиям:
+// возвратимый (recoverable) сбой ветки схлопывался бы в CANCELLED и делал
+// join_child_failed на родителе НЕОБРАТИМЫМ (задача-родитель залипала в BLOCKED
+// навсегда). Обход цепочки предков — тот же паттерн WITH RECURSIVE по parent_task_id,
+// что и в resolveHostTaskContext.
 export async function closeBlockedDuplicateTasks(c) {
   const r = await c.query(
-    `WITH active AS (
+    `WITH RECURSIVE active AS (
        SELECT t.id, t.project_id, t.service_id, t.status::text AS status,
               t.current_role_id, t.data_card, t.created_at,
               t.data_card->>'messageFingerprint' AS fp,
@@ -4371,7 +4381,7 @@ export async function closeBlockedDuplicateTasks(c) {
          FROM tasks t
         WHERE t.status NOT IN ('DONE','CANCELLED','FAILED')
           AND COALESCE(t.data_card->>'messageFingerprint', '') <> ''
-     ), victims AS (
+     ), candidates AS (
        SELECT id, status, current_role_id, original_id
          FROM active
         WHERE dup_count > 1
@@ -4379,6 +4389,28 @@ export async function closeBlockedDuplicateTasks(c) {
           AND status = 'BLOCKED'
           AND NOT EXISTS (
             SELECT 1 FROM tasks tx WHERE tx.id = active.id AND tx.assigned_agent_id IS NOT NULL
+          )
+     ), ancestors AS (
+       -- Цепочка предков каждого кандидата (кандидат → parent → ... по parent_task_id).
+       SELECT c0.id AS candidate_id, t.parent_task_id AS ancestor_id, 1 AS depth
+         FROM candidates c0
+         JOIN tasks t ON t.id = c0.id
+        WHERE t.parent_task_id IS NOT NULL
+       UNION ALL
+       SELECT a.candidate_id, p.parent_task_id, a.depth + 1
+         FROM ancestors a
+         JOIN tasks p ON p.id = a.ancestor_id
+        WHERE p.parent_task_id IS NOT NULL
+          AND a.depth < 8
+     ), victims AS (
+       SELECT id, status, current_role_id, original_id
+         FROM candidates c1
+        WHERE NOT EXISTS (
+            -- fork-ребёнок не может дублировать своего предка: если original_id есть
+            -- в цепочке предков кандидата — исключаем его из victims (оставляем
+            -- восстановимым: ре-фид ветки / перезапуск роли, а не CANCELLED).
+            SELECT 1 FROM ancestors a
+             WHERE a.candidate_id = c1.id AND a.ancestor_id = c1.original_id
           )
      ), fixed AS (
        UPDATE tasks t
