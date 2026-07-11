@@ -21,6 +21,7 @@ import {
 import { projectsApi } from '../../api/projectsApi';
 import type { Project, Stage } from '../../types/project';
 import { taskStatusLabel } from '../../data/taskStatuses';
+import { cancelReasonLabel } from '../../data/cancelReasons';
 import {
   SELECTABLE_PRIORITIES,
   isOrchestratorPriority,
@@ -227,14 +228,17 @@ export function AcceptanceBoardPage({ mode }: { mode: AcceptanceMode }) {
                     <td className={styles.titleCell} title={task.title}>
                       <span className={styles.title}>{task.title}</span>
                       {task.status === CANCELLED_STATUS && task.cancelReason && (
-                        <span className={styles.reason} title={task.cancelReason}>
-                          {task.cancelReason}
+                        <span
+                          className={styles.reason}
+                          title={cancelReasonLabel(task.cancelReason)}
+                        >
+                          {cancelReasonLabel(task.cancelReason)}
                         </span>
                       )}
                     </td>
                     {mode === 'done' && (
                       <td>
-                        <Badge tone={task.status === CANCELLED_STATUS ? 'warning' : 'success'}>
+                        <Badge tone={task.status === CANCELLED_STATUS ? 'neutral' : 'success'}>
                           {taskStatusLabel(task.status)}
                         </Badge>
                       </td>
@@ -539,7 +543,7 @@ function TaskAcceptanceModal({
             <section className={styles.block}>
               <h3 className={styles.blockTitle}>Причина отмены</h3>
               <p className={styles.reasonText}>
-                {task.cancelReason ?? 'Причина не указана.'}
+                {cancelReasonLabel(task.cancelReason)}
               </p>
               {task.duplicateOf && (
                 <p className={styles.muted}>Дубликат задачи: {task.duplicateOf}</p>

@@ -558,13 +558,32 @@ export async function acceptScannerCompletionTx(c, payload) {
 async function findProject(c, ref) {
   const v = String(ref ?? '').trim();
   if (!v) return null;
-  const r = await c.query(
+  // Быстрый путь: точное совпадение по id/code/name/root_path.
+  const exact = await c.query(
     `SELECT id, code, root_path FROM projects
       WHERE id::text = $1 OR code = $1 OR name = $1 OR root_path = $1
       ORDER BY created_at LIMIT 1`,
     [v],
   );
-  return r.rowCount ? r.rows[0] : null;
+  if (exact.rowCount) return exact.rows[0];
+  // projectPath может прийти с другим регистром диска (F:\ vs f:\) или иными слешами —
+  // на Windows root_path регистронезависим и «\» ≡ «/». Тогда точное сравнение выше
+  // промахивается, и задача уходит в «Неразобранные». Сопоставляем НОРМАЛИЗОВАННО
+  // (только по пути; id/code/name остаются строгими) среди всех проектов — их единицы.
+  const vNorm = normalizeProjectPath(v);
+  if (!vNorm) return null;
+  const all = await c.query('SELECT id, code, root_path FROM projects ORDER BY created_at');
+  return all.rows.find((row) => normalizeProjectPath(row.root_path) === vNorm) ?? null;
+}
+
+// Нормализация пути проекта для регистро/сепаратор-независимого сравнения:
+// «\» → «/», срез хвостовых слешей, нижний регистр. Пусто → ''.
+function normalizeProjectPath(p) {
+  return String(p ?? '')
+    .trim()
+    .replace(/\\/g, '/')
+    .replace(/\/+$/, '')
+    .toLowerCase();
 }
 
 // =====================================================================
