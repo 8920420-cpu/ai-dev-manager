@@ -13,6 +13,21 @@ const pexec = promisify(execFile);
 
 const sanitizeSeg = (s) => String(s ?? '').replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 60) || '_';
 
+// GI-MEMORY-DELTA-SKIP-001 — артефакты codebase-memory / авто-доков
+// (`.claude/rules/*`, `CLAUDE.md`, `CONVENTIONS.md`, `API_MAP.md`) НЕПРЕРЫВНО
+// перегенеривает вотчдог: они пляшут и в грязном общем дереве, и (исторически,
+// до PROGRAMMER-DELTA-DENYLIST-MEMORY-001) внутри коммитов-дельте программиста.
+// Ни то, ни другое не должно валить интеграцию продуктовой дельты: память ведёт
+// codebase-memory, а не Git Integrator. Сегментный матч (`.claude` ловит вложенное
+// `.claude/rules/changelog.md`; имена-файлы — как сегмент пути).
+const MEMORY_DENY_SEGMENTS = new Set(['.claude']);
+const MEMORY_DENY_FILES = new Set(['CLAUDE.md', 'CONVENTIONS.md', 'API_MAP.md']);
+function isMemoryArtifact(p) {
+  const segs = String(p ?? '').replace(/\\/g, '/').split('/').filter(Boolean);
+  for (const s of segs) if (MEMORY_DENY_SEGMENTS.has(s) || MEMORY_DENY_FILES.has(s)) return true;
+  return false;
+}
+
 // PIPELINE-WORKTREE-LONGPATH-001 — каноничная (длинная) база для эфемерных
 // worktree. Под кириллическим/пробельным именем пользователя os.tmpdir() отдаёт
 // 8.3-КОРОТКОЕ имя (напр. C:\Users\7272~1\AppData\Local\Temp), а vite/vitest
@@ -294,11 +309,15 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
   // после успешной интеграции stash дропаем (дельта уже в main). Если содержимое
   // НЕ совпадает с tip — это чужая незакоммиченная работа: честный провал, файлы
   // не трогаем (не затираем чужой труд).
+  // GI-MEMORY-DELTA-SKIP-001: memory/doc-артефакты не участвуют в проверке грязного
+  // дерева — их постоянная перегенерация в общем дереве иначе давала ложный
+  // dirty_worktree_conflict на `.claude/rules/changelog.md` и блокировала GI.
   const affected = new Set();
   for (const commit of commits) {
     const names = await git(repoRoot, ['diff-tree', '--no-commit-id', '--name-only', '-r', commit])
       .then((r) => r.stdout).catch(() => '');
-    names.split('\n').map((s) => s.trim()).filter(Boolean).forEach((n) => affected.add(n));
+    names.split('\n').map((s) => s.trim()).filter(Boolean)
+      .forEach((n) => { if (!isMemoryArtifact(n)) affected.add(n); });
   }
   let autostashRef = null;
   if (affected.size > 0) {
@@ -358,6 +377,15 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
     const already = await git(repoRoot, ['merge-base', '--is-ancestor', commit, 'HEAD'])
       .then(() => true).catch(() => false);
     if (already) continue;
+    // GI-MEMORY-DELTA-SKIP-001: коммит, вся дельта которого — только memory/doc
+    // артефакты (исторический changelog-мусор от `git add -A` в worktree до фикса
+    // denylist), пропускаем целиком: продукта в нём нет, а cherry-pick его
+    // append'ов в `.claude/rules/changelog.md` детерминированно конфликтует с
+    // непрерывно перегенерируемым файлом общего дерева. Память ведёт codebase-memory.
+    const cf = await git(repoRoot, ['diff-tree', '--no-commit-id', '--name-only', '-r', commit])
+      .then((r) => r.stdout).catch(() => '');
+    const cfiles = cf.split('\n').map((s) => s.trim()).filter(Boolean);
+    if (cfiles.length && cfiles.every(isMemoryArtifact)) continue;
     try {
       // -x фиксирует исходный SHA в теле коммита — дельту в main можно проследить.
       await git(repoRoot, [...ident, 'cherry-pick', '-x', commit]);

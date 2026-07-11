@@ -16,6 +16,7 @@ import { resolveDuration, resolveInt, logEffectiveConfig, parseDurationMs } from
 import { asObject, parseDataCard } from './dataCard.js';
 import { isDriverProvider } from './connectors.js';
 import { hashToken, messageFingerprint } from './intakeIntegrations.js';
+import { exportLatestAgentRunObservation } from './clickhouseObservability.js';
 
 const { Client } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -326,7 +327,18 @@ async function resolveAfterSkippedReviewer(c, route, task, currentStatus, curren
  */
 export async function acceptScannerCompletion(s, input) {
   const payload = normalizeScannerCompletion(input);
-  return withClient(clientConfig(s), (c) => acceptScannerCompletionTx(c, payload));
+  return withClient(clientConfig(s), async (c) => {
+    const result = await acceptScannerCompletionTx(c, payload);
+    if (result?.accepted && !result.duplicate) {
+      await exportLatestAgentRunObservation(c, result.taskId || payload.taskId, {
+        eventType: 'programmer_completion',
+        roleCode: 'PROGRAMMER',
+        reason: result.kind === 'subtask' ? 'programmer_subtask_done' : 'programmer_completed',
+        payload: { result },
+      });
+    }
+    return result;
+  });
 }
 
 /**
@@ -2083,7 +2095,18 @@ function clipReleaseText(v) {
 // Публичная обёртка над Tx: открывает соединение и делегирует транзакционной части
 // (её же дёргают юнит-тесты с поддельным клиентом, как advanceTaskTx/moveTaskTx).
 export async function releaseClaudeTask(s, taskId, opts = {}) {
-  return withClient(clientConfig(s), (c) => releaseClaudeTaskTx(c, taskId, opts));
+  return withClient(clientConfig(s), async (c) => {
+    const result = await releaseClaudeTaskTx(c, taskId, opts);
+    if (result?.released) {
+      await exportLatestAgentRunObservation(c, taskId, {
+        eventType: 'programmer_released',
+        roleCode: 'PROGRAMMER',
+        reason: opts.reason || 'released',
+        payload: { result, meta: opts.meta ?? null },
+      });
+    }
+    return result;
+  });
 }
 
 export async function releaseClaudeTaskTx(c, taskId, opts = {}) {
@@ -2261,15 +2284,18 @@ export async function resolveHostTaskContext(c, taskId) {
   // программиста по цепочке событий (события отсортированы created_at DESC, поэтому
   // первое непустое значение — самое свежее). Нужны Git Integrator, чтобы влить
   // ветку programmer/<...> в main. Старая сдача без этих полей → null (прежнее поведение).
-  const lastNonEmpty = (field) => {
-    const row = ev.rows.find((r) => {
-      const v = r.payload_json?.[field];
-      return typeof v === 'string' && v.trim() !== '';
-    });
-    return row ? row.payload_json[field] : null;
-  };
-  const worktreeBranch = lastNonEmpty('worktreeBranch');
-  const deliveredCommit = lastNonEmpty('deliveredCommit');
+  // DELIVERED-COMMIT-COUPLE-001: worktreeBranch и deliveredCommit ОБЯЗАНЫ браться из
+  // ОДНОЙ и той же (самой свежей) сдачи. Раньше они резолвились независимо: после
+  // повторного прогона с ПУСТОЙ дельтой у свежей сдачи deliveredCommit=null, но
+  // worktreeBranch есть — и независимый поиск дотягивал deliveredCommit до СТАРОГО
+  // цикла. Git Integrator пытался влить устаревший коммит и падал cherry_pick_failed,
+  // хотя ветка уже сброшена на main и дельта пуста. Берём самую свежую сдачу с
+  // непустым worktreeBranch и её deliveredCommit «как есть»: null → GI сам возьмёт
+  // tip ветки (already_integrated + повтор доставки), а не устаревший SHA.
+  const str = (v) => (typeof v === 'string' && v.trim() !== '' ? v : null);
+  const deliveryRow = ev.rows.find((r) => str(r.payload_json?.worktreeBranch) !== null);
+  const worktreeBranch = deliveryRow ? str(deliveryRow.payload_json.worktreeBranch) : null;
+  const deliveredCommit = deliveryRow ? str(deliveryRow.payload_json.deliveredCommit) : null;
   return { chainIds, rootTask, scan: { payload_json: { changedFiles, result, worktreeBranch, deliveredCommit } } };
 }
 
@@ -2467,7 +2493,18 @@ const TERMINAL_TASK_STATUSES = new Set(['DONE', 'CANCELLED', 'FAILED']);
  * провала. Для GIT_INTEGRATOR success → конец маршрута (DONE), fail → BLOCKED.
  */
 export async function completeHostTask(s, input) {
-  return withClient(clientConfig(s), (c) => completeHostTaskTx(c, input));
+  return withClient(clientConfig(s), async (c) => {
+    const result = await completeHostTaskTx(c, input);
+    if (result?.taskId) {
+      await exportLatestAgentRunObservation(c, result.taskId, {
+        eventType: 'host_role_completed',
+        roleCode: result.role,
+        reason: result.reason || (result.success === false ? 'host_failed' : 'host_completed'),
+        payload: { result },
+      });
+    }
+    return result;
+  });
 }
 
 /**
@@ -2660,7 +2697,15 @@ export async function releaseHostTask(s, taskId) {
       `UPDATE agent_runs SET status = 'CANCELLED', finished_at = now() WHERE task_id = $1 AND status = 'RUNNING'`,
       [id],
     );
-    return { released: r.rowCount > 0, taskId: id };
+    const result = { released: r.rowCount > 0, taskId: id };
+    if (result.released) {
+      await exportLatestAgentRunObservation(c, id, {
+        eventType: 'host_role_released',
+        reason: 'host_released',
+        payload: { result },
+      });
+    }
+    return result;
   });
 }
 
@@ -2792,7 +2837,17 @@ export async function claimNextReasoningTask(s, engineParam = null, roleParam = 
 // данные перечитываем на сервере по taskId (раннеру не доверяем). Идемпотентно:
 // если задача терминальна или RUNNING-прогона нет (реапер/повтор) — duplicate.
 export async function completeReasoningTask(s, input) {
-  return withClient(clientConfig(s), (c) => completeReasoningTaskTx(c, input));
+  return withClient(clientConfig(s), async (c) => {
+    const result = await completeReasoningTaskTx(c, input);
+    if (result?.taskId && !result.duplicate) {
+      await exportLatestAgentRunObservation(c, result.taskId, {
+        eventType: 'reasoning_role_completed',
+        reason: result.reason || result.verdict || result.toStatus || 'reasoning_completed',
+        payload: { result },
+      });
+    }
+    return result;
+  });
 }
 
 export async function completeReasoningTaskTx(c, input) {
@@ -2917,7 +2972,15 @@ export async function releaseReasoningTask(s, taskId) {
         WHERE id = $1 AND assigned_agent_id IS NOT NULL AND status NOT IN ('DONE','CANCELLED') RETURNING id`,
       [id],
     );
-    return { released: r.rowCount > 0, taskId: id };
+    const result = { released: r.rowCount > 0, taskId: id };
+    if (result.released) {
+      await exportLatestAgentRunObservation(c, id, {
+        eventType: 'reasoning_role_released',
+        reason: 'reasoning_released',
+        payload: { result },
+      });
+    }
+    return result;
   });
 }
 

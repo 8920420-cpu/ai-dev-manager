@@ -58,6 +58,15 @@ const DEFAULT_DENY_GLOBS = [
   'node_modules', 'dist',
   '.next', '.nuxt', '.svelte-kit', '.turbo',
   '__pycache__', '*.pyc',
+  // PROGRAMMER-DELTA-DENYLIST-MEMORY-001: артефакты codebase-memory и авто-доки
+  // регенерируются вотчдогом/analyze НЕЗАВИСИМО от задач и постоянно пляшут в
+  // рабочем дереве. `git add -A` в worktree затягивал `.claude/rules/changelog.md`
+  // (и др.) в дельту → Git Integrator честно падал на dirty_worktree_conflict в
+  // общем дереве (файл там свой, мисматч с tip). Память ведёт codebase-memory, а
+  // не дельты ролей — исключаем её из коммита-дельты, как и артефакты сборки.
+  // Сегментный матч: `.claude` ловит `.claude/rules/*`; имена-файлы ловятся как
+  // сегмент пути (`docs/API_MAP.md`, `orchestrator-service/backend/CLAUDE.md`).
+  '.claude', 'CLAUDE.md', 'CONVENTIONS.md', 'API_MAP.md',
 ];
 
 function parseDenyGlobs(raw) {

@@ -185,6 +185,30 @@ test('последняя непустая ветка/коммит выигрыв
   assert.equal(ctx.scan.payload_json.deliveredCommit, 'abc123');
 });
 
+// DELIVERED-COMMIT-COUPLE-001: свежая пустая дельта (ветка есть, commit пуст) НЕ
+// должна дотягивать deliveredCommit до устаревшего коммита прошлого цикла. Оба поля
+// берутся из ОДНОЙ (самой свежей) сдачи с непустой веткой → deliveredCommit=null,
+// а Git Integrator сам возьмёт tip ветки (already_integrated), не устаревший SHA.
+test('свежая пустая дельта (branch есть, commit пуст) → deliveredCommit=null, не устаревший', async () => {
+  const c = fakeClient([
+    { re: CHAIN_RE, reply: { rowCount: 1, rows: [{ id: 't1', title: 'T', description: 'd', depth: 0 }] } },
+    {
+      re: EVENTS_RE,
+      reply: { rowCount: 2, rows: [
+        // самая свежая сдача (DESC first): ветка сброшена на main, дельта пуста
+        { payload_json: { changedFiles: [], result: 'уже в main', worktreeBranch: 'programmer/PS/svc', deliveredCommit: '' } },
+        // старый цикл со «своим» коммитом — НЕ должен просочиться
+        { payload_json: { changedFiles: ['a.js'], result: 'старьё', worktreeBranch: 'programmer/PS/svc', deliveredCommit: 'stale99' } },
+      ] },
+    },
+  ]);
+
+  const ctx = await resolveHostTaskContext(c, 't1');
+
+  assert.equal(ctx.scan.payload_json.worktreeBranch, 'programmer/PS/svc');
+  assert.equal(ctx.scan.payload_json.deliveredCommit, null, 'устаревший commit не просочился — GI возьмёт tip ветки');
+});
+
 // Обратная совместимость: сдача без worktree-полей (старый раннер) → они null,
 // прежнее поведение сохраняется.
 test('сдача без worktreeBranch/deliveredCommit → поля пустые (null)', async () => {
