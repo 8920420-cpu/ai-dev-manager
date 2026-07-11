@@ -4,7 +4,7 @@ import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ROLE_FLOW, fastForwardHiddenRoles } from './rolePipeline.js';
-import { runReasoningRole, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict, renderProjectMaps, isMissingArtifactComplaint } from './roleEngine.js';
+import { runReasoningRole, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict, renderProjectMaps, isMissingArtifactComplaint, REVIEW_DELTA_ROLES } from './roleEngine.js';
 import { buildRoute, resolveTransition, forwardFrom, routeIsUsable, TERMINAL_STATUSES } from './projectRoute.js';
 import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey, reworkNodeKey } from './graphRoute.js';
 import { extractOutputs, missingRequiredInputs } from './fieldsContract.js';
@@ -5101,6 +5101,19 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
     ? await fetchFailureArtifact(c, claimed.id)
     : null;
 
+  // REVIEW-DELTA-VISIBILITY-001: ролям-ревьюерам/гейтам подаём ветку+коммит доставки
+  // Программиста (тот же источник, что видит Git Integrator — resolveHostTaskContext по
+  // цепочке предков), чтобы ревьюер смотрел РЕАЛЬНУЮ дельту в изолированной ветке, а не
+  // «пустое» рабочее дерево (main). Без него ревьюер отбивал корректные сдачи как
+  // NEEDS_FIX «реализация отсутствует». Нет ветки/коммита → null (прежнее поведение).
+  let reviewDelta = null;
+  if (REVIEW_DELTA_ROLES.has(claimed.role_code)) {
+    const host = await resolveHostTaskContext(c, claimed.id).catch(() => null);
+    const branch = host?.scan?.payload_json?.worktreeBranch ?? null;
+    const commit = host?.scan?.payload_json?.deliveredCommit ?? null;
+    if (branch || commit) reviewDelta = { branch, commit };
+  }
+
   // DECOMP-CONTRACT-001: если это задача-на-сервис (kind='service' с подзадачами),
   // её реальные результаты лежат на детях-подзадачах. Соберём их, чтобы Task
   // Reviewer видел весь сервис целиком, а не пустой programmerResult.
@@ -5203,6 +5216,9 @@ async function buildRoleContext(c, claimed, { engine = null } = {}) {
     lastReview: prior.lastReview,
     // FA-MISSING-ARTIFACT-001: артефакт последнего провала host-роли (только для FA).
     failureArtifact,
+    // REVIEW-DELTA-VISIBILITY-001: ветка/коммит доставки для ролей-ревьюеров (иначе null).
+    // buildUserPayload вынет его в markdown-блок renderReviewDelta (в JSON не кладём).
+    reviewDelta,
     recentEvents: ev.rows.slice(0, 8).map((r) => ({ type: r.event_type, from: r.from_status, to: r.to_status })),
   };
 }

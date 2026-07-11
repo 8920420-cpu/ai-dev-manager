@@ -226,6 +226,14 @@ export const LLM_ROLE_CODES = [
 // Роли реального действия — их выполняет host-мост (docker/git), не ИИ.
 export const HOST_ROLE_CODES = ['PIPELINE_SERVICE', 'GIT_INTEGRATOR'];
 
+// REVIEW-DELTA-VISIBILITY-001 — роли-гейты, которые ревьюят ДЕЛЬТУ Программиста.
+// Они читают рабочее дерево (main), но дельта лежит в ИЗОЛИРОВАННОЙ ветке доставки
+// и в main ещё не влита (WORKTREE-ISOLATE-DELIVERY-001) — поэтому им подаём
+// ветку/коммит доставки и инструкцию смотреть дельту через git (renderReviewDelta).
+export const REVIEW_DELTA_ROLES = new Set([
+  'TASK_REVIEWER', 'REVIEWER', 'SECURITY_ENGINEER', 'SRE_ENGINEER', 'MONITORING_ENGINEER',
+]);
+
 const SUCCESS_STATUSES = new Set([
   'APPROVED', 'READY', 'DONE', 'DIAGNOSED', 'PASS', 'OK', 'SUCCESS',
   'COMPLETED', 'READY_FOR_REVIEW', 'AUDITED', 'UPDATED', 'PROCEED',
@@ -401,6 +409,40 @@ export function renderProjectMaps(maps) {
   ].join('\n\n');
 }
 
+// REVIEW-DELTA-VISIBILITY-001 — отрендерить указатель на реальную дельту под ревью
+// как читаемый markdown-блок (подаётся ПЕРЕД контекстом задачи, чтобы ревьюер увидел
+// его до любых выводов). Дельта Программиста доставлена в ИЗОЛИРОВАННУЮ git-ветку и в
+// рабочем дереве (cwd ревьюера = main) её НЕТ. Без этого блока ревьюер видел «пустое»
+// дерево и отбивал сдачу к Программисту (NEEDS_FIX «реализация отсутствует»). Пусто/нет
+// ветки-коммита → пустая строка (прежнее поведение — блок не добавляется).
+export function renderReviewDelta(reviewDelta) {
+  if (!reviewDelta || typeof reviewDelta !== 'object') return '';
+  const branch = typeof reviewDelta.branch === 'string' ? reviewDelta.branch.trim() : '';
+  const commit = typeof reviewDelta.commit === 'string' ? reviewDelta.commit.trim() : '';
+  const ref = commit || branch; // коммит точнее ветки; если коммита нет — берём ветку
+  if (!ref) return '';
+  const lines = [
+    '## Дельта под ревью — она в ОТДЕЛЬНОЙ git-ветке, НЕ в рабочем дереве',
+    'Изменения Программиста доставлены в ИЗОЛИРОВАННУЮ ветку и ещё НЕ влиты в основную',
+    '(их вливает Git Integrator уже ПОСЛЕ твоего одобрения). Рабочий каталог (cwd) сейчас',
+    'на основной ветке и этих изменений НЕ содержит — НЕ делай вывод «реализация отсутствует»',
+    'или «изменений нет» по состоянию рабочего дерева.',
+    '',
+  ];
+  if (branch) lines.push(`- Ветка доставки: \`${branch}\``);
+  if (commit) lines.push(`- Коммит доставки: \`${commit}\``);
+  lines.push(
+    '',
+    'Смотри РЕАЛЬНУЮ дельту через git (в cwd, только чтение):',
+    '```',
+    `git diff HEAD...${ref}      # полный дифф ветки от точки расхождения с основной`,
+    `git show --stat ${ref}      # список изменённых файлов и объём правок`,
+    '```',
+    'Ревьюй ИМЕННО эту дельту (ветку/коммит), а не текущее состояние рабочего дерева.',
+  );
+  return lines.join('\n');
+}
+
 // Пользовательский payload: карта проекта инлайн (если есть) + компактный контекст
 // задачи + требование вердикта. outputFields — объявленные исходящие поля роли.
 // TOKEN-EFFICIENCY: контекст сериализуем КОМПАКТНО (без отступов). Pretty-print
@@ -412,10 +454,14 @@ export function renderProjectMaps(maps) {
 // PROMPT-CACHE-001: includeMap=false — карту НЕ кладём в user-payload (её выносят в
 // кэшируемый system-префикс для claude_code, чтобы не переоплачивать на каждый вызов).
 export function buildUserPayload(roleCode, context, outputFields = [], { includeMap = true } = {}) {
-  const { projectMaps, ...rest } = asObject(context);
+  // REVIEW-DELTA-VISIBILITY-001: reviewDelta вынимаем из контекста и рендерим
+  // markdown-блоком (как projectMaps) — внутри JSON он читался бы хуже и дублировался.
+  const { projectMaps, reviewDelta, ...rest } = asObject(context);
   const mapBlock = includeMap ? renderProjectMaps(projectMaps) : '';
+  const deltaBlock = renderReviewDelta(reviewDelta);
   const sections = [];
   if (mapBlock) sections.push(mapBlock, '');
+  if (deltaBlock) sections.push(deltaBlock, '');
   sections.push(
     `Задача роли ${roleCode}. Контекст задачи (JSON):`,
     JSON.stringify(rest),
@@ -651,6 +697,12 @@ export function decideOutcome(roleCode, verdict, {
       // на доработку ближайшему исполнителю; Failure Analyst нужен для падений
       // pipeline/host-ролей, а не для обычных замечаний ревьюера.
       if (verdict.ok === true) return forward;
+      // REVIEW-VERDICT-INDETERMINATE-001: вердикт распознан, но его статус ВНЕ
+      // контракта роли (не APPROVED и не NEEDS_FIX/REJECTED → ok===null). Ревьюер
+      // РЕШЕНИЯ не вынес — это НЕ отказ ревью. Не гоним задачу к Программисту на
+      // «доработку» (иначе неопределённость молча превращается в лишний круг
+      // Programmer→Review и списывается Программисту): блокируем на ручной разбор.
+      if (verdict.ok !== false) return block('review_indeterminate');
       // REVIEWER-ONE-REWORK-001: Programmer -> Reviewer -> Rework -> Programmer
       // допускается ровно один раз. Повторный отрицательный вердикт reviewer
       // пропускаем вперёд, иначе изолированная worktree-доставка может гонять
@@ -734,9 +786,12 @@ export function decideTransition(roleCode, verdict, { reworkCount = 0, maxRework
   });
   switch (roleCode) {
     case 'TASK_REVIEWER':
-      // Гейт качества: проходим только при явном APPROVED. Любой не-успех
-      // возвращает задачу Programmer на доработку.
+      // Гейт качества: проходим только при явном APPROVED. Явный отказ
+      // (NEEDS_FIX/REJECTED → ok===false) возвращает задачу Programmer на доработку.
       if (verdict.ok === true) return proceed();
+      // REVIEW-VERDICT-INDETERMINATE-001: статус вне контракта роли (ok===null) —
+      // ревьюер не вынес решения; это НЕ отказ ревью и не повод грузить Программиста.
+      if (verdict.ok !== false) return block('review_indeterminate');
       if (reworkCount >= maxRework) return block('max_rework_exceeded');
       return {
         toStatus: 'CODING',

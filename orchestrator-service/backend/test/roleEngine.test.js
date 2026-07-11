@@ -9,6 +9,7 @@ import {
   buildVerdictInstruction,
   buildUserPayload,
   renderProjectMaps,
+  renderReviewDelta,
   summarizePriorRuns,
   LLM_ROLE_CODES,
   capToolArgs,
@@ -180,9 +181,28 @@ test('decideOutcome: TASK_REVIEWER after one reviewer rework => FORWARD', () => 
   assert.equal(d.reason, 'review_rework_limit_forwarded');
 });
 
-test('decideTransition: TASK_REVIEWER неразобранный вердикт не апрувит', () => {
-  const d = decideTransition('TASK_REVIEWER', { ok: null, status: '' }, { reworkCount: 0 });
-  assert.equal(d.nextRole, 'PROGRAMMER');
+// REVIEW-VERDICT-INDETERMINATE-001: статус вне контракта роли (ok===null) — ревьюер
+// не вынес решения. Это НЕ отказ ревью: НЕ гоним к Программисту, а блокируем.
+test('decideTransition: TASK_REVIEWER неопределённый вердикт (ok=null) => BLOCKED, не PROGRAMMER', () => {
+  const d = decideTransition('TASK_REVIEWER', { ok: null, status: 'WAT' }, { reworkCount: 0 });
+  assert.equal(d.nextRole, null);
+  assert.equal(d.blocked, true);
+  assert.equal(d.reason, 'review_indeterminate');
+});
+
+test('decideOutcome: TASK_REVIEWER неопределённый вердикт (ok=null) => BLOCK review_indeterminate', () => {
+  const d = decideOutcome('TASK_REVIEWER', { ok: null, status: 'WAT' }, { reworkCount: 0 });
+  assert.equal(d.outcome, 'BLOCK');
+  assert.equal(d.reason, 'review_indeterminate');
+  // Гейты Инфраструктурного отдела ведут себя так же.
+  assert.equal(decideOutcome('SECURITY_ENGINEER', { ok: null, status: '' }).outcome, 'BLOCK');
+});
+
+// Явный отказ (ok===false) по-прежнему уводит задачу к Программисту на доработку.
+test('decideOutcome: TASK_REVIEWER NEEDS_FIX (ok=false) => REWORK (не тронуто)', () => {
+  const d = decideOutcome('TASK_REVIEWER', { ok: false, status: 'NEEDS_FIX' }, { reworkCount: 0 });
+  assert.equal(d.outcome, 'REWORK');
+  assert.equal(d.reason, 'review_failed');
 });
 
 test('decideTransition: защита от цикла — max rework => BLOCKED', () => {
@@ -300,6 +320,36 @@ test('renderProjectMaps: проект + сервис → markdown-блок; пу
   assert.match(block, /P-MAP/);
   assert.match(block, /Карта микросервиса scanner/);
   assert.match(block, /S-MAP/);
+});
+
+// --- REVIEW-DELTA-VISIBILITY-001: указатель на дельту под ревью -------------
+
+test('renderReviewDelta: ветка+коммит → git-инструкция; пусто → пустая строка', () => {
+  assert.equal(renderReviewDelta(null), '');
+  assert.equal(renderReviewDelta({}), '');
+  assert.equal(renderReviewDelta({ branch: '', commit: '' }), '');
+  const block = renderReviewDelta({ branch: 'programmer/task-42', commit: 'abc1234' });
+  assert.match(block, /ОТДЕЛЬНОЙ git-ветке/);
+  assert.match(block, /programmer\/task-42/);
+  assert.match(block, /abc1234/);
+  // Команда диффа использует коммит (точнее ветки), от точки расхождения с основной.
+  assert.match(block, /git diff HEAD\.\.\.abc1234/);
+});
+
+test('renderReviewDelta: только ветка (коммит null) → дифф по ветке', () => {
+  const block = renderReviewDelta({ branch: 'programmer/task-7', commit: null });
+  assert.match(block, /git diff HEAD\.\.\.programmer\/task-7/);
+});
+
+test('buildUserPayload: reviewDelta рендерится markdown-блоком и НЕ попадает в JSON', () => {
+  const payload = buildUserPayload('TASK_REVIEWER', {
+    taskId: 'x', title: 'T', reviewDelta: { branch: 'programmer/task-9', commit: 'deadbeef' },
+  });
+  assert.match(payload, /ОТДЕЛЬНОЙ git-ветке/);
+  assert.match(payload, /deadbeef/);
+  assert.match(payload, /"title":"T"/);
+  // reviewDelta не дублируется внутри JSON-контекста.
+  assert.ok(!/"reviewDelta"/.test(payload));
 });
 
 test('buildUserPayload: projectMaps рендерится инлайн и НЕ попадает в JSON-контекст', () => {
