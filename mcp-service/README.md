@@ -37,7 +37,8 @@ npm test
 | `PROJECT_ROOT` | Корень проекта, **передаётся в tools-service как `root`** (резолвится в его окружении). | `process.cwd()` |
 | `ORCHESTRATOR_URL` | Базовый URL orchestrator-service. | `http://localhost:4186` |
 | `TOOLS_SERVICE_URL` | Базовый URL tools-service. | `http://localhost:4188` |
-| `ORCHESTRATOR_API_TOKEN` | Bearer-токен (если сервисы закрыты токеном). | — |
+| `ORCHESTRATOR_API_TOKEN` | Bearer-токен (если сервисы закрыты токеном). Если не задан в окружении процесса — добирается из репозиторного `.env` (единый источник). | — |
+| `MCP_ENV_FILE` | Путь к `.env`-файлу единого источника (по умолчанию — `<repo>/.env` относительно модуля). | `<repo>/.env` |
 | `MCP_SERVICE_PORT` | Порт HTTP-режима. | `4190` |
 | `MCP_REQUEST_TIMEOUT_MS` | Таймаут HTTP-запросов. | `30000` |
 | `MCP_ENABLE_WRITE` | Включить `project_edit_file` / `project_write_file`. | выкл |
@@ -97,9 +98,15 @@ npm test
 См. [docs/MCP_SETUP.md](../docs/MCP_SETUP.md) — настройка Claude Code (`.mcp.json`),
 VS Code (`.vscode/mcp.json`) и Codex (`~/.codex/config.toml`).
 
-> **Авторизация:** если сервисы подняты с `ORCHESTRATOR_API_TOKEN`, тот же токен
-> нужен MCP-клиенту — иначе оркестраторные read-инструменты и codebase-memory дают
+> **Авторизация (единый источник токена):** если сервисы подняты с
+> `ORCHESTRATOR_API_TOKEN`, тот же токен нужен MCP-клиенту — иначе оркестраторные
+> read-инструменты, codebase-memory и мутации (`orchestrator_create_task`) дают
 > `401` (при этом `orchestrator_health`/`orchestrator_version` публичны и проблему
-> прячут). Передавайте токен ссылкой `"ORCHESTRATOR_API_TOKEN": "${ORCHESTRATOR_API_TOKEN:-}"`
-> в `.mcp.json`, а само значение — переменной окружения клиента (секрет в git не
-> коммитим). Подробности и настройка под Windows — в [MCP_SETUP.md](../docs/MCP_SETUP.md).
+> прячут). Чтобы не копировать секрет в каждый конфиг клиента, `mcp-service` при
+> старте добирает недостающие переменные (в т.ч. токен) из репозиторного `.env`
+> (gitignored, единый источник) — приоритет всегда у окружения процесса. Это
+> закрывает сценарий stdio-запуска из Codex (`~/.codex/config.toml` не разворачивает
+> `${VAR}`, поэтому токен туда не попадает). Проверить согласованность конфигурации
+> до первого вызова — `node bin/mcp-service.js --check` (exit 1 при мутациях без
+> токена, значение токена не печатается). Подробности, настройка под Windows и
+> ротация токена — в [MCP_SETUP.md](../docs/MCP_SETUP.md).

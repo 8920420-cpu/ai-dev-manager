@@ -6,7 +6,7 @@ import { createServer } from 'node:http';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import { loadConfig } from './config.js';
+import { loadConfig, checkConfig } from './config.js';
 import { createToolsClient } from './toolsClient.js';
 import { createOrchestratorClient } from './orchestratorClient.js';
 import { registerTools } from './tools.js';
@@ -43,9 +43,18 @@ export async function startStdio(config = loadConfig()) {
   const { server, tools } = buildServer(config);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  // MCP-TOKEN-SYNC-001 — диагностика конфигурации ДО первого вызова: если
+  // мутации включены без токена, предупреждаем в stderr (stdout занят протоколом).
+  // Логируем только булев признак наличия токена, но НЕ его значение.
+  const check = checkConfig(config);
+  for (const p of check.problems) {
+    console.error(`[mcp-service] КОНФИГУРАЦИЯ (${p.level}): ${p.message}`);
+  }
   console.error(
     `[mcp-service] stdio готов: ${tools.length} инструментов, ROOT=${config.projectRoot}, ` +
-      `orchestrator=${config.orchestratorUrl}, tools=${config.toolsServiceUrl}`,
+      `orchestrator=${config.orchestratorUrl}, tools=${config.toolsServiceUrl}, ` +
+      `token=${check.tokenConfigured ? 'задан' : 'отсутствует'}, ` +
+      `mutations=${check.mutationsEnabled ? 'on' : 'off'}`,
   );
   return { server, transport, tools };
 }
@@ -97,8 +106,25 @@ export function startHttp(config = loadConfig(), { logger = console.error } = {}
     const path = url.pathname;
 
     if (req.method === 'GET' && (path === '/health' || path === '/healthz' || path === '/readiness')) {
+      // MCP-TOKEN-SYNC-001 — health отдаёт диагностику согласованности токена/мутаций
+      // (булев tokenConfigured, БЕЗ значения токена), чтобы проблему было видно до
+      // первого вызова. Сам liveness остаётся 200 (для Docker healthcheck).
+      const check = checkConfig(config);
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-      return res.end(JSON.stringify({ status: 'ok', service: 'mcp-service', version: SERVICE_VERSION }));
+      return res.end(
+        JSON.stringify({
+          status: 'ok',
+          service: 'mcp-service',
+          version: SERVICE_VERSION,
+          orchestrator: {
+            url: check.orchestratorUrl,
+            tokenConfigured: check.tokenConfigured,
+            mutationsEnabled: check.mutationsEnabled,
+            configOk: check.ok,
+          },
+          ...(check.ok ? {} : { warnings: check.problems.map((p) => p.message) }),
+        }),
+      );
     }
 
     if (path === '/mcp') {

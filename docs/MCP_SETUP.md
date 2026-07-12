@@ -48,14 +48,36 @@ cd mcp-service && npm install
 Если сервисы подняты с непустым `ORCHESTRATOR_API_TOKEN` (см. `.env`), защищённые
 эндпоинты `/api/*` требуют тот же Bearer-токен у MCP-клиента — иначе оркестраторные
 read-инструменты (`orchestrator_list_projects`, `orchestrator_list_codebase_memory`,
-`orchestrator_get_codebase_memory`, …) и постановка задач вернут `401`. Публичные
-`orchestrator_health` и `orchestrator_version` работают без токена и проблему НЕ
-показывают.
+`orchestrator_get_codebase_memory`, …) и мутации (`orchestrator_create_task` и др.)
+вернут `401`. Публичные `orchestrator_health` и `orchestrator_version` работают без
+токена и проблему НЕ показывают.
 
-Секрет **не храните в закоммиченном** `.mcp.json`. Передавайте его ссылкой на
-переменную окружения — `"ORCHESTRATOR_API_TOKEN": "${ORCHESTRATOR_API_TOKEN:-}"`
-(форма `${VAR:-}` не ломает парсинг конфига, если переменная не задана). Само
-значение задаётся в окружении, из которого **запускается** клиент:
+### Единый источник токена — репозиторный `.env` (MCP-TOKEN-SYNC-001)
+
+Раньше токен приходилось дублировать в каждый конфиг клиента, и при stdio-запуске
+из Codex это ломалось: env-блок `~/.codex/config.toml` **не разворачивает** форму
+`${VAR}` (в отличие от Claude Code/оболочек), поэтому `ORCHESTRATOR_API_TOKEN` туда
+не попадал и stdio-процесс уходил в оркестратор без Bearer → систематический `401`,
+хотя контейнерный `mcp-service` тот же токен имел.
+
+Теперь `mcp-service` на старте **добирает недостающие переменные (в т.ч. токен) из
+репозиторного `.env`** — единого источника:
+
+- файл `.env` лежит в корне репозитория (`<repo>/.env`), **gitignored** (секрет в
+  git не попадает), содержит строку `ORCHESTRATOR_API_TOKEN=<значение>`;
+- путь резолвится **относительно самого модуля** (`<repo>/mcp-service/src/config.js`
+  → `<repo>/.env`), а не от `cwd`, — Codex запускает процесс с произвольным `cwd`;
+- **приоритет всегда у окружения процесса**: если `ORCHESTRATOR_API_TOKEN` (или
+  `ORCHESTRATOR_URL` и т.п.) задан в Docker/оболочке/`config.toml` — он не
+  перетирается файлом; `.env` лишь заполняет то, чего в окружении нет. Поэтому
+  Docker/HTTP-запуск продолжает работать как раньше, а stdio-запуск без переменной
+  добирает секрет из `.env`;
+- переопределить путь файла можно переменной `MCP_ENV_FILE=<абсолютный путь>`.
+
+Итог: **при stdio-запуске (Claude Code / Codex / VS Code) env-блок клиента можно
+не указывать вовсе** — токен подхватится из репозиторного `.env`. Явно задавать
+`ORCHESTRATOR_API_TOKEN` в окружении клиента по-прежнему можно (оно приоритетнее),
+но больше не обязательно:
 
 - **Windows (Claude Code):** постоянная пользовательская переменная —
   `[Environment]::SetEnvironmentVariable('ORCHESTRATOR_API_TOKEN', '<токен из .env>', 'User')`,
@@ -65,6 +87,33 @@ read-инструменты (`orchestrator_list_projects`, `orchestrator_list_co
 Токен должен совпадать со значением `ORCHESTRATOR_API_TOKEN` в `.env` (им подняты
 сервисы). Локальная работа без токена возможна только при `ALLOW_INSECURE_LOCAL=1`
 у сервисов (по умолчанию fail-closed — `/api/*` закрыт).
+
+### Диагностика до первого вызова (`--check`, health)
+
+Чтобы отсутствие токена не всплывало как внезапный `401` во время работы,
+`mcp-service` проверяет согласованность `ORCHESTRATOR_URL` /
+`ORCHESTRATOR_API_TOKEN` / `MCP_ENABLE_ORCHESTRATOR_MUTATIONS`:
+
+- **CLI:** `node mcp-service/bin/mcp-service.js --check` — печатает диагностику и
+  выходит с кодом `1`, если мутации включены, а токен пуст (и нет
+  `ALLOW_INSECURE_LOCAL=1`). Значение токена **не печатается** — только булев
+  признак `tokenConfigured`.
+- **stdio-старт:** при несогласованности сервис пишет предупреждение в `stderr`
+  ещё до приёма первого запроса (в stdio-режиме `stdout` занят протоколом).
+- **HTTP health:** `GET /health` возвращает блок `orchestrator` с
+  `tokenConfigured` / `mutationsEnabled` / `configOk` (без значения токена); при
+  несогласованности добавляется массив `warnings`.
+
+### Ротация токена
+
+Токен хранится **в одном месте** — репозиторном `.env`. Ротация:
+
+1. заменить `ORCHESTRATOR_API_TOKEN=<новое значение>` в `<repo>/.env`;
+2. перезапустить сервисы, которыми токен проверяется (`docker compose up -d`
+   orchestrator/tools/mcp) и **перезапустить stdio-клиент** (Claude Code/Codex/VS
+   Code читают окружение и `.env` на старте процесса);
+3. повторный вызов после рестарта авторизуется тем же новым токеном — `401` не
+   возвращается. Проверить заранее — `node mcp-service/bin/mcp-service.js --check`.
 
 ## Claude Code
 
@@ -131,6 +180,14 @@ MCP_ENABLE_WRITE = "1"
 MCP_ENABLE_DELETE = "1"
 MCP_ENABLE_ORCHESTRATOR_MUTATIONS = "1"
 ```
+
+> **`ORCHESTRATOR_API_TOKEN` здесь указывать НЕ нужно.** Env-блок Codex не
+> разворачивает `${VAR}`, поэтому раньше токен пришлось бы хардкодить (секрет в
+> конфиг — плохо) — именно это давало систематический `401`. Теперь `mcp-service`
+> добирает токен из репозиторного `.env` (единый источник, см. «Авторизация»).
+> Если всё же задать `ORCHESTRATOR_API_TOKEN` в этом блоке явно — он приоритетнее
+> `.env`. Проверить, что токен виден процессу, —
+> `node /абсолютный/путь/к/ai-dev-manager/mcp-service/bin/mcp-service.js --check`.
 
 ## HTTP/SSE-режим
 

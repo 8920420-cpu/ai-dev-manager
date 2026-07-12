@@ -5,12 +5,23 @@
 // env MCP_HTTP=1 дополнительно/вместо поднимает HTTP-режим (Streamable + health).
 // В stdio-режиме логи идут только в stderr (stdout зарезервирован под протокол).
 import process from 'node:process';
-import { loadConfig, truthy } from '../src/config.js';
+import { loadConfig, truthy, checkConfig } from '../src/config.js';
 import { startStdio, startHttp } from '../src/server.js';
 
 const config = loadConfig();
 const wantHttp = process.argv.includes('--http') || process.argv.includes('--http-only') || truthy(process.env.MCP_HTTP);
 const httpOnly = process.argv.includes('--http-only');
+
+// MCP-TOKEN-SYNC-001 — `--check`: проверить согласованность конфигурации
+// (ORCHESTRATOR_URL / ORCHESTRATOR_API_TOKEN / mutation-флаг) без запуска
+// транспортов. Печатает диагностику (без значения токена) и выходит с кодом
+// 1 при ошибке — удобно для health-check/скрипта ротации токена.
+if (process.argv.includes('--check')) {
+  const check = checkConfig(config);
+  console.error('[mcp-service] проверка конфигурации:');
+  console.error(JSON.stringify(check, null, 2));
+  process.exit(check.ok ? 0 : 1);
+}
 
 async function main() {
   if (wantHttp) startHttp(config);
