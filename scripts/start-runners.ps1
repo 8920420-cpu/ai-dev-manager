@@ -68,6 +68,14 @@ $EnvKeys = [ordered]@{
   # read-команд и их таймаутов на Windows). .env побеждает дефолт кода раннера.
   'CODEX_BYPASS_SANDBOX'   = $true
   'CODEX_PROVIDER_COOLDOWN_MS' = $true
+  # CODEX-MODEL-PIN-001: модель Codex-ролей закрепляем в раннере, а НЕ полагаемся на
+  # дефолт из ~/.codex/config.toml. Инцидент 2026-07-12: config.toml уехал на
+  # `gpt-5.6-sol` (её не тянет установленный codex-cli 0.141.0 → 400 «requires a
+  # newer version»), каждый прогon Codex-ролей падал → CANCELLED → задача улетала в
+  # BLOCKED (run_budget_exhausted). За ночь так легло 6 задач + 2 эпика. codex-runner
+  # передаёт `-m $CODEX_MODEL` (codexAgent.js), поэтому явное значение делает раннер
+  # источником истины и иммунным к дрейфу глобального codex-конфига. .env побеждает.
+  'CODEX_MODEL'            = $true
   # CLAUDE-POOL-001: параллелизм и модель единого пула рассуждающих Claude-агентов.
   # .env — источник истины (побеждает унаследованное окружение Scheduled Task).
   'CLAUDE_REASONING_CONCURRENCY' = $true
@@ -122,6 +130,16 @@ if (-not $env:CLAUDE_REASONING_TASK_TIMEOUT_MS) { $env:CLAUDE_REASONING_TASK_TIM
 # КОНТРАКТ: < RUNNER_ROLE_TIMEOUT_MS (орфан оркестратора, поднят до 1500000 в .env).
 if (-not $env:ARCHITECT_TASK_TIMEOUT_MS)        { $env:ARCHITECT_TASK_TIMEOUT_MS = '1200000' }
 Write-Host "CONFIG: CODEX_TASK_TIMEOUT_MS=$($env:CODEX_TASK_TIMEOUT_MS) ($codexTimeoutSrc), CLAUDE_REASONING_TASK_TIMEOUT_MS=$($env:CLAUDE_REASONING_TASK_TIMEOUT_MS) ($claudeTimeoutSrc), ARCHITECT_TASK_TIMEOUT_MS=$($env:ARCHITECT_TASK_TIMEOUT_MS) ($architectTimeoutSrc)"
+
+# CODEX-MODEL-PIN-001 (2026-07-12): guard-дефолт модели Codex-ролей. Если .env/окружение
+# не задали CODEX_MODEL, раннер всё равно передаёт codex явную `-m <модель>` вместо того,
+# чтобы молча унаследовать дефолт из ~/.codex/config.toml (который дрейфует на модели,
+# не поддерживаемые установленным codex-cli, и роняет весь Codex-конвейер в BLOCKED).
+# gpt-5.5 — проверенная рабочая модель на codex-cli 0.141.0. При апгрейде CLI до версии
+# с поддержкой 5.6 — поднять значение здесь или в .env (env побеждает).
+$codexModelSrc = if ($env:CODEX_MODEL) { 'env/.env' } else { 'default' }
+if (-not $env:CODEX_MODEL) { $env:CODEX_MODEL = 'gpt-5.5' }
+Write-Host "CONFIG: CODEX_MODEL=$($env:CODEX_MODEL) ($codexModelSrc)"
 
 # CLAUDE-POOL-001 (2026-07-03): единый пул Claude-агентов на все рассуждающие роли —
 # минимум 3 одновременных агента (решение пользователя), дефолт 4. Значение обычно
