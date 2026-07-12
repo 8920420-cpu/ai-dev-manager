@@ -779,16 +779,32 @@ export async function deriveRoleLoadBlock(c, nowISO, projectDbId = null) {
     // Фолбэк: деплой-маркеров ещё нет → окно 24ч от последней активности, без сравнения.
     // projectDbId — опциональный JOIN на tasks + фильтр t.project_id (индекс зависит от
     // наличия projectDbId: RELEASE_OUTCOMES всегда $1, projectDbId — $2).
+    // ROLE-LOAD-UNIFIED-COHORT-001: фильтр проекта нужен И на границе окна (CTE bounds),
+    // а не только на внешних строках ролей. Иначе last_activity = max(started_at) по
+    // ГЛОБАЛЬНОЙ активности всех проектов, и окно [last_activity−24ч; last_activity]
+    // якорится к чужой активности: у выбранного проекта последний прогон мог быть раньше,
+    // и тогда его строки/итоги вымываются из окна (метрики проекта занижаются/пустеют).
+    // При projectDbId=null bounds остаётся глобальным — поведение прежнее.
     const roleParams = [RELEASE_OUTCOMES];
     let projJoin = '';
     let projFilter = '';
+    let boundsJoin = '';
+    let boundsFilter = '';
     if (projectDbId) {
       roleParams.push(projectDbId);
+      const projParam = `$${roleParams.length}`;
       projJoin = 'JOIN tasks t ON t.id = ar.task_id';
-      projFilter = `AND t.project_id = $${roleParams.length}`;
+      projFilter = `AND t.project_id = ${projParam}`;
+      boundsJoin = 'JOIN tasks tb ON tb.id = ab.task_id';
+      boundsFilter = `WHERE tb.project_id = ${projParam}`;
     }
     const roleRows = await c.query(
-      `WITH bounds AS (SELECT max(started_at) AS last_activity FROM agent_runs)
+      `WITH bounds AS (
+         SELECT max(ab.started_at) AS last_activity
+           FROM agent_runs ab
+           ${boundsJoin}
+          ${boundsFilter}
+       )
        SELECT r.code AS role_code, r.name AS role_name,
               count(*)::int AS runs,
               count(DISTINCT ar.task_id)::int AS tasks,
