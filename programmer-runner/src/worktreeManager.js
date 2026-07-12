@@ -34,11 +34,36 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { withRepoWorktreeLock } from '../../shared/repoWorktreeLock.js';
 
+// WORKTREE-GIT-ENV-ISOLATE-001: раннер запускается пайплайном ВНУТРИ git-хука
+// (post-commit/post-merge), который экспортирует контекст текущего репозитория
+// (GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_COMMON_DIR, GIT_OBJECT_DIRECTORY,
+// GIT_QUARANTINE_PATH и т.п.). При их наличии `-C <dir>` меняет только рабочий
+// каталог, но git всё равно читает git-dir/index/objects из env → любая наша
+// `git -C <репо>` фактически бьёт по ЧУЖОМУ репозиторию: `worktree add -b <branch>`
+// видит ветки внешнего репо («a branch named ... already exists»), а `commit`
+// пишет в дерево пайплайна, а не в целевой worktree. Чистим этот контекст, чтобы
+// каждая команда работала строго в переданном ей репозитории (тот же приём, что и
+// в тестовом хелпере). НЕ трогаем прочие GIT_* (config/ssh/pager) — они безвредны.
+const GIT_CONTEXT_ENV_RE =
+  /^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|ALTERNATE_OBJECT_DIRECTORIES|COMMON_DIR|NAMESPACE|PREFIX|CEILING_DIRECTORIES|QUARANTINE_PATH)$/;
+
+function cleanGitEnv(base = process.env) {
+  const env = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (!GIT_CONTEXT_ENV_RE.test(k)) env[k] = v;
+  }
+  return env;
+}
+
 function git(cwd, args, opts = {}) {
+  const { env, ...rest } = opts;
   return execFileSync('git', ['-C', cwd, ...args], {
     encoding: 'utf8',
     maxBuffer: 64 * 1024 * 1024,
-    ...opts,
+    ...rest,
+    // Ставим ПОСЛЕ ...rest, чтобы очищенное окружение не перебивалось: даже если
+    // вызывающий передал свой env, контекст-переменные всё равно вычищаются.
+    env: cleanGitEnv(env),
   });
 }
 
