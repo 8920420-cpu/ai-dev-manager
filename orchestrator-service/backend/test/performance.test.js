@@ -9,9 +9,15 @@ import {
   computeRoleLoadWindow,
   buildRoleLoadTotals,
   buildRoleLoadTaskTotals,
+  buildRoleLoadPeriodTotals,
   computeMetricDelta,
   attachRoleLoadDeltas,
   attachRoleLoadTaskTotalsDelta,
+  attachRoleLoadPeriodTotalsDelta,
+  queryRoleLoadRows,
+  queryRoleLoadPeriodTotalsRow,
+  queryRoleLoadTaskTotalsRow,
+  deriveRoleLoadBlock,
   isReleaseOutcome,
   RELEASE_OUTCOMES,
   buildProgrammerKindStats,
@@ -636,4 +642,248 @@ test('buildDailyModelStats: returns отсутствует в строке → 0
   const [day] = buildDailyModelStats(rows);
   assert.equal(day.models[0].returns, 0);
   assert.equal(day.totals.returns, 0);
+});
+
+// ROLE-LOAD-UNIFIED-COHORT-001 — ЕДИНАЯ периодная когорта «Итого» + projectId-фильтр.
+// Основной «Итого» вкладки «Средние на задачу» считается по ОДНОЙ когорте DISTINCT
+// task_id прогонов периода (совпадает по составу со строками ролей), а не по независимой
+// выборке DONE-задач. Lifecycle-когорта «Завершённые по DONE» вынесена отдельно.
+
+// --- (a) чистый маппер периодной когорты --------------------------------------
+
+test('buildRoleLoadPeriodTotals: средние per-task сумм периода (cost 6 знаков, tokens/ms целые), без avgLeadMs', () => {
+  const m = buildRoleLoadPeriodTotals({
+    tasks: 3,
+    avg_cost: 1.2253941,
+    avg_tokens_in: 811972.4,
+    avg_tokens_out: 5123.6,
+    avg_work_ms: 456789.7,
+  });
+  assert.equal(m.tasks, 3);
+  assert.equal(m.avgCost, 1.225394); // до 6 знаков
+  assert.equal(m.avgTokensIn, 811972); // до целого
+  assert.equal(m.avgTokensOut, 5124);
+  assert.equal(m.avgWorkMs, 456790);
+  // Периодная когорта НЕ несёт сквозного avgLeadMs — это атрибут завершённой задачи.
+  assert.equal('avgLeadMs' in m, false);
+});
+
+test('buildRoleLoadPeriodTotals: tasks = 0 → совокупность пуста, все средние null', () => {
+  const m = buildRoleLoadPeriodTotals({
+    tasks: 0, avg_cost: null, avg_tokens_in: null, avg_tokens_out: null, avg_work_ms: null,
+  });
+  assert.equal(m.tasks, 0);
+  assert.equal(m.avgCost, null);
+  assert.equal(m.avgTokensIn, null);
+  assert.equal(m.avgTokensOut, null);
+  assert.equal(m.avgWorkMs, null);
+});
+
+test('buildRoleLoadPeriodTotals: пустой/undefined вход → tasks 0, средние null, без падения', () => {
+  const empty = { tasks: 0, avgCost: null, avgTokensIn: null, avgTokensOut: null, avgWorkMs: null };
+  assert.deepEqual(buildRoleLoadPeriodTotals(), empty);
+  assert.deepEqual(buildRoleLoadPeriodTotals(undefined), empty);
+  assert.deepEqual(buildRoleLoadPeriodTotals({}), empty);
+});
+
+test('attachRoleLoadPeriodTotalsDelta: дельта периодной когорты без avgLeadMs', () => {
+  const current = buildRoleLoadPeriodTotals({
+    tasks: 5, avg_cost: 0.8, avg_tokens_in: 8000, avg_tokens_out: 2000, avg_work_ms: 400000,
+  });
+  const previous = buildRoleLoadPeriodTotals({
+    tasks: 4, avg_cost: 1.0, avg_tokens_in: 8000, avg_tokens_out: 2000, avg_work_ms: 500000,
+  });
+  const out = attachRoleLoadPeriodTotalsDelta(current, previous);
+  // Стоимость 1.0→0.8: −20%, улучшение.
+  assert.equal(out.delta.avgCost.pct, -0.2);
+  assert.equal(out.delta.avgCost.improved, true);
+  // Время работы 500000→400000: −20%, улучшение.
+  assert.equal(out.delta.avgWorkMs.improved, true);
+  // Токены не менялись → серый (improved null).
+  assert.equal(out.delta.avgTokensIn.improved, null);
+  // avgLeadMs НЕ входит в дельту периодной когорты.
+  assert.equal('avgLeadMs' in out.delta, false);
+});
+
+test('attachRoleLoadPeriodTotalsDelta: нет периода сравнения или в нём 0 задач → delta null', () => {
+  const current = buildRoleLoadPeriodTotals({
+    tasks: 5, avg_cost: 0.8, avg_tokens_in: 8000, avg_tokens_out: 2000, avg_work_ms: 400000,
+  });
+  assert.equal(attachRoleLoadPeriodTotalsDelta(current, null).delta, null);
+  assert.equal(attachRoleLoadPeriodTotalsDelta(current, buildRoleLoadPeriodTotals({ tasks: 0 })).delta, null);
+});
+
+// --- клиент-заглушка pg: записывает вызовы, отвечает канонической строкой ------
+// (SQL исполняет Postgres; здесь проверяем, что запросы СКОНСТРУИРОВАНЫ верно —
+// именно эти клаузы обеспечивают когортную семантику и projectId-изоляцию в БД.)
+function captureClient(row) {
+  const calls = [];
+  return {
+    calls,
+    async query(sql, params) {
+      calls.push({ sql, params });
+      return { rows: [row ?? {}], rowCount: 1 };
+    },
+  };
+}
+
+// --- (b)+(d)+(e) единая когорта: группировка по задаче, границы, projectId ------
+
+test('queryRoleLoadPeriodTotalsRow: когорта по ar.task_id (роли не удваивают tasks), суммы прогонов, без статуса и ролей', async () => {
+  const c = captureClient({ tasks: 3, avg_cost: 1.2, avg_tokens_in: 100, avg_tokens_out: 50, avg_work_ms: 1000 });
+  const row = await queryRoleLoadPeriodTotalsRow(c, 'S', 'E');
+  const { sql, params } = c.calls[0];
+  // (b) когорта по задачам: GROUP BY ar.task_id → разные роли одной задачи = одна задача.
+  assert.ok(/GROUP BY ar\.task_id/.test(sql), 'группировка по задаче');
+  assert.ok(/count\(\*\)::int AS tasks/.test(sql), 'tasks = число уникальных задач когорты');
+  assert.ok(!/JOIN roles/.test(sql), 'период не джойнит roles — роли не размножают задачи');
+  // (b) повторные прогоны одной роли/задачи суммируются per-task.
+  assert.ok(/sum\(ar\.cost\)/.test(sql) && /sum\(ar\.token_input\)/.test(sql), 'per-task суммы');
+  // (c) статус прогона НЕ фильтруется → RUNNING-задачи входят в когорту.
+  assert.ok(!/ar\.status/.test(sql), 'нет фильтра по статусу прогона (активные включены)');
+  // (d) границы периода и task_id IS NOT NULL исключают прогоны вне окна/без задачи.
+  assert.ok(/ar\.started_at >= \$1 AND ar\.started_at < \$2/.test(sql), 'полуинтервал по started_at');
+  assert.ok(/ar\.task_id IS NOT NULL/.test(sql), 'служебные прогоны без задачи не в когорте');
+  assert.deepEqual(params, ['S', 'E']);
+  assert.equal(row.tasks, 3);
+});
+
+test('queryRoleLoadPeriodTotalsRow: projectId → JOIN tasks + t.project_id (чужой проект отсечён SQL)', async () => {
+  const c = captureClient({ tasks: 1 });
+  await queryRoleLoadPeriodTotalsRow(c, 'S', 'E', 7);
+  const { sql, params } = c.calls[0];
+  assert.ok(/JOIN tasks t ON t\.id = ar\.task_id/.test(sql), 'JOIN на tasks по ar.task_id');
+  assert.ok(/t\.project_id = \$3/.test(sql), 'фильтр проекта на позиции $3');
+  assert.equal(params[2], 7, 'projectDbId прокинут параметром');
+});
+
+test('queryRoleLoadPeriodTotalsRow: без projectId — глобально, без фильтра проекта', async () => {
+  const c = captureClient({ tasks: 0 });
+  await queryRoleLoadPeriodTotalsRow(c, 'S', 'E');
+  const { sql, params } = c.calls[0];
+  assert.ok(!/t\.project_id/.test(sql));
+  assert.ok(!/JOIN tasks t/.test(sql));
+  assert.deepEqual(params, ['S', 'E']);
+});
+
+test('queryRoleLoadRows: projectId → JOIN tasks + t.project_id, params прокинуты; без него — глобально', async () => {
+  const withProj = captureClient({ role_code: 'X' });
+  await queryRoleLoadRows(withProj, 'S', 'E', 42);
+  const a = withProj.calls[0];
+  assert.ok(/JOIN tasks t ON t\.id = ar\.task_id/.test(a.sql), 'JOIN на tasks');
+  assert.ok(/t\.project_id = \$4/.test(a.sql), 'фильтр проекта на $4 (после start,end,RELEASE_OUTCOMES)');
+  assert.deepEqual(a.params.slice(0, 2), ['S', 'E']);
+  assert.equal(a.params[3], 42);
+
+  const global = captureClient({ role_code: 'X' });
+  await queryRoleLoadRows(global, 'S', 'E');
+  const b = global.calls[0];
+  assert.ok(!/t\.project_id/.test(b.sql), 'без projectId — нет фильтра проекта');
+  assert.ok(!/JOIN tasks t/.test(b.sql), 'без projectId — нет JOIN на tasks');
+  assert.equal(b.params.length, 3, 'params: start, end, RELEASE_OUTCOMES');
+});
+
+// --- (c)+(f) lifecycle-когорта: только DONE, все прогоны за жизненный цикл, lead ---
+
+test('queryRoleLoadTaskTotalsRow: lifecycle — только DONE, все прогоны задачи, avgLeadMs создание→DONE', async () => {
+  const c = captureClient({ tasks: 2, avg_cost: 3, avg_tokens_in: 5, avg_tokens_out: 6, avg_work_ms: 7, avg_lead_ms: 8 });
+  await queryRoleLoadTaskTotalsRow(c, 'S', 'E');
+  const { sql, params } = c.calls[0];
+  // (c) когорта только DONE — активные (RUNNING) задачи сюда НЕ входят.
+  assert.ok(/t\.status = 'DONE'/.test(sql), 'только завершённые по статусу DONE');
+  // (f) все прогоны задачи без ограничения периодом (LEFT JOIN без bound по started_at).
+  assert.ok(/LEFT JOIN agent_runs ar ON ar\.task_id = dt\.task_id/.test(sql), 'весь lifecycle прогонов задачи');
+  assert.ok(!/ar\.started_at >= \$1/.test(sql), 'прогоны НЕ ограничены периодом окна');
+  // (f) avgLeadMs = создание→DONE.
+  assert.ok(/avg\(extract\(epoch FROM \(done_at - created_at\)\) \* 1000\) AS avg_lead_ms/.test(sql), 'lead = создание→DONE');
+  assert.deepEqual(params, ['S', 'E']);
+});
+
+test('queryRoleLoadTaskTotalsRow: projectId → фильтр t.project_id на когорте DONE-задач', async () => {
+  const c = captureClient({ tasks: 0 });
+  await queryRoleLoadTaskTotalsRow(c, 'S', 'E', 11);
+  const { sql, params } = c.calls[0];
+  assert.ok(/t\.project_id = \$3/.test(sql));
+  assert.equal(params[2], 11);
+});
+
+// --- сборка блока: две когорты, projectId прокинут во все запросы --------------
+// Мини-клиент отвечает по первому подходящему regex-правилу (как в forkJoin.test.js).
+function fakeBlockClient(rules) {
+  const calls = [];
+  return {
+    calls,
+    async query(sql, params) {
+      calls.push({ sql, params });
+      for (const rule of rules) {
+        if (rule.re.test(sql)) return rule.reply;
+      }
+      return { rows: [], rowCount: 0 };
+    },
+  };
+}
+
+test('deriveRoleLoadBlock: периодная когорта → roleLoadTaskTotals, lifecycle → roleLoadCompletedTotals; projectId во всех запросах', async () => {
+  const PROJECT = 99;
+  const markers = [
+    { id: 'm2', ref: 'r2', description: 'last', created_at: '2026-07-12T00:00:00.000Z' },
+    { id: 'm1', ref: 'r1', description: 'prev', created_at: '2026-07-11T00:00:00.000Z' },
+  ];
+  const c = fakeBlockClient([
+    { re: /FROM kpi_markers/, reply: { rows: markers, rowCount: 2 } },
+    // Период: единая когорта. tasks=3 включает активную (RUNNING) задачу.
+    { re: /WITH per_task AS/, reply: { rows: [{ tasks: 3, avg_cost: 1.2, avg_tokens_in: 800, avg_tokens_out: 100, avg_work_ms: 5000 }], rowCount: 1 } },
+    // Lifecycle: только DONE-задачи. tasks=2 (RUNNING не входит), есть avg_lead_ms.
+    { re: /WITH done_tasks AS/, reply: { rows: [{ tasks: 2, avg_cost: 2.5, avg_tokens_in: 1500, avg_tokens_out: 300, avg_work_ms: 9000, avg_lead_ms: 3600000 }], rowCount: 1 } },
+    // Строки ролей (одна роль, у неё есть активный прогон running=1).
+    { re: /GROUP BY r\.code, r\.name/, reply: { rows: [
+      { role_code: 'PROGRAMMER', role_name: 'Программист', runs: 5, tasks: 3, success: 3, failed: 0, returns: 0, timeout: 0, running: 1, avg_ms: 1000, tokens_in: 900, tokens_out: 120, tokens_cache_read: 0, tokens_cache_creation: 0, cost: 1.5, avg_cold_start_ms: null },
+    ], rowCount: 1 } },
+  ]);
+
+  const res = await deriveRoleLoadBlock(c, '2026-07-12T05:00:00.000Z', PROJECT);
+
+  // Основной «Итого» — периодная когорта: tasks = уникальные задачи таблицы (3), без avgLeadMs.
+  assert.equal(res.roleLoadTaskTotals.tasks, 3);
+  assert.equal(res.roleLoadTaskTotals.avgCost, 1.2);
+  assert.equal('avgLeadMs' in res.roleLoadTaskTotals, false);
+  assert.ok('delta' in res.roleLoadTaskTotals);
+
+  // Отдельная lifecycle-когорта: только DONE (tasks=2), с avgLeadMs.
+  assert.equal(res.roleLoadCompletedTotals.tasks, 2);
+  assert.equal(res.roleLoadCompletedTotals.avgLeadMs, 3600000);
+  assert.ok('delta' in res.roleLoadCompletedTotals);
+
+  // (c) периодная когорта содержит активную задачу, которой нет в lifecycle-когорте.
+  assert.ok(res.roleLoadTaskTotals.tasks > res.roleLoadCompletedTotals.tasks);
+
+  // (e) projectId прокинут во ВСЕ запросы блока (кроме маркеров): период, lifecycle, строки ролей.
+  const dataCalls = c.calls.filter((x) => !/FROM kpi_markers/.test(x.sql));
+  assert.ok(dataCalls.length >= 3);
+  for (const call of dataCalls) {
+    assert.ok(call.params.includes(PROJECT), `projectDbId в параметрах: ${call.sql.slice(0, 32)}`);
+  }
+});
+
+test('deriveRoleLoadBlock: fallback без маркеров — обе когорты присутствуют, дельты null, mode fallback', async () => {
+  const c = fakeBlockClient([
+    { re: /FROM kpi_markers/, reply: { rows: [], rowCount: 0 } },
+    { re: /WITH per_task AS/, reply: { rows: [{ tasks: 4, avg_cost: 0.5, avg_tokens_in: 200, avg_tokens_out: 30, avg_work_ms: 4000 }], rowCount: 1 } },
+    { re: /WITH done_tasks AS/, reply: { rows: [{ tasks: 2, avg_cost: 0.9, avg_tokens_in: 400, avg_tokens_out: 60, avg_work_ms: 8000, avg_lead_ms: 7200000 }], rowCount: 1 } },
+    { re: /GROUP BY r\.code, r\.name/, reply: { rows: [
+      { role_code: 'ARCHITECT', role_name: 'Архитектор', runs: 3, tasks: 2, success: 3, failed: 0, returns: 0, timeout: 0, running: 0, avg_ms: 1000, tokens_in: 100, tokens_out: 20, tokens_cache_read: 0, tokens_cache_creation: 0, cost: 0.3, avg_cold_start_ms: null, last_activity: '2026-07-12T00:00:00.000Z' },
+    ], rowCount: 1 } },
+  ]);
+
+  const res = await deriveRoleLoadBlock(c, '2026-07-12T01:00:00.000Z');
+
+  assert.equal(res.roleLoadPeriods.mode, 'fallback');
+  // Периодная когорта → roleLoadTaskTotals (без avgLeadMs), дельта null (сравнения нет).
+  assert.equal(res.roleLoadTaskTotals.tasks, 4);
+  assert.equal(res.roleLoadTaskTotals.delta, null);
+  assert.equal('avgLeadMs' in res.roleLoadTaskTotals, false);
+  // Lifecycle-когорта → roleLoadCompletedTotals (с avgLeadMs), дельта null.
+  assert.equal(res.roleLoadCompletedTotals.tasks, 2);
+  assert.equal(res.roleLoadCompletedTotals.avgLeadMs, 7200000);
+  assert.equal(res.roleLoadCompletedTotals.delta, null);
 });

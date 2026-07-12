@@ -47,8 +47,10 @@ function countMap(rows, keyField = 'status', nField = 'n') {
 
 /**
  * GET /api/performance — сводка НЕ-AI метрик по всему оркестратору.
- * Опционально projectId — сузить задачи до одного проекта (метрики ролей и
- * лимитера остаются глобальными).
+ * Опционально projectId — сузить задачи до одного проекта. Блок «Нагрузка по ролям»
+ * (строки ролей + обе когорты «Итого») тоже сужается до проекта по tasks.project_id
+ * (ROLE-LOAD-UNIFIED-COHORT-001), чтобы чужие задачи не попадали в метрики проекта;
+ * метрики лимитера остаются глобальными.
  */
 export async function getPerformanceMetrics(s, { projectId } = {}) {
   return withClient(clientConfig(s), async (c) => {
@@ -138,8 +140,14 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
     //    период сравнения = [предпоследний маркер; последний]. По каждому показателю —
     //    дельта {pct, improved} с учётом направленности метрики. Фолбэк без маркеров —
     //    прежнее окно 24ч от последней активности, без сравнения.
-    const { roleLoad, roleLoadWindow, roleLoadTaskTotals, roleLoadPeriods } =
-      await deriveRoleLoadBlock(c, generatedAt.toISOString());
+    // ROLE-LOAD-UNIFIED-COHORT-001: две явные когорты «Итого». roleLoadTaskTotals —
+    // ЕДИНАЯ периодная когорта (DISTINCT task_id прогонов текущего периода: per-task
+    // суммы → AVG), совпадает по составу задач со строками ролей. roleLoadCompletedTotals —
+    // отдельная lifecycle-когорта «Завершённые по DONE» (полный жизненный цикл задачи,
+    // со сквозным avgLeadMs). projectDbId сужает обе когорты и строки ролей до проекта.
+    const {
+      roleLoad, roleLoadWindow, roleLoadTaskTotals, roleLoadCompletedTotals, roleLoadPeriods,
+    } = await deriveRoleLoadBlock(c, generatedAt.toISOString(), projectDbId);
 
     // 7) Программист: проходы и упоры в лимит ходов (PROGRAMMER-LIMIT-KPI-001).
     //    avgPasses/maxPasses — «за сколько проходов программист справляется» (numTurns
@@ -208,6 +216,7 @@ export async function getPerformanceMetrics(s, { projectId } = {}) {
       roleLoad,
       roleLoadWindow,
       roleLoadTaskTotals,
+      roleLoadCompletedTotals,
       roleLoadPeriods,
       connector: connectorBuckets(),
     };
@@ -388,14 +397,43 @@ export function buildRoleLoadTotals(rows = []) {
 }
 
 /**
- * ROLE-LOAD-TASK-TOTALS-001 — ЧИСТЫЙ маппинг агрегата «Итого (полная задача)».
+ * ROLE-LOAD-UNIFIED-COHORT-001 — ЧИСТЫЙ маппинг ЕДИНОЙ периодной когорты «Итого».
+ * Вынесен для юнит-теста без БД. Вход — одна строка агрегата по DISTINCT task_id
+ * прогонов ТЕКУЩЕГО периода: tasks (число уникальных задач = число уникальных задач
+ * всей таблицы ролей, БЕЗ суммирования role tasks) и средние per-task сумм прогонов
+ * того же периода (avg_cost, avg_tokens_in, avg_tokens_out, avg_work_ms — суммарное
+ * время прогонов задачи в периоде). Стоимость округляется до 6 знаков, токены/мс — до
+ * целого. При tasks = 0 совокупность пуста → все средние = null (в UI «—»). БЕЗ
+ * avgLeadMs: сквозное календарное время — атрибут завершённой задачи (см.
+ * buildRoleLoadTaskTotals). Итог = среднее ПОЛНЫХ per-task сумм по общей когорте, а не
+ * сумма независимых средних по ролям (последнее ЗАПРЕЩЕНО методикой).
+ * @param {Object} row сырая строка агрегата (одна на весь период)
+ * @returns {{tasks:number, avgCost:number|null, avgTokensIn:number|null, avgTokensOut:number|null, avgWorkMs:number|null}}
+ */
+export function buildRoleLoadPeriodTotals(row = {}) {
+  const tasks = Number(row?.tasks) || 0;
+  if (tasks <= 0) {
+    return { tasks: 0, avgCost: null, avgTokensIn: null, avgTokensOut: null, avgWorkMs: null };
+  }
+  const roundInt = (v) => (v == null ? null : Math.round(Number(v)));
+  return {
+    tasks,
+    avgCost: row.avg_cost == null ? null : Math.round(Number(row.avg_cost) * 1e6) / 1e6,
+    avgTokensIn: roundInt(row.avg_tokens_in),
+    avgTokensOut: roundInt(row.avg_tokens_out),
+    avgWorkMs: roundInt(row.avg_work_ms),
+  };
+}
+
+/**
+ * ROLE-LOAD-TASK-TOTALS-001 — ЧИСТЫЙ маппинг lifecycle-когорты «Завершённые по DONE».
  * Вынесен для юнит-теста без БД. Вход — одна строка агрегата по DONE-задачам окна:
  * tasks (размер совокупности) и средние ПОЛНЫХ сумм на задачу (avg_cost,
- * avg_tokens_in, avg_tokens_out, avg_work_ms — суммарное время работы всех ролей)
- * плюс сквозное календарное время создание→DONE (avg_lead_ms). Стоимость
- * округляется до 6 знаков, токены/мс — до целого. При tasks = 0 совокупность пуста
- * → все средние = null (в UI «—»). Это ИСТИННОЕ сквозное среднее по задачам, а не
- * сумма независимых средних по ролям (последнее ЗАПРЕЩЕНО методикой).
+ * avg_tokens_in, avg_tokens_out, avg_work_ms — суммарное время работы всех ролей за
+ * весь жизненный цикл задачи, без ограничения периодом) плюс сквозное календарное
+ * время создание→DONE (avg_lead_ms). Стоимость округляется до 6 знаков, токены/мс — до
+ * целого. При tasks = 0 совокупность пуста → все средние = null (в UI «—»). Это
+ * ОТДЕЛЬНАЯ явно названная когорта; смешивать её с периодной под одним «Итого» ЗАПРЕЩЕНО.
  * @param {Object} row сырая строка агрегата (одна на всё окно)
  * @returns {{tasks:number, avgCost:number|null, avgTokensIn:number|null, avgTokensOut:number|null, avgWorkMs:number|null, avgLeadMs:number|null}}
  */
@@ -442,7 +480,18 @@ export const ROLE_LOAD_METRICS = [
   { key: 'avgColdStartMs', lowerIsBetter: true },
 ];
 
-// Направленность строки «Итого (полная задача)». tasks — нейтральный (без дельты).
+// ROLE-LOAD-UNIFIED-COHORT-001: направленность ЕДИНОЙ периодной когорты «Итого»
+// (roleLoadTaskTotals). tasks — нейтральный счётчик (без дельты). avgLeadMs здесь НЕТ:
+// сквозное календарное время — атрибут завершённой задачи, а не периодной выборки.
+export const ROLE_LOAD_PERIOD_TOTALS_METRICS = [
+  { key: 'avgCost', lowerIsBetter: true },
+  { key: 'avgTokensIn', lowerIsBetter: true },
+  { key: 'avgTokensOut', lowerIsBetter: true },
+  { key: 'avgWorkMs', lowerIsBetter: true },
+];
+
+// Направленность lifecycle-когорты «Завершённые по DONE» (roleLoadCompletedTotals).
+// tasks — нейтральный. Полный набор с avgLeadMs (создание→DONE за весь жизненный цикл).
 export const ROLE_LOAD_TASK_TOTALS_METRICS = [
   { key: 'avgCost', lowerIsBetter: true },
   { key: 'avgTokensIn', lowerIsBetter: true },
@@ -508,20 +557,45 @@ export function attachRoleLoadDeltas(currentRows = [], previousRows = null, peri
 }
 
 /**
- * ЧИСТОЕ присоединение дельты к строке «Итого (полная задача)». Вынесено для юнит-
- * теста без БД. Если периода сравнения нет или в нём нет DONE-задач (previous.tasks
- * не > 0) → delta = null (требование 4). Иначе delta по ROLE_LOAD_TASK_TOTALS_METRICS.
- * @param {Object} current текущий roleLoadTaskTotals (после buildRoleLoadTaskTotals)
- * @param {Object|null} previous roleLoadTaskTotals периода сравнения или null
+ * ЧИСТОЕ присоединение дельты к строке «Итого» по списку метрик. Вынесено для юнит-
+ * теста без БД. Если периода сравнения нет или в нём пусто (previous.tasks не > 0) →
+ * delta = null (требование 4). Иначе delta по переданному списку метрик.
+ * @param {Object} current текущий итог
+ * @param {Object|null} previous итог периода сравнения или null
+ * @param {Array<{key:string, lowerIsBetter:boolean}>} metrics список метрик и их направленность
  * @returns {Object} current + поле delta
  */
-export function attachRoleLoadTaskTotalsDelta(current, previous = null) {
+function attachTotalsDelta(current, previous, metrics) {
   if (!previous || !(Number(previous.tasks) > 0)) return { ...current, delta: null };
   const delta = {};
-  for (const { key, lowerIsBetter } of ROLE_LOAD_TASK_TOTALS_METRICS) {
+  for (const { key, lowerIsBetter } of metrics) {
     delta[key] = computeMetricDelta(current[key], previous[key], lowerIsBetter);
   }
   return { ...current, delta };
+}
+
+/**
+ * ROLE-LOAD-UNIFIED-COHORT-001 — дельта ЕДИНОЙ периодной когорты «Итого»
+ * (roleLoadTaskTotals) по ROLE_LOAD_PERIOD_TOTALS_METRICS (без avgLeadMs).
+ * @param {Object} current текущий roleLoadTaskTotals (после buildRoleLoadPeriodTotals)
+ * @param {Object|null} previous roleLoadTaskTotals периода сравнения или null
+ * @returns {Object} current + поле delta
+ */
+export function attachRoleLoadPeriodTotalsDelta(current, previous = null) {
+  return attachTotalsDelta(current, previous, ROLE_LOAD_PERIOD_TOTALS_METRICS);
+}
+
+/**
+ * ЧИСТОЕ присоединение дельты к lifecycle-когорте «Завершённые по DONE»
+ * (roleLoadCompletedTotals). Вынесено для юнит-теста без БД. Если периода сравнения
+ * нет или в нём нет DONE-задач (previous.tasks не > 0) → delta = null (требование 4).
+ * Иначе delta по ROLE_LOAD_TASK_TOTALS_METRICS (с avgLeadMs).
+ * @param {Object} current текущий roleLoadCompletedTotals (после buildRoleLoadTaskTotals)
+ * @param {Object|null} previous roleLoadCompletedTotals периода сравнения или null
+ * @returns {Object} current + поле delta
+ */
+export function attachRoleLoadTaskTotalsDelta(current, previous = null) {
+  return attachTotalsDelta(current, previous, ROLE_LOAD_TASK_TOTALS_METRICS);
 }
 
 // Последние N деплой-маркеров (общесистемные, role_id IS NULL) по убыванию времени.
@@ -542,7 +616,18 @@ async function fetchLastDeployMarkers(c, limit = 2) {
 
 // Сырые строки нагрузки по ролям за явный полуинтервал [startISO, endISO).
 // Те же поля, что у основного вида; границы задаются параметрами (маркеры/фолбэк).
-async function queryRoleLoadRows(c, startISO, endISO) {
+// ROLE-LOAD-UNIFIED-COHORT-001: при projectDbId — опциональный JOIN на tasks по
+// ar.task_id и фильтр t.project_id, чтобы метрики проекта не включали чужие задачи
+// (при projectDbId=null поведение прежнее — глобально по всем задачам).
+export async function queryRoleLoadRows(c, startISO, endISO, projectDbId = null) {
+  const params = [startISO, endISO, RELEASE_OUTCOMES];
+  let projJoin = '';
+  let projFilter = '';
+  if (projectDbId) {
+    params.push(projectDbId);
+    projJoin = 'JOIN tasks t ON t.id = ar.task_id';
+    projFilter = `AND t.project_id = $${params.length}`;
+  }
   const r = await c.query(
     `SELECT r.code AS role_code, r.name AS role_name,
             count(*)::int AS runs,
@@ -566,17 +651,74 @@ async function queryRoleLoadRows(c, startISO, endISO) {
             avg(ar.cold_start_ms) FILTER (WHERE ar.cold_start_ms IS NOT NULL) AS avg_cold_start_ms
        FROM agent_runs ar
        JOIN roles r ON r.id = ar.role_id
+       ${projJoin}
       WHERE ar.started_at >= $1 AND ar.started_at < $2
+        ${projFilter}
       GROUP BY r.code, r.name
       ORDER BY runs DESC`,
-    [startISO, endISO, RELEASE_OUTCOMES],
+    params,
   );
   return r.rows;
 }
 
-// Сырой агрегат «Итого (полная задача)» за явный полуинтервал по времени DONE-события
-// задачи [startISO, endISO). Логика совпадает с шагом 6b, границы — параметрами.
-async function queryRoleLoadTaskTotalsRow(c, startISO, endISO) {
+// ROLE-LOAD-UNIFIED-COHORT-001 — сырой агрегат ЕДИНОЙ периодной когорты «Итого» за
+// явный полуинтервал [startISO, endISO). CTE per_task: GROUP BY ar.task_id, per-task
+// суммы (стоимость, вход/выход токенов, суммарное время прогонов с finished_at);
+// внешний SELECT — count(*) уникальных задач и AVG каждой метрики по общей когорте.
+// Границы по ar.started_at; task_id IS NOT NULL (служебные прогоны без задачи не в
+// когорте). Статус прогона НЕ фильтруется — активные (RUNNING) задачи входят в
+// периодную когорту, как и строки ролей. projectDbId — опциональный JOIN/фильтр по
+// tasks.project_id (при null — глобально). tasks = число уникальных task_id прогонов
+// периода (= число уникальных задач всей таблицы ролей).
+export async function queryRoleLoadPeriodTotalsRow(c, startISO, endISO, projectDbId = null) {
+  const params = [startISO, endISO];
+  let projJoin = '';
+  let projFilter = '';
+  if (projectDbId) {
+    params.push(projectDbId);
+    projJoin = 'JOIN tasks t ON t.id = ar.task_id';
+    projFilter = `AND t.project_id = $${params.length}`;
+  }
+  const r = await c.query(
+    `WITH per_task AS (
+       SELECT ar.task_id,
+              coalesce(sum(ar.cost), 0) AS task_cost,
+              coalesce(sum(ar.token_input), 0) AS task_tokens_in,
+              coalesce(sum(ar.token_output), 0) AS task_tokens_out,
+              coalesce(sum(extract(epoch FROM (ar.finished_at - ar.started_at)) * 1000)
+                       FILTER (WHERE ar.finished_at IS NOT NULL), 0) AS task_work_ms
+         FROM agent_runs ar
+         ${projJoin}
+        WHERE ar.started_at >= $1 AND ar.started_at < $2
+          AND ar.task_id IS NOT NULL
+          ${projFilter}
+        GROUP BY ar.task_id
+     )
+     SELECT count(*)::int AS tasks,
+            avg(task_cost) AS avg_cost,
+            avg(task_tokens_in) AS avg_tokens_in,
+            avg(task_tokens_out) AS avg_tokens_out,
+            avg(task_work_ms) AS avg_work_ms
+       FROM per_task`,
+    params,
+  );
+  return r.rows[0];
+}
+
+// ROLE-LOAD-TASK-TOTALS-001 — сырой агрегат lifecycle-когорты «Завершённые по DONE»
+// за явный полуинтервал по времени DONE-события задачи [startISO, endISO). Когорта —
+// задачи с текущим status=DONE и DONE-событием в периоде; к ним присоединяются ВСЕ
+// прогоны задачи за весь жизненный цикл (LEFT JOIN agent_runs без ограничения по
+// периоду). avg_lead_ms — сквозное календарное время создание→DONE. Это ОТДЕЛЬНАЯ
+// когорта, НЕ основной «Итого» вкладки. projectDbId — опциональный фильтр по
+// t.project_id прямо на CTE done_tasks (при null — глобально).
+export async function queryRoleLoadTaskTotalsRow(c, startISO, endISO, projectDbId = null) {
+  const params = [startISO, endISO];
+  let projFilter = '';
+  if (projectDbId) {
+    params.push(projectDbId);
+    projFilter = `AND t.project_id = $${params.length}`;
+  }
   const r = await c.query(
     `WITH done_tasks AS (
        SELECT t.id AS task_id, t.created_at AS created_at, ev.done_at AS done_at
@@ -588,6 +730,7 @@ async function queryRoleLoadTaskTotalsRow(c, startISO, endISO) {
         WHERE t.status = 'DONE'
           AND ev.done_at IS NOT NULL
           AND ev.done_at >= $1 AND ev.done_at < $2
+          ${projFilter}
      ),
      per_task AS (
        SELECT dt.created_at, dt.done_at,
@@ -607,26 +750,43 @@ async function queryRoleLoadTaskTotalsRow(c, startISO, endISO) {
             avg(task_work_ms) AS avg_work_ms,
             avg(extract(epoch FROM (done_at - created_at)) * 1000) AS avg_lead_ms
        FROM per_task`,
-    [startISO, endISO],
+    params,
   );
   return r.rows[0];
 }
 
 /**
- * ROLE-LOAD-DEPLOY-PERIOD-001 — сборка блока «Нагрузка по ролям» по периодам
- * деплой-маркеров. Возвращает { roleLoad, roleLoadWindow, roleLoadTaskTotals,
- * roleLoadPeriods }. Основной путь: последний deploy-маркер задаёт начало текущего
- * периода, предпоследний — период сравнения; по каждому показателю считается дельта.
- * Фолбэк (маркеров нет): прежнее окно 24ч от последней активности, дельт нет — чтобы
- * блок не пустел до первого деплоя.
+ * ROLE-LOAD-DEPLOY-PERIOD-001 / ROLE-LOAD-UNIFIED-COHORT-001 — сборка блока «Нагрузка
+ * по ролям» по периодам деплой-маркеров. Возвращает { roleLoad, roleLoadWindow,
+ * roleLoadTaskTotals, roleLoadCompletedTotals, roleLoadPeriods }, где:
+ *  - roleLoadTaskTotals — ЕДИНАЯ периодная когорта «Итого» (buildRoleLoadPeriodTotals):
+ *    DISTINCT task_id прогонов текущего периода, совпадает по составу со строками ролей;
+ *  - roleLoadCompletedTotals — отдельная lifecycle-когорта «Завершённые по DONE»
+ *    (buildRoleLoadTaskTotals, с avgLeadMs), считается за весь жизненный цикл задачи.
+ * У каждой когорты своя дельта к периоду сравнения. Основной путь: последний deploy-
+ * маркер задаёт начало текущего периода, предпоследний — период сравнения. Фолбэк
+ * (маркеров нет): прежнее окно 24ч от последней активности, дельт нет — чтобы блок не
+ * пустел до первого деплоя. projectDbId (при !=null) сужает ВСЕ запросы блока до одного
+ * проекта по tasks.project_id, чтобы чужие задачи не попадали в метрики проекта.
  * @param {Object} c pg-клиент
  * @param {string} nowISO время среза (generatedAt)
+ * @param {string|number|null} projectDbId id проекта для сужения или null (глобально)
  */
-async function deriveRoleLoadBlock(c, nowISO) {
+export async function deriveRoleLoadBlock(c, nowISO, projectDbId = null) {
   const markers = await fetchLastDeployMarkers(c, 2);
 
   if (markers.length === 0) {
     // Фолбэк: деплой-маркеров ещё нет → окно 24ч от последней активности, без сравнения.
+    // projectDbId — опциональный JOIN на tasks + фильтр t.project_id (индекс зависит от
+    // наличия projectDbId: RELEASE_OUTCOMES всегда $1, projectDbId — $2).
+    const roleParams = [RELEASE_OUTCOMES];
+    let projJoin = '';
+    let projFilter = '';
+    if (projectDbId) {
+      roleParams.push(projectDbId);
+      projJoin = 'JOIN tasks t ON t.id = ar.task_id';
+      projFilter = `AND t.project_id = $${roleParams.length}`;
+    }
     const roleRows = await c.query(
       `WITH bounds AS (SELECT max(started_at) AS last_activity FROM agent_runs)
        SELECT r.code AS role_code, r.name AS role_name,
@@ -652,22 +812,31 @@ async function deriveRoleLoadBlock(c, nowISO) {
               (SELECT last_activity FROM bounds) AS last_activity
          FROM agent_runs ar
          JOIN roles r ON r.id = ar.role_id
+         ${projJoin}
         WHERE ar.started_at >= (SELECT last_activity FROM bounds) - interval '24 hours'
+          ${projFilter}
         GROUP BY r.code, r.name
         ORDER BY runs DESC`,
-      [RELEASE_OUTCOMES],
+      roleParams,
     );
     const lastActivity = roleRows.rows[0]?.last_activity ?? null;
     const lastActivityISO = lastActivity ? new Date(lastActivity).toISOString() : null;
     const roleLoad = deriveRoleLoad(roleRows.rows).map((row) => ({ ...row, delta: null }));
     const roleLoadWindow = computeRoleLoadWindow(lastActivityISO, nowISO, 24);
+    // Периодная когорта — по тем же прогонам, что и строки ролей (от начала окна до now:
+    // last_activity — максимум started_at, так что прогонов после него нет).
+    const periodTotalsRow = await queryRoleLoadPeriodTotalsRow(
+      c, roleLoadWindow.windowStart, nowISO, projectDbId,
+    );
+    // Lifecycle-когорта — по DONE-событию в том же окне.
     const taskTotalsRow = await queryRoleLoadTaskTotalsRow(
-      c, roleLoadWindow.windowStart, lastActivityISO ?? nowISO,
+      c, roleLoadWindow.windowStart, lastActivityISO ?? nowISO, projectDbId,
     );
     return {
       roleLoad,
       roleLoadWindow,
-      roleLoadTaskTotals: { ...buildRoleLoadTaskTotals(taskTotalsRow), delta: null },
+      roleLoadTaskTotals: { ...buildRoleLoadPeriodTotals(periodTotalsRow), delta: null },
+      roleLoadCompletedTotals: { ...buildRoleLoadTaskTotals(taskTotalsRow), delta: null },
       roleLoadPeriods: {
         mode: 'fallback', current: null, previous: null, marker: null, previousHasRuns: false,
       },
@@ -678,18 +847,29 @@ async function deriveRoleLoadBlock(c, nowISO) {
   const prevMarker = markers[1] ?? null;
   const lastISO = new Date(lastMarker.createdAt).toISOString();
 
-  // Текущий период [последний маркер; now].
-  const curRoleLoad = deriveRoleLoad(await queryRoleLoadRows(c, lastISO, nowISO));
-  const curTaskTotals = buildRoleLoadTaskTotals(await queryRoleLoadTaskTotalsRow(c, lastISO, nowISO));
+  // Текущий период [последний маркер; now]. Обе когорты сужаются projectDbId.
+  const curRoleLoad = deriveRoleLoad(await queryRoleLoadRows(c, lastISO, nowISO, projectDbId));
+  const curPeriodTotals = buildRoleLoadPeriodTotals(
+    await queryRoleLoadPeriodTotalsRow(c, lastISO, nowISO, projectDbId),
+  );
+  const curCompletedTotals = buildRoleLoadTaskTotals(
+    await queryRoleLoadTaskTotalsRow(c, lastISO, nowISO, projectDbId),
+  );
 
   // Период сравнения [предпоследний маркер; последний], если он есть.
   let prevRoleLoad = null;
-  let prevTaskTotals = null;
+  let prevPeriodTotals = null;
+  let prevCompletedTotals = null;
   let previous = null;
   if (prevMarker) {
     const prevISO = new Date(prevMarker.createdAt).toISOString();
-    prevRoleLoad = deriveRoleLoad(await queryRoleLoadRows(c, prevISO, lastISO));
-    prevTaskTotals = buildRoleLoadTaskTotals(await queryRoleLoadTaskTotalsRow(c, prevISO, lastISO));
+    prevRoleLoad = deriveRoleLoad(await queryRoleLoadRows(c, prevISO, lastISO, projectDbId));
+    prevPeriodTotals = buildRoleLoadPeriodTotals(
+      await queryRoleLoadPeriodTotalsRow(c, prevISO, lastISO, projectDbId),
+    );
+    prevCompletedTotals = buildRoleLoadTaskTotals(
+      await queryRoleLoadTaskTotalsRow(c, prevISO, lastISO, projectDbId),
+    );
     previous = { start: prevISO, end: lastISO };
   }
 
@@ -705,7 +885,10 @@ async function deriveRoleLoadBlock(c, nowISO) {
       stale: false, staleHours: 0,
       windowStart: lastISO, windowEnd: nowISO, lastActivityAt: null,
     },
-    roleLoadTaskTotals: attachRoleLoadTaskTotalsDelta(curTaskTotals, prevTaskTotals),
+    // ЕДИНАЯ периодная когорта — основной «Итого» вкладки (дельта без avgLeadMs).
+    roleLoadTaskTotals: attachRoleLoadPeriodTotalsDelta(curPeriodTotals, prevPeriodTotals),
+    // Отдельная lifecycle-когорта «Завершённые по DONE» (дельта с avgLeadMs).
+    roleLoadCompletedTotals: attachRoleLoadTaskTotalsDelta(curCompletedTotals, prevCompletedTotals),
     roleLoadPeriods: {
       mode: 'markers',
       current: { start: lastISO, end: nowISO },
