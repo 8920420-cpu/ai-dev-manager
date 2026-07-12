@@ -10,6 +10,7 @@
 - `.claude/rules/models.md` — схемы БД, типы, сущности
 - `.claude/rules/api.md` — маршруты и endpoints
 - `.claude/rules/conventions.md` — naming, patterns, testing
+- `.claude/rules/design-system.md` — обязательная цветовая схема приложений и правила её применения
 - `.claude/rules/gotchas.md` — quirks, workarounds, do-not-touch
 - `.claude/rules/changelog.md` — что менялось и когда
 - `CONVENTIONS.md` — сгенерированные project conventions для инструментов без Claude Memory

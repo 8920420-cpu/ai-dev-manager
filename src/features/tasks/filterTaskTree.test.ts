@@ -8,7 +8,7 @@ const tree: TaskTree = {
       id: 'p1',
       name: 'Проект',
       code: 'P',
-      taskCount: 2,
+      taskCount: 4,
       tasks: [
         {
           id: 't1',
@@ -18,45 +18,49 @@ const tree: TaskTree = {
           subtasks: [
             { id: 's1', title: 'Выполненная подзадача', status: 'DONE', priority: 'P2' },
             { id: 's2', title: 'Активная подзадача', status: 'REVIEW', priority: 'P2' },
+            { id: 's3', title: 'Провальная подзадача', status: 'FAILED', priority: 'P2' },
           ],
         },
         { id: 't2', title: 'Выполненная', status: 'DONE', priority: 'P2', subtasks: [] },
+        { id: 't3', title: 'Отменённая', status: 'CANCELLED', priority: 'P2', subtasks: [] },
+        { id: 't4', title: 'Заблокированная', status: 'BLOCKED', priority: 'P1', subtasks: [] },
       ],
     },
   ],
 };
 
-describe('filterTaskTree — фильтр выполненных (DONE)', () => {
-  it('по умолчанию скрывает DONE-задачи и DONE-подзадачи, пересчитывает счётчик', () => {
+describe('filterTaskTree — фильтр терминальных статусов (DONE/CANCELLED/FAILED)', () => {
+  it('по умолчанию скрывает DONE/CANCELLED/FAILED, но оставляет BLOCKED, пересчитывает счётчик', () => {
     const out = filterTaskTree(tree, false);
     const project = out.projects[0]!;
-    // DONE-задача t2 скрыта → остаётся одна задача верхнего уровня.
-    expect(project.tasks.map((t) => t.id)).toEqual(['t1']);
-    expect(project.taskCount).toBe(1);
-    // DONE-подзадача s1 скрыта, активная s2 остаётся.
+    // t2 (DONE) и t3 (CANCELLED) скрыты; t1 (активная) и t4 (BLOCKED) остаются.
+    expect(project.tasks.map((t) => t.id)).toEqual(['t1', 't4']);
+    expect(project.taskCount).toBe(2);
+    // Скрыты DONE-подзадача s1 и FAILED-подзадача s3; активная s2 остаётся.
     expect(project.tasks[0]!.subtasks.map((s) => s.id)).toEqual(['s2']);
   });
 
   it('при showDone=true возвращает дерево без изменений', () => {
     const out = filterTaskTree(tree, true);
     expect(out).toBe(tree);
-    expect(out.projects[0]!.taskCount).toBe(2);
+    expect(out.projects[0]!.taskCount).toBe(4);
   });
 
   it('проект без активных задач остаётся в дереве с нулевым счётчиком', () => {
-    const onlyDone: TaskTree = {
-      projects: [{ id: 'p2', name: 'Готовый', code: null, taskCount: 1, tasks: [
+    const onlyClosed: TaskTree = {
+      projects: [{ id: 'p2', name: 'Готовый', code: null, taskCount: 2, tasks: [
         { id: 'x', title: 'Готово', status: 'DONE', priority: 'P3', subtasks: [] },
+        { id: 'y', title: 'Отменено', status: 'CANCELLED', priority: 'P3', subtasks: [] },
       ] }],
     };
-    const out = filterTaskTree(onlyDone, false);
+    const out = filterTaskTree(onlyClosed, false);
     expect(out.projects).toHaveLength(1);
     expect(out.projects[0]!.taskCount).toBe(0);
     expect(countTopLevelTasks(out)).toBe(0);
   });
 
   it('countTopLevelTasks суммирует задачи верхнего уровня по проектам', () => {
-    expect(countTopLevelTasks(tree)).toBe(2);
+    expect(countTopLevelTasks(tree)).toBe(4);
   });
 });
 

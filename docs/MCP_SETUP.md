@@ -110,8 +110,9 @@ read-инструменты (`orchestrator_list_projects`, `orchestrator_list_co
 
 1. заменить `ORCHESTRATOR_API_TOKEN=<новое значение>` в `<repo>/.env`;
 2. перезапустить сервисы, которыми токен проверяется (`docker compose up -d`
-   orchestrator/tools/mcp) и **перезапустить stdio-клиент** (Claude Code/Codex/VS
-   Code читают окружение и `.env` на старте процесса);
+   orchestrator-service tools-service mcp-service`) и **перезапустить
+   stdio-клиент** (Claude Code/Codex/VS Code читают окружение и `.env` на старте
+   процесса);
 3. повторный вызов после рестарта авторизуется тем же новым токеном — `401` не
    возвращается. Проверить заранее — `node mcp-service/bin/mcp-service.js --check`.
 
