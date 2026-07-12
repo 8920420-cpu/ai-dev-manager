@@ -63,22 +63,42 @@ export interface RoleLoadWindow {
   lastActivityAt: string | null;
 }
 
-// ROLE-LOAD-TASK-TOTALS-001 — «Итого (полная задача)» вкладки «Средние на задачу».
-// ИСТИННОЕ сквозное среднее по DONE-задачам за окно 24ч: суммарные затраты всех
-// прогонов всех ролей одной задачи (включая повторы/RESTART/доработки), усреднённые
-// по завершённым задачам. Считается на бэкенде; фронтенд только отображает.
-// tasks — размер совокупности (знаменатель). При tasks = 0 все средние = null («—»).
+// ROLE-LOAD-TASK-TOTALS-001 — «Итого (единая когорта периода)» вкладки «Средние на
+// задачу». ЕДИНАЯ когорта с отображаемыми строками ролей: DISTINCT task_id из всех
+// agent_runs текущего периода; по каждой задаче суммируются метрики её прогонов ТОГО
+// ЖЕ периода, затем AVG по этой общей когорте. tasks = число уникальных задач всей
+// таблицы (НЕ сумма task-ов ролей). Считается на бэкенде; фронтенд только отображает.
+// При tasks = 0 все средние = null («—»). Метрику полной завершённой задачи за весь
+// lifecycle сюда мешать ЗАПРЕЩЕНО — она вынесена в RoleLoadCompletedTotals.
 export interface RoleLoadTaskTotals {
   tasks: number;
   avgCost: number | null;
   avgTokensIn: number | null;
   avgTokensOut: number | null;
-  // Среднее суммарное время работы ролей на задачу (Σ finished−started всех прогонов).
+  // Среднее суммарное время работы ролей на задачу (Σ finished−started прогонов периода).
   avgWorkMs: number | null;
-  // Дополнительно: среднее сквозное календарное время создание → DONE.
-  avgLeadMs: number | null;
-  // ROLE-LOAD-DEPLOY-PERIOD-001: дельта средних (avgCost/avgTokens*/avgWorkMs/avgLeadMs)
+  // ROLE-LOAD-DEPLOY-PERIOD-001: дельта средних (avgCost/avgTokens*/avgWorkMs)
   // к периоду предыдущего обновления. null — сравнения нет.
+  delta: RoleLoadDelta | null;
+}
+
+// ROLE-LOAD-COMPLETED-TOTALS-001 — отдельная когорта «Завершённые задачи (по событию
+// DONE, полный lifecycle)». Период отсчитывается по DONE-событию: берутся задачи с
+// текущим status=DONE и DONE-событием в периоде, а метрики считаются по ВСЕМ их
+// прогонам за весь жизненный цикл (без ограничения периодом). Это НЕ итог таблицы, а
+// самостоятельная метрика с собственным знаменателем tasks. avgLeadMs — календарное
+// время создание → DONE. При tasks = 0 все средние = null («—»). Бэкенд может быть
+// старее и не присылать этот блок — чтение обязано быть толерантным к его отсутствию.
+export interface RoleLoadCompletedTotals {
+  tasks: number;
+  avgCost: number | null;
+  avgTokensIn: number | null;
+  avgTokensOut: number | null;
+  // Среднее суммарное время работы ролей на задачу за весь lifecycle (Σ finished−started).
+  avgWorkMs: number | null;
+  // Среднее сквозное календарное время создание → DONE.
+  avgLeadMs: number | null;
+  // ROLE-LOAD-DEPLOY-PERIOD-001: дельта средних к периоду предыдущего обновления.
   delta: RoleLoadDelta | null;
 }
 
@@ -145,6 +165,9 @@ export interface PerformanceMetrics {
   roleLoad: RoleLoad[];
   roleLoadWindow: RoleLoadWindow;
   roleLoadTaskTotals: RoleLoadTaskTotals;
+  // ROLE-LOAD-COMPLETED-TOTALS-001: опционально — бэкенд может быть старее и не
+  // присылать блок «Завершённые задачи (полный lifecycle)». Читаем толерантно.
+  roleLoadCompletedTotals?: RoleLoadCompletedTotals;
   roleLoadPeriods: RoleLoadPeriods;
   connector: Record<string, ConnectorBucket>;
 }

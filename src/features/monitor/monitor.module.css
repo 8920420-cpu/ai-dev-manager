@@ -103,6 +103,23 @@
   background: var(--surface-2);
 }
 
+/* ROLE-LOAD-COMPLETED-TOTALS-001 — отдельная карточка когорты «Завершённые задачи
+   (полный lifecycle)». Отделяем от таблицы «Итого» верхним отступом и заголовком,
+   чтобы пользователь не путал её с итогом таблицы (разные когорты). */
+.cohortBlock {
+  margin-top: var(--space-4);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.cohortTitle {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
 .statusRow {
   display: flex;
   flex-wrap: wrap;

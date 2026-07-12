@@ -6,6 +6,7 @@ import {
   type RoleLoad,
   type RoleLoadWindow,
   type RoleLoadTaskTotals,
+  type RoleLoadCompletedTotals,
   type RoleLoadPeriods,
   type RoleLoadTotals,
   type RoleLoadPeriod,
@@ -67,15 +68,22 @@ function Metric({
   label,
   hint,
   tone,
+  title,
+  delta,
 }: {
   value: string | number;
   label: string;
   hint?: string;
   tone?: 'warn' | 'danger';
+  title?: string;
+  delta?: PeriodDelta | null;
 }) {
   return (
-    <div className={styles.metric}>
-      <span className={cn(styles.metricValue, tone && styles[tone])}>{value}</span>
+    <div className={styles.metric} title={title}>
+      <span className={cn(styles.metricValue, tone && styles[tone])}>
+        {value}
+        <PeriodDeltaTag delta={delta} />
+      </span>
       <span className={styles.metricLabel}>{label}</span>
       {hint && <span className={styles.metricHint}>{hint}</span>}
     </div>
@@ -207,6 +215,62 @@ function PeriodNote({ periods }: { periods: RoleLoadPeriods }) {
   );
 }
 
+// ROLE-LOAD-COMPLETED-TOTALS-001 — карточка «Завершённые задачи (по событию DONE,
+// полный lifecycle)». Отдельная когорта с собственным знаменателем: НЕ итог таблицы.
+// Период отсчитывается по DONE-событию, а прогоны берутся за весь жизненный цикл
+// задачи (не только за период) — поэтому вынесена из строки «Итого» и явно названа.
+function CompletedTotalsCard({ totals }: { totals: RoleLoadCompletedTotals }) {
+  const cohortTitle =
+    'Завершённые (status=DONE) задачи, у которых DONE-событие попало в текущий период. ' +
+    'Метрики считаются по ВСЕМ прогонам этих задач за весь жизненный цикл (не только за период). ' +
+    'Собственный знаменатель — это отдельная когорта, а не итог таблицы выше.';
+  return (
+    <div className={styles.cohortBlock}>
+      <h4 className={styles.cohortTitle} title={cohortTitle}>
+        Завершённые задачи (по событию DONE, полный lifecycle)
+      </h4>
+      <div className={styles.metricGrid}>
+        <Metric
+          value={totals.tasks || '—'}
+          label="Завершённых задач (DONE)"
+          hint="знаменатель средних этой когорты"
+          title={cohortTitle}
+        />
+        <Metric
+          value={totals.avgCost == null ? '—' : fmtCost(totals.avgCost)}
+          label="Ср. стоимость / задача"
+          hint="сумма всех прогонов задачи за весь lifecycle"
+          delta={totals.delta?.avgCost}
+        />
+        <Metric
+          value={totals.avgTokensIn == null ? '—' : fmtTokens(totals.avgTokensIn)}
+          label="Ср. токены вх / задача"
+          hint="весь lifecycle"
+          delta={totals.delta?.avgTokensIn}
+        />
+        <Metric
+          value={totals.avgTokensOut == null ? '—' : fmtTokens(totals.avgTokensOut)}
+          label="Ср. токены исх / задача"
+          hint="весь lifecycle"
+          delta={totals.delta?.avgTokensOut}
+        />
+        <Metric
+          value={fmtDuration(totals.avgWorkMs)}
+          label="Ср. время работы / задача"
+          hint="Σ finished−started всех прогонов за lifecycle"
+          delta={totals.delta?.avgWorkMs}
+        />
+        <Metric
+          value={fmtDuration(totals.avgLeadMs)}
+          label="Ср. время создание → DONE"
+          hint="календарное сквозное время задачи"
+          delta={totals.delta?.avgLeadMs}
+        />
+      </div>
+    </div>
+  );
+}
+
 /**
  * Блок «Нагрузка по ролям» с двумя вкладками:
  *  — «Средние на задачу» (основной вид): токены/стоимость усреднены на задачу;
@@ -215,28 +279,36 @@ function PeriodNote({ periods }: { periods: RoleLoadPeriods }) {
  * маркера ([последний маркер; now]); рядом с показателями — сравнение с периодом
  * предыдущего обновления (стрелка ↑/↓ и процент, цвет по направленности метрики).
  * Фолбэк без деплой-маркеров: окно 24ч от последней активности, без сравнения.
+ *
+ * ROLE-LOAD-TASK-TOTALS-001 / ROLE-LOAD-COMPLETED-TOTALS-001 — две РАЗНЫЕ когорты,
+ * которые запрещено смешивать под одним «Итого»:
+ *  — строки ролей + строка «Итого (единая когорта периода)» (taskTotals): единая
+ *    когорта DISTINCT task_id из прогонов ТЕКУЩЕГО периода; по каждой задаче
+ *    суммируются метрики прогонов этого же периода, затем AVG по задачам. Число
+ *    задач итога = число уникальных задач всей таблицы (НЕ сумма task-ов ролей);
+ *  — карточка «Завершённые задачи (по событию DONE, полный lifecycle)»
+ *    (completedTotals): задачи с DONE-событием в периоде, но метрики — по ВСЕМ их
+ *    прогонам за весь жизненный цикл; свой знаменатель. Рендерится только если
+ *    бэкенд прислал блок (старый бэкенд его не отдаёт).
  */
 function RoleLoadSection({
   roleLoad,
   window: windowInfo,
   taskTotals,
+  completedTotals,
   periods,
 }: {
   roleLoad: RoleLoad[];
   window: RoleLoadWindow;
   taskTotals: RoleLoadTaskTotals;
+  completedTotals?: RoleLoadCompletedTotals;
   periods: RoleLoadPeriods;
 }) {
   const [tab, setTab] = useState<'avg' | 'totals'>('avg');
-  // ROLE-LOAD-TASK-TOTALS-001: «Итого (полная задача)» — ИСТИННОЕ сквозное среднее
-  // по задачам, посчитанное на бэкенде (roleLoadTaskTotals): сумма всех прогонов
-  // всех ролей одной DONE-задачи (включая повторы/RESTART/доработки), усреднённая
-  // по завершённым задачам за окно. Клиентская сумма средних по ролям УДАЛЕНА —
-  // она ЗАПРЕЩЕНА методикой. Здесь фронтенд только отображает готовые значения.
   return (
     <Section
       title="Нагрузка по ролям (с последнего обновления)"
-      description="Основной вид считается с нуля от последнего обновления системы (деплой-маркер): данные разных обновлений не смешиваются. Рядом с каждым показателем — сравнение с периодом предыдущего обновления: стрелка ↑/↓ и процент изменения, зелёным при росте эффективности и красным при снижении. «Токены вх/исх» и «Стоимость» — средние на задачу; суммарные значения по периодам месяц/неделя/день — на вкладке «Суммы»."
+      description="Основной вид считается с нуля от последнего обновления системы (деплой-маркер): данные разных обновлений не смешиваются. Рядом с каждым показателем — сравнение с периодом предыдущего обновления: стрелка ↑/↓ и процент изменения, зелёным при росте эффективности и красным при снижении. «Токены вх/исх» и «Стоимость» — средние на задачу за текущий период; строка «Итого (единая когорта периода)» — среднее по тем же уникальным задачам таблицы. Отдельная карточка «Завершённые задачи» показывает полный lifecycle DONE-задач и не смешивается с итогом. Суммарные значения по периодам месяц/неделя/день — на вкладке «Суммы»."
     >
       <div className={styles.tabs}>
         <button
@@ -280,7 +352,7 @@ function RoleLoadSection({
                   <th className={styles.num} title="Возвраты захвата в пул без результата (напр. outcome='released'), а не провалы кода: прогон освобождён из-за петли захват→release, таймаута назначения или рестарта оркестратора">Возвраты</th>
                   <th className={styles.num}>Таймаут</th>
                   <th className={styles.num}>В работе</th>
-                  <th className={styles.num}>Ср. время</th>
+                  <th className={styles.num} title="Среднее время одного прогона (finished−started), не на задачу">Ср. время / прогон</th>
                   <th className={styles.num}>Токены вх / зад.</th>
                   <th className={styles.num}>Токены исх / зад.</th>
                   <th className={styles.num}>Стоимость / зад.</th>
@@ -348,11 +420,11 @@ function RoleLoadSection({
               </tbody>
               <tfoot>
                 <tr className={styles.totalRow}>
-                  <td title="Истинное сквозное среднее по DONE-задачам за окно: суммарные затраты всех прогонов всех ролей одной задачи (включая повторы, RESTART и доработки), усреднённые по завершённым задачам">
-                    Итого (полная задача)
+                  <td title="Все уникальные задачи с прогонами в текущем периоде; по каждой задаче суммируются метрики прогонов этого периода, затем среднее по задачам. Число задач = число уникальных задач всей таблицы">
+                    Итого (единая когорта периода)
                   </td>
                   <td className={styles.num}>—</td>
-                  <td className={styles.num} title="Число завершённых (DONE) задач в окне — знаменатель средних">
+                  <td className={styles.num} title="Число уникальных задач всей таблицы (единая когорта периода) — знаменатель средних">
                     {taskTotals.tasks || '—'}
                   </td>
                   <td className={styles.num}>—</td>
@@ -360,18 +432,9 @@ function RoleLoadSection({
                   <td className={styles.num}>—</td>
                   <td className={styles.num}>—</td>
                   <td className={styles.num}>—</td>
-                  <td className={styles.num}>
+                  <td className={styles.num} title="Среднее суммарное время работы ролей на задачу за период (Σ finished−started прогонов периода)">
                     {fmtDuration(taskTotals.avgWorkMs)}
                     <PeriodDeltaTag delta={taskTotals.delta?.avgWorkMs} />
-                    {taskTotals.avgLeadMs != null && (
-                      <span
-                        className={styles.tokenSplit}
-                        title="Среднее сквозное календарное время: создание задачи → DONE"
-                      >
-                        календарно {fmtDuration(taskTotals.avgLeadMs)}
-                        <PeriodDeltaTag delta={taskTotals.delta?.avgLeadMs} />
-                      </span>
-                    )}
                   </td>
                   <td className={styles.num}>
                     {taskTotals.avgTokensIn == null ? '—' : fmtTokens(taskTotals.avgTokensIn)}
@@ -390,6 +453,7 @@ function RoleLoadSection({
               </tfoot>
             </table></div>
           )}
+          {completedTotals && <CompletedTotalsCard totals={completedTotals} />}
         </>
       ) : (
         <RoleLoadTotalsTab />
@@ -893,6 +957,7 @@ export function PerformanceMonitorPage() {
             roleLoad={data.roleLoad}
             window={data.roleLoadWindow}
             taskTotals={data.roleLoadTaskTotals}
+            completedTotals={data.roleLoadCompletedTotals}
             periods={data.roleLoadPeriods}
           />
 
