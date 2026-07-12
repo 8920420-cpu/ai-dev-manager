@@ -19,8 +19,25 @@ import { WorktreeManager } from '../src/worktreeManager.js';
 
 const silent = { warn() {}, info() {}, log() {}, error() {} };
 
+// Git-переменные окружения РОДИТЕЛЬСКОГО процесса (GIT_DIR, GIT_WORK_TREE,
+// GIT_INDEX_FILE и пр. worktree-контекст) навязали бы каждой `git -C <tmp>` внешний
+// репозиторий-checkout вместо свежесозданного temp-репо: `git commit` тогда
+// исполнялся бы в дереве пайплайна («nothing to commit / ahead of origin/main»), а не
+// в тестовом repo. Пайплайн гоняет раннер внутри git-хука (post-commit/post-merge),
+// который эти переменные экспортирует. Чистим их, чтобы тест был изолирован от того,
+// где именно его запустили.
+const CLEAN_GIT_ENV = (() => {
+  const env = { ...process.env };
+  for (const k of Object.keys(env)) {
+    if (/^GIT_(DIR|WORK_TREE|INDEX_FILE|OBJECT_DIRECTORY|COMMON_DIR|NAMESPACE|PREFIX|CEILING_DIRECTORIES|ALTERNATE_OBJECT_DIRECTORIES)$/.test(k)) {
+      delete env[k];
+    }
+  }
+  return env;
+})();
+
 function git(cwd, args) {
-  return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] });
+  return execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], env: CLEAN_GIT_ENV });
 }
 
 // SHA ветки в репозитории или '' (без throw), для проверок наличия ветки.
@@ -188,6 +205,81 @@ test('sync: неинтегрированная дельта в ветке → о
   // Коммит невлитой дельты по-прежнему в ветке (его вольёт GI).
   const kept = git(wtDir(root, 'PROJECT:SVC'), ['merge-base', '--is-ancestor', res1.commit, 'HEAD']);
   assert.equal(kept, '', 'коммит первой сдачи не потерян при пропуске освежения');
+  cleanup(repo, root);
+});
+
+// Регрессия WORKTREE-SYNC-MAIN-001 (регрессия коммита 4986587, разбор застрявшей
+// задачи bbd7cc03): сервисная ветка разошлась с main давно (древний merge-base), а
+// main уехал далеко вперёд, добавив файлы, которых ветка не видит. Нетто-дифф
+// доставки такой ветки (`git diff main..tip`) УДАЛИЛ БЫ эти файлы из main —
+// форс-доставка отревертила бы влитую работу. Перед переиспользованием под новую
+// задачу стухшую ветку обязаны БЕЗУСЛОВНО пересадить на актуальный main (hard-reset),
+// чтобы дельта считалась от свежей базы и не тащила стухшую историю.
+test('sync: стухшая ветка (древний merge-base, нетто-дифф удаляет файлы main вне changed-set) ресетится на актуальный main', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr = new WorktreeManager({ root, log: silent, staleForeignDeletionLimit: 5 });
+  // Задача 1: ветка сервиса форкается от древнего base и добавляет свой файл.
+  const res1 = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    put(wt, 'pkg/old.txt', 'old\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res1.ok, true, `первая сдача, error=${res1.error}`);
+  // main УЕХАЛ ДАЛЕКО вперёд: другие потоки добавили в main целые поддеревья
+  // (packages/app-switcher/* из инцидента), которых древняя ветка не видит.
+  for (let i = 0; i < 12; i++) put(repo, `packages/app-switcher/f${i}.ts`, `export const f${i} = ${i};\n`);
+  git(repo, ['add', '-A']);
+  git(repo, ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '--quiet', '-m', 'main: массивная работа после развилки']);
+  const mainHead = git(repo, ['rev-parse', 'HEAD']).trim();
+  // Задача 2 переиспользует ту же ветку. Нетто-дифф ветки удалил бы 12 файлов
+  // app-switcher (вне её реальной работы) → ветка стухшая → БЕЗУСЛОВНЫЙ hard-sync.
+  const res2 = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    // Ветка пересажена на актуальный main: файлы main видны, стухшего old.txt нет.
+    assert.equal(existsSync(join(wt, 'packages/app-switcher/f0.ts')), true, 'после ресинка видны файлы актуального main');
+    assert.equal(existsSync(join(wt, 'pkg/old.txt')), false, 'стухший файл ветки убран ресинком');
+    put(wt, 'src/new.ts', 'export const n = 1;\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res2.ok, true, `после ресинка задача ложится, error=${res2.error}`);
+  assert.deepEqual(res2.changedFiles, ['src/new.ts'], 'дельта задачи 2 — только её новый файл');
+  const wt = wtDir(root, 'PROJECT:SVC');
+  // Ветка растёт от актуального HEAD main — стухших коммитов в дельте нет.
+  assert.equal(git(wt, ['merge-base', '--is-ancestor', mainHead, 'HEAD']), '', 'ветка сервиса растёт от актуального main');
+  // Нетто-дифф ветки против main больше НЕ удаляет посторонних файлов main.
+  const netStatus = git(repo, ['diff', '--name-status', `${mainHead}..${res2.commit}`])
+    .split('\n').map((l) => l.trim()).filter(Boolean);
+  assert.equal(netStatus.filter((l) => l.startsWith('D')).length, 0, 'нетто-дифф не удаляет файлы main');
+  cleanup(repo, root);
+});
+
+// Контрпример: настоящая аддитивная неинтегрированная дельта (ветка чуть отстала —
+// main отъехал по паре ДРУГИХ файлов, обычный дрейф ниже порога стухлости) НЕ
+// сбрасывается: сданная, но ещё не влитая GI работа должна пережить синхронизацию.
+test('sync: аддитивная неинтегрированная дельта (дрейф ниже порога) НЕ ресетится', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr = new WorktreeManager({ root, log: silent, staleForeignDeletionLimit: 5 });
+  // Задача 1 сдана, GI ещё НЕ вливал — аддитивная неинтегрированная дельта.
+  const res1 = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    put(wt, 'pkg/f.txt', 'v1\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res1.ok, true, `первая сдача, error=${res1.error}`);
+  // main чуть отъехал по паре ДРУГИХ файлов — 2 постороннних удаления < порога 5.
+  put(repo, 'other1.txt', 'o1\n');
+  put(repo, 'other2.txt', 'o2\n');
+  git(repo, ['add', '-A']);
+  git(repo, ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '--quiet', '-m', 'main: небольшой дрейф']);
+  const res2 = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    // Невлитая дельта задачи 1 НА МЕСТЕ — стухлого ресинка не случилось.
+    assert.equal(readFileSync(join(wt, 'pkg/f.txt'), 'utf8'), 'v1\n', 'аддитивная неинтегрированная дельта сохранена');
+    put(wt, 'pkg/g.txt', 'v2\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res2.ok, true, `вторая сдача, error=${res2.error}`);
+  // Коммит невлитой (аддитивной) дельты не потерян ресинком.
+  const kept = git(wtDir(root, 'PROJECT:SVC'), ['merge-base', '--is-ancestor', res1.commit, 'HEAD']);
+  assert.equal(kept, '', 'коммит первой (аддитивной) сдачи не сброшен');
   cleanup(repo, root);
 });
 

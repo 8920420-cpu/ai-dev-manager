@@ -74,6 +74,13 @@ function parseDenyGlobs(raw) {
   return list.length ? list : DEFAULT_DENY_GLOBS;
 }
 
+// Положительное целое из env (порог посторонних удалений для детекта стухшей ветки).
+// Пустое/невалидное/<=0 → дефолт.
+function parsePositiveInt(raw, fallback) {
+  const n = Number.parseInt(String(raw ?? '').trim(), 10);
+  return Number.isFinite(n) && n > 0 ? n : fallback;
+}
+
 // Совпадает ли путь дельты с deny-glob. path — от git (уже forward-slash, но на
 // всякий случай нормализуем). `*.ext` → по суффиксу; имя без `*` → как ТОЧНЫЙ
 // сегмент пути (не подстрока: `dist` не заденет `distributor.js`).
@@ -96,7 +103,7 @@ export class WorktreeManager {
    * @param {string} [cfg.root]  корень для worktree сервисов (по умолчанию tmp)
    * @param {Console} [cfg.log]
    */
-  constructor({ root, log = console, denyGlobs } = {}) {
+  constructor({ root, log = console, denyGlobs, staleForeignDeletionLimit } = {}) {
     this.root = root || process.env.PROGRAMMER_WORKTREE_ROOT || join(tmpdir(), 'programmer-worktrees');
     this.log = log;
     this.services = new Map(); // serviceKey -> { worktreeCwd, branch }
@@ -104,6 +111,12 @@ export class WorktreeManager {
     this.repoLocks = new Map();// repoCwd -> Promise (mutex по репозиторию)
     // PROGRAMMER-DELTA-DENYLIST-001: артефакты, исключаемые из дельты (см. выше).
     this.denyGlobs = denyGlobs || parseDenyGlobs(process.env.PROGRAMMER_DELTA_DENY_GLOBS);
+    // WORKTREE-SYNC-MAIN-001: порог посторонних удалений main, при котором сервисная
+    // ветка считается стухшей и БЕЗУСЛОВНО пересаживается на актуальный main. Ниже
+    // порога — обычный дрейф (ветка чуть отстала аддитивно), настоящую неинтегрированную
+    // дельту НЕ сбрасываем. Настраивается PROGRAMMER_STALE_FOREIGN_DELETIONS.
+    this.staleForeignDeletionLimit = staleForeignDeletionLimit
+      ?? parsePositiveInt(process.env.PROGRAMMER_STALE_FOREIGN_DELETIONS, 10);
   }
 
   // Сериализация задач одного микросервиса: следующая ждёт предыдущую.
@@ -219,11 +232,40 @@ export class WorktreeManager {
   // Неинтегрированную дельту (окно «сдано, GI ещё не вливал») не трогаем.
   _syncWithMain(repoCwd, handle) {
     const wt = handle.worktreeCwd;
-    const mainHead = git(repoCwd, ['rev-parse', 'HEAD']).trim();
+    // WORKTREE-SYNC-MAIN-001: базу синка берём от АКТУАЛЬНОГО main (origin/main), а не
+    // от локального HEAD repoCwd. Сервисная ветка живёт столько же, сколько процесс
+    // раннера, а origin/main тем временем уезжает вперёд; синк против устаревшего
+    // локального HEAD оставлял бы дельту, посчитанную от протухшей базы.
+    const mainHead = this._resolveMainHead(repoCwd);
     const tip = git(wt, ['rev-parse', 'HEAD']).trim();
     if (tip === mainHead) return; // уже синхронны
     const mergeBase = git(repoCwd, ['merge-base', mainHead, tip]).trim();
-    if (mergeBase === mainHead) return; // main не двигался — ветка просто несёт свежую дельту
+    if (mergeBase === mainHead) return; // main не двигался относительно ветки
+
+    // ДЕТЕКТОР СТУХШЕЙ ВЕТКИ (WORKTREE-SYNC-MAIN-001, регрессия коммита 4986587).
+    // Нетто-эффект доставки ветки — `git diff <mainHead>..<tip>`. Статус D там = файл
+    // ЕСТЬ в актуальном main, но ОТСУТСТВУЕТ в ветке → доставка ветки удалила бы его
+    // из main. Если такие удаления НЕ входят в реальную новую работу ветки (её
+    // собственный changeset mergeBase..tip), значит файл появился в main ПОСЛЕ развилки,
+    // а древняя ветка его не видит — стухшая история (ветка отстала от main), и
+    // форс-доставка отревертила бы влитую работу main. Когда посторонних удалений
+    // МНОГО (порог staleForeignDeletionLimit), ветку считаем стухшей и БЕЗУСЛОВНО
+    // пересаживаем на актуальный main, переопределяя защиту «неинтегрированная дельта»
+    // ниже (стухшую историю доставлять нельзя). Настоящую аддитивную неинтегрированную
+    // дельту (мало/ноль посторонних удалений — обычный дрейф) не трогаем.
+    const foreignDeletions = this._foreignDeletions(repoCwd, mainHead, tip, mergeBase);
+    if (foreignDeletions.length >= this.staleForeignDeletionLimit) {
+      git(wt, ['reset', '--hard', mainHead]);
+      this.log.warn?.('worktree branch стухла (посторонние удаления main вне changed-set) — hard-sync на актуальный main', {
+        branch: handle.branch,
+        mergeBase: mergeBase.slice(0, 12),
+        head: mainHead.slice(0, 12),
+        foreignDeletions: foreignDeletions.length,
+        sample: foreignDeletions.slice(0, 5),
+      });
+      return;
+    }
+
     if (mergeBase !== tip) {
       // Ветка несёт коммиты после развилки — сброс безопасен, только если все
       // они уже в main (git cherry: '+' = патча в main нет)…
@@ -246,6 +288,40 @@ export class WorktreeManager {
     git(wt, ['reset', '--hard', mainHead]);
     this.log.info?.('worktree branch синхронизирована с main',
       { branch: handle.branch, head: mainHead.slice(0, 12) });
+  }
+
+  // Актуальный HEAD main для базы синка. Стухшая сервисная ветка живёт долго, а
+  // origin/main уезжает вперёд, поэтому базу берём от origin/main (best-effort fetch),
+  // а не от локального HEAD repoCwd. Fallback на локальный HEAD — если origin/main
+  // недоступен (нет remote / офлайн / тестовый репозиторий без origin).
+  _resolveMainHead(repoCwd) {
+    try {
+      try { git(repoCwd, ['fetch', '--quiet', 'origin', 'main'], { stdio: 'ignore' }); } catch { /* офлайн / нет remote — ок */ }
+      const sha = git(repoCwd, ['rev-parse', '--verify', '--quiet', 'refs/remotes/origin/main']).trim();
+      if (sha) return sha;
+    } catch { /* origin/main нет — падаем на локальный HEAD */ }
+    return git(repoCwd, ['rev-parse', 'HEAD']).trim();
+  }
+
+  // Файлы, которые доставка ветки УДАЛИЛА БЫ из актуального main, НЕ будучи частью
+  // реальной работы ветки. `git diff --name-status <mainHead>..<tip>`: статус D = файл
+  // есть в mainHead, но нет в tip. Из них исключаем те, что ветка тронула в СВОЁМ
+  // changeset (mergeBase..tip) — намеренные удаления/переименования её работы. Остаток —
+  // файлы, добавленные в main ПОСЛЕ развилки, которых древняя ветка не видит: их
+  // «удаление» в нетто-диффе — артефакт стухшей базы, а не работа задачи.
+  _foreignDeletions(repoCwd, mainHead, tip, mergeBase) {
+    const deleted = git(repoCwd, ['diff', '--name-status', `${mainHead}..${tip}`])
+      .split('\n').map((l) => l.trim()).filter(Boolean)
+      .map((l) => l.split('\t'))
+      .filter((parts) => parts[0] === 'D')
+      .map((parts) => parts[1])
+      .filter(Boolean);
+    if (!deleted.length) return [];
+    const branchTouched = new Set(
+      git(repoCwd, ['diff', '--name-only', `${mergeBase}..${tip}`])
+        .split('\n').map((s) => s.trim()).filter(Boolean),
+    );
+    return deleted.filter((f) => !branchTouched.has(f));
   }
 
   /**
