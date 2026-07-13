@@ -44,13 +44,22 @@ function pipelineWorktreeBase() {
   }
 }
 
-// WORKTREE-ISOLATE-DELIVERY-001: стадии, которые НЕ выполняем в изолированном
-// worktree. build/deploy/smoke трогают общий docker-стек по фиксированным
-// container_name (конфликт с живым стеком) и мутируют прод — их место в
-// пост-merge автодоставке Git Integrator, а не в per-task верификации.
+// PIPELINE-LOCAL-REBUILD-001: стадии, которые НЕ выполняем в изолированном worktree.
+// РАНЬШЕ здесь были build,deploy,smoke — Pipeline в изоляции гонял только тесты, а
+// локальные контейнеры не пересобирались/не рестартились, и «сразу проверить» было
+// нечего (доставка кода жила только в пост-merge автодоставке Git Integrator → k3s).
+// Теперь build+deploy ВЫПОЛНЯЮТСЯ и в изоляции: Pipeline пересобирает образы из
+// доставленного коммита (эфемерный worktree) и `docker compose up -d` рестартит
+// ОБЩИЙ локальный стек, чтобы пользователь мог проверить результат ДО коммита. Это
+// безопасно: подсистемные compose фиксируют имя проекта (`name:`) → up реконсилит
+// существующий проект без коллизии портов, а образы самодостаточны (bind-mount
+// исходников нет) → снос worktree не ломает контейнеры. Git Integrator идёт ПОСЛЕ и
+// делает коммит+пуш+автодоставку, не блокируя локальную проверку. Пропускаем только
+// smoke (`up -d --wait`): его healthy-ожидание против общего стека делает не место в
+// per-task верификации — финальную проверку делает пользователь.
 // Переопределяется PIPELINE_ISOLATION_SKIP_STAGES (список через запятую).
 const ISOLATION_SKIP_STAGES = String(
-  process.env.PIPELINE_ISOLATION_SKIP_STAGES ?? 'build,deploy,smoke',
+  process.env.PIPELINE_ISOLATION_SKIP_STAGES ?? 'smoke',
 )
   .split(',')
   .map((s) => s.trim())
@@ -138,9 +147,12 @@ async function withPipelineWorktree(repoRoot, task, run) {
     return run(repoRoot); // не смогли изолировать — безопасный фолбэк на общее дерево
   }
   try {
-    // В изоляции: доставить node_modules (в worktree их нет) и не гонять
-    // deploy/build/smoke против общего стека. Общее дерево (фолбэки выше) сохраняет
-    // прежнее поведение — там node_modules есть, а compose-project стабилен.
+    // В изоляции: доставить node_modules (в worktree их нет) и прогнать пайплайн.
+    // PIPELINE-LOCAL-REBUILD-001: build+deploy теперь ВЫПОЛНЯЮТСЯ и здесь — образы
+    // собираются из доставленного коммита, `up -d` рестартит общий стек (compose с
+    // фиксированным `name:` реконсилит существующий проект). Пропускается только
+    // smoke (см. ISOLATION_SKIP_STAGES). Снос worktree ниже безопасен: контейнеры
+    // живут на собранных образах, а не на bind-mount из каталога worktree.
     return await run(dir, { provisionDeps: true, skipStages: ISOLATION_SKIP_STAGES });
   } finally {
     await withRepoWorktreeLock(repoRoot, async () => {
