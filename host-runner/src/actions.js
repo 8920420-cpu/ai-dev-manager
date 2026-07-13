@@ -278,7 +278,24 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
   if (delivered && tip !== delivered) {
     const contained = await git(repoRoot, ['merge-base', '--is-ancestor', delivered, tip])
       .then(() => true).catch(() => false);
-    if (!contained) tip = delivered;
+    if (!contained) {
+      // GI-STALE-DELIVERED-ALREADY-IN-MAIN-001: ветка НЕ содержит deliveredCommit.
+      // Раньше безусловно доставляли сам deliveredCommit. Но если ветку
+      // ПЕРЕСИНХРОНИЗИРОВАЛИ на актуальный main (rebase выкинул дельту как
+      // patch-equivalent — её уже влил сиблинг/предыдущая задача), deliveredCommit
+      // «стух»: его нетто-дифф ОТКАТИЛ БЫ main (stale_branch_reverts_main) и он
+      // зацикливал GI, хотя контент дельты УЖЕ в main. Отличаем два случая по
+      // patch-присутствию deliveredCommit в текущем main (`git cherry`): «-» на всех
+      // коммитах (или пустой вывод) — патч уже в HEAD → доставлять нечего, оставляем
+      // tip = tip ветки (== main → already_integrated ниже). Иначе (есть «+» —
+      // дельта реально отсутствует, ветку сбросили ДО доставки) — доставляем
+      // deliveredCommit, как прежде.
+      const cherry = await git(repoRoot, ['cherry', 'HEAD', delivered])
+        .then((r) => r.stdout).catch(() => null);
+      const deliveredPatchInMain = cherry !== null
+        && cherry.split('\n').map((l) => l.trim()).filter(Boolean).every((l) => l.startsWith('-'));
+      if (!deliveredPatchInMain) tip = delivered;
+    }
   }
 
   const before = await git(repoRoot, ['rev-parse', 'HEAD']).then((r) => r.stdout.trim()).catch(() => null);

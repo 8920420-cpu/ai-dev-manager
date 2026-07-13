@@ -1667,7 +1667,29 @@ export async function getOrCreateService(c, projectId, serviceCode, serviceName,
   // SERVICE-REPO-PATH-001: при авторегистрации сразу пишем каталог сервиса
   // (выведенный из путей work_item/сдачи), чтобы PIPELINE_SERVICE не собирал от
   // корня репозитория. Пустой путь → NULL (бэкфилл по коду произойдёт на claim).
-  const repoPath = String(repositoryPath ?? '').trim() || null;
+  let repoPath = String(repositoryPath ?? '').trim() || null;
+  if (!repoPath) {
+    // SERVICE-REPO-PATH-INHERIT-001: новый ВАРИАНТ ИМЕНИ того же сервиса
+    // (PS-Torg-frontend vs PSTORG_FRONTEND vs front_salesflow/front-salesflow) иначе
+    // авто-создаётся с repository_path=NULL и гарантированно блокирует Архитектора —
+    // preflightServiceRepoPath трактует NULL-путь как missing_repository_path (бэкфилл
+    // по коду каталога он намеренно отвергает). Каждый источник (scanner-intake, виджет,
+    // постановщик) шлёт своё написание кода → плодятся пустые дубли и блоки. Наследуем
+    // путь от существующего сервиса-СИБЛИНГА того же проекта с совпадающим
+    // НОРМАЛИЗОВАННЫМ кодом (lower, без разделителей -/_) и валидным путём. Порог
+    // неоднозначности: если под одним норм-кодом у сиблингов РАЗНЫЕ пути — не угадываем,
+    // оставляем NULL (штатный блок, регистр правит человек). Логические не-код «сервисы»
+    // (ARCHITECTURE/INTEGRATION/…) сиблинга с путём не имеют → остаются NULL, как и было.
+    const sib = await c.query(
+      `SELECT DISTINCT repository_path FROM services
+        WHERE project_id = $1
+          AND repository_path IS NOT NULL AND btrim(repository_path) <> ''
+          AND regexp_replace(lower(service_code), '[-_]', '', 'g')
+            = regexp_replace(lower($2), '[-_]', '', 'g')`,
+      [projectId, code],
+    );
+    if (sib.rowCount === 1) repoPath = String(sib.rows[0].repository_path).trim();
+  }
   const ins = await c.query(
     `INSERT INTO services (project_id, service_code, service_name, repository_path)
      VALUES ($1, $2, $3, $4)
@@ -2619,9 +2641,10 @@ export async function completeHostTaskTx(c, input) {
       const hostContract = await loadRoleContract(c, roleCode);
       const { values: hostCardValues } = extractOutputs(output?.fields ?? output, hostContract.outputs);
 
-      const nextRoleId = !nextRole
-        ? null
-        : await roleIdByCode(c, nextRole);
+      const keepCurrentRoleOnBlock = roleCode === 'GIT_INTEGRATOR' && !success && resolved.blocked;
+      const nextRoleId = keepCurrentRoleOnBlock
+        ? t.current_role_id
+        : (!nextRole ? null : await roleIdByCode(c, nextRole));
       if (nextRole && !nextRoleId) {
         const reason = `next_role_missing:${nextRole}`;
         await c.query(

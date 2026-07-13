@@ -387,6 +387,64 @@ test('runGitAction: стухшая ветка, чей нетто-дифф уда
   assert.notEqual(git(dir, ['stash', 'list']).trim(), '', 'autostash с дублем дельты должен сохраниться');
 });
 
+// GI-STALE-DELIVERED-ALREADY-IN-MAIN-001 (инцидент 13.07): у стухшей ветки дельту
+// УЖЕ влил сиблинг/предыдущая задача. Ветку пересинхронизировали на актуальный main
+// (rebase выкинул дельту как patch-equivalent) → branch == main, но записанный
+// deliveredCommit «стух» (его нетто-дифф удалил бы новые файлы main). Раньше GI
+// безусловно откатывался на этот SHA и зацикливался stale_branch_reverts_main, хотя
+// доставлять НЕЧЕГО. Теперь: patch deliveredCommit уже в main (git cherry «-») →
+// tip остаётся tip-ом ветки (== main) → already_integrated_content, main не тронут.
+test('runGitAction: пересинканная ветка, дельта уже в main (стухший deliveredCommit) → already_integrated_content, не stale_branch', async (t) => {
+  const dir = initRepo(t);
+
+  // Ветка отходит от ДРЕВНЕГО main и несёт дельту feature.js (deliveredCommit «стухнет»).
+  git(dir, ['checkout', '--quiet', '-b', 'programmer/PROJECT_2/PS-Torg-frontend']);
+  writeFileSync(path.join(dir, 'feature.js'), 'export const x = 1;\n');
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '--quiet', '-m', 'programmer: task delta']);
+  const deliveredCommit = git(dir, ['rev-parse', 'HEAD']).trim();
+  git(dir, ['checkout', '--quiet', 'main']);
+
+  // main УШЁЛ ВПЕРЁД двумя коммитами: (1) новый файл app-switcher, которого в стухшей
+  // ветке нет; (2) ОТДЕЛЬНЫМ коммитом — ТА ЖЕ дельта feature.js (сиблинг доставил её
+  // своим коммитом → patch-id совпадает с deliveredCommit, git cherry увидит «-»).
+  // Нетто-дифф стухшего deliveredCommit относительно main удалил бы app-switcher
+  // (stale_branch), но его патч (feature.js) уже присутствует в main.
+  mkdirSync(path.join(dir, 'packages', 'app-switcher'), { recursive: true });
+  writeFileSync(path.join(dir, 'packages', 'app-switcher', 'index.js'), 'export const app = 1;\n');
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '--quiet', '-m', 'main: app-switcher влит другой задачей']);
+  writeFileSync(path.join(dir, 'feature.js'), 'export const x = 1;\n'); // тот же контент/дифф, влит сиблингом
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '--quiet', '-m', 'programmer: task delta']); // patch-id == deliveredCommit
+  const mainHead = git(dir, ['rev-parse', 'HEAD']).trim();
+
+  // Ресинк: ветку пересинхронизировали на актуальный main (== rebase, выкинувший дельту).
+  git(dir, ['branch', '-f', 'programmer/PROJECT_2/PS-Torg-frontend', 'main']);
+
+  const res = await runGitAction(
+    {
+      id: 't-resync',
+      title: 'PS-Torg frontend',
+      worktreeBranch: 'programmer/PROJECT_2/PS-Torg-frontend',
+      deliveredCommit,
+      changedFiles: ['feature.js'],
+    },
+    { repoRoot: dir },
+  );
+
+  // Доставлять нечего (контент уже в main) — успех already_integrated_content, НЕ блок.
+  assert.notEqual(res.output.note, 'stale_branch_reverts_main', 'не должно быть stale-блока: дельта уже в main');
+  assert.equal(res.success, true, 'пересинканная ветка с уже влитой дельтой → успех');
+  assert.equal(res.output.note, 'already_integrated_content');
+  // main не откачен: app-switcher на месте, HEAD прежний.
+  assert.equal(git(dir, ['rev-parse', 'HEAD']).trim(), mainHead, 'main остаётся на прежнем HEAD');
+  assert.doesNotThrow(
+    () => git(dir, ['cat-file', '-e', 'main:packages/app-switcher/index.js']),
+    'влитый сиблингом файл не должен быть удалён стухшей доставкой',
+  );
+});
+
 test('runGitAction: ветка удаляет файл ТОЛЬКО внутри своего changed-set → доставка проходит штатно', async (t) => {
   const dir = initRepo(t);
 
