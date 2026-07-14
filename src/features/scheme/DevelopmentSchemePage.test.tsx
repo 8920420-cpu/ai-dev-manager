@@ -7,11 +7,12 @@ import type { DevelopmentScheme } from '../../api/developmentSchemeApi';
 
 // --- Моки сетевых клиентов страницы ---------------------------------------
 //
-// FORK-JOIN-001 / регресс TASK_REVIEWER: важно проверить путь ЗАГРУЗКИ страницы
-// (load), а не только сохранение. Backend может вернуть уже сохранённые рёбра,
-// в которых Documentation Auditor и Keeper стоят как ПАРАЛЛЕЛЬНЫЕ одноузловые
-// ветки (старая логика). Страница обязана вывести рёбра из узлов + ролей заново
-// (deriveSchemeEdges) и показать документационную ветку последовательно.
+// SCHEME-GRAPH-LAYOUT-001 — проверяем путь ЗАГРУЗКИ (load): сохранённые рёбра схемы
+// (`global_stage_edges`) — источник истины маршрута и НЕ подменяются клиентским
+// deriveSchemeEdges. В частности, УСЛОВНАЯ развилка Task Router (small→Mini Architect /
+// иначе→Architect) выражена именно рёбрами с condition — deriveSchemeEdges такие
+// рёбра не генерирует, поэтому подпись «small» на экране доказывает: рисуются
+// сохранённые рёбра, а не выведенные заново.
 
 const getMock = vi.fn();
 const getRuntimeMock = vi.fn();
@@ -36,35 +37,34 @@ vi.mock('../../api/tasksApi', () => ({
 import { ToastProvider } from '../../components/ui';
 import { DevelopmentSchemePage } from './DevelopmentSchemePage';
 
-// Роли документационной ветки и Git Integrator — сопоставление по каноническому коду.
 const ROLES: Role[] = [
-  { id: 'rDA', name: 'Documentation Auditor', code: 'DOCUMENTATION_AUDITOR' },
-  { id: 'rDK', name: 'Documentation Keeper', code: 'DOCUMENTATION_KEEPER' },
-  { id: 'rGI', name: 'Git Integrator', code: 'GIT_INTEGRATOR' },
+  { id: 'rIntake', name: 'Task Intake', code: 'TASK_INTAKE_OFFICER' },
+  { id: 'rRouter', name: 'Task Router', code: 'TASK_ROUTER' },
+  { id: 'rMini', name: 'Mini Architect', code: 'MINI_ARCHITECT' },
+  { id: 'rArch', name: 'Architect', code: 'ARCHITECT' },
+  { id: 'rProg', name: 'Programmer', code: 'PROGRAMMER' },
 ];
 
-// Узлы: fork → (Auditor, Keeper, Git Integrator) → join.
+// Узлы контура: Intake → Router → {Mini | Architect} → Programmer.
 const STAGES: Stage[] = [
-  { id: 'F', stageKey: 'F', kind: 'fork', name: 'Разделить', roleIds: [], enabled: true },
-  { id: 'DA', stageKey: 'DA', kind: 'stage', name: 'Documentation Auditor', roleIds: ['rDA'], enabled: true },
-  { id: 'DK', stageKey: 'DK', kind: 'stage', name: 'Documentation Keeper', roleIds: ['rDK'], enabled: true },
-  { id: 'GI', stageKey: 'GI', kind: 'stage', name: 'Git Integrator', roleIds: ['rGI'], enabled: true },
-  { id: 'J', stageKey: 'J', kind: 'join', name: 'Объединить', roleIds: [], enabled: true },
+  { id: 'intake', stageKey: 'intake', kind: 'stage', name: 'Приёмщик', roleIds: ['rIntake'], enabled: true },
+  { id: 'router', stageKey: 'router', kind: 'stage', name: 'Task Router', roleIds: ['rRouter'], enabled: true },
+  { id: 'mini', stageKey: 'mini', kind: 'stage', name: 'Mini Architect', roleIds: ['rMini'], enabled: true },
+  { id: 'arch', stageKey: 'arch', kind: 'stage', name: 'Architect', roleIds: ['rArch'], enabled: true },
+  { id: 'prog', stageKey: 'prog', kind: 'stage', name: 'Programmer', roleIds: ['rProg'], enabled: true },
 ];
 
-// Сохранённые «старые» рёбра: КАЖДЫЙ узел — отдельная параллельная ветка
-// (F→DA, DA→J, F→DK, DK→J, F→GI, GI→J) → тремя колонками. Именно из этого
-// состояния страница должна восстановить правильную двухколоночную раскладку.
-const LEGACY_PARALLEL_EDGES = [
-  { fromKey: 'F', toKey: 'DA', condition: null, position: 0 },
-  { fromKey: 'DA', toKey: 'J', condition: null, position: 1 },
-  { fromKey: 'F', toKey: 'DK', condition: null, position: 2 },
-  { fromKey: 'DK', toKey: 'J', condition: null, position: 3 },
-  { fromKey: 'F', toKey: 'GI', condition: null, position: 4 },
-  { fromKey: 'GI', toKey: 'J', condition: null, position: 5 },
+// Сохранённая УСЛОВНАЯ развилка: router→mini(small) / router→arch(fallback), обе ветки
+// сходятся на Programmer. Именно эти рёбра страница обязана нарисовать без подмены.
+const CONDITIONAL_EDGES = [
+  { fromKey: 'intake', toKey: 'router', condition: null, position: 0 },
+  { fromKey: 'router', toKey: 'mini', condition: 'small', position: 0 },
+  { fromKey: 'router', toKey: 'arch', condition: null, position: 1 },
+  { fromKey: 'mini', toKey: 'prog', condition: null, position: 0 },
+  { fromKey: 'arch', toKey: 'prog', condition: null, position: 0 },
 ];
 
-const SCHEME: DevelopmentScheme = { stages: STAGES, roles: ROLES, edges: LEGACY_PARALLEL_EDGES };
+const SCHEME: DevelopmentScheme = { stages: STAGES, roles: ROLES, edges: CONDITIONAL_EDGES };
 
 function renderPage(): ReturnType<typeof render> {
   const ui: ReactElement = (
@@ -86,26 +86,35 @@ afterEach(() => {
   cleanup();
 });
 
-describe('DevelopmentSchemePage — загрузка сохранённой схемы (регресс отображения)', () => {
-  it('при сохранённых «параллельных» рёбрах Auditor/Keeper рисует ровно две колонки: Auditor→Keeper и Git Integrator', async () => {
+describe('DevelopmentSchemePage — сохранённые рёбра рисуются без подмены deriveEdges', () => {
+  it('условная развилка Task Router из сохранённых рёбер: small→Mini Architect / иначе→Architect', async () => {
     renderPage();
 
-    // Дожидаемся готовности схемы: появился блок параллельных веток после fork.
-    const branchesGroup = await screen.findByRole('group', { name: 'Параллельные ветки' });
+    // Дожидаемся готовности схемы: появилось ветвление по условию.
+    const branchGroup = await screen.findByRole('group', { name: 'Ветвление по условию' });
 
-    // Ровно две ветки-колонки (а не три параллельные из сохранённых рёбер).
-    const branchEls = Array.from(branchesGroup.children) as HTMLElement[];
-    expect(branchEls).toHaveLength(2);
+    // Ровно две ветки-колонки.
+    const columns = Array.from(branchGroup.children) as HTMLElement[];
+    expect(columns).toHaveLength(2);
 
-    // Колонка 1 — документационная цепочка: Auditor сверху, Keeper под ним.
-    expect(within(branchEls[0]!).getByText('Documentation Auditor')).toBeInTheDocument();
-    expect(within(branchEls[0]!).getByText('Documentation Keeper')).toBeInTheDocument();
-    expect(within(branchEls[0]!).queryByText('Git Integrator')).not.toBeInTheDocument();
+    // Колонка 1 — ветка small с подписью условия и Mini Architect.
+    expect(within(columns[0]!).getByText('small')).toBeInTheDocument();
+    expect(within(columns[0]!).getByText('Mini Architect')).toBeInTheDocument();
+    expect(within(columns[0]!).queryByText('Architect')).not.toBeInTheDocument();
 
-    // Колонка 2 — отдельная параллельная ветка Git Integrator.
-    expect(within(branchEls[1]!).getByText('Git Integrator')).toBeInTheDocument();
-    expect(within(branchEls[1]!).queryByText('Documentation Auditor')).not.toBeInTheDocument();
-    expect(within(branchEls[1]!).queryByText('Documentation Keeper')).not.toBeInTheDocument();
+    // Колонка 2 — fallback («по умолчанию») и полный Architect.
+    expect(within(columns[1]!).getByText('по умолчанию')).toBeInTheDocument();
+    expect(within(columns[1]!).getByText('Architect')).toBeInTheDocument();
+
+    // Программист — узел схождения обеих веток (нарисован после развилки).
+    expect(screen.getByText('Programmer')).toBeInTheDocument();
+  });
+
+  it('подпись условия «small» есть только из сохранённых рёбер (deriveEdges их не создаёт)', async () => {
+    renderPage();
+    // Если бы страница выводила рёбра заново через deriveSchemeEdges, условных подписей
+    // не было бы вовсе — deriveSchemeEdges не генерирует condition-рёбра.
+    expect(await screen.findByText('small')).toBeInTheDocument();
   });
 
   it('вызывает загрузку схемы (get) при монтировании', async () => {

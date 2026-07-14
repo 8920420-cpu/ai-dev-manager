@@ -3,7 +3,7 @@ import { render, screen, within, fireEvent } from '@testing-library/react';
 import type { ReactElement } from 'react';
 import { ToastProvider } from '../../components/ui';
 import { SchemeFlowchart } from './SchemeFlowchart';
-import type { Role, Stage } from '../../types/project';
+import type { Role, SchemeEdge, Stage } from '../../types/project';
 
 // Роли-пресеты, участвующие в проверке ветвления исходов Task Reviewer.
 const PROG_ROLE: Role = { id: 'r-prog', name: 'Programmer', code: 'PROGRAMMER' };
@@ -157,5 +157,105 @@ describe('SchemeFlowchart — терминальный узел «Выполне
     expect(prev!.querySelector('.lucide-arrow-down')).not.toBeNull();
     // Это выделенный li-коннектор, а не карточка (в нём нет кнопок).
     expect(prev!.querySelector('button')).toBeNull();
+  });
+});
+
+// SCHEME-GRAPH-LAYOUT-001 — graph-mode: маршрут рисуется строго по рёбрам.
+describe('SchemeFlowchart — graph-mode (маршрут по рёбрам)', () => {
+  const ROUTER_ROLE: Role = { id: 'r-router', name: 'Task Router', code: 'TASK_ROUTER' };
+  const MINI_ROLE: Role = { id: 'r-mini', name: 'Mini Architect', code: 'MINI_ARCHITECT' };
+  const ARCH_ROLE: Role = { id: 'r-arch', name: 'Architect', code: 'ARCHITECT' };
+  const GRAPH_ROLES = [ROUTER_ROLE, MINI_ROLE, ARCH_ROLE, PROG_ROLE, REVIEWER_ROLE, PIPELINE_ROLE];
+
+  function gStage(id: string, roleId: string): Stage {
+    return { id, stageKey: id, kind: 'stage', name: id, roleIds: [roleId], enabled: true };
+  }
+
+  function renderGraph(stages: Stage[], edges: SchemeEdge[]) {
+    const ui: ReactElement = (
+      <SchemeFlowchart
+        stages={stages}
+        edges={edges}
+        roles={GRAPH_ROLES}
+        stageErrors={{}}
+        scanErrors={{}}
+        statusErrors={{}}
+        onAddStage={vi.fn()}
+        onRemoveStage={vi.fn()}
+        onRenameStage={vi.fn()}
+        onReorderStage={vi.fn()}
+        onSetStageRole={vi.fn()}
+        onSetStageEnabled={vi.fn()}
+        onSetStageScanPath={vi.fn()}
+        onSetStageStatus={vi.fn()}
+        onApplyDefaults={vi.fn()}
+      />
+    );
+    return render(ui);
+  }
+
+  it('условная развилка: обе ветви и condition-подписи видны, стрелки нарисованы', () => {
+    const stages = [
+      gStage('router', ROUTER_ROLE.id),
+      gStage('mini', MINI_ROLE.id),
+      gStage('arch', ARCH_ROLE.id),
+      gStage('prog', PROG_ROLE.id),
+    ];
+    const edges: SchemeEdge[] = [
+      { fromKey: 'router', toKey: 'mini', condition: 'small', position: 0 },
+      { fromKey: 'router', toKey: 'arch', condition: null, position: 1 },
+      { fromKey: 'mini', toKey: 'prog', position: 0 },
+      { fromKey: 'arch', toKey: 'prog', position: 0 },
+    ];
+    const { container } = renderGraph(stages, edges);
+
+    // Ветвление по условию с двумя колонками и подписями исходов.
+    const branchGroup = screen.getByRole('group', { name: 'Ветвление по условию' });
+    const columns = Array.from(branchGroup.children) as HTMLElement[];
+    expect(columns).toHaveLength(2);
+    expect(within(columns[0]!).getByText('small')).toBeInTheDocument();
+    expect(within(columns[0]!).getByText('Mini Architect')).toBeInTheDocument();
+    expect(within(columns[1]!).getByText('по умолчанию')).toBeInTheDocument();
+    expect(within(columns[1]!).getByText('Architect')).toBeInTheDocument();
+
+    // Programmer — узел схождения после развилки; терминал «Выполнено» у конца маршрута.
+    expect(screen.getByText('Programmer')).toBeInTheDocument();
+    expect(screen.getByText('Выполнено')).toBeInTheDocument();
+    // Все стрелки направлены вниз (коннекторы графа).
+    expect(container.querySelectorAll('.lucide-arrow-down').length).toBeGreaterThan(0);
+  });
+
+  it('ручной Task Reviewer-branch НЕ появляется, если рёбра задают линейный маршрут', () => {
+    const stages = [
+      gStage('prog', PROG_ROLE.id),
+      gStage('rev', REVIEWER_ROLE.id),
+      gStage('pipe', PIPELINE_ROLE.id),
+    ];
+    const edges: SchemeEdge[] = [
+      { fromKey: 'prog', toKey: 'rev', position: 0 },
+      { fromKey: 'rev', toKey: 'pipe', position: 1 },
+    ];
+    renderGraph(stages, edges);
+
+    // Хардкод-ветвление исходов Task Reviewer в graph-mode не рисуется — маршрут из рёбер.
+    expect(
+      screen.queryByRole('list', { name: /Исходы проверки Task Reviewer/i }),
+    ).not.toBeInTheDocument();
+    // Task Reviewer — обычный узел оси, за ним Pipeline Service.
+    expect(screen.getByText('Task Reviewer')).toBeInTheDocument();
+    expect(screen.getByText('Pipeline Service')).toBeInTheDocument();
+  });
+
+  it('недостижимый узел показан отдельной группой (не теряется)', () => {
+    const stages = [
+      gStage('a', PROG_ROLE.id),
+      gStage('b', REVIEWER_ROLE.id),
+      gStage('orphan', PIPELINE_ROLE.id),
+    ];
+    const edges: SchemeEdge[] = [{ fromKey: 'a', toKey: 'b', position: 0 }];
+    renderGraph(stages, edges);
+
+    const detached = screen.getByRole('group', { name: 'Недостижимые узлы' });
+    expect(within(detached).getByText('Pipeline Service')).toBeInTheDocument();
   });
 });

@@ -1,7 +1,8 @@
-import { Fragment, useState, type DragEvent } from 'react';
+import { Fragment, useState, type DragEvent, type ReactNode } from 'react';
 import {
   Activity,
   AlertCircle,
+  AlertTriangle,
   ArrowDown,
   CornerDownLeft,
   Diamond,
@@ -20,7 +21,12 @@ import { TASK_STATUSES, taskStatusLabel } from '../../data/taskStatuses';
 import { cn } from '../../lib/cn';
 import type { StageSaveErrorItem } from '../../api/projectsApi';
 import type { Role, SchemeEdge, Stage, StageKind } from '../../types/project';
-import { buildSchemeLayout, type LayoutItem, type PlacedNode } from './schemeLayout';
+import {
+  buildSchemeLayout,
+  type LayoutBranch,
+  type LayoutItem,
+  type PlacedNode,
+} from './schemeLayout';
 
 /** Метаданные типа узла блок-схемы для панели инструментов и рендера карточки. */
 const KIND_META: Record<Exclude<StageKind, 'stage'>, { label: string; hint: string }> = {
@@ -29,11 +35,10 @@ const KIND_META: Record<Exclude<StageKind, 'stage'>, { label: string; hint: stri
   condition: { label: 'Условие', hint: 'Ветвление по исходу: задача идёт по одной из веток' },
 };
 
-// «Тесты и анализ сбоя» — Pipeline Service (прогон тестов) и Failure Analyst
-// (диагност падения) образуют один логический шаг: тесты → при провале анализ
-// (при зелёных тестах анализ пропускается). Соседние этапы этих ролей показываем
-// одним визуальным блоком. Группировка чисто презентационная — маршрут/данные
-// этапов не меняются.
+// LEGACY-LINEAR-FALLBACK: «Тесты и анализ сбоя» — Pipeline Service (прогон тестов) и
+// Failure Analyst (диагност падения) образуют один логический шаг. Группировка чисто
+// презентационная и применяется ТОЛЬКО в linear-fallback (когда валидных рёбер нет).
+// В graph-mode ветвление берётся из рёбер, а не из соседства ролей по порядку.
 const TESTING_GROUP_ROLES = new Set(['PIPELINE_SERVICE', 'FAILURE_ANALYST']);
 const TESTING_GROUP_LABEL = 'Тесты и анализ сбоя';
 import { StageSettingsModal } from './StageSettingsModal';
@@ -44,8 +49,9 @@ import styles from './SchemeFlowchart.module.css';
 interface SchemeFlowchartProps {
   stages: Stage[];
   /**
-   * FORK-JOIN-001: рёбра графа схемы. Если заданы и соответствуют узлам — участок
-   * fork→join рисуется параллельными ветками (колонками); иначе раскладка линейна.
+   * SCHEME-GRAPH-LAYOUT-001: рёбра графа схемы (`global_stage_edges`). Если заданы и
+   * соответствуют узлам — маршрут рисуется ПО РЁБРАМ (graph-mode: ветвления, condition-
+   * подписи, схождения). Иначе — linear-fallback по порядку узлов.
    */
   edges?: SchemeEdge[];
   roles: Role[];
@@ -83,9 +89,10 @@ interface SchemeFlowchartProps {
 }
 
 /**
- * Блок-схема «Схемы разработки»: конвейер ролей в виде связанных карточек-узлов.
- * На карточке — номер этапа, роль, чекбокс включения и шестерёнка; вся подробная
- * настройка этапа открывается в модальном окне {@link StageSettingsModal}.
+ * Блок-схема «Разработка»: конвейер ролей в виде связанных карточек-узлов.
+ * Маршрут рисуется по РЁБРАМ графа (graph-mode): линейная ось, ветвления fork/condition
+ * с подписями исходов, схождение в merge, терминал «Выполнено» у реального конца и
+ * группа недостижимых узлов. Без валидных рёбер — linear-fallback по порядку узлов.
  */
 export function SchemeFlowchart({
   stages,
@@ -168,88 +175,48 @@ export function SchemeFlowchart({
       : [],
   );
 
-  // FORK-JOIN-001: раскладка — участок fork→join сворачивается в параллельные
-  // ветки (рисуются колонками рядом), остальное остаётся линейной цепочкой.
+  // SCHEME-GRAPH-LAYOUT-001: раскладка по рёбрам графа (или linear-fallback).
   const layout = buildSchemeLayout(stages, edges ?? []);
 
-  // Код роли этапа (для группировки «Тесты и анализ сбоя»).
-  const roleCodeOfStage = (stage: Stage): string =>
-    roles.find((r) => r.id === stage.roleIds[0])?.code ?? '';
-
-  // Единицы рендера: соседние линейные узлы ролей из TESTING_GROUP_ROLES
-  // сворачиваются в один групповой блок. Остальные элементы раскладки (включая
-  // параллельные fork→join) остаются как есть.
-  type RenderUnit =
-    | { type: 'group'; key: string; nodes: PlacedNode[] }
-    | { type: 'layout'; key: string; item: LayoutItem };
-  const renderUnits: RenderUnit[] = [];
-  for (const item of layout) {
-    const inGroup =
-      item.type === 'node' && TESTING_GROUP_ROLES.has(roleCodeOfStage(item.node.stage));
-    const prev = renderUnits[renderUnits.length - 1];
-    if (inGroup && prev && prev.type === 'group') {
-      prev.nodes.push(item.node);
-    } else if (inGroup && item.type === 'node') {
-      renderUnits.push({ type: 'group', key: `grp-${item.node.stage.id}`, nodes: [item.node] });
-    } else {
-      const key = item.type === 'node' ? item.node.stage.id : item.fork.stage.id;
-      renderUnits.push({ type: 'layout', key, item });
+  // Порядковые номера карточек — по ПОРЯДКУ ОБХОДА графа (а не по позиции в массиве:
+  // в БД узлы могут стоять не в порядке маршрута). Для linear-fallback номер = index+1.
+  const seq = new Map<string, number>();
+  if (layout.mode === 'graph') {
+    let n = 0;
+    const number = (items: LayoutItem[]): void => {
+      for (const it of items) {
+        if (it.type === 'node') {
+          n += 1;
+          seq.set(it.node.stage.id, n);
+        } else {
+          n += 1;
+          seq.set(it.parent.stage.id, n);
+          for (const b of it.branches) number(b.items);
+        }
+      }
+    };
+    number(layout.items);
+    for (const pn of layout.detached) {
+      n += 1;
+      seq.set(pn.stage.id, n);
     }
   }
 
-  // Инвариант схемы: трейлинг-стрелка последнего юнита ведёт в узел «Выполнено».
-  // Он держится для групп, одиночных узлов и участка fork→join (все они
-  // заканчиваются обычным connector), но НАРУШАЕТСЯ, когда последний юнит —
-  // карточка Task Reviewer: у неё вместо стрелки вниз рисуется ветвление исходов
-  // (reviewOutcomes). В этом случае добавляем явную стрелку перед «Выполнено».
-  const lastUnit = renderUnits[renderUnits.length - 1];
-  const needsFinishConnector =
-    lastUnit?.type === 'layout' &&
-    lastUnit.item.type === 'node' &&
-    roleCodeOfStage(lastUnit.item.node.stage) === 'TASK_REVIEWER';
+  // Код роли этапа (для linear-fallback: группировка «Тесты и анализ сбоя»).
+  const roleCodeOfStage = (stage: Stage): string =>
+    roles.find((r) => r.id === stage.roleIds[0])?.code ?? '';
 
-  const connector = (
-    <div className={styles.connector} aria-hidden="true">
+  const connectorEl = (key?: string): ReactNode => (
+    <div key={key} className={styles.connector} aria-hidden="true">
       <ArrowDown size={16} />
     </div>
   );
 
-  // Исходы проверки Task Reviewer вынесены ЗА карточку: две стрелки-ответвления с
-  // подписями. «Ошибка → Programmer» — боковое ответвление с загибом (CornerDownLeft,
-  // красный); «Успех → Pipeline Service» — совмещён с обычным коннектором вниз к
-  // следующему этапу (ArrowDown, зелёный). Список исходов сохраняет aria-разметку.
-  const reviewOutcomes = (
-    <div
-      className={styles.reviewOutcomes}
-      role="list"
-      aria-label="Исходы проверки Task Reviewer"
-    >
-      <span
-        className={cn(styles.reviewOutcome, styles.reviewOutcomeError)}
-        role="listitem"
-      >
-        <CornerDownLeft className={styles.reviewOutcomeIcon} size={16} aria-hidden="true" />
-        <span className={styles.reviewOutcomeText}>
-          <span className={styles.reviewOutcomeLabel}>Ошибка</span>
-          <span className={styles.reviewOutcomeTarget}>Programmer</span>
-        </span>
-      </span>
-      <span
-        className={cn(styles.reviewOutcome, styles.reviewOutcomeSuccess)}
-        role="listitem"
-      >
-        <ArrowDown className={styles.reviewOutcomeIcon} size={16} aria-hidden="true" />
-        <span className={styles.reviewOutcomeText}>
-          <span className={styles.reviewOutcomeLabel}>Успех</span>
-          <span className={styles.reviewOutcomeTarget}>Pipeline Service</span>
-        </span>
-      </span>
-    </div>
-  );
-
-  // Карточка одного узла-этапа. Вынесена из рендера, чтобы переиспользовать её и
-  // в линейной цепочке, и внутри колонок параллельных веток.
+  // Карточка одного узла-этапа. Переиспользуется в линейной цепочке, в колонках
+  // параллельных веток и в группе недостижимых узлов. Номер берётся из seq (порядок
+  // обхода графа), с откатом на index+1 (linear-fallback).
   const renderCard = (stage: Stage, index: number) => {
+    const displayNo = seq.get(stage.id) ?? index + 1;
     const enabled = stage.enabled === true;
     const kind = stage.kind ?? 'stage';
     const control = kind !== 'stage';
@@ -259,7 +226,7 @@ export function SchemeFlowchart({
       stageErrors[stage.id] || scanErrors[stage.id] || statusErrors[stage.id],
     );
     const stageLabel =
-      stage.name.trim() || (control ? KIND_META[kind].label : `Этап ${index + 1}`);
+      stage.name.trim() || (control ? KIND_META[kind].label : `Этап ${displayNo}`);
     // Перезапущенные задачи (статус RESTART) стоят в очереди именно к Приёмщику
     // задач — учитываем их в счётчике его этапа, иначе они «пропадают» из схемы.
     const restartHere = role?.code === 'TASK_INTAKE_OFFICER' ? taskCounts['RESTART'] ?? 0 : 0;
@@ -317,7 +284,7 @@ export function SchemeFlowchart({
             <GripVertical size={16} aria-hidden="true" />
           </button>
           <span className={cn(styles.number, control && styles.numberControl)}>
-            {index + 1}
+            {displayNo}
           </span>
           {control && (
             <span className={styles.kindTag}>
@@ -510,109 +477,14 @@ export function SchemeFlowchart({
         </div>
       )}
 
-      <ol className={styles.flow}>
-        <li className={styles.startNode} aria-hidden="true">
-          <span className={styles.startDot} />
-          Старт
-        </li>
-        <li className={styles.connector} aria-hidden="true">
-          <ArrowDown size={16} />
-        </li>
-
-        {renderUnits.map((unit) => {
-          // Групповой блок «Тесты и анализ сбоя». Один узел в группе (напр. когда
-          // Failure Analyst удалён) рисуем обычной карточкой — без рамки группы.
-          if (unit.type === 'group') {
-            if (unit.nodes.length === 1) {
-              const { stage, index } = unit.nodes[0]!;
-              return (
-                <li key={unit.key} className={styles.nodeWrap}>
-                  {renderCard(stage, index)}
-                  {connector}
-                </li>
-              );
-            }
-            return (
-              <li key={unit.key} className={styles.nodeWrap}>
-                <div className={styles.groupBlock} role="group" aria-label={TESTING_GROUP_LABEL}>
-                  <span className={styles.groupLabel}>{TESTING_GROUP_LABEL}</span>
-                  {unit.nodes.map((pn, ni) => (
-                    <Fragment key={pn.stage.id}>
-                      {renderCard(pn.stage, pn.index)}
-                      {ni < unit.nodes.length - 1 && connector}
-                    </Fragment>
-                  ))}
-                </div>
-                {connector}
-              </li>
-            );
-          }
-          const { item } = unit;
-          if (item.type === 'node') {
-            const { stage, index } = item.node;
-            // Task Reviewer: исходы проверки выносим ЗА карточку — вместо обычного
-            // коннектора рисуем ветвление «Успех → Pipeline Service / Ошибка → Programmer».
-            const isReviewer = roleCodeOfStage(stage) === 'TASK_REVIEWER';
-            return (
-              <li key={stage.id} className={styles.nodeWrap}>
-                {renderCard(stage, index)}
-                {isReviewer ? reviewOutcomes : connector}
-              </li>
-            );
-          }
-          // FORK-JOIN-001: участок fork → [ветки колонками] → join.
-          const { fork, branches, join } = item;
-          return (
-            <li key={fork.stage.id} className={styles.nodeWrap}>
-              {renderCard(fork.stage, fork.index)}
-              {connector}
-              <div
-                className={styles.branches}
-                role="group"
-                aria-label="Параллельные ветки"
-              >
-                {branches.map((branch, bi) => (
-                  <div key={branch[0]?.stage.id ?? `branch-${bi}`} className={styles.branch}>
-                    {branch.map((pn, ni) => (
-                      <Fragment key={pn.stage.id}>
-                        {renderCard(pn.stage, pn.index)}
-                        {ni < branch.length - 1 && connector}
-                      </Fragment>
-                    ))}
-                  </div>
-                ))}
-              </div>
-              {connector}
-              {renderCard(join.stage, join.index)}
-              {connector}
-            </li>
-          );
-        })}
-
-        {/* Когда последний юнит — Task Reviewer, его трейлинг-блок это ветвление
-            исходов (без стрелки вниз). Добавляем явный коннектор, чтобы к узлу
-            «Выполнено» вела стрелка. */}
-        {needsFinishConnector && (
-          <li className={styles.connector} aria-hidden="true">
-            <ArrowDown size={16} />
-          </li>
-        )}
-
-        {/* Терминальный узел «Выполнено» — симметричен «Старту»: декоративная
-            пилюля с точкой-индикатором в тоне success. Трейлинг-стрелка
-            последнего этапа/join естественно ведёт в него. */}
-        <li className={styles.finishNode} aria-hidden="true">
-          <span className={styles.finishDot} />
-          Выполнено
-        </li>
-
-        <li className={styles.addNodeWrap}>
-          <button type="button" className={styles.addNode} onClick={onAddStage}>
-            <Plus size={18} aria-hidden="true" />
-            Добавить этап
-          </button>
-        </li>
-      </ol>
+      {layout.mode === 'graph'
+        ? renderGraphFlow(layout, { renderCard, connectorEl, onAddStage })
+        : renderLinearFlow(stages, {
+            renderCard,
+            connectorEl,
+            onAddStage,
+            roleCodeOfStage,
+          })}
 
       {openStage && (
         <StageSettingsModal
@@ -663,6 +535,298 @@ export function SchemeFlowchart({
         }}
         onCancel={() => setConfirmDefaults(false)}
       />
+
+      {/* Ветвление исходов Task Reviewer (linear-fallback) вынесено в renderLinearFlow. */}
     </div>
   );
+
+  // ======================================================================
+  // GRAPH-MODE РЕНДЕР — маршрут строго по рёбрам графа.
+  // ======================================================================
+  function renderGraphFlow(
+    lay: ReturnType<typeof buildSchemeLayout>,
+    ctx: {
+      renderCard: (stage: Stage, index: number) => ReactNode;
+      connectorEl: (key?: string) => ReactNode;
+      onAddStage: () => void;
+    },
+  ): ReactNode {
+    // Подпись условной ветки: значение condition или «по умолчанию» для fallback-ребра.
+    const branchLabel = (branch: LayoutBranch, kind: 'fork' | 'condition'): ReactNode => {
+      if (kind !== 'condition') return null;
+      const text = branch.condition ?? 'по умолчанию';
+      return (
+        <span className={styles.branchLabel} title={`Условие перехода: ${text}`}>
+          {text}
+        </span>
+      );
+    };
+
+    // Последовательность элементов оси/колонки: карточки/ветвления + коннекторы между.
+    const renderSequence = (items: LayoutItem[], keyBase: string): ReactNode[] => {
+      const out: ReactNode[] = [];
+      items.forEach((item, i) => {
+        out.push(renderItem(item, `${keyBase}-${i}`));
+        if (i < items.length - 1) out.push(ctx.connectorEl(`${keyBase}-c${i}`));
+      });
+      return out;
+    };
+
+    const renderColumn = (
+      branch: LayoutBranch,
+      kind: 'fork' | 'condition',
+      hasMerge: boolean,
+      key: string,
+    ): ReactNode => (
+      <div key={key} className={styles.branch}>
+        <div className={styles.branchHead}>{branchLabel(branch, kind)}</div>
+        {branch.items.length > 0 ? (
+          renderSequence(branch.items, `${key}-seq`)
+        ) : (
+          // Пустая ветка (прямой переход к merge) — тонкая проходная связь.
+          <div className={styles.branchPassthrough} aria-hidden="true" />
+        )}
+        {/* Хвост-заполнитель тянет вертикаль ветки до шины схождения (fan-in). */}
+        {hasMerge && <div className={styles.branchTail} aria-hidden="true" />}
+      </div>
+    );
+
+    const renderItem = (item: LayoutItem, key: string): ReactNode => {
+      if (item.type === 'node') {
+        return (
+          <div key={key} className={styles.nodeWrap}>
+            {ctx.renderCard(item.node.stage, item.node.index)}
+          </div>
+        );
+      }
+      const { parent, kind, branches, merge, incomplete } = item;
+      const groupLabel = kind === 'condition' ? 'Ветвление по условию' : 'Параллельные ветки';
+      return (
+        <div key={key} className={styles.branchBlock}>
+          <div className={styles.nodeWrap}>
+            {ctx.renderCard(parent.stage, parent.index)}
+            {incomplete && (
+              <span className={styles.todoBadge}>
+                <AlertTriangle size={13} aria-hidden="true" />
+                TODO: у ветвления меньше двух ветвей
+              </span>
+            )}
+          </div>
+          {ctx.connectorEl(`${key}-fanout`)}
+          <div
+            className={cn(styles.branches, merge && styles.branchesMerge)}
+            role="group"
+            aria-label={groupLabel}
+          >
+            {branches.map((b, bi) =>
+              renderColumn(b, kind, Boolean(merge), `${key}-b${bi}`),
+            )}
+          </div>
+        </div>
+      );
+    };
+
+    const lastItem = lay.items[lay.items.length - 1];
+    const endsAtTerminal =
+      lastItem !== undefined && lastItem.type === 'node' && lastItem.terminal;
+
+    return (
+      <div className={styles.flow}>
+        <div className={styles.startNode} aria-hidden="true">
+          <span className={styles.startDot} />
+          Старт
+        </div>
+        {ctx.connectorEl('start-c')}
+
+        {lay.items.length > 0 ? (
+          <>
+            {lay.items.map((item, i) => (
+              <Fragment key={`g-${i}`}>
+                {renderItem(item, `g-${i}`)}
+                {i < lay.items.length - 1 && ctx.connectorEl(`g-c${i}`)}
+              </Fragment>
+            ))}
+            {/* Терминал «Выполнено» — только если реальный конец маршрута (нет исходящих). */}
+            {endsAtTerminal && (
+              <>
+                {ctx.connectorEl('finish-c')}
+                <div className={styles.finishNode} aria-hidden="true">
+                  <span className={styles.finishDot} />
+                  Выполнено
+                </div>
+              </>
+            )}
+          </>
+        ) : (
+          <Callout tone="warning">Нет входа графа — проверьте рёбра схемы.</Callout>
+        )}
+
+        {lay.hasCycle && (
+          <div className={styles.cycleNote} role="note">
+            <AlertTriangle size={14} aria-hidden="true" />
+            В графе есть цикл: маршрут показан до повторного узла.
+          </div>
+        )}
+
+        {lay.detached.length > 0 && (
+          <div
+            className={styles.detachedGroup}
+            role="group"
+            aria-label="Недостижимые узлы"
+          >
+            <span className={styles.detachedLabel}>
+              <AlertTriangle size={13} aria-hidden="true" />
+              TODO: недостижимые узлы (нет пути из старта)
+            </span>
+            {lay.detached.map((pn) => (
+              <div key={pn.stage.id} className={styles.nodeWrap}>
+                {ctx.renderCard(pn.stage, pn.index)}
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className={styles.addNodeWrap}>
+          <button type="button" className={styles.addNode} onClick={ctx.onAddStage}>
+            <Plus size={18} aria-hidden="true" />
+            Добавить этап
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // ======================================================================
+  // LINEAR-FALLBACK РЕНДЕР — обратная совместимость, когда валидных рёбер нет.
+  // Маршрут по порядку узлов; презентационные группировки (Тесты и анализ сбоя,
+  // ветвление исходов Task Reviewer) допустимы ТОЛЬКО здесь и изолированы от graph-mode.
+  // ======================================================================
+  function renderLinearFlow(
+    linStages: Stage[],
+    ctx: {
+      renderCard: (stage: Stage, index: number) => ReactNode;
+      connectorEl: (key?: string) => ReactNode;
+      onAddStage: () => void;
+      roleCodeOfStage: (stage: Stage) => string;
+    },
+  ): ReactNode {
+    const connector = ctx.connectorEl();
+
+    // Исходы проверки Task Reviewer вынесены ЗА карточку: две стрелки-ответвления с
+    // подписями. Чисто презентационно (в отсутствие рёбер), aria-разметка сохранена.
+    const reviewOutcomes = (
+      <div
+        className={styles.reviewOutcomes}
+        role="list"
+        aria-label="Исходы проверки Task Reviewer"
+      >
+        <span className={cn(styles.reviewOutcome, styles.reviewOutcomeError)} role="listitem">
+          <CornerDownLeft className={styles.reviewOutcomeIcon} size={16} aria-hidden="true" />
+          <span className={styles.reviewOutcomeText}>
+            <span className={styles.reviewOutcomeLabel}>Ошибка</span>
+            <span className={styles.reviewOutcomeTarget}>Programmer</span>
+          </span>
+        </span>
+        <span className={cn(styles.reviewOutcome, styles.reviewOutcomeSuccess)} role="listitem">
+          <ArrowDown className={styles.reviewOutcomeIcon} size={16} aria-hidden="true" />
+          <span className={styles.reviewOutcomeText}>
+            <span className={styles.reviewOutcomeLabel}>Успех</span>
+            <span className={styles.reviewOutcomeTarget}>Pipeline Service</span>
+          </span>
+        </span>
+      </div>
+    );
+
+    // Единицы рендера: соседние узлы ролей из TESTING_GROUP_ROLES сворачиваются в один
+    // групповой блок «Тесты и анализ сбоя».
+    type RenderUnit =
+      | { type: 'group'; key: string; nodes: PlacedNode[] }
+      | { type: 'node'; key: string; node: PlacedNode };
+    const renderUnits: RenderUnit[] = [];
+    linStages.forEach((stage, index) => {
+      const node: PlacedNode = { stage, index };
+      const inGroup = TESTING_GROUP_ROLES.has(ctx.roleCodeOfStage(stage));
+      const prev = renderUnits[renderUnits.length - 1];
+      if (inGroup && prev && prev.type === 'group') {
+        prev.nodes.push(node);
+      } else if (inGroup) {
+        renderUnits.push({ type: 'group', key: `grp-${stage.id}`, nodes: [node] });
+      } else {
+        renderUnits.push({ type: 'node', key: stage.id, node });
+      }
+    });
+
+    // Инвариант: трейлинг-стрелка последнего юнита ведёт в «Выполнено». Нарушается,
+    // когда последний юнит — карточка Task Reviewer (вместо стрелки — ветвление исходов).
+    const lastUnit = renderUnits[renderUnits.length - 1];
+    const needsFinishConnector =
+      lastUnit?.type === 'node' &&
+      ctx.roleCodeOfStage(lastUnit.node.stage) === 'TASK_REVIEWER';
+
+    return (
+      <ol className={styles.flow}>
+        <li className={styles.startNode} aria-hidden="true">
+          <span className={styles.startDot} />
+          Старт
+        </li>
+        <li className={styles.connector} aria-hidden="true">
+          <ArrowDown size={16} />
+        </li>
+
+        {renderUnits.map((unit) => {
+          if (unit.type === 'group') {
+            if (unit.nodes.length === 1) {
+              const { stage, index } = unit.nodes[0]!;
+              return (
+                <li key={unit.key} className={styles.nodeWrap}>
+                  {ctx.renderCard(stage, index)}
+                  {connector}
+                </li>
+              );
+            }
+            return (
+              <li key={unit.key} className={styles.nodeWrap}>
+                <div className={styles.groupBlock} role="group" aria-label={TESTING_GROUP_LABEL}>
+                  <span className={styles.groupLabel}>{TESTING_GROUP_LABEL}</span>
+                  {unit.nodes.map((pn, ni) => (
+                    <Fragment key={pn.stage.id}>
+                      {ctx.renderCard(pn.stage, pn.index)}
+                      {ni < unit.nodes.length - 1 && connector}
+                    </Fragment>
+                  ))}
+                </div>
+                {connector}
+              </li>
+            );
+          }
+          const { stage, index } = unit.node;
+          const isReviewer = ctx.roleCodeOfStage(stage) === 'TASK_REVIEWER';
+          return (
+            <li key={stage.id} className={styles.nodeWrap}>
+              {ctx.renderCard(stage, index)}
+              {isReviewer ? reviewOutcomes : connector}
+            </li>
+          );
+        })}
+
+        {needsFinishConnector && (
+          <li className={styles.connector} aria-hidden="true">
+            <ArrowDown size={16} />
+          </li>
+        )}
+
+        <li className={styles.finishNode} aria-hidden="true">
+          <span className={styles.finishDot} />
+          Выполнено
+        </li>
+
+        <li className={styles.addNodeWrap}>
+          <button type="button" className={styles.addNode} onClick={ctx.onAddStage}>
+            <Plus size={18} aria-hidden="true" />
+            Добавить этап
+          </button>
+        </li>
+      </ol>
+    );
+  }
 }

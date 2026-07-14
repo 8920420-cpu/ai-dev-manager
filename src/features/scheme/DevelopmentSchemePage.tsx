@@ -11,6 +11,7 @@ import { wizardReducer, type WizardState } from '../projects/wizardState';
 import { RouteHealthPanel } from '../projects/RouteHealthPanel';
 import { SchemeFlowchart } from './SchemeFlowchart';
 import { deriveSchemeEdges } from './deriveEdges';
+import { edgesMatchStages } from './schemeLayout';
 import styles from './scheme.module.css';
 
 type LoadState = 'loading' | 'error' | 'ready';
@@ -86,14 +87,20 @@ export function DevelopmentSchemePage() {
         developmentSchemeApi.get(),
         developmentSchemeApi.getRuntime(),
       ]);
-      // FORK-JOIN-001: рёбра для ОТОБРАЖЕНИЯ выводим из узлов + ролей теми же
-      // правилами, что и при сохранении (deriveSchemeEdges) — единый источник рёбер.
-      // Иначе уже сохранённая схема со старыми рёбрами (Documentation Auditor и
-      // Keeper как параллельные ветки) рисовалась бы неверно до повторного
-      // сохранения. Группировка документационной ветки Auditor → Keeper видна сразу.
-      const derived = deriveSchemeEdges(scheme.stages, scheme.roles);
-      dispatch({ type: 'reset', state: toWizardState({ ...scheme, stages: derived.stages }) });
-      setEdges(derived.edges);
+      // SCHEME-GRAPH-LAYOUT-001 — источник истины маршрута: СОХРАНЁННЫЕ рёбра схемы
+      // (`global_stage_edges`). Их и рисуем, когда они валидны (ссылаются на узлы): в
+      // них выражены реальные развилки (Task Router small→Mini Architect / иначе→Architect,
+      // последовательность Documentation Auditor→Keeper, пост-join Git Integrator).
+      // deriveSchemeEdges здесь НЕ подменяет их — это лишь фолбэк авторинга для схем БЕЗ
+      // сохранённых рёбер (обратная совместимость), изолированный от graph-mode.
+      if (edgesMatchStages(scheme.stages, scheme.edges)) {
+        dispatch({ type: 'reset', state: toWizardState(scheme) });
+        setEdges(scheme.edges);
+      } else {
+        const derived = deriveSchemeEdges(scheme.stages, scheme.roles);
+        dispatch({ type: 'reset', state: toWizardState({ ...scheme, stages: derived.stages }) });
+        setEdges(derived.edges);
+      }
       setOrchestratorEnabled(runtime.orchestratorEnabled);
       setLoadState('ready');
     } catch {

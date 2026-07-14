@@ -643,35 +643,215 @@
   max-width: none;
 }
 
-/* ---- Параллельные ветки (fork → колонки → join) ---- */
-/* align-items: stretch — колонки-ветки тянутся до высоты самой длинной, чтобы
-   их блоки были выровнены по высоте независимо от числа узлов в ветке. */
+/* ==== GRAPH-MODE: ветвления графа (fork / condition) ==================== */
+
+/* Блок ветвления: родитель → шина ветвления → колонки-ветки. */
+.branchBlock {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+}
+
+/* Колонки-ветки. Ширина стабильна, align-items: stretch выравнивает высоту, чтобы
+   шина схождения (fan-in) снизу выстроилась в одну линию у веток разной длины. */
 .branches {
   display: flex;
   flex-wrap: wrap;
   align-items: stretch;
   justify-content: center;
-  gap: var(--space-4);
+  gap: var(--space-6);
   width: 100%;
-  padding: var(--space-3) 0;
+  padding-top: 0;
 }
 
-/* justify-content: center — узлы внутри ветки центрируются по вертикали, поэтому
-   одноузловая ветка (напр. Git Integrator) встаёт по центру высоты против
-   многоузловой соседки (Documentation Auditor → Documentation Keeper). */
 .branch {
+  position: relative;
   flex: 1 1 0;
-  min-width: 270px;
-  max-width: 310px;
+  min-width: 250px;
+  max-width: 320px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
-  padding: var(--space-2) 0;
 }
 
 /* Внутри ветки карточки занимают всю ширину колонки. */
-.branch .node {
+.branch .node,
+.branch .branchBlock {
+  max-width: none;
+}
+
+/* Голова колонки: горизонтальная шина ветвления (fan-out) + вертикальный спуск к
+   первой карточке; по центру головы — подпись условия (для condition-веток). */
+.branchHead {
+  position: relative;
+  width: 100%;
+  min-height: 36px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  padding-bottom: var(--space-2);
+}
+
+/* Горизонтальная шина: сегмент этой колонки заходит в gap с обеих сторон, чтобы
+   сомкнуться с соседними сегментами в одну непрерывную линию. */
+.branchHead::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: calc(-1 * var(--space-6) / 2 - 1px);
+  right: calc(-1 * var(--space-6) / 2 - 1px);
+  height: 2px;
+  background: var(--border);
+}
+
+/* Крайние колонки: обрезаем шину до центра карточки, чтобы не свисала за края. */
+.branch:first-child .branchHead::before {
+  left: 50%;
+}
+
+.branch:last-child .branchHead::before {
+  right: 50%;
+}
+
+/* Вертикальный спуск от шины к карточке (подпись условия маскирует его своим фоном). */
+.branchHead::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-1px);
+  background: var(--border);
+}
+
+/* Подпись условного перехода (condition) — warning-тон, по центру шины. */
+.branchLabel {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--warning-soft);
+  border: 1px solid var(--warning);
+  color: var(--warning-text);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Пустая ветка (прямой переход к merge) — короткая проходная линия. */
+.branchPassthrough {
+  width: 2px;
+  height: var(--space-6);
+  background: var(--border);
+}
+
+/* Хвост колонки: тянет вертикаль до низа блока; для .branchesMerge внизу — шина
+   схождения (fan-in), симметричная fan-out. */
+.branchTail {
+  position: relative;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: var(--space-4);
+}
+
+.branchTail::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 50%;
+  width: 2px;
+  transform: translateX(-1px);
+  background: var(--border);
+}
+
+.branchesMerge .branchTail::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: calc(-1 * var(--space-6) / 2 - 1px);
+  right: calc(-1 * var(--space-6) / 2 - 1px);
+  height: 2px;
+  background: var(--border);
+}
+
+.branchesMerge .branch:first-child .branchTail::after {
+  left: 50%;
+}
+
+.branchesMerge .branch:last-child .branchTail::after {
+  right: 50%;
+}
+
+/* Пометка неполного ветвления (condition/fork с <2 ветвями) — TODO. */
+.todoBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: var(--space-2);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--warning-soft);
+  border: 1px solid var(--warning);
+  color: var(--warning-text);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+}
+
+/* Заметка о цикле в графе. */
+.cycleNote {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  background: var(--warning-soft);
+  border: 1px solid var(--warning);
+  color: var(--warning-text);
+  font-size: var(--text-sm);
+}
+
+/* Группа недостижимых узлов (нет пути из старта) — danger-тон, отдельно от оси. */
+.detachedGroup {
+  position: relative;
+  width: 100%;
+  max-width: 340px;
+  margin-top: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-5) var(--space-3) var(--space-3);
+  border: 1px dashed var(--danger);
+  border-radius: var(--radius-xl);
+  background: var(--danger-soft);
+}
+
+.detachedLabel {
+  position: absolute;
+  top: calc(-1 * var(--space-2));
+  left: var(--space-4);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-full);
+  background: var(--surface);
+  border: 1px solid var(--danger);
+  color: var(--danger-text);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-semibold);
+}
+
+.detachedGroup .node {
   max-width: none;
 }
 
@@ -679,6 +859,19 @@
   .branches {
     flex-direction: column;
     align-items: center;
+    gap: var(--space-2);
+  }
+
+  /* На узком экране колонки идут вертикально — шины/хвосты скрываем, чтобы не
+     висели поперёк вертикальной раскладки. */
+  .branchHead::before,
+  .branchTail::after {
+    display: none;
+  }
+
+  .branchTail {
+    flex: none;
+    min-height: var(--space-2);
   }
 }
 
