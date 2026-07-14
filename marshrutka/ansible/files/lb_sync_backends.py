@@ -16,14 +16,20 @@ import urllib.request
 
 BALANCER_ID = 134251
 API = "https://api.timeweb.cloud/api/v1/balancers/%d/ips" % BALANCER_ID
-STATIC_IPS = {"195.98.86.63"}  # базовая (giga) — статический WAN
+# Основной backend — timeweb-vpn (nginx-stream релей :30443 через WireGuard к
+# нодам k3s 10.10.8.9/.8). Заменил giga 195.98.86.63 14.07.2026: прямой giga-NAT
+# давал плавающие 504/долгий TTFB под конкурентной нагрузкой LB, а WG-путь чист
+# (150/150 под нагрузкой). Возврат giga в active-ротацию вернёт блипы (round-robin).
+STATIC_IPS = {"72.56.73.96"}
 DDNS_NAMES = [
     "kaskadvrn.keenetic.link",  # Каскад
     "psvrn.keenetic.link",      # Барикадная
 ]
-# Бэкенды, которые скрипт не трогает, даже если их нет в желаемом списке
-# (запасной вход через VPN-сервер, может добавляться руками при инцидентах):
-KEEP_EXTRA = {"72.56.73.96"}
+# Бэкенды, которые скрипт НЕ форсит, но и НЕ удаляет, если добавлены руками.
+# giga 195.98.86.63 — аварийный прямой вход: при инциденте с VPN-релеем ops
+# может вернуть его руками (POST .../ips), вотчдог не снесёт. В штатном режиме
+# giga вне ротации, чтобы не возвращать giga-NAT блипы.
+KEEP_EXTRA = {"195.98.86.63"}
 
 DRY_RUN = "--dry-run" in sys.argv[1:]
 TOKEN = os.environ.get("TIMEWEB_CLOUD_TOKEN", "")
