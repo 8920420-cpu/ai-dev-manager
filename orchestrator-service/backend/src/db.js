@@ -1611,8 +1611,7 @@ export async function autoAcceptDoneTasks(c) {
 export async function acceptTaskTx(c, taskId) {
   const id = String(taskId ?? '').trim();
   if (!id) throw scannerError(422, 'task_required');
-  await c.query('BEGIN');
-  try {
+  return withTransaction(c, async () => {
     const cur = await c.query(
       `SELECT id, status::text AS status, accepted_at FROM tasks WHERE id = $1 FOR UPDATE`,
       [id],
@@ -1632,12 +1631,8 @@ export async function acceptTaskTx(c, taskId) {
        VALUES ($1, 'TASK_UPDATED', 'DONE'::task_status, 'DONE'::task_status, NULL, $2::jsonb)`,
       [id, JSON.stringify({ source: 'manual-accept', via: 'acceptance-gate' })],
     );
-    await c.query('COMMIT');
     return { accepted: true, taskId: id };
-  } catch (error) {
-    await c.query('ROLLBACK');
-    throw error;
-  }
+  });
 }
 
 // Найти сервис по (project, code) или СОЗДАТЬ его (авто-регистрация при импорте).
