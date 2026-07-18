@@ -3575,8 +3575,7 @@ async function advanceSkippedStageRoles(c) {
     const nextRoleId = !nextRoleCode
       ? null
       : await roleIdByCode(c, nextRoleCode);
-    await c.query('BEGIN');
-    try {
+    const updated = await withTransaction(c, async () => {
       const upd = await c.query(
         `UPDATE tasks SET status = $2::task_status, current_role_id = $3
           WHERE id = $1 AND assigned_agent_id IS NULL AND status NOT IN ('DONE','CANCELLED')`,
@@ -3600,13 +3599,10 @@ async function advanceSkippedStageRoles(c) {
             }),
           ],
         );
-        moved += 1;
       }
-      await c.query('COMMIT');
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+      return upd.rowCount > 0;
+    });
+    if (updated) moved += 1;
   }
   return moved;
 }
