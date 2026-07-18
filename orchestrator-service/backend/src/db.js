@@ -3641,8 +3641,7 @@ export async function advanceForkNodes(c) {
     const joinGate = await c.query(`SELECT id FROM roles WHERE code = 'JOIN_GATE'`);
     const joinGateId = joinGate.rows[0]?.id ?? null;
     const card = parseDataCard(p);
-    await c.query('BEGIN');
-    try {
+    await withTransaction(c, async () => {
       const childIds = [];
       for (const b of branches) {
         const ins = await c.query(
@@ -3673,12 +3672,8 @@ export async function advanceForkNodes(c) {
         [p.id, p.status, p.current_role_id,
          JSON.stringify({ runner: true, reason: 'fork_spawned', children: childIds, branches: branchKeys })],
       );
-      await c.query('COMMIT');
-      forked += 1;
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+    });
+    forked += 1;
   }
   return forked;
 }
