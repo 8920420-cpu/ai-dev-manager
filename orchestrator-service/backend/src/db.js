@@ -3952,8 +3952,7 @@ export async function advanceDecompositionParents(c) {
   );
   let advanced = 0;
   for (const p of parents.rows) {
-    await c.query('BEGIN');
-    try {
+    await withTransaction(c, async () => {
       const bad = await c.query(
         `SELECT count(*)::int AS n FROM tasks
           WHERE parent_task_id = $1 AND task_kind IN ('service','epic') AND status IN ('BLOCKED','FAILED')`,
@@ -3998,12 +3997,8 @@ export async function advanceDecompositionParents(c) {
            missingServices: missing,
          })],
       );
-      await c.query('COMMIT');
       advanced += 1;
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+    });
   }
   return advanced;
 }
