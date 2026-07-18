@@ -1212,8 +1212,7 @@ export async function assignTaskProject(s, taskId, projectRef) {
   return withClient(clientConfig(s), async (c) => {
     const project = await findProject(c, projectRef);
     if (!project) throw scannerError(404, 'project_not_registered');
-    await c.query('BEGIN');
-    try {
+    return withTransaction(c, async () => {
       const cur = await c.query(
         'SELECT id, external_id, project_id, priority FROM tasks WHERE id = $1 FOR UPDATE', [id],
       );
@@ -1256,12 +1255,8 @@ export async function assignTaskProject(s, taskId, projectRef) {
          VALUES ($1, 'TASK_UPDATED', 'BACKLOG', $2, $3::jsonb)`,
         [id, role.id, JSON.stringify({ source: 'intake-assign', project: project.code, nextRole: role.code })],
       );
-      await c.query('COMMIT');
       return { assigned: true, taskId: id, project: project.code, nextRole: role.code };
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+    });
   });
 }
 
