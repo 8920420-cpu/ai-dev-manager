@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import { dirname, resolve, join, relative, sep, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { withClient, clientConfig } from './db.js';
+import { withTransaction } from './transaction.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -319,8 +320,7 @@ export async function updateRole(s, code, input) {
   const patch = normalizeRoleUpdate(input, { validSkillPaths });
 
   return withClient(clientConfig(s), async (c) => {
-    await c.query('BEGIN');
-    try {
+    return withTransaction(c, async () => {
       const role = await c.query('SELECT id FROM roles WHERE code = $1 FOR UPDATE', [roleCode]);
       if (!role.rowCount) throw httpError(404, 'role_not_found');
       const roleId = role.rows[0].id;
@@ -382,12 +382,8 @@ export async function updateRole(s, code, input) {
         [roleId],
       );
       const skills = await fetchRoleSkillIds(c, roleId);
-      await c.query('COMMIT');
       return mapRoleCard(r.rows[0], skills);
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+    });
   });
 }
 
