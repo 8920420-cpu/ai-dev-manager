@@ -9,6 +9,7 @@
 import { withClient, clientConfig } from './db.js';
 import { resolveProjectId, readStages } from './stages.js';
 import { applySchemeToProject } from './developmentScheme.js';
+import { withTransaction } from './transaction.js';
 
 import { httpError } from './httpError.js';
 
@@ -212,8 +213,8 @@ export async function createOrUpsertProject(s, input) {
   }
 
   return withClient(clientConfig(s), async (c) => {
-    await c.query('BEGIN');
     try {
+      return await withTransaction(c, async () => {
       const existing = await c.query(
         `SELECT ${PROJECT_COLUMNS} FROM projects WHERE root_path = $1`, [rootPath],
       );
@@ -248,10 +249,9 @@ export async function createOrUpsertProject(s, input) {
       }
 
       const rich = await buildRich(c, await reloadRow(c, row.id));
-      await c.query('COMMIT');
       return rich;
+      });
     } catch (error) {
-      await c.query('ROLLBACK');
       // Гонка по root_path/code при параллельном создании.
       if (error.code === '23505') {
         return getProject(s, rootPath);
@@ -307,8 +307,8 @@ export async function updateProject(s, idOrRef, patch) {
       throw httpError(409, 'project_conflict', { code: 'project_conflict' });
     }
 
-    await c.query('BEGIN');
     try {
+      return await withTransaction(c, async () => {
       const fields = pickProjectFields(patch, { partial: true });
       const row = await applyProjectUpdate(c, current.id, fields);
       // Папка задач/документов изменилась → Scanner должен следить за новой папкой
@@ -317,10 +317,9 @@ export async function updateProject(s, idOrRef, patch) {
         await applySchemeToProject(c, row.id, row.tasks_path ?? row.docs_path);
       }
       const rich = await buildRich(c, await reloadRow(c, row.id));
-      await c.query('COMMIT');
       return rich;
+      });
     } catch (error) {
-      await c.query('ROLLBACK');
       if (error.code === '23505') {
         throw httpError(409, 'project_conflict', { code: 'project_conflict' });
       }
