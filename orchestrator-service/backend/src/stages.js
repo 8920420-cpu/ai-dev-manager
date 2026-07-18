@@ -6,6 +6,7 @@ import { withClient, clientConfig } from './db.js';
 import { buildRoute } from './projectRoute.js';
 import { validateFieldConsistency } from './fieldsContract.js';
 import { roleHasExecutor } from './rolePipeline.js';
+import { withTransaction } from './transaction.js';
 
 // Канонический код роли-сканера. Единственный источник признака Scanner.
 export const SCANNER_ROLE_CODE = 'SCANNER';
@@ -451,14 +452,9 @@ export async function saveProjectStages(s, projectId, input) {
     const projectDbId = await resolveProjectId(c, projectId);
     const normalized = await normalizeStagesInput(c, rawStages);
 
-    await c.query('BEGIN');
-    try {
+    return withTransaction(c, async () => {
       const saved = await saveStagesRows(c, projectDbId, normalized);
-      await c.query('COMMIT');
       return { projectId: projectDbId, stages: saved };
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+    });
   });
 }
