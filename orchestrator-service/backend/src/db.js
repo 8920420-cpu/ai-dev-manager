@@ -6462,8 +6462,7 @@ async function finalizeRole(c, claimed, { verdict, response, exchangeId, duratio
 // заполнено в карточке задачи → ставим задачу BLOCKED (роль не запускаем), агент-
 // прогон помечаем FAILED, пишем диагностическое событие с перечнем полей.
 async function blockClaimedForFields(c, claimed, missingFields) {
-  await c.query('BEGIN');
-  try {
+  return withTransaction(c, async () => {
     await c.query(
       `UPDATE agent_runs SET status = 'FAILED', finished_at = now(), error_text = $2 WHERE id = $1`,
       [claimed.agentRunId, `missing_required_inputs: ${missingFields.join(', ')}`],
@@ -6479,12 +6478,8 @@ async function blockClaimedForFields(c, claimed, missingFields) {
         runner: true, reason: 'missing_required_inputs', role: claimed.role_code, fields: missingFields,
       })],
     );
-    await c.query('COMMIT');
     return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: 'BLOCKED', reason: 'missing_required_inputs', fields: missingFields };
-  } catch (error) {
-    await c.query('ROLLBACK');
-    throw error;
-  }
+  });
 }
 
 // Ошибка вызова ИИ: освободить слот, пометить прогон FAILED. После MAX_REWORK
