@@ -1429,8 +1429,7 @@ export async function setTaskPriorityTx(c, taskId, priority) {
   }
   const n = Math.trunc(Number(priority));
   if (!Number.isFinite(n) || n < 0 || n > 3) throw scannerError(422, 'priority_out_of_range');
-  await c.query('BEGIN');
-  try {
+  return withTransaction(c, async () => {
     const cur = await c.query(
       `SELECT t.id, t.priority, p.code AS project_code, p.root_path
          FROM tasks t LEFT JOIN projects p ON p.id = t.project_id
@@ -1445,7 +1444,6 @@ export async function setTaskPriorityTx(c, taskId, priority) {
     // Оркестраторную не понижать ниже 0: её приоритет всегда 0 (форс сервера).
     if (isOrch && n !== 0) throw scannerError(422, 'priority_orchestrator_forced_zero');
     if (row.priority === n) {
-      await c.query('COMMIT');
       return { updated: true, taskId: id, priority: n, changed: false };
     }
     await c.query('UPDATE tasks SET priority = $2::smallint, updated_at = now() WHERE id = $1', [id, n]);
@@ -1454,12 +1452,8 @@ export async function setTaskPriorityTx(c, taskId, priority) {
        VALUES ($1, 'TASK_UPDATED', $2::jsonb)`,
       [id, JSON.stringify({ source: 'manual-priority', fromPriority: row.priority, toPriority: n })],
     );
-    await c.query('COMMIT');
     return { updated: true, taskId: id, priority: n, changed: true };
-  } catch (error) {
-    await c.query('ROLLBACK');
-    throw error;
-  }
+  });
 }
 
 /**
