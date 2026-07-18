@@ -3703,8 +3703,7 @@ export async function advanceJoinNodes(c) {
       FOR UPDATE OF t SKIP LOCKED`,
   );
   for (const k of kids.rows) {
-    await c.query('BEGIN');
-    try {
+    const updated = await withTransaction(c, async () => {
       const upd = await c.query(
         `UPDATE tasks SET status = 'DONE', current_role_id = NULL, assigned_agent_id = NULL
           WHERE id = $1 AND status NOT IN ('DONE','CANCELLED','FAILED')`,
@@ -3716,13 +3715,10 @@ export async function advanceJoinNodes(c) {
            VALUES ($1, 'TASK_DONE', $2::task_status, 'DONE', $3, $4::jsonb)`,
           [k.id, k.status, k.current_role_id, JSON.stringify({ runner: true, reason: 'branch_reached_join' })],
         );
-        advanced += 1;
       }
-      await c.query('COMMIT');
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+      return upd.rowCount > 0;
+    });
+    if (updated) advanced += 1;
   }
 
   // (2) Fork-родители на join со всеми терминальными детьми → снять барьер.
