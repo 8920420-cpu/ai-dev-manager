@@ -4646,8 +4646,7 @@ export async function advanceStuckDocumentationBranches(c, maxAttempts = MAX_REW
     const nextRoleId = resolved.done || !resolved.nextRole
       ? null
       : await roleIdByCode(c, resolved.nextRole);
-    await c.query('BEGIN');
-    try {
+    await withTransaction(c, async () => {
       const upd = await c.query(
         `UPDATE tasks SET status = $2::task_status, current_role_id = $3,
                 current_stage_key = $4::uuid, assigned_agent_id = NULL
@@ -4669,11 +4668,7 @@ export async function advanceStuckDocumentationBranches(c, maxAttempts = MAX_REW
         );
         moved += 1;
       }
-      await c.query('COMMIT');
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+    });
   }
   return moved;
 }
