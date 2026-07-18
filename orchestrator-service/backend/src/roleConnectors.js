@@ -3,6 +3,7 @@
 // коннектор на код роли. connectorId:null снимает назначение (строку оставляем).
 import { withClient, clientConfig } from './db.js';
 import { LLM_ROLE_CODES } from './roleEngine.js';
+import { withTransaction } from './transaction.js';
 
 // ROLE-CONNECTOR-REASONING-ONLY-001 — движок (коннектор) можно назначить только
 // рассуждающим ролям (их исполняет ИИ через runReasoningRole). Остальные роли
@@ -92,8 +93,7 @@ export async function saveRoleConnectors(s, input) {
       reasoningRoleCodes: REASONING_ROLE_CODES,
     });
 
-    await c.query('BEGIN');
-    try {
+    return withTransaction(c, async () => {
       for (const { roleCode, connectorId } of normalized) {
         await c.query(
           `INSERT INTO role_connectors (role_code, connector_id, updated_at)
@@ -106,11 +106,7 @@ export async function saveRoleConnectors(s, input) {
       const r = await c.query(
         'SELECT role_code, connector_id, updated_at FROM role_connectors ORDER BY role_code',
       );
-      await c.query('COMMIT');
       return { assignments: r.rows.map(mapAssignment) };
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+    });
   });
 }
