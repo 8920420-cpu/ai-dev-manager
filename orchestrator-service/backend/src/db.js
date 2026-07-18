@@ -1480,8 +1480,7 @@ export async function restartStuckTasks(s) {
 
 export async function restartStuckTasksTx(c) {
   await resetStaleClaims(c);
-  await c.query('BEGIN');
-  try {
+  return withTransaction(c, async () => {
     // Перезапуск на текущем этапе: статус/роль/стадия не меняются. Пишем
     // диагностическое событие (to_status = from_status) и трогаем updated_at,
     // чтобы зафиксировать намерение «переиграть здесь же».
@@ -1503,12 +1502,8 @@ export async function restartStuckTasksTx(c) {
          FROM targets
        RETURNING task_id`,
     );
-    await c.query('COMMIT');
     return { restarted: upd.rowCount };
-  } catch (error) {
-    await c.query('ROLLBACK');
-    throw error;
-  }
+  });
 }
 
 /**
