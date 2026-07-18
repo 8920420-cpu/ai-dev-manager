@@ -10,6 +10,7 @@
 // Папка Scanner у каждого проекта своя — берётся из projects.docs_path («карта»
 // проекта). В самой схеме watch_directory не хранится.
 import { withClient, clientConfig } from './db.js';
+import { withTransaction } from './transaction.js';
 import {
   normalizeStagesInput,
   saveStagesRows,
@@ -266,19 +267,14 @@ export async function saveScheme(s, input) {
   const rawEdges = Array.isArray(input?.edges) ? input.edges : [];
   return withClient(clientConfig(s), async (c) => {
     const normalized = await normalizeStagesInput(c, rawStages, { requireScannerWatch: false });
-    await c.query('BEGIN');
-    try {
+    return withTransaction(c, async () => {
       const validKeys = await saveGlobalStages(c, normalized);
       // Рёбра валидируются ПОСЛЕ записи этапов: их концы должны ссылаться на
       // существующие stage_key (несуществующие/самопетли отбрасываются).
       await saveGlobalEdges(c, normalizeEdges(rawEdges, validKeys));
       await applySchemeToAllProjects(c);
       const scheme = await readScheme(c);
-      await c.query('COMMIT');
       return scheme;
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+    });
   });
 }
