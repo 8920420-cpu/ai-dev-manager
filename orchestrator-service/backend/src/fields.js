@@ -8,6 +8,7 @@
 // во ВКЛЮЧЁННЫХ этапах какого-либо проекта, такие проекты ставятся на паузу
 // (status='paused' + pause_reason) — требуется пересогласование полей этапов.
 import { withClient, clientConfig } from './db.js';
+import { withTransaction } from './transaction.js';
 
 import { httpCodedError as httpError } from './httpError.js';
 
@@ -209,8 +210,7 @@ export async function saveRoleFields(s, code, input) {
       [roleId],
     );
 
-    await c.query('BEGIN');
-    try {
+    const { changed, pausedProjects } = await withTransaction(c, async () => {
       await c.query('DELETE FROM role_fields WHERE role_id = $1', [roleId]);
       for (const row of rows) {
         await c.query(
@@ -239,13 +239,10 @@ export async function saveRoleFields(s, code, input) {
         );
         pausedProjects = paused.rows.map((x) => x.code);
       }
-      await c.query('COMMIT');
-      const contract = await getRoleFields(s, roleCode);
-      return { ...contract, changed, pausedProjects };
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+      return { changed, pausedProjects };
+    });
+    const contract = await getRoleFields(s, roleCode);
+    return { ...contract, changed, pausedProjects };
   });
 }
 
