@@ -4,6 +4,7 @@
 // (function-calling рассуждающих ролей), mcp прокидывается Claude Code (PROGRAMMER).
 import { withClient, clientConfig } from './db.js';
 import { httpError } from './httpError.js';
+import { withTransaction } from './transaction.js';
 
 export const VALID_TOOL_KINDS = new Set(['builtin', 'mcp']);
 
@@ -241,8 +242,7 @@ export async function saveRoleTools(s, code, input) {
         if (!known.has(id)) throw httpError(422, 'tool_unknown', { code: 'tool_unknown', toolId: id });
       }
     }
-    await c.query('BEGIN');
-    try {
+    return withTransaction(c, async () => {
       await c.query('DELETE FROM role_tools WHERE role_code = $1', [roleCode]);
       for (let i = 0; i < ids.length; i += 1) {
         await c.query(
@@ -251,12 +251,8 @@ export async function saveRoleTools(s, code, input) {
         );
       }
       const tools = await readRoleToolRows(c, roleCode);
-      await c.query('COMMIT');
       return { roleCode, toolIds: tools.map((t) => t.id), tools };
-    } catch (e) {
-      await c.query('ROLLBACK');
-      throw e;
-    }
+    });
   });
 }
 
@@ -280,8 +276,7 @@ export async function saveRoleCapabilities(s, code, input) {
     if (!CAPABILITY_SET.has(cap)) throw httpError(422, 'capability_invalid', { code: 'capability_invalid', capability: cap });
   }
   return withClient(clientConfig(s), async (c) => {
-    await c.query('BEGIN');
-    try {
+    return withTransaction(c, async () => {
       await c.query('DELETE FROM role_capabilities WHERE role_code = $1', [roleCode]);
       for (const cap of caps) {
         await c.query(
@@ -289,12 +284,8 @@ export async function saveRoleCapabilities(s, code, input) {
           [roleCode, cap],
         );
       }
-      await c.query('COMMIT');
       return { roleCode, capabilities: caps };
-    } catch (e) {
-      await c.query('ROLLBACK');
-      throw e;
-    }
+    });
   });
 }
 
