@@ -1365,8 +1365,7 @@ export async function moveTaskTx(c, taskId, input) {
   // запись в task_events теряет смысл, поэтому пустой reason отклоняем.
   const reason = String(input?.reason ?? '').trim();
   if (!reason) throw scannerError(422, 'reason_required');
-  await c.query('BEGIN');
-  try {
+  return withTransaction(c, async () => {
     const cur = await c.query(
       `SELECT id, project_id, status::text AS status FROM tasks WHERE id = $1 FOR UPDATE`,
       [id],
@@ -1407,12 +1406,8 @@ export async function moveTaskTx(c, taskId, input) {
         targetStage: stage.name ?? null, reason,
       })],
     );
-    await c.query('COMMIT');
     return { moved: true, taskId: id, fromStatus: task.status, toStatus, targetStage: stage.name ?? null };
-  } catch (error) {
-    await c.query('ROLLBACK');
-    throw error;
-  }
+  });
 }
 
 /**
