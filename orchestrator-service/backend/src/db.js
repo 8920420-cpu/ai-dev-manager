@@ -1278,8 +1278,7 @@ export async function advanceTask(s, taskId) {
 export async function advanceTaskTx(c, taskId) {
   const id = String(taskId ?? '').trim();
   if (!id) throw scannerError(422, 'task_required');
-  await c.query('BEGIN');
-  try {
+  return withTransaction(c, async () => {
     const cur = await c.query(
       `SELECT t.id, t.project_id, t.status::text AS status, t.current_role_id,
               t.current_stage_key, t.assigned_agent_id, r.code AS role_code
@@ -1338,15 +1337,11 @@ export async function advanceTaskTx(c, taskId) {
         done: resolved.done === true,
       })],
     );
-    await c.query('COMMIT');
     return {
       advanced: true, taskId: id, fromStatus: task.status,
       toStatus: resolved.toStatus, nextRole: resolved.nextRole ?? null, done: resolved.done === true,
     };
-  } catch (error) {
-    await c.query('ROLLBACK');
-    throw error;
-  }
+  });
 }
 
 /**
