@@ -3836,8 +3836,7 @@ const WORK_STACK_LOCK_KEY = 911_018;
  * Возвращает { reconciled, promoted }.
  */
 export async function advanceWorkStack(c) {
-  await c.query('BEGIN');
-  try {
+  return withTransaction(c, async () => {
     await c.query('SELECT pg_advisory_xact_lock($1)', [WORK_STACK_LOCK_KEY]);
 
     // (1) Reconcile: промоутнутые элементы, чьи задачи терминальны. Идемпотентно —
@@ -3911,12 +3910,8 @@ export async function advanceWorkStack(c) {
       );
       promoted += 1;
     }
-    await c.query('COMMIT');
     return { reconciled, promoted };
-  } catch (error) {
-    await c.query('ROLLBACK');
-    throw error;
-  }
+  });
 }
 
 /**
