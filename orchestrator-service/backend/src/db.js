@@ -1883,10 +1883,8 @@ export async function claimNextClaudeTask(s) {
  * с cooldown-предикатом PROGRAMMER-RELEASE-BACKOFF-001 (см. picked ниже).
  */
 export async function claimNextClaudeTaskTx(c) {
-  {
-    if (!(await getOrchestratorEnabledTx(c))) return { task: null, paused: true };
-    await c.query('BEGIN');
-    try {
+  if (!(await getOrchestratorEnabledTx(c))) return { task: null, paused: true };
+  return withTransaction(c, async () => {
       await c.query('SELECT pg_advisory_xact_lock($1)', [CLAUDE_CLAIM_LOCK_KEY]);
       const picked = await c.query(
         `WITH picked AS (
@@ -1967,7 +1965,6 @@ export async function claimNextClaudeTaskTx(c) {
         [PROGRAMMER_RELEASE_BACKOFF_MS],
       );
       if (!picked.rowCount) {
-        await c.query('COMMIT');
         return { task: null };
       }
       const row = picked.rows[0];
@@ -2072,13 +2069,8 @@ export async function claimNextClaudeTaskTx(c) {
         requiredFields,
         completionKey,
       });
-      await c.query('COMMIT');
       return { task };
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
-  }
+  });
 }
 
 /**
