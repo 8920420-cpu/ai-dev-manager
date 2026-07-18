@@ -11,7 +11,15 @@ import { roleKind } from './rolePipeline.js';
 
 // Сопоставление абстрактного исхода роли с меткой ветки узла condition.
 // FORWARD/успех → 'success'; провал/блок → 'failure'; иначе — null (без метки).
+//
+// TASK-ROUTER-001: роль может задать ЯВНУЮ метку ветки (decision.branchLabel), напр.
+// Task Router кладёт туда выбранный route (small|medium|large). Тогда выбор исходящего
+// ребра идёт ПО НЕЙ (edge.condition === branchLabel), а не по success/failure — это и
+// есть условная развилка small → MINI_ARCHITECT / иначе → ARCHITECT через рёбра графа.
+// Прочие роли метку не задают → прежнее поведение success/failure не меняется.
 export function outcomeLabel(decision) {
+  const explicit = decision?.branchLabel;
+  if (typeof explicit === 'string' && explicit.trim()) return explicit.trim();
   const o = decision?.outcome;
   if (o === 'BLOCK') return 'failure';
   if (o === 'REWORK' || o === 'BRANCH') return 'failure';

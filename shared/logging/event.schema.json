@@ -1,0 +1,58 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://ai-dev-manager/logging/event.schema.json",
+  "title": "Structured log event (LOGGING-STANDARD-001)",
+  "type": "object",
+  "required": ["ts", "level", "service", "message"],
+  "additionalProperties": true,
+  "properties": {
+    "ts": { "type": "string", "format": "date-time", "description": "ISO-8601 UTC время события" },
+    "level": { "enum": ["trace", "debug", "info", "warn", "error", "fatal"] },
+    "message": { "type": "string", "maxLength": 16384, "description": "Человекочитаемый текст; НЕ единственное средство классификации" },
+    "service": { "type": "string", "description": "Имя сервиса (orchestrator-service/tools-service/mcp-service)" },
+    "service_version": { "type": "string" },
+    "env": { "type": "string" },
+
+    "event_code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$", "description": "Стабильный код события из реестра" },
+    "event_category": { "type": "string" },
+    "operation": { "type": "string" },
+    "operation_type": { "enum": ["inbound", "outbound", "internal", "background"] },
+    "protocol": { "type": "string" },
+    "method": { "type": "string" },
+    "route": { "type": "string" },
+
+    "request_id": { "type": "string", "maxLength": 128 },
+    "correlation_id": { "type": "string", "maxLength": 128 },
+    "trace_id": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "span_id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+    "parent_span_id": { "type": "string", "pattern": "^[0-9a-f]{16}$" },
+
+    "status": { "enum": ["started", "success", "failed", "skipped", "timeout", "cancelled"] },
+    "status_code": { "type": "integer", "minimum": 0, "maximum": 599 },
+    "duration_ms": { "type": "number", "minimum": 0 },
+    "retry_count": { "type": "integer", "minimum": 0 },
+
+    "tenant_id": { "type": "string" },
+    "user_id": { "type": "string" },
+    "session_id": { "type": "string" },
+    "entity_type": { "type": "string" },
+    "entity_id": { "type": "string" },
+
+    "error_code": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]+$" },
+    "error_type": { "enum": ["validation", "authentication", "authorization", "not_found", "conflict", "timeout", "rate_limit", "dependency", "infrastructure", "internal"] },
+    "error_message": { "type": "string" },
+    "error_source": { "type": "string" },
+    "stack_trace": { "type": "string" },
+    "retryable": { "type": "boolean" },
+    "action_required": { "type": "string" },
+    "operator_hint": { "type": "string" },
+
+    "dependency_name": { "type": "string" },
+    "dependency_type": { "type": "string" },
+    "dependency_operation": { "type": "string" },
+    "dependency_status": { "type": "string" },
+    "dependency_duration_ms": { "type": "number" },
+
+    "attributes": { "type": "object" }
+  }
+}

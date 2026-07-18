@@ -4,7 +4,8 @@ import { readFile } from 'node:fs/promises';
 import { existsSync, readFileSync } from 'node:fs';
 import { dirname, resolve, join, extname, normalize, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { isBearerOrApiTokenAuthorized, readTokenAuthConfig } from '../../../shared/httpAuth.js';
+import { isBearerOrApiTokenAuthorized, isPublicHealthPath, readTokenAuthConfig } from '../../../shared/httpAuth.js';
+import { createLogger, withHttpLogging } from '../../../shared/logging/index.js';
 import { loadSettings, saveSettings, resolveSettings, redactSettings } from './config.js';
 import { getAppSettings, updateAppSettings } from './appSettings.js';
 import { stats as connectorCapacity, allStats as connectorCapacityBuckets } from './connectorLimiter.js';
@@ -148,6 +149,7 @@ const FRONTEND_DIR =
 
 const API_AUTH = readTokenAuthConfig();
 const UI_BOOTSTRAP_API_TOKEN = process.env.UI_BOOTSTRAP_API_TOKEN === '1';
+const log = createLogger({ service: 'orchestrator-service' });
 
 function isAuthorized(req, { allowQueryToken = false } = {}) {
   return isBearerOrApiTokenAuthorized(req, { ...API_AUTH, allowQueryToken });
@@ -366,7 +368,7 @@ function matchFeedbackScreenshotRoute(pathname) {
 }
 
 export function createApp() {
-  return createServer(async (req, res) => {
+  const handler = async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
     const p = url.pathname;
     try {
@@ -1102,11 +1104,24 @@ export function createApp() {
       res.writeHead(405);
       res.end('Method not allowed');
     } catch (e) {
+      const status = e.statusCode || 500;
       const body = { ok: false, error: e.message };
       // Стабильный машинный код и привязанные к stageId ошибки валидации.
       if (e.code) body.code = e.code;
       if (Array.isArray(e.errors)) body.errors = e.errors;
-      sendJson(res, e.statusCode || 500, body);
+      // Финальная точка логирования: 5xx — ERROR со stack; ожидаемые 4xx (битый ввод,
+      // слишком большое тело) не шумят на уровне ERROR — их отметит access-лог как warn.
+      if (status >= 500) {
+        log.error('unhandled request error', {
+          event_code: 'HTTP_REQUEST_FAILED', operation: `${req.method} ${p}`,
+          error_code: e.code || 'INTERNAL_ERROR', err: e,
+        });
+      }
+      sendJson(res, status, body);
     }
-  });
+  };
+
+  // Корреляция запроса (request_id/trace_id) + access-лог по завершении ответа.
+  // /health и probes не шумят (isPublicHealthPath).
+  return createServer(withHttpLogging(log, handler, { isHealthPath: isPublicHealthPath }));
 }

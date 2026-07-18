@@ -105,3 +105,22 @@
 
 ## New Models (added 2026-07-10)
 - `orchestrator-service/backend/db/migrations/0059_infrastructure_pipeline.sql`
+
+## New Models (added 2026-07-11)
+- `orchestrator-service/backend/src/clickhouseSchema.js`
+
+## New Models (added 2026-07-12)
+- `orchestrator-service/backend/tmp-inspect-schema.mjs`
+- `orchestrator-service/backend/tmp-schema.txt`
+
+## New Models (added 2026-07-13)
+- `orchestrator-service/backend/db/migrations/0060_restore_postjoin_git_integrator.sql`
+
+## New Models (added 2026-07-14)
+- `orchestrator-service/backend/db/migrations/0061_task_size_triage.sql`
+
+## New Models (added 2026-07-14)
+- `orchestrator-service/backend/db/migrations/0062_task_router_mini_architect.sql`
+
+## New Models (added 2026-07-14)
+- `shared/logging/event.schema.json`

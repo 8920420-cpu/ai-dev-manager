@@ -6,8 +6,8 @@
 //   {"PROJECT_2":{"cwd":"F:/git/PS","env":{"GOWORK":"off"}}, "PROJECT":{"cwd":"..."}}
 
 const DEFAULT_MAP = {
-  PROJECT_2: { cwd: 'F:/git/PS', env: { GOWORK: 'off' } },
-  PROJECT: { cwd: 'F:/git/ai-dev-manager', env: {} },
+  PROJECT_2: { cwd: 'E:/git/PS', env: { GOWORK: 'off' } },
+  PROJECT: { cwd: 'E:/git/ai-dev-manager', env: {} },
 };
 
 export function loadRepoMap(env = process.env) {

@@ -1,4 +1,4 @@
-# Defender-исключения для ускорения reasoning-прогонов (codex/claude) на Windows.
+﻿# Defender-исключения для ускорения reasoning-прогонов (codex/claude) на Windows.
 #
 # ПОЧЕМУ: диск K: читается быстро (~1.4 мс/файл при чтении одним процессом), но
 # КАЖДАЯ read-команда модели — это отдельный spawn процесса (~50–75 мс), который
@@ -26,7 +26,7 @@ if (-not $admin) {
 # F:\git — покрывает ai-dev-manager, PS и остальные) и CODEX_HOME (~/.codex с
 # крупными sqlite-логами codex).
 $paths = @(
-  'F:\git',
+  'E:\git',
   (Join-Path $env:USERPROFILE '.codex')
 )
 # Процессы-исключения (по имени бинарника): раннеры и сам codex.

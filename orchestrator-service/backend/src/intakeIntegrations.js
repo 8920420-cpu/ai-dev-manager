@@ -15,8 +15,10 @@ import { createHash, randomBytes } from 'node:crypto';
 import pg from 'pg';
 import { loadSettings } from './config.js';
 import { asObject } from './dataCard.js';
+import { createLogger } from '../../../shared/logging/index.js';
 
 const { Client } = pg;
+const log = createLogger({ service: 'orchestrator-service' });
 
 let createClient = (cfg) => new Client(cfg);
 
@@ -35,7 +37,7 @@ async function withClient(fn) {
   const s = await loadSettings();
   const client = createClient(clientConfig(s));
   client.on('error', (err) => {
-    console.error(`[orchestrator-service] DB client error (intake-integrations, не фатально): ${err.message}`);
+    log.warn('DB client error (intake-integrations, не фатально)', { event_code: 'DB_QUERY_FAILED', operation: 'db.client', error_code: 'DB_UNAVAILABLE', err });
   });
   await client.connect();
   try {
@@ -44,7 +46,7 @@ async function withClient(fn) {
     try {
       await client.end();
     } catch (endErr) {
-      console.error(`[orchestrator-service] DB client.end() error (intake-integrations, игнор): ${endErr.message}`);
+      log.warn('DB client.end() error (intake-integrations, игнор)', { event_code: 'DB_QUERY_FAILED', operation: 'db.client.end', err: endErr });
     }
   }
 }

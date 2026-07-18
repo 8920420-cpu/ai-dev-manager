@@ -19,6 +19,9 @@ import {
   isMissingSchemaError,
 } from './clickhouseClient.js';
 import { ensureClickhouseSchema } from './clickhouseSchema.js';
+import { createLogger } from '../../../shared/logging/index.js';
+
+const log = createLogger({ service: 'orchestrator-service' });
 
 const DEFAULT_BATCH_SIZE = 50;
 const DEFAULT_FLUSH_MS = 1000;
@@ -205,7 +208,7 @@ async function flushQueue() {
       await sendBatch(batch);
     }
   } catch (error) {
-    console.warn?.('[orchestrator-service] ClickHouse observability flush skipped', { error: error.message });
+    log.warn('ClickHouse observability flush skipped', { event_code: 'OBSERVABILITY_EXPORT_SKIPPED', operation: 'clickhouse.flush', err: error });
   } finally {
     flushing = false;
     if (queue.length) scheduleFlush();
@@ -218,7 +221,7 @@ function enqueueRows(rows) {
   if (queue.length + rows.length > maxQueue) {
     const drop = queue.length + rows.length - maxQueue;
     queue.splice(0, drop);
-    console.warn?.('[orchestrator-service] ClickHouse observability queue overflow', { dropped: drop });
+    log.warn('ClickHouse observability queue overflow', { event_code: 'OBSERVABILITY_EXPORT_SKIPPED', operation: 'clickhouse.enqueue', attributes: { dropped: drop } });
   }
   queue.push(...rows);
   if (queue.length >= positiveIntEnv('CLICKHOUSE_OBSERVABILITY_BATCH_SIZE', DEFAULT_BATCH_SIZE)) {
@@ -286,7 +289,7 @@ export async function exportAgentRunObservation(c, agentRunId, meta = {}) {
       payload_json: jsonString({ ...meta.payload, output: row.output_json ?? null, errorText: row.error_text ?? null }),
     }]);
   } catch (error) {
-    console.warn?.('[orchestrator-service] ClickHouse observability export skipped', { error: error.message });
+    log.warn('ClickHouse observability export skipped', { event_code: 'OBSERVABILITY_EXPORT_SKIPPED', operation: 'clickhouse.export', err: error });
     return { skipped: true, error: error.message };
   }
 }
@@ -313,7 +316,7 @@ export async function exportLatestAgentRunObservation(c, taskId, meta = {}) {
     );
     return exportAgentRunObservation(c, r.rows[0]?.id, meta);
   } catch (error) {
-    console.warn?.('[orchestrator-service] ClickHouse latest-run lookup skipped', { error: error.message });
+    log.warn('ClickHouse latest-run lookup skipped', { event_code: 'OBSERVABILITY_EXPORT_SKIPPED', operation: 'clickhouse.latest_lookup', err: error });
     return { skipped: true, error: error.message };
   }
 }

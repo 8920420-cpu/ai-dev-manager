@@ -7,7 +7,7 @@
 // переходы делает db.js (advanceOne), чтобы держать сетевой вызов вне
 // транзакции. Чистые функции (parseVerdict/normalizeVerdict/decideTransition)
 // покрыты юнит-тестами без сети и без Postgres.
-import { ROLE_FLOW } from './rolePipeline.js';
+import { ROLE_FLOW, normalizeTaskRoute } from './rolePipeline.js';
 import { invoke as llmInvoke, invokeChat } from './llmConnector.js';
 import { resolveInt, resolveDuration } from './envConfig.js';
 import { asObject } from './dataCard.js';
@@ -199,6 +199,10 @@ export const MAX_REWORK = resolveInt('RUNNER_MAX_REWORK', 3, { min: 0, max: 100 
 export const LLM_ROLE_CODES = [
   // Приёмщик задач — первая рассуждающая роль: классифицирует входящий запрос.
   'TASK_INTAKE_OFFICER',
+  // TASK-ROUTER-001 — лёгкий триаж после Приёмщика (выбор контура small|medium|large)
+  // и облегчённый архитектор small-контура. Обе — рассуждающие роли (в ROLE_FLOW).
+  'TASK_ROUTER',
+  'MINI_ARCHITECT',
   'ARCHITECT',
   'DECOMPOSER',
   'TASK_REVIEWER',
@@ -743,6 +747,20 @@ export function decideOutcome(roleCode, verdict, {
       }
       if (reworkCount >= maxRework) return block('max_rework_exceeded');
       return rework('diagnosed');
+    case 'TASK_ROUTER': {
+      // TASK-ROUTER-001 — лёгкий триаж. Явный отказ/BLOCKED → остановка на пользователя.
+      // Нужны уточнения (needs_clarification) → BLOCK: маршрут выбирать не на чем.
+      // Иначе FORWARD, неся выбранный route МЕТКОЙ ветки графа (branchLabel): small →
+      // ребро к MINI_ARCHITECT, medium/large/мусор → fallback-ребро к ARCHITECT.
+      if (verdict.ok === false) return block(verdict.status.toLowerCase() || 'blocked');
+      const nc = verdict.fields?.needs_clarification;
+      const needsClar = nc === true
+        || (typeof nc === 'string' && nc.trim() !== '' && !/^(false|no|нет|0|none|n\/a|-)$/i.test(nc.trim()));
+      if (needsClar) return block('router_needs_clarification');
+      const route = normalizeTaskRoute(verdict.fields?.route);
+      return { ...forward, branchLabel: route, reason: `route_${route}` };
+    }
+    case 'MINI_ARCHITECT':
     case 'ARCHITECT':
     case 'DECOMPOSER':
     // INFRA-DEPARTMENT-001 — инфраструктурный архитектор ведёт себя как проектная

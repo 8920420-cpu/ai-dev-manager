@@ -5,7 +5,9 @@ import { createServer } from 'node:http';
 import { handleRoute } from '../src/server.js';
 import { parseAllowedRoots } from '../src/builtins.js';
 import { isBearerOrApiTokenAuthorized, isPublicHealthPath, readTokenAuthConfig } from '../../shared/httpAuth.js';
+import { createLogger, withHttpLogging } from '../../shared/logging/index.js';
 
+const log = createLogger({ service: 'tools-service' });
 const PORT = Number(process.env.TOOLS_SERVICE_PORT || 4188);
 const AUTH = readTokenAuthConfig();
 const BODY_LIMIT = 8 << 20; // 8 МБ
@@ -49,7 +51,7 @@ function validateExecutionPolicy(body) {
   return null;
 }
 
-const server = createServer(async (req, res) => {
+async function handleRequest(req, res) {
   const path = (req.url || '').split('?')[0];
   try {
     if (!authorized(req, path)) return send(res, 401, { ok: false, error: 'unauthorized' });
@@ -68,12 +70,19 @@ const server = createServer(async (req, res) => {
     const { status, body: out } = await handleRoute(req.method, path, body, { allowedRoots: ALLOWED_ROOTS });
     send(res, status, out);
   } catch (e) {
+    // Финальная точка логирования ошибки запроса: код + stack + корреляция из контекста.
+    log.error('unhandled request error', { event_code: 'HTTP_REQUEST_FAILED', operation: `${req.method} ${path}`, err: e });
     send(res, 500, { ok: false, error: e.message });
   }
-});
+}
 
-server.listen(PORT, () => console.log(`tools-service listening on :${PORT}`));
+const server = createServer(withHttpLogging(log, handleRequest, { isHealthPath: isPublicHealthPath }));
 
-const stop = () => server.close(() => process.exit(0));
+server.listen(PORT, () => log.info('tools-service listening', { event_code: 'APP_STARTED', attributes: { port: PORT } }));
+
+const stop = () => {
+  log.info('tools-service stopping', { event_code: 'APP_STOPPING' });
+  server.close(() => process.exit(0));
+};
 process.on('SIGINT', stop);
 process.on('SIGTERM', stop);

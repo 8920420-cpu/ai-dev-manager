@@ -3,7 +3,7 @@ import pg from 'pg';
 import { readFile, readdir } from 'node:fs/promises';
 import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { ROLE_FLOW, fastForwardHiddenRoles } from './rolePipeline.js';
+import { ROLE_FLOW, fastForwardHiddenRoles, normalizeTaskRoute } from './rolePipeline.js';
 import { runReasoningRole, decideOutcome, summarizePriorRuns, LLM_ROLE_CODES, MAX_REWORK, buildUserPayload, buildVerdictJsonSchema, normalizeVerdict, parseVerdict, renderProjectMaps, isMissingArtifactComplaint, REVIEW_DELTA_ROLES, DOC_BRANCH_ROLE_CODES } from './roleEngine.js';
 import { buildRoute, resolveTransition, forwardFrom, routeIsUsable, TERMINAL_STATUSES } from './projectRoute.js';
 import { buildGraph, nextNodeKey, forkBranchKeys, nodeByKey, reworkNodeKey } from './graphRoute.js';
@@ -17,12 +17,50 @@ import { asObject, parseDataCard } from './dataCard.js';
 import { isDriverProvider } from './connectors.js';
 import { hashToken, messageFingerprint } from './intakeIntegrations.js';
 import { exportLatestAgentRunObservation } from './clickhouseObservability.js';
+import {
+  computeTaskPriority,
+  isOrchestratorProject,
+  normalizeClientPriority,
+  normalizeTaskSize,
+  renderWorkArtifactSections,
+  shouldSkipReviewerForSmallTask,
+  taskRouteFromCard,
+  taskSizeFromCard,
+} from './taskPolicy.js';
+import {
+  looksCorruptedText,
+  normalizeScannerCompletion,
+  resultSummaryText,
+  scannerError,
+} from './scannerCompat.js';
+import { createLogger } from '../../../shared/logging/index.js';
+
+const log = createLogger({ service: 'orchestrator-service' });
 
 const { Client } = pg;
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
 export const MIGRATIONS_DIR = process.env.MIGRATIONS_DIR || resolve(__dirname, '../db/migrations');
 export const SEED_DIR = process.env.SEED_DIR || resolve(__dirname, '../db/seed');
+
+export {
+  REVIEWER_SKIP_MAX_FILES,
+  TASK_SIZES,
+  computeTaskPriority,
+  isOrchestratorProject,
+  normalizeClientPriority,
+  normalizeTaskSize,
+  renderWorkArtifactSections,
+  reviewerSkipHasDangerousFile,
+  shouldSkipReviewerForSmallTask,
+  taskRouteFromCard,
+  taskSizeFromCard,
+} from './taskPolicy.js';
+
+export {
+  looksCorruptedText,
+  normalizeScannerCompletion,
+} from './scannerCompat.js';
 
 export function clientConfig(s, database) {
   return {
@@ -79,7 +117,7 @@ export async function withClient(cfg, fn) {
   // делает обрыв нефатальным: in-flight запрос всё равно отклонится и будет
   // обработан вызывающим (tick runner'а ловит ошибку и повторит на след. тике).
   client.on('error', (err) => {
-    console.error(`[orchestrator-service] DB client error (не фатально): ${err.message}`);
+    log.warn('DB client error (не фатально)', { event_code: 'DB_QUERY_FAILED', operation: 'db.client', error_code: 'DB_UNAVAILABLE', err });
   });
   await client.connect();
   try {
@@ -90,7 +128,7 @@ export async function withClient(cfg, fn) {
     try {
       await client.end();
     } catch (endErr) {
-      console.error(`[orchestrator-service] DB client.end() error (игнор): ${endErr.message}`);
+      log.warn('DB client.end() error (игнор)', { event_code: 'DB_QUERY_FAILED', operation: 'db.client.end', err: endErr });
     }
   }
 }
@@ -217,20 +255,6 @@ export async function getAppliedMigrations(s) {
     }));
     return { count: migrations.length, migrations };
   });
-}
-
-// COMPLETION-SUMMARY-TEXT-001 — текстовый summary сдачи из поля result. Раннер
-// программиста шлёт result ОБЪЕКТОМ ({ summary, outcome, agent, ... }); наивный
-// String(object) давал «[object Object]» в task_events, в output_json прогона и в
-// priorRoleOutputs следующих ролей (теряя читаемую сдачу). Строка → как есть;
-// объект → .summary (иначе JSON); null/undefined → ''.
-function resultSummaryText(result) {
-  if (typeof result === 'string') return result;
-  if (result && typeof result === 'object') {
-    if (typeof result.summary === 'string' && result.summary.trim()) return result.summary;
-    try { return JSON.stringify(result); } catch { return ''; }
-  }
-  return result == null ? '' : String(result);
 }
 
 // PROGRAMMER-UNIFY-001 — финализировать RUNNING-прогон программиста при успешной
@@ -419,13 +443,28 @@ export async function acceptScannerCompletionTx(c, payload) {
           : await roleIdByCode(c, resolved.nextRole);
       }
       let skippedReviewer = false;
-      if (nextRoleCode === 'TASK_REVIEWER' && (await countTaskReviewerReworks(c, payload.taskId)) >= 1) {
-        const skipped = await resolveAfterSkippedReviewer(c, route, task, toStatus, nextStageKey);
-        toStatus = skipped.toStatus;
-        nextRoleCode = skipped.nextRoleCode;
-        nextStageKey = skipped.nextStageKey;
-        nextRoleId = skipped.nextRoleId;
-        skippedReviewer = true;
+      let skipReason;
+      if (nextRoleCode === 'TASK_REVIEWER') {
+        // TASK-SIZE-TRIAGE-001 + REVIEWER-SKIP-GUARD-001: мелкая задача (size=small)
+        // может пропустить Reviewer — НО только если фактическая дельта действительно
+        // узкая и низкорисковая (shouldSkipReviewerForSmallTask сверяет changedFiles с
+        // рискованными зонами: миграции/БД/контракты/инфра/auth, лимит файлов, cross-
+        // service). Иначе ошибочный small протащил бы опасную правку мимо ревью → ведём
+        // как medium (в Task Reviewer). Продвигаем мимо Reviewer тем же
+        // resolveAfterSkippedReviewer, что и REVIEW-SKIP-REWORK-LIMIT-001 (анти-петля
+        // после ≥1 возврата Reviewer→Programmer). Размер проверяем ПЕРВЫМ — короткое
+        // замыкание не гоняет лишний запрос счётчика возвратов для small.
+        const small = shouldSkipReviewerForSmallTask(task, payload);
+        const reworkLimit = !small && (await countTaskReviewerReworks(c, payload.taskId)) >= 1;
+        if (small || reworkLimit) {
+          const skipped = await resolveAfterSkippedReviewer(c, route, task, toStatus, nextStageKey);
+          toStatus = skipped.toStatus;
+          nextRoleCode = skipped.nextRoleCode;
+          nextStageKey = skipped.nextStageKey;
+          nextRoleId = skipped.nextRoleId;
+          skippedReviewer = true;
+          skipReason = small ? 'task_size_small' : 'review_rework_limit_forwarded';
+        }
       }
 
       // Поля Programmer → кумулятивная карточка задачи.
@@ -494,7 +533,7 @@ export async function acceptScannerCompletionTx(c, payload) {
                  VALUES ($1, 'STATUS_CHANGED', 'WAITING_FOR_CHILDREN', $4::task_status, $2, $3::jsonb)`,
                 [task.parent_task_id, nextRoleId, JSON.stringify({
                   source: 'scanner', reason: 'all_subtasks_done', nextRole: nextRoleCode, kind: 'service',
-                  skippedReviewer,
+                  skippedReviewer, skipReason,
                 }), toStatus],
               );
             }
@@ -532,7 +571,7 @@ export async function acceptScannerCompletionTx(c, payload) {
           deliveredCommit: payload.deliveredCommit,
           nextRole: nextRoleCode,
           skippedReviewer,
-          skipReason: skippedReviewer ? 'review_rework_limit_forwarded' : undefined,
+          skipReason,
           fields: progCardValues,
           passes: payload.numTurns,
           codeVersion: payload.codeVersion,
@@ -584,42 +623,6 @@ function normalizeProjectPath(p) {
     .replace(/\\/g, '/')
     .replace(/\/+$/, '')
     .toLowerCase();
-}
-
-// =====================================================================
-// TASK-PRIORITY-SCALE-001 — шкала приоритетов задач (SMALLINT, меньше = важнее).
-//   0 — зарезервирован ЗА ПРОЕКТОМ ОРКЕСТРАТОРА (форсит сервер);
-//   1 — максимальный пользовательский; 2 — обычный (дефолт); 3 — низкий.
-// =====================================================================
-
-// Проект оркестратора: code = env ORCHESTRATOR_PROJECT_CODE (по умолчанию 'PROJECT')
-// ИЛИ root_path содержит 'ai-dev-manager'. Принимает строку проекта из БД
-// ({ code, root_path }); null/пустой → false.
-export function isOrchestratorProject(projectRow) {
-  if (!projectRow) return false;
-  const orchCode = String(process.env.ORCHESTRATOR_PROJECT_CODE || 'PROJECT').trim().toLowerCase();
-  const code = String(projectRow.code ?? '').trim().toLowerCase();
-  if (code && code === orchCode) return true;
-  const rootPath = String(projectRow.root_path ?? projectRow.rootPath ?? '');
-  return /ai-dev-manager/i.test(rootPath);
-}
-
-// Нормализация ПОЛЬЗОВАТЕЛЬСКОГО приоритета к диапазону 1..3: 0 (и любое ≤0) → 1
-// (клиент не может задать 0 — это привилегия сервера), >3 → 3, пусто/мусор → дефолт (2).
-export function normalizeClientPriority(requested, def = 2) {
-  if (requested === null || requested === undefined || requested === '') return def;
-  const n = Math.trunc(Number(requested));
-  if (!Number.isFinite(n)) return def;
-  if (n <= 0) return 1;
-  if (n >= 3) return 3;
-  return n;
-}
-
-// Итоговый приоритет задачи при создании/смене проекта: проект оркестратора → 0
-// (форс сервера), иначе нормализованный пользовательский (1..3, дефолт 2).
-export function computeTaskPriority(projectRow, requested, def = 2) {
-  if (isOrchestratorProject(projectRow)) return 0;
-  return normalizeClientPriority(requested, def);
 }
 
 // Вычислить роль входа, стартовый узел графа и стартовый статус для задачи проекта.
@@ -1712,16 +1715,6 @@ export async function getOrCreateService(c, projectId, serviceCode, serviceName,
  *  - доля «?» среди непробельных символов ≥ 25% (рассыпанные «?»).
  * Одиночные/двойные «?» (риторический вопрос) НЕ считаются порчей.
  */
-export function looksCorruptedText(text) {
-  const s = String(text ?? '');
-  if (!s) return false;
-  if (s.includes('�')) return true;
-  if (/\?{3,}/.test(s)) return true;
-  const q = (s.match(/\?/g) || []).length;
-  const nonSpace = s.replace(/\s/g, '').length;
-  return q >= 3 && nonSpace > 0 && q / nonSpace >= 0.25;
-}
-
 export function normalizeScannerIntake(input) {
   const required = (key) => {
     const value = String(input?.[key] ?? '').trim();
@@ -1765,7 +1758,7 @@ export function normalizeScannerIntake(input) {
 const SCANNER_TASK_SELECT = `SELECT t.id, t.status::text AS status, p.id AS project_id,
         p.code AS project_code, s.service_code, rr.id AS reviewer_role_id,
         t.current_role_id, t.current_stage_key, cr.code AS current_role_code,
-        t.task_kind, t.parent_task_id
+        t.task_kind, t.parent_task_id, t.data_card
    FROM tasks t
    JOIN projects p ON p.id = t.project_id
    LEFT JOIN services s ON s.id = t.service_id
@@ -3462,10 +3455,11 @@ export async function advanceAutomatedTasks(s, opts = {}) {
         // и он исчерпан — логируем явно. Прогон остаётся RUNNING и будет подобран
         // per-tick сбросом (reapOrphanRunningRuns/resetStaleClaims по таймауту роли).
         // Возврат null не роняет тик — прочие слоты и предшаги продолжают работать.
-        console.error(
-          `[orchestrator-service] прогон роли ${roleCode}: claim/финализация не завершена `
-          + `(${error?.message ?? error}); прогон оставлен под per-tick сброс`,
-        );
+        log.error('прогон роли: claim/финализация не завершена; оставлен под per-tick сброс', {
+          event_code: 'DB_QUERY_FAILED', operation: 'role.finalize',
+          error_code: isDbConnectionError(error) ? 'DB_UNAVAILABLE' : 'INTERNAL_ERROR',
+          attributes: { roleCode }, err: error,
+        });
         return null;
       }),
     ),
@@ -5624,7 +5618,11 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
   // форварде ГАРАНТИРУЕТ, что у задачи есть service_id (иначе claim_next_claude_task её
   // не выдаст — тихий висяк в CODING). Резолвим главный сервис из вердикта; если у задачи
   // service_id ещё нет и резолв не удался — BLOCKED с диагностикой, а не молчаливый висяк.
+  // Объявлены здесь (не ниже), чтобы ветка MINI_ARCHITECT могла задать description work item.
   let setServiceId;
+  let setDescription;
+  let setTitle;
+  let setPriority;
   if (claimed.role_code === 'ARCHITECT' && decision.outcome === 'FORWARD') {
     // ARCH-SERVICE-SPLIT-001: если разбивка Архитектора (normalizeWorkItems из
     // data_card + поля вердикта) затрагивает ДВА И БОЛЕЕ разных зарегистрированных
@@ -5641,7 +5639,23 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
     // 10.07 — кластер quick_reply_id в PROJECT_2, ~17 вложенных эпиков). Такой ребёнок уже
     // сфокусирован на ОДНОМ сервисе — ведём его дальше одиночным путём (ensureArchitectService
     // резолвит его же service_id и форвардит к Programmer), а не расщепляем повторно.
+    // ARCH-SIZE-ESCALATION-001: task_size — лишь ПОДСКАЗКА Приёмщика, а НЕ вето на
+    // расщепление. Архитектор видит технический контекст глубже: если его разбивка
+    // затронула ≥2 РАЗНЫХ зарегистрированных сервиса, расщепляем НЕЗАВИСИМО от
+    // task_size (в т.ч. ошибочного small) — иначе неверный small от Приёмщика молча
+    // склеил бы мультисервисную работу в одну задачу и часть сервисов осталась бы
+    // нетронутой. Эскалацию фиксируем в карточке эпика (size_escalation: small →
+    // large by architect) ради traceability. medium/large — прежнее поведение.
+    const taskSize = taskSizeFromCard(claimed.data_card);
     if (split.services.length >= 2 && !claimed.parent_task_id) {
+      if (taskSize === 'small') {
+        cardValues.task_size = 'large';
+        cardValues.size_escalation = {
+          from: 'small', to: 'large', by: 'architect',
+          reason: 'multi_service_scope', services: split.services.length,
+          at: new Date().toISOString(),
+        };
+      }
       // SERVICE-REPO-PATH-PREFLIGHT-001: ту же проверку repository_path, что и на
       // одиночном пути (ensureArchitectService ниже), прогоняем по КАЖДОМУ сервису
       // split ДО материализации детей. Дочерние service-задачи создаются сразу в
@@ -5685,6 +5699,69 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
       });
     }
     setServiceId = ensured.serviceId; // uuid, либо undefined если service_id уже задан
+    // TASK-ROUTER-001 (item 7): доливаем структурированные артефакты Архитектора
+    // (критерии приёмки/границы/план/риски) в ХВОСТ описания задачи — Программист/Ревьюер
+    // получают конкретику через «## Task Description», не только summary. Пусто → не трогаем.
+    const archArtifacts = renderWorkArtifactSections(verdict.fields);
+    if (archArtifacts) {
+      const base = String(claimed.description ?? '').trim();
+      setDescription = (base ? `${base}\n\n${archArtifacts}` : archArtifacts).slice(0, 20000);
+    }
+  }
+
+  // TASK-ROUTER-001: Task Router кладёт выбранный контур в карточку. route — ГЛАВНОЕ
+  // решение (small|medium|large); синхронно проставляем task_size = route, чтобы guard
+  // пропуска Reviewer (shouldSkipReviewerForSmallTask) и эскалация Архитектора читали
+  // единый сигнал. Условную развилку (small → MINI_ARCHITECT, иначе → ARCHITECT) уже
+  // несёт decision.branchLabel (метка ветки графа, см. decideOutcome/graphRoute).
+  if (claimed.role_code === 'TASK_ROUTER' && decision.outcome === 'FORWARD') {
+    const route = normalizeTaskRoute(verdict.fields?.route ?? cardValues?.route);
+    cardValues.route = route;
+    cardValues.task_size = route; // route ↔ task_size 1:1 (единый домен small|medium|large)
+    const conf = verdict.fields?.route_confidence ?? cardValues?.route_confidence;
+    const confStr = typeof conf === 'string' && conf.trim() ? conf.trim().slice(0, 40) : null;
+    if (confStr) cardValues.route_confidence = confStr;
+    const rreason = verdict.fields?.route_reason ?? cardValues?.route_reason;
+    if (typeof rreason === 'string' && rreason.trim()) cardValues.route_reason = rreason.trim().slice(0, 2000);
+    cardValues.route_decision = { route, confidence: confStr, by: 'task_router', at: new Date().toISOString() };
+  }
+
+  // TASK-ROUTER-001: MINI_ARCHITECT — облегчённый архитектор small-контура. Как и полный
+  // Архитектор, он ОБЯЗАН гарантировать service_id перед CODING (иначе claim_next_claude_task
+  // не выдаст задачу — тихий висяк), НО он НЕ расщепляет (small = один сервис). Резолвим
+  // сервис тем же ensureArchitectService; если у задачи ещё нет service_id, подсказываем его
+  // из target_service вердикта (или service-классификации Приёмщика) work_items-хинтом.
+  if (claimed.role_code === 'MINI_ARCHITECT' && decision.outcome === 'FORWARD') {
+    const svcHint = [verdict.fields?.target_service, cardValues?.target_service, cardValues?.service]
+      .map((v) => (typeof v === 'string' ? v.trim() : ''))
+      .find((v) => v && !/^unknown$/i.test(v)) || '';
+    const fieldsForService = { ...asObject(verdict.fields) };
+    if (svcHint && !Array.isArray(fieldsForService.work_items)) {
+      fieldsForService.work_items = [{ serviceCode: svcHint, title: 'small task', files: [] }];
+    }
+    const ensured = await ensureArchitectService(c, claimed, fieldsForService, cardValues);
+    if (ensured.blocked) {
+      return blockClaimedReason(c, claimed, ensured.reason, { verdict, cardValues, kpi, event: 'mini_architect_no_service' });
+    }
+    const preflight = await preflightServiceRepoPath(c, ensured.resolvedServiceId);
+    if (!preflight.ok) {
+      return blockClaimedReason(c, claimed, preflight.reason, {
+        verdict, cardValues, kpi, event: 'missing_repository_path', detail: preflight.message,
+      });
+    }
+    setServiceId = ensured.serviceId; // uuid, либо undefined если service_id уже задан
+    // TASK-ROUTER-001 (item 7): даём Программисту сфокусированный work item в описании
+    // задачи (task.description → «## Task Description» в промте раннера), а не только
+    // summary в priorRoleOutputs. Не раздуваем: work_item + область + критерии + границы.
+    const workItem = typeof verdict.fields?.work_item === 'string' ? verdict.fields.work_item.trim() : '';
+    if (workItem) {
+      const area = typeof verdict.fields?.target_area === 'string' ? verdict.fields.target_area.trim() : '';
+      const parts = [workItem];
+      if (area) parts.push(`## Область\n${area}`);
+      const artifacts = renderWorkArtifactSections(verdict.fields);
+      if (artifacts) parts.push(artifacts);
+      setDescription = parts.join('\n\n').slice(0, 20000);
+    }
   }
 
   // DECOMPOSER-REMOVE-001: Приёмщик кладёт развёрнутое описание (structured_description)
@@ -5693,13 +5770,15 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
   // TASK-INTAKE-COMMIT-001: он же кладёт человекочитаемое название (short_title →
   // task_title) в tasks.title — чтобы весь конвейер, карточка задачи и коммит
   // Git Integrator использовали название, придуманное Приёмщиком, а не сырой заголовок.
-  let setDescription;
-  let setTitle;
   // TASK-PRIORITY-SCALE-001: Приёмщик выставляет пользовательский приоритет (fields.priority
   // 1..3). Форс сервера: проект оркестратора → всегда 0 (роль/значение игнорируем); иначе
   // применяем нормализованный fields.priority, а если роль его не задала — не трогаем.
-  let setPriority;
+  // (setDescription/setTitle/setPriority объявлены выше — их задают MINI_ARCHITECT и Приёмщик.)
   if (claimed.role_code === 'TASK_INTAKE_OFFICER') {
+    // TASK-SIZE-TRIAGE-001: нормализуем размер задачи (Приёмщик оценил fields.task_size);
+    // отсутствие/мусор → medium. Пишем в кумулятивную карточку — по нему триаж пропускает
+    // Reviewer для small (acceptScannerCompletionTx) и подавляет расщепление Архитектора.
+    cardValues.task_size = normalizeTaskSize(verdict.fields?.task_size ?? cardValues?.task_size);
     const dd = verdict.fields?.structured_description ?? cardValues?.structured_description;
     if (typeof dd === 'string' && dd.trim()) setDescription = dd.trim().slice(0, 20000);
     const tt = verdict.fields?.short_title ?? cardValues?.short_title
@@ -5803,7 +5882,12 @@ async function routeIntakeToProject(c, claimed, { verdict, response, exchangeId,
       return { taskId: claimed.id, fromRole: claimed.role_code, toStatus: cur.rows[0].status, alreadyFinalized: true };
     }
 
-    const mergedCard = { ...(cardValues || {}), project: project.code, projectPath: project.root_path };
+    // TASK-SIZE-TRIAGE-001: нормализуем размер и для беспроектного интейка (тот же
+    // триаж, что и в обычном форварде Приёмщика) — small пропустит Reviewer ниже по маршруту.
+    const mergedCard = {
+      ...(cardValues || {}), project: project.code, projectPath: project.root_path,
+      task_size: normalizeTaskSize(verdict.fields?.task_size ?? cardValues?.task_size),
+    };
     const sets = [
       'project_id = $2', 'status = $3::task_status', 'current_role_id = $4',
       'current_stage_key = $5::uuid', 'assigned_agent_id = NULL', 'data_card = data_card || $6::jsonb',
@@ -6615,67 +6699,4 @@ async function failRoleUnparsed(c, claimed, result) {
     await c.query('ROLLBACK');
     throw error;
   }
-}
-
-export function normalizeScannerCompletion(input) {
-  const required = (key) => {
-    const value = String(input?.[key] ?? '').trim();
-    if (!value) throw scannerError(422, `${key}_required`);
-    return value;
-  };
-  const taskId = required('taskId');
-  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(taskId)) {
-    throw scannerError(422, 'taskId_must_be_uuid');
-  }
-  return {
-    taskId,
-    completionKey: required('completionKey'),
-    project: required('project'),
-    service: required('service'),
-    title: required('title'),
-    status: 'completed',
-    // COMPLETION-SUMMARY-TEXT-001: раннер программиста шлёт result ОБЪЕКТОМ
-    // ({ summary, ... }); извлекаем текстовый summary вместо String(object) —
-    // иначе «[object Object]» в task_events, output_json прогона и приорах.
-    result: resultSummaryText(input?.result),
-    changedFiles: Array.isArray(input?.changedFiles) ? input.changedFiles.map(String) : [],
-    // WORKTREE-BRANCH-CONTEXT-001: ветка/коммит worktree программиста (programmer-runner
-    // сдаёт код коммитом в programmer/<project>/<service> в отдельном worktree). Нужны
-    // Git Integrator, чтобы влить ветку в main, а не искать незакоммиченные файлы в
-    // основном дереве. Отсутствуют (старый раннер) → null, поведение прежнее.
-    worktreeBranch: typeof input?.worktreeBranch === 'string' && input.worktreeBranch.trim()
-      ? input.worktreeBranch.trim().slice(0, 255) : null,
-    deliveredCommit: typeof input?.deliveredCommit === 'string' && input.deliveredCommit.trim()
-      ? input.deliveredCommit.trim().slice(0, 80) : null,
-    // usage/cost/cold start сдачи программиста (контракт с programmer-runner). В
-    // теле идут как есть; finalizeProgrammerRunOnCompletion читает их через
-    // normalizeRunKpi/runKpiSet. Числа/строки; отсутствуют (старый раннер) → null.
-    tokensIn: input?.tokensIn ?? null,
-    tokensOut: input?.tokensOut ?? null,
-    tokensCacheRead: input?.tokensCacheRead ?? null,
-    tokensCacheCreation: input?.tokensCacheCreation ?? null,
-    costUsd: input?.costUsd ?? null,
-    coldStartMs: input?.coldStartMs ?? null,
-    // Число проходов (ходов агента) до завершения — скалярная метрика для Монитора.
-    numTurns: Number.isFinite(Number(input?.numTurns)) ? Math.trunc(Number(input.numTurns)) : null,
-    // VERSION-KPI-TRACKING-001: версия кода раннера и модель — у программиста промт
-    // в коде, поэтому code_version версионирует и логику, и промт. Метки идут в
-    // payload события сдачи (KPI программиста живут в task_events, не в agent_runs).
-    codeVersion: typeof input?.codeVersion === 'string' && input.codeVersion.trim()
-      ? input.codeVersion.trim().slice(0, 80) : null,
-    model: typeof input?.model === 'string' && input.model.trim()
-      ? input.model.trim().slice(0, 120) : null,
-    completedAt: input?.completedAt ?? null,
-    sourceDocument: required('sourceDocument'),
-    nextRole: 'TASK_REVIEWER',
-    // ROLE-FIELD-CONTRACT-001: значения полей карточки от Programmer (если есть).
-    fields: input?.fields && typeof input.fields === 'object' && !Array.isArray(input.fields)
-      ? input.fields : null,
-  };
-}
-
-function scannerError(statusCode, message) {
-  const error = new Error(message);
-  error.statusCode = statusCode;
-  return error;
 }

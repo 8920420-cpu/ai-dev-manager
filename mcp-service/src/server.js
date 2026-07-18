@@ -10,10 +10,15 @@ import { loadConfig, checkConfig } from './config.js';
 import { createToolsClient } from './toolsClient.js';
 import { createOrchestratorClient } from './orchestratorClient.js';
 import { registerTools } from './tools.js';
-import { isBearerOrApiTokenAuthorized } from '../../shared/httpAuth.js';
+import { isBearerOrApiTokenAuthorized, isPublicHealthPath } from '../../shared/httpAuth.js';
+import { createLogger, withHttpLogging } from '../../shared/logging/index.js';
 
 export const SERVICE_NAME = 'ai-dev-manager';
 export const SERVICE_VERSION = '1.0.0';
+
+// Структурный логгер HTTP-режима (в stdio-режиме НЕ используется — там stdout занят
+// протоколом, логи идут через console.error в stderr).
+const log = createLogger({ service: 'mcp-service', version: SERVICE_VERSION });
 
 /** Создать McpServer с зарегистрированными инструментами и клиентами. */
 export function buildServer(config = loadConfig()) {
@@ -100,8 +105,8 @@ async function readJsonBody(req, limitBytes = 1048576) {
  *   POST /mcp              → MCP Streamable HTTP (на запрос — свежий server+transport).
  * stdio остаётся основным транспортом; HTTP — опционален.
  */
-export function startHttp(config = loadConfig(), { logger = console.error } = {}) {
-  const httpServer = createServer(async (req, res) => {
+export function startHttp(config = loadConfig(), { logger } = {}) {
+  const handler = async (req, res) => {
     const url = new URL(req.url || '/', 'http://localhost');
     const path = url.pathname;
 
@@ -163,8 +168,14 @@ export function startHttp(config = loadConfig(), { logger = console.error } = {}
 
     res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ error: 'not_found' }));
-  });
+  };
 
-  httpServer.listen(config.port, () => logger(`[mcp-service] HTTP готов на :${config.port} (POST /mcp, GET /health)`));
+  // Корреляция (request_id/trace_id из заголовков) + access-лог. Тесты передают
+  // свой logger:()=>{}, чтобы подавить стартовую строку; по умолчанию — структурно.
+  const httpServer = createServer(withHttpLogging(log, handler, { isHealthPath: isPublicHealthPath }));
+  httpServer.listen(config.port, () => {
+    if (logger) logger(`[mcp-service] HTTP готов на :${config.port} (POST /mcp, GET /health)`);
+    else log.info('mcp-service http ready', { event_code: 'APP_STARTED', attributes: { port: config.port } });
+  });
   return httpServer;
 }

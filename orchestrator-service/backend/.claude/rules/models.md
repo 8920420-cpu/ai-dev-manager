@@ -77,3 +77,19 @@
 
 ## New Models (added 2026-07-10)
 - `db/migrations/0059_infrastructure_pipeline.sql`
+
+## New Models (added 2026-07-11)
+- `src/clickhouseSchema.js`
+
+## New Models (added 2026-07-12)
+- `tmp-inspect-schema.mjs`
+- `tmp-schema.txt`
+
+## New Models (added 2026-07-13)
+- `db/migrations/0060_restore_postjoin_git_integrator.sql`
+
+## New Models (added 2026-07-14)
+- `db/migrations/0061_task_size_triage.sql`
+
+## New Models (added 2026-07-14)
+- `db/migrations/0062_task_router_mini_architect.sql`

@@ -65,11 +65,27 @@ inert-проекты (`scanner_enabled=false`, без задач/папок — 
 PG-зеркало держит свежим тот же вотчдог (`-SyncPg` после обновления любого корня),
 так что ручной `memory:sync:pg:all` нужен только для разовой заливки/проверки.
 
+Немедленную свежесть (без 30-мин лага вотчдога) даёт глобальный Stop-хук Claude Code
+`~/.codebase-memory/hooks/auto-update.ps1`: после локального `codebase-memory update .`
+он вызывает `scripts/sync-codebase-memory-to-postgres.js --all-projects`, поэтому правки
+долетают в MCP сразу по завершении сессии. `--all-projects` трогает только уже
+зарегистрированные проекты (upsert по checksum, новых НЕ создаёт) — хук безопасен из
+любого cwd, а ошибки/недоступность БД гасятся (Stop не падает).
+
 Прочие проекты оркестратора (`PROJECT`=ai-dev-manager, `PROJECT_2`=ПС, `LANDINGHUB`,
 `SMETA`) — обычные проекты со своими `root_path`; их память тоже наполнена (10.07) и
 входит в `-AllProjects`/`memory:sync:pg:all`. Память НЕ генерится автоматически —
 только `codebase-memory analyze <root>` создаёт её; вотчдог лишь поддерживает свежей
 существующую (проект без `.claude/rules` в `-AllProjects`/sync тихо пропускается).
+
+Кроме них в оркестраторе заведены память-only inert-проекты прочих git-сервисов из
+`E:\git` (онбординг 17.07: `codebase-memory analyze <root>` + регистрация через
+`sync-codebase-memory-to-postgres.js --root=<путь>`): `CHATBOT`, `CUSTOMERCORE`,
+`PRODUCTCORE`, `BOTUSLUGI`, `FINDATE`, `HAPPYPARTYVRN`, `CONTRACTSPSSMETALIB`, `ARCHIVUM`,
+`CLEAR36`, `ETL_SPLITTER`, `FASTTABLE`, `MATERIAL_BALANCES`, `PHONESERV`, `WINDTEST`,
+`MONITOR` и `INFRA` (`deploy`). Все `scanner_enabled=false`; их память держат свежей тот
+же `-AllProjects`/Stop-хук. Итого ~22 не-archived проекта, Scanner не включён ни у одного.
+Песочницы (`lern`, `Test`) и third-party (`protoc-gen-validate`) намеренно НЕ заводили.
 
 ### ПРАВИЛО: Codebase Memory MCP — по умолчанию, без напоминаний
 

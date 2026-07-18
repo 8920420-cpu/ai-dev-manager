@@ -20,7 +20,18 @@
 export const ROLE_FLOW = {
   // Приёмщик задач — первая роль: классифицирует входящий запрос и готовит карточку.
   // Задачи приходят либо из Scanner (intake из папки), либо из модального окна.
-  TASK_INTAKE_OFFICER:   { auto: true,  from: ['BACKLOG', 'READY'],                 next: 'ARCHITECT',             to: 'ARCHITECTURE' },
+  // TASK-ROUTER-001: после Приёмщика идёт Task Router (лёгкий триаж), а не сразу
+  // Архитектор. В граф-режиме (все реальные проекты) развилку задаёт условное ребро;
+  // здесь next=TASK_ROUTER — КАНОНИЧЕСКИЙ фолбэк для проектов без графа.
+  TASK_INTAKE_OFFICER:   { auto: true,  from: ['BACKLOG', 'READY'],                 next: 'TASK_ROUTER',           to: 'ARCHITECTURE' },
+  // TASK-ROUTER-001: Task Router — лёгкая роль-триаж после Приёмщика. Выбирает контур
+  // small|medium|large. Реальная развилка (small → MINI_ARCHITECT, иначе → ARCHITECT)
+  // выражена УСЛОВНЫМИ рёбрами графа (project_stage_edges.condition); здесь next —
+  // безопасный фолбэк на полного Архитектора (medium/large-контур).
+  TASK_ROUTER:           { auto: true,  from: ['ARCHITECTURE'],                      next: 'ARCHITECT',             to: 'ARCHITECTURE' },
+  // MINI_ARCHITECT — облегчённый архитектор для route=small: без разведки и без
+  // расщепления, короткий work item и сразу к Программисту.
+  MINI_ARCHITECT:        { auto: true,  from: ['ARCHITECTURE'],                      next: 'PROGRAMMER',            to: 'CODING' },
   // DECOMPOSER-REMOVE-001: Декомпозитор выведен из маршрута — Архитектор передаёт
   // задачу прямо Программисту (service_id гарантирует финализация Архитектора в
   // db.js, см. ensureArchitectService). Роль DECOMPOSER сохранена в roles/ROLE_FLOW
@@ -94,7 +105,12 @@ export function roleHasExecutor(code) {
 export const ROLE_KINDS = {
   STRUCTURE_KEEPER:      'structure',
   TASK_INTAKE_OFFICER:   'intake',
+  // TASK-ROUTER-001: 'router' — нейтральный тип (не executor/design/analyst): триаж
+  // не является целью REWORK/BRANCH и не пропускается forward-логикой как аналитик.
+  TASK_ROUTER:           'router',
   ARCHITECT:             'design',
+  // MINI_ARCHITECT — тоже проектная роль (design): облегчённый архитектор small-контура.
+  MINI_ARCHITECT:        'design',
   DECOMPOSER:            'design',
   PROGRAMMER:            'executor',
   SCANNER:               'scanner',
@@ -139,6 +155,17 @@ export function roleKind(code) {
 
 // Статусы, из которых задачу уже не двигают.
 export const TERMINAL_STATUSES = new Set(['DONE', 'CANCELLED']);
+
+// TASK-ROUTER-001 — контур маршрута, который выбирает Task Router: small|medium|large.
+// Значения совпадают с task_size (триаж Приёмщика), но route — ГЛАВНОЕ решение после
+// Router (task_size остаётся вспомогательным hint/наблюдаемостью). Отсутствие/мусор →
+// medium (безопасный дефолт: полный Архитектор). Единый нормализатор — чтобы roleEngine
+// (метка ветки графа) и db (запись в карточку) трактовали значение одинаково.
+export const TASK_ROUTES = ['small', 'medium', 'large'];
+export function normalizeTaskRoute(value, dflt = 'medium') {
+  const s = String(value ?? '').trim().toLowerCase();
+  return TASK_ROUTES.includes(s) ? s : dflt;
+}
 
 /**
  * Чистый переход роли: что делать с задачей, которой владеет роль roleCode.

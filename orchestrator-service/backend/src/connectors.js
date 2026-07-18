@@ -4,8 +4,10 @@
 import pg from 'pg';
 import { loadSettings } from './config.js';
 import { invoke as llmInvoke } from './llmConnector.js';
+import { createLogger } from '../../../shared/logging/index.js';
 
 const { Client } = pg;
+const log = createLogger({ service: 'orchestrator-service' });
 
 // Фабрика pg-клиента вынесена отдельно, чтобы unit-тесты могли подменить её
 // (мок connect/query/end) и проверять ветвления invokeConnector без реальной БД.
@@ -65,7 +67,7 @@ async function withClient(fn) {
   // DB-CONN-RESILIENCE-001: см. db.js — слушатель 'error' делает обрыв соединения
   // (Patroni/PgBouncer переключение лидера) нефатальным, иначе Node роняет процесс.
   client.on('error', (err) => {
-    console.error(`[orchestrator-service] DB client error (connectors, не фатально): ${err.message}`);
+    log.warn('DB client error (connectors, не фатально)', { event_code: 'DB_QUERY_FAILED', operation: 'db.client', error_code: 'DB_UNAVAILABLE', err });
   });
   await client.connect();
   try {
@@ -74,7 +76,7 @@ async function withClient(fn) {
     try {
       await client.end();
     } catch (endErr) {
-      console.error(`[orchestrator-service] DB client.end() error (connectors, игнор): ${endErr.message}`);
+      log.warn('DB client.end() error (connectors, игнор)', { event_code: 'DB_QUERY_FAILED', operation: 'db.client.end', err: endErr });
     }
   }
 }

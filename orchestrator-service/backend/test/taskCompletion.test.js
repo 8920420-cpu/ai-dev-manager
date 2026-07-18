@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   completeHostTaskTx, acceptScannerCompletionTx, resolveHostTaskContext,
   normalizeScannerCompletion, __resetRoleFieldsCacheForTests, deriveHostFailureText,
+  normalizeTaskSize, taskSizeFromCard,
 } from '../src/db.js';
 
 // Мини-клиент pg: отвечает по первому подходящему правилу (regex по SQL).
@@ -193,6 +194,161 @@ test('после одного Reviewer→Programmer возврата сдача 
   const payload = JSON.parse(ev.params[3]);
   assert.equal(payload.skippedReviewer, true);
   assert.equal(payload.skipReason, 'review_rework_limit_forwarded');
+});
+
+// TASK-SIZE-TRIAGE-001: мелкая задача (data_card.task_size='small') пропускает Reviewer
+// сразу при первой сдаче Programmer'а (без возвратов) — узкая правка не нуждается в ревью.
+test('TASK-SIZE-TRIAGE-001: сдача small-задачи пропускает Reviewer и идёт в Pipeline', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient([
+    { re: /SELECT id, code FROM projects/, reply: { rowCount: 1, rows: [{ id: 'proj-1', code: 'PS' }] } },
+    {
+      re: /FROM tasks t[\s\S]*FOR UPDATE OF t/,
+      reply: { rowCount: 1, rows: [{
+        id: TASK, status: 'CODING', project_id: 'proj-1', project_code: 'PS',
+        service_code: 'Catalog_Service', reviewer_role_id: 'rev-1',
+        current_role_id: 'role-prog', current_role_code: 'PROGRAMMER',
+        data_card: { task_size: 'small' },
+      }] },
+    },
+    { re: /INSERT INTO scanner_dispatches/, reply: { rowCount: 1, rows: [{ id: 'disp-1' }] } },
+    { re: /FROM project_stages WHERE project_id/, reply: { rowCount: 0, rows: [] } },
+    { re: /to_regclass\('public\.role_fields'\)/, reply: { rowCount: 1, rows: [{ t: 'role_fields' }] } },
+    { re: /FROM role_fields rf/, reply: { rowCount: 1, rows: [{ direction: 'out', required: true, key: 'diff' }] } },
+    {
+      re: /SELECT id FROM roles WHERE code = \$1/,
+      reply: (_hits, params) => ({ rowCount: 1, rows: [{ id: params[0] === 'PIPELINE_SERVICE' ? 'pipe-1' : 'role-x' }] }),
+    },
+  ]);
+  const res = await acceptScannerCompletionTx(c, scannerPayload({ fields: { diff: 'patch text' } }));
+  assert.equal(res.accepted, true);
+  assert.equal(res.nextRole, 'PIPELINE_SERVICE');
+  const upd = c.calls.find((q) => /UPDATE tasks\s+SET status/.test(q.sql));
+  assert.ok(upd, 'задача продвинута');
+  assert.equal(upd.params[1], 'TESTING');
+  assert.equal(upd.params[2], 'pipe-1');
+  // Счётчик возвратов Reviewer'а для small не нужен (короткое замыкание по size): его
+  // запрос (from_status='REVIEW' → to_status='CODING', outcome='REWORK') не выполняется.
+  assert.equal(
+    c.calls.some((q) => /e\.from_status = 'REVIEW'[\s\S]*e\.to_status = 'CODING'/.test(q.sql)),
+    false,
+    'счётчик возвратов не запрашивается для small',
+  );
+  const ev = c.calls.find((q) => /INSERT INTO task_events[\s\S]*STATUS_CHANGED/.test(q.sql));
+  const payload = JSON.parse(ev.params[3]);
+  assert.equal(payload.skippedReviewer, true);
+  assert.equal(payload.skipReason, 'task_size_small');
+});
+
+// REVIEWER-SKIP-GUARD-001 — правила скан-приёма для small-задачи с заданным
+// data_card и changedFiles. Роль PIPELINE_SERVICE резолвится для пропуска Reviewer.
+const smallSkipRules = (dataCard = { task_size: 'small' }) => [
+  { re: /SELECT id, code FROM projects/, reply: { rowCount: 1, rows: [{ id: 'proj-1', code: 'PS' }] } },
+  {
+    re: /FROM tasks t[\s\S]*FOR UPDATE OF t/,
+    reply: { rowCount: 1, rows: [{
+      id: TASK, status: 'CODING', project_id: 'proj-1', project_code: 'PS',
+      service_code: 'Catalog_Service', reviewer_role_id: 'rev-1',
+      current_role_id: 'role-prog', current_role_code: 'PROGRAMMER',
+      data_card: dataCard,
+    }] },
+  },
+  { re: /INSERT INTO scanner_dispatches/, reply: { rowCount: 1, rows: [{ id: 'disp-1' }] } },
+  { re: /FROM project_stages WHERE project_id/, reply: { rowCount: 0, rows: [] } },
+  { re: /to_regclass\('public\.role_fields'\)/, reply: { rowCount: 1, rows: [{ t: 'role_fields' }] } },
+  { re: /FROM role_fields rf/, reply: { rowCount: 1, rows: [{ direction: 'out', required: true, key: 'diff' }] } },
+  {
+    re: /SELECT id FROM roles WHERE code = \$1/,
+    reply: (_hits, params) => ({ rowCount: 1, rows: [{ id: params[0] === 'PIPELINE_SERVICE' ? 'pipe-1' : 'role-x' }] }),
+  },
+];
+
+// REVIEWER-SKIP-GUARD-001: small + узкая безопасная дельта → пропуск Reviewer.
+test('REVIEWER-SKIP-GUARD-001: small + безопасный changedFiles → пропуск Reviewer', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(smallSkipRules());
+  const res = await acceptScannerCompletionTx(c, scannerPayload({
+    fields: { diff: 'patch' }, changedFiles: ['src/Button.tsx'],
+  }));
+  assert.equal(res.accepted, true);
+  assert.equal(res.nextRole, 'PIPELINE_SERVICE', 'узкая безопасная правка пропускает Reviewer');
+  const ev = c.calls.find((q) => /INSERT INTO task_events[\s\S]*STATUS_CHANGED/.test(q.sql));
+  const payload = JSON.parse(ev.params[3]);
+  assert.equal(payload.skippedReviewer, true);
+  assert.equal(payload.skipReason, 'task_size_small');
+});
+
+// REVIEWER-SKIP-GUARD-001: small, но дельта задевает контракт (*.proto) → НЕ
+// пропускаем ревью (medium-поведение), несмотря на small-подсказку Приёмщика.
+test('REVIEWER-SKIP-GUARD-001: small + опасный файл (proto) → НЕ пропускает Reviewer', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(smallSkipRules());
+  const res = await acceptScannerCompletionTx(c, scannerPayload({
+    fields: { diff: 'patch' }, changedFiles: ['proto/service.proto'],
+  }));
+  assert.equal(res.accepted, true);
+  assert.equal(res.nextRole, 'TASK_REVIEWER', 'рискованная зона → ревью обязательно');
+  const ev = c.calls.find((q) => /INSERT INTO task_events[\s\S]*STATUS_CHANGED/.test(q.sql));
+  const payload = JSON.parse(ev.params[3]);
+  assert.equal(payload.skippedReviewer, false);
+});
+
+// REVIEWER-SKIP-GUARD-001: small, но изменённых файлов больше лимита → НЕ пропускаем.
+test('REVIEWER-SKIP-GUARD-001: small + >5 файлов → НЕ пропускает Reviewer', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient(smallSkipRules());
+  const res = await acceptScannerCompletionTx(c, scannerPayload({
+    fields: { diff: 'patch' },
+    changedFiles: ['a.ts', 'b.ts', 'c.ts', 'd.ts', 'e.ts', 'f.ts'],
+  }));
+  assert.equal(res.accepted, true);
+  assert.equal(res.nextRole, 'TASK_REVIEWER', 'широкая правка (>5 файлов) → ревью обязательно');
+  const ev = c.calls.find((q) => /INSERT INTO task_events[\s\S]*STATUS_CHANGED/.test(q.sql));
+  const payload = JSON.parse(ev.params[3]);
+  assert.equal(payload.skippedReviewer, false);
+});
+
+// TASK-SIZE-TRIAGE-001: medium (и отсутствие размера) идёт к Reviewer как раньше.
+test('TASK-SIZE-TRIAGE-001: medium-задача (и без размера) не пропускает Reviewer', async () => {
+  __resetRoleFieldsCacheForTests();
+  const c = fakeClient([
+    { re: /SELECT id, code FROM projects/, reply: { rowCount: 1, rows: [{ id: 'proj-1', code: 'PS' }] } },
+    {
+      re: /FROM tasks t[\s\S]*FOR UPDATE OF t/,
+      reply: { rowCount: 1, rows: [{
+        id: TASK, status: 'CODING', project_id: 'proj-1', project_code: 'PS',
+        service_code: 'Catalog_Service', reviewer_role_id: 'rev-1',
+        current_role_id: 'role-prog', current_role_code: 'PROGRAMMER',
+        data_card: { task_size: 'medium' },
+      }] },
+    },
+    { re: /INSERT INTO scanner_dispatches/, reply: { rowCount: 1, rows: [{ id: 'disp-1' }] } },
+    { re: /FROM project_stages WHERE project_id/, reply: { rowCount: 0, rows: [] } },
+    { re: /to_regclass\('public\.role_fields'\)/, reply: { rowCount: 1, rows: [{ t: 'role_fields' }] } },
+    { re: /FROM role_fields rf/, reply: { rowCount: 1, rows: [{ direction: 'out', required: true, key: 'diff' }] } },
+  ]);
+  const res = await acceptScannerCompletionTx(c, scannerPayload({ fields: { diff: 'patch text' } }));
+  assert.equal(res.accepted, true);
+  assert.equal(res.nextRole, 'TASK_REVIEWER');
+  const ev = c.calls.find((q) => /INSERT INTO task_events[\s\S]*STATUS_CHANGED/.test(q.sql));
+  const payload = JSON.parse(ev.params[3]);
+  assert.equal(payload.skippedReviewer, false);
+  assert.equal(payload.skipReason, undefined);
+});
+
+// TASK-SIZE-TRIAGE-001: чистые хелперы нормализации размера.
+test('TASK-SIZE-TRIAGE-001: normalizeTaskSize/taskSizeFromCard', () => {
+  assert.equal(normalizeTaskSize('small'), 'small');
+  assert.equal(normalizeTaskSize('LARGE'), 'large');
+  assert.equal(normalizeTaskSize('  Medium '), 'medium');
+  assert.equal(normalizeTaskSize('huge'), 'medium', 'мусор → medium');
+  assert.equal(normalizeTaskSize(undefined), 'medium', 'отсутствие → medium');
+  assert.equal(normalizeTaskSize(null), 'medium');
+  assert.equal(taskSizeFromCard({ task_size: 'small' }), 'small');
+  assert.equal(taskSizeFromCard('{"task_size":"large"}'), 'large', 'JSON-строка тоже');
+  assert.equal(taskSizeFromCard({}), 'medium', 'нет ключа → medium');
+  assert.equal(taskSizeFromCard(null), 'medium');
+  assert.equal(taskSizeFromCard('not json'), 'medium');
 });
 
 // FORK-JOIN-STAGEKEY-001: у graph-задачи (current_stage_key задан — её порождают

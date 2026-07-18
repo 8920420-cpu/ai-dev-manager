@@ -472,9 +472,10 @@ test('compactToolResult: undefined-результат инструмента →
 
 test('LLM_ROLE_CODES покрывает рассуждающие роли разработки и Инфраструктурного отдела', () => {
   assert.deepEqual([...LLM_ROLE_CODES].sort(), [
-    // Разработка (вкл. Приёмщика задач).
+    // Разработка (вкл. Приёмщика задач, Task Router и Mini Architect).
     'ARCHITECT', 'DECOMPOSER', 'DOCUMENTATION_AUDITOR',
-    'DOCUMENTATION_KEEPER', 'FAILURE_ANALYST', 'TASK_INTAKE_OFFICER', 'TASK_REVIEWER',
+    'DOCUMENTATION_KEEPER', 'FAILURE_ANALYST', 'MINI_ARCHITECT', 'TASK_INTAKE_OFFICER',
+    'TASK_ROUTER', 'TASK_REVIEWER',
     // INFRA-DEPARTMENT-001 — Инфраструктурный отдел (архитектор + 7 исполнителей + ИБ/SRE/мониторинг).
     'BACKUP_ENGINEER', 'DEVOPS_ENGINEER', 'DOCKER_ENGINEER', 'INFRA_ARCHITECT',
     'K8S_ENGINEER', 'MONITORING_ENGINEER', 'NETWORK_ENGINEER', 'SECURITY_ENGINEER',

@@ -10,6 +10,7 @@ resources:
   - 41-tools-service.yaml
   - 42-mcp-service.yaml
   - 50-ingress.yaml
+  - 60-k8s-logs-clickhouse.yaml
 
 # Секрет с общим API-токеном (обязателен: на него ссылаются все три сервиса).
 # Значение задаётся при деплое: см. deploy/k8s/README.md.

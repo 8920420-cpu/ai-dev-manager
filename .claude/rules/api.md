@@ -73,3 +73,6 @@ No route files detected
 - `tasks/review/pipeline-runner__P1.1.md`
 - `tasks/review/pipeline-runner__P1.2.md`
 - `tasks/review/scanner-service__P1.1.md`
+
+## New Routes (added 2026-07-12)
+- `src/api/performanceApi.test.ts`

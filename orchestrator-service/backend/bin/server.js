@@ -8,7 +8,9 @@ import { bootstrap, reconcileOnStartup } from '../src/db.js';
 import { createTaskRunner } from '../src/taskRunner.js';
 import { recordDeployMarker, recordDowntimeMarker } from '../src/performance.js';
 import { ensureClickhouseSchema } from '../src/clickhouseSchema.js';
+import { createLogger } from '../../../shared/logging/index.js';
 
+const log = createLogger({ service: 'orchestrator-service' });
 const PORT = Number(process.env.PORT || 4186);
 const HOST = process.env.HOST || '0.0.0.0';
 const AUTO_INIT = process.env.AUTO_INIT !== 'false';
@@ -23,14 +25,14 @@ async function main() {
     try {
       const s = await loadSettings();
       const r = await bootstrap(s);
-      console.error(
-        `[orchestrator-service] БД "${s.database}": ${r.created ? 'создана' : 'уже существует'}; ` +
-          `миграции: ${r.migrated.length ? r.migrated.join(', ') : 'нет новых'}`
-      );
+      log.info(`БД "${s.database}": ${r.created ? 'создана' : 'уже существует'}; миграции: ${r.migrated.length ? r.migrated.join(', ') : 'нет новых'}`, {
+        event_code: 'APP_BOOT_STEP', operation: 'db.bootstrap',
+        attributes: { database: s.database, created: r.created, migrated: r.migrated },
+      });
     } catch (e) {
-      console.error(
-        `[orchestrator-service] автоинициализация БД не удалась (продолжаю, настройте через UI): ${e.message}`
-      );
+      log.error('автоинициализация БД не удалась (продолжаю, настройте через UI)', {
+        event_code: 'APP_BOOT_FAILED', operation: 'db.bootstrap', error_code: 'DB_UNAVAILABLE', err: e,
+      });
     }
   }
   // VERSION-KPI-TRACKING-001: авто-метка деплоя. APP_CODE_VERSION задаётся build-arg
@@ -39,9 +41,9 @@ async function main() {
   if (process.env.APP_CODE_VERSION) {
     try {
       const dm = await recordDeployMarker(await loadSettings(), { ref: process.env.APP_CODE_VERSION });
-      if (dm.created) console.error(`[orchestrator-service] метка деплоя поставлена: ${dm.ref}`);
+      if (dm.created) log.info(`метка деплоя поставлена: ${dm.ref}`, { event_code: 'APP_BOOT_STEP', operation: 'deploy.marker', attributes: { ref: dm.ref } });
     } catch (e) {
-      console.error(`[orchestrator-service] метка деплоя не поставлена (продолжаю): ${e.message}`);
+      log.warn('метка деплоя не поставлена (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'deploy.marker', err: e });
     }
   }
 
@@ -51,19 +53,19 @@ async function main() {
   // и не путаются с реальными зависаниями задач.
   try {
     const dt = await recordDowntimeMarker(await loadSettings());
-    if (dt.downtime) console.error(`[orchestrator-service] отмечен простой ~${dt.hours} ч: ${dt.ref}`);
+    if (dt.downtime) log.info(`отмечен простой ~${dt.hours} ч: ${dt.ref}`, { event_code: 'APP_BOOT_STEP', operation: 'downtime.marker', attributes: { hours: dt.hours, ref: dt.ref } });
   } catch (e) {
-    console.error(`[orchestrator-service] метка простоя не поставлена (продолжаю): ${e.message}`);
+    log.warn('метка простоя не поставлена (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'downtime.marker', err: e });
   }
 
   if (STARTUP_RECONCILE) {
     try {
       const released = await reconcileOnStartup(await loadSettings());
-      console.error(
-        `[orchestrator-service] стартовая реконсиляция: освобождено осиротевших Programmer-задач: ${released}`,
-      );
+      log.info(`стартовая реконсиляция: освобождено осиротевших Programmer-задач: ${released}`, {
+        event_code: 'APP_BOOT_STEP', operation: 'startup.reconcile', attributes: { released },
+      });
     } catch (e) {
-      console.error(`[orchestrator-service] стартовая реконсиляция не удалась (продолжаю): ${e.message}`);
+      log.warn('стартовая реконсиляция не удалась (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'startup.reconcile', err: e });
     }
   }
 
@@ -73,19 +75,19 @@ async function main() {
   // пустом volume). Гейты: CLICKHOUSE_OBSERVABILITY_ENABLED, ..._ENSURE_SCHEMA.
   void ensureClickhouseSchema()
     .then((r) => {
-      if (r?.ok) console.error('[orchestrator-service] ClickHouse observability: схема готова');
-      else if (r?.ok === false) console.error(`[orchestrator-service] ClickHouse observability: схема не накатилась (продолжаю): ${r.error}`);
+      if (r?.ok) log.info('ClickHouse observability: схема готова', { event_code: 'APP_BOOT_STEP', operation: 'clickhouse.ensure_schema' });
+      else if (r?.ok === false) log.warn('ClickHouse observability: схема не накатилась (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'clickhouse.ensure_schema', attributes: { error: r.error } });
     })
-    .catch((e) => console.error(`[orchestrator-service] ClickHouse observability: ensure schema error (продолжаю): ${e.message}`));
+    .catch((e) => log.warn('ClickHouse observability: ensure schema error (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'clickhouse.ensure_schema', err: e }));
 
   createApp().listen(PORT, HOST, () => {
-    console.error(`[orchestrator-service] http://localhost:${PORT}`);
+    log.info(`orchestrator-service слушает http://localhost:${PORT}`, { event_code: 'APP_STARTED', attributes: { port: PORT, host: HOST } });
   });
 
   if (RUNNER_ENABLED) {
     const runner = createTaskRunner();
     runner.start();
-    console.error('[orchestrator-service] task runner запущен');
+    log.info('task runner запущен', { event_code: 'APP_BOOT_STEP', operation: 'runner.start' });
     const stop = () => runner.stop();
     process.on('SIGINT', stop);
     process.on('SIGTERM', stop);
