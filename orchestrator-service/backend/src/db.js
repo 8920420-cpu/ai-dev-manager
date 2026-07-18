@@ -17,6 +17,7 @@ import { asObject, parseDataCard } from './dataCard.js';
 import { isDriverProvider } from './connectors.js';
 import { hashToken, messageFingerprint } from './intakeIntegrations.js';
 import { exportLatestAgentRunObservation } from './clickhouseObservability.js';
+import { withTransaction } from './transaction.js';
 import {
   computeTaskPriority,
   isOrchestratorProject,
@@ -2146,7 +2147,7 @@ export async function releaseClaudeTask(s, taskId, opts = {}) {
 export async function releaseClaudeTaskTx(c, taskId, opts = {}) {
   const id = String(taskId ?? '').trim();
   if (!id) throw scannerError(422, 'taskId_required');
-  {
+  return withTransaction(c, async () => {
     const r = await c.query(
       `UPDATE tasks SET assigned_agent_id = NULL
         WHERE id = $1 AND status = 'CODING'
@@ -2236,7 +2237,7 @@ export async function releaseClaudeTaskTx(c, taskId, opts = {}) {
       }
     }
     return { released, taskId: id, crossServiceBlocked };
-  }
+  });
 }
 
 // --- Host-мост для ролей действия (PIPELINE_SERVICE, GIT_INTEGRATOR) ---------

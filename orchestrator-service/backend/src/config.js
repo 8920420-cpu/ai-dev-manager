@@ -4,6 +4,7 @@ import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { resolveInt } from './envConfig.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 export const SETTINGS_PATH =
@@ -11,7 +12,7 @@ export const SETTINGS_PATH =
 
 const DEFAULTS = {
   host: process.env.PGHOST || '127.0.0.1',
-  port: Number(process.env.PGPORT || 5432),
+  port: resolveInt('PGPORT', 5432, { min: 1, max: 65535 }).value,
   user: process.env.PGUSER || 'postgres',
   password: process.env.PGPASSWORD || 'postgres',
   database: process.env.PGDATABASE || 'orchestrator_db',

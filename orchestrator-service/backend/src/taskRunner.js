@@ -5,9 +5,10 @@
 import { loadSettings } from './config.js';
 import { advanceAutomatedTasks } from './db.js';
 import { touchOrchestratorHeartbeat } from './performance.js';
+import { resolveDuration } from './envConfig.js';
 
 export function createTaskRunner({
-  intervalMs = Number(process.env.RUNNER_INTERVAL_MS || 3000),
+  intervalMs = resolveDuration('RUNNER_INTERVAL_MS', 3000, { min: 100 }).value,
   log = console,
   loadSettings: load = loadSettings,
   advance = advanceAutomatedTasks,

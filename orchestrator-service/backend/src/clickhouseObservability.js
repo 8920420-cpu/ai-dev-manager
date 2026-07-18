@@ -215,6 +215,14 @@ async function flushQueue() {
   }
 }
 
+export async function flushClickhouseObservability() {
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  await flushQueue();
+}
+
 function enqueueRows(rows) {
   if (!enabled() || !rows.length) return { skipped: true };
   const maxQueue = positiveIntEnv('CLICKHOUSE_OBSERVABILITY_MAX_QUEUE', DEFAULT_MAX_QUEUE);

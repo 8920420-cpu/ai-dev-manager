@@ -8,17 +8,19 @@ import { bootstrap, reconcileOnStartup } from '../src/db.js';
 import { createTaskRunner } from '../src/taskRunner.js';
 import { recordDeployMarker, recordDowntimeMarker } from '../src/performance.js';
 import { ensureClickhouseSchema } from '../src/clickhouseSchema.js';
+import { flushClickhouseObservability } from '../src/clickhouseObservability.js';
+import { resolveBool, resolveDuration, resolveInt } from '../src/envConfig.js';
 import { createLogger } from '../../../shared/logging/index.js';
 
 const log = createLogger({ service: 'orchestrator-service' });
-const PORT = Number(process.env.PORT || 4186);
+const PORT = resolveInt('PORT', 4186, { min: 1, max: 65535 }).value;
 const HOST = process.env.HOST || '0.0.0.0';
-const AUTO_INIT = process.env.AUTO_INIT !== 'false';
+const AUTO_INIT = resolveBool('AUTO_INIT', true).value;
 // Фоновый runner продвигает автоматические роли по БД (RUNNER_ENABLED=false — выкл).
-const RUNNER_ENABLED = process.env.RUNNER_ENABLED !== 'false';
+const RUNNER_ENABLED = resolveBool('RUNNER_ENABLED', true).value;
 // Стартовая реконсиляция: немедленно освободить осиротевшие Programmer-назначения,
 // чтобы зависшие после прошлого сеанса задачи переподались сразу (STARTUP_RECONCILE=false — выкл).
-const STARTUP_RECONCILE = process.env.STARTUP_RECONCILE !== 'false';
+const STARTUP_RECONCILE = resolveBool('STARTUP_RECONCILE', true).value;
 
 async function main() {
   if (AUTO_INIT) {
@@ -80,18 +82,41 @@ async function main() {
     })
     .catch((e) => log.warn('ClickHouse observability: ensure schema error (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'clickhouse.ensure_schema', err: e }));
 
-  createApp().listen(PORT, HOST, () => {
+  const server = createApp().listen(PORT, HOST, () => {
     log.info(`orchestrator-service слушает http://localhost:${PORT}`, { event_code: 'APP_STARTED', attributes: { port: PORT, host: HOST } });
   });
 
+  let runner = null;
   if (RUNNER_ENABLED) {
-    const runner = createTaskRunner();
+    runner = createTaskRunner();
     runner.start();
     log.info('task runner запущен', { event_code: 'APP_BOOT_STEP', operation: 'runner.start' });
-    const stop = () => runner.stop();
-    process.on('SIGINT', stop);
-    process.on('SIGTERM', stop);
   }
+
+  let shuttingDown = false;
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info('orchestrator-service shutdown requested', { event_code: 'APP_SHUTDOWN', attributes: { signal } });
+    runner?.stop();
+    const force = setTimeout(() => {
+      log.warn('orchestrator-service shutdown timeout', { event_code: 'APP_SHUTDOWN_TIMEOUT' });
+      process.exit(1);
+    }, resolveDuration('SHUTDOWN_TIMEOUT_MS', 10000, { min: 1000 }).value);
+    force.unref?.();
+    try {
+      await new Promise((resolve) => server.close(resolve));
+      await flushClickhouseObservability();
+      clearTimeout(force);
+      process.exit(0);
+    } catch (e) {
+      clearTimeout(force);
+      log.error('orchestrator-service shutdown failed', { event_code: 'APP_SHUTDOWN_FAILED', err: e });
+      process.exit(1);
+    }
+  };
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
 }
 
 main();

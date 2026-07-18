@@ -1,8 +1,10 @@
 // Клиент микросервиса tools-service: исполнение builtin-инструментов (function
 // calling рассуждающих ролей) и сборка MCP-конфигурации для Claude Code.
+import { resolveDuration } from './envConfig.js';
+
 const BASE = String(process.env.TOOLS_SERVICE_URL || 'http://tools-service:4188').replace(/\/+$/, '');
 const TOKEN = String(process.env.ORCHESTRATOR_API_TOKEN || '').trim();
-const TIMEOUT_MS = Number(process.env.TOOLS_SERVICE_TIMEOUT_MS || 30000);
+const TIMEOUT_MS = resolveDuration('TOOLS_SERVICE_TIMEOUT_MS', 30000, { min: 1000 }).value;
 
 // PROJECT-PATH-MAP-001: оркестратор хранит root_path как путь ХОСТА (напр.
 // Windows «K:\…\PS»), а tools-service видит проекты в своём контейнере (см.

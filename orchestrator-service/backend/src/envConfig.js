@@ -37,6 +37,14 @@ function parseIntStrict(raw) {
   return Number(s);
 }
 
+function parseBoolStrict(raw) {
+  const s = String(raw).trim().toLowerCase();
+  if (s === '') return null;
+  if (['1', 'true', 'yes', 'on'].includes(s)) return true;
+  if (['0', 'false', 'no', 'off'].includes(s)) return false;
+  return NaN;
+}
+
 function resolve(name, dflt, parse, { env, min, max, unit }) {
   const raw = env[name];
   if (raw == null || String(raw).trim() === '') {
@@ -77,6 +85,11 @@ export function resolveDuration(name, defaultMs, opts = {}) {
 export function resolveInt(name, defaultVal, opts = {}) {
   const { env = process.env, min = Number.NEGATIVE_INFINITY, max = Number.POSITIVE_INFINITY } = opts;
   return resolve(name, defaultVal, parseIntStrict, { env, min, max, unit: '' });
+}
+
+export function resolveBool(name, defaultVal, opts = {}) {
+  const { env = process.env } = opts;
+  return resolve(name, Boolean(defaultVal), parseBoolStrict, { env, min: false, max: true, unit: '' });
 }
 
 /**

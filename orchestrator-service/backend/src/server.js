@@ -122,6 +122,7 @@ import {
   testConnectionById,
 } from './databaseConnections.js';
 import { pickFolder } from './fsPicker.js';
+import { resolveInt } from './envConfig.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -148,7 +149,6 @@ const FRONTEND_DIR =
   resolve(__dirname, '../../frontend');
 
 const API_AUTH = readTokenAuthConfig();
-const UI_BOOTSTRAP_API_TOKEN = process.env.UI_BOOTSTRAP_API_TOKEN === '1';
 const log = createLogger({ service: 'orchestrator-service' });
 
 function isAuthorized(req, { allowQueryToken = false } = {}) {
@@ -173,7 +173,7 @@ const BODY_LIMIT_BYTES = 1e6; // 1 МБ на тело запроса по умо
 
 // Скриншоты обращений («Обратная связь») приходят data-URL'ом (base64) и крупнее
 // глобального лимита readBody — для /api/feedback/screenshot нужен отдельный потолок.
-const FEEDBACK_SCREENSHOT_BODY_LIMIT = Number(process.env.FEEDBACK_SCREENSHOT_BODY_LIMIT) || 8e6;
+const FEEDBACK_SCREENSHOT_BODY_LIMIT = resolveInt('FEEDBACK_SCREENSHOT_BODY_LIMIT', 8e6, { min: 1 }).value;
 
 // maxBytes переопределяет BODY_LIMIT_BYTES для эндпоинтов с заведомо большим телом
 // (напр. загрузка скриншота). Прочие вызовы (readBody(req)) сохраняют лимит 1 МБ.
@@ -377,9 +377,6 @@ export function createApp() {
         if (req.method === 'GET' && p === '/health') return sendJson(res, 200, { status: 'ok' });
 
         if (req.method === 'GET' && p === '/api/client-auth') {
-          if (UI_BOOTSTRAP_API_TOKEN && API_AUTH.token) {
-            return sendJson(res, 200, { token: API_AUTH.token });
-          }
           return sendJson(res, 200, { token: null });
         }
 
@@ -1105,10 +1102,10 @@ export function createApp() {
       res.end('Method not allowed');
     } catch (e) {
       const status = e.statusCode || 500;
-      const body = { ok: false, error: e.message };
+      const body = { ok: false, error: status >= 500 ? 'internal_error' : e.message };
       // Стабильный машинный код и привязанные к stageId ошибки валидации.
-      if (e.code) body.code = e.code;
-      if (Array.isArray(e.errors)) body.errors = e.errors;
+      if (status < 500 && e.code) body.code = e.code;
+      if (status < 500 && Array.isArray(e.errors)) body.errors = e.errors;
       // Финальная точка логирования: 5xx — ERROR со stack; ожидаемые 4xx (битый ввод,
       // слишком большое тело) не шумят на уровне ERROR — их отметит access-лог как warn.
       if (status >= 500) {
