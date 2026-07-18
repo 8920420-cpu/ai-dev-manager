@@ -19,6 +19,11 @@ import { hashToken, messageFingerprint } from './intakeIntegrations.js';
 import { exportLatestAgentRunObservation } from './clickhouseObservability.js';
 import { withTransaction } from './transaction.js';
 import {
+  buildProgrammerClaimTask,
+  buildProgrammerRunSnapshot,
+  programmerModelForKind,
+} from './programmerClaim.js';
+import {
   computeTaskPriority,
   isOrchestratorProject,
   normalizeClientPriority,
@@ -62,6 +67,8 @@ export {
   looksCorruptedText,
   normalizeScannerCompletion,
 } from './scannerCompat.js';
+
+export { programmerModelForKind };
 
 export function clientConfig(s, database) {
   return {
@@ -2019,26 +2026,19 @@ export async function claimNextClaudeTaskTx(c) {
             AND lower(cn.provider) IN ('claude_code', 'anthropic')
           LIMIT 1`,
       );
-      const connModel = String(progConn.rows[0]?.model ?? '').trim();
-      const agentModel = String(progAgent.rows[0]?.model ?? '').trim();
       // PROGRAMMER-MODEL-ROUTING-001: модель по сложности задачи (Sonnet для мелких
       // подзадач-на-файл, Opus для цельных задач-на-сервис). Эффективная модель:
       // явный Claude-коннектор роли (осознанный override оператора) > роутинг по
       // сложности > дефолт агента > пусто (раннер сам решит).
-      const routedModel = programmerModelForKind(task_kind);
-      const programmerModel = connModel || routedModel || agentModel || null;
       // ROLE-ENGINE-ROUTING-002: неизменяемый снимок фактического движка программиста.
       // Источник истины — назначенный роли Claude-совместимый коннектор (см. выше). Нет
       // назначения → снимок пустой (раннер исполняет дефолтным агентом, коннектор не
       // зафиксирован). snapshot_model = эффективная модель, которой реально исполняется.
-      const progProvider = progConn.rows[0]?.provider == null
-        ? null : String(progConn.rows[0].provider);
-      const progSnap = {
-        connectorId: progConn.rows[0]?.connector_id ?? null,
-        provider: progProvider,
-        model: programmerModel,
-        driverType: progProvider == null ? null : (isDriverProvider(progProvider) ? 'driver' : 'api'),
-      };
+      const { model: programmerModel, snapshot: progSnap } = buildProgrammerRunSnapshot({
+        connectorRow: progConn.rows[0] ?? null,
+        agentRow: progAgent.rows[0] ?? null,
+        taskKind: task_kind,
+      });
       // Прогон закрывают по task_id (на задачу — ровно один RUNNING под PROGRAMMER),
       // поэтому id прогона дальше не нужен.
       if (progAgentId) {
@@ -2061,51 +2061,19 @@ export async function claimNextClaudeTaskTx(c) {
       // свежий ключ на каждый заход и сохраняет идемпотентность в рамках одного
       // захвата (исполнитель сдаёт ровно тем ключом, что получил здесь).
       const completionKey = `programmer-${row.id}-${assigned.rows[0].id}`;
+      const task = buildProgrammerClaimTask({
+        row,
+        projectCode: project_code,
+        serviceCode: service_code,
+        model: programmerModel,
+        prior,
+        tools: progTools,
+        mcpConfig,
+        requiredFields,
+        completionKey,
+      });
       await c.query('COMMIT');
-      return {
-        task: {
-          id: row.id,
-          project: project_code,
-          service: service_code ?? '',
-          title: row.title,
-          description: row.description ?? '',
-          // PROGRAMMER-UNIFY-001: модель из движка роли (или дефолт) — раннер
-          // запускает агента ровно на ней; null = раннер берёт свой дефолт.
-          model: programmerModel,
-          priorRoleOutputs: prior.priorRoleOutputs,
-          lastReview: prior.lastReview,
-          // Инструменты для Claude Code: MCP-конфиг и разрешённые уровни доступа.
-          capabilities: progTools.capabilities,
-          mcpConfig,
-          // Требования контракта роли: ключи полей, которые обязательно вернуть
-          // в fields при сдаче (orchestrator_complete_scanner_task). Пусто — нет требований.
-          requiredFields,
-          // ЖЁСТКОЕ УСЛОВИЕ сдачи: задача остаётся claimed в статусе CODING, пока
-          // исполнитель не вернёт результат во внешнюю систему. Чтобы пайплайн НЕ
-          // тормозил, исполнитель ОБЯЗАН СРАЗУ после внесения изменений вызвать
-          // orchestrator_complete_scanner_task. Все обязательные параметры заранее
-          // подставлены здесь (completionKey идемпотентен, повтор безопасен) —
-          // придумывать ничего не нужно, рапорт делается немедленно.
-          completion: {
-            required: true,
-            tool: 'orchestrator_complete_scanner_task',
-            completionKey,
-            project: project_code,
-            service: service_code ?? '',
-            title: row.title,
-            sourceDocument: 'tasks/claude-tasks.json',
-            instruction:
-              'ОБЯЗАТЕЛЬНО: сразу после внесения изменений вызови ' +
-              'orchestrator_complete_scanner_task с этими taskId, completionKey, ' +
-              'project, service, title, sourceDocument; перечисли changedFiles и ' +
-              'result. Не оставляй задачу без рапорта — иначе она зависнет на этапе ' +
-              'Programmer (CODING) и затормозит весь пайплайн. После успешной сдачи ' +
-              'результата очисти рабочий контекст сессии программиста (например, ' +
-              'командой /clear в Claude Code), чтобы следующая задача не получила ' +
-              'остатки контекста выполненной задачи.',
-          },
-        },
-      };
+      return { task };
     } catch (error) {
       await c.query('ROLLBACK');
       throw error;
@@ -3113,11 +3081,6 @@ const PROGRAMMER_RELEASE_LOOP_MAX = programmerLoopMaxCfg.value;
 // мелочи. Имена моделей переопределяемы через env (сменить поколение без правки кода).
 // Явно назначенный роли Claude-коннектор (role_connectors) ПЕРЕБИВАЕТ роутинг — это
 // осознанный выбор оператора «одна модель на всё» (см. claimNextClaudeTaskTx).
-const PROGRAMMER_MODEL_SIMPLE = String(process.env.PROGRAMMER_MODEL_SIMPLE || 'claude-sonnet-5').trim();
-const PROGRAMMER_MODEL_COMPLEX = String(process.env.PROGRAMMER_MODEL_COMPLEX || 'claude-opus-4-8').trim();
-export function programmerModelForKind(taskKind) {
-  return String(taskKind) === 'subtask' ? PROGRAMMER_MODEL_SIMPLE : PROGRAMMER_MODEL_COMPLEX;
-}
 // ARCHITECT-BUDGET-LOOP-001: сколько подряд CANCELLED/TIMEOUT-прогонов Архитектора
 // (мега-эпик не влезает в бюджет одного прогона) уводят задачу в BLOCKED С ПРИЧИНОЙ.
 // Дефолт 3 — по инциденту («три CANCELLED подряд по таймауту»). Настройка.
