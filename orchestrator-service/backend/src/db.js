@@ -3743,8 +3743,7 @@ export async function advanceJoinNodes(c) {
       [p.id],
     );
     const failed = childRows.rows.some((ch) => ch.status === 'FAILED' || ch.status === 'CANCELLED');
-    await c.query('BEGIN');
-    try {
+    const advancedParent = await withTransaction(c, async () => {
       if (failed) {
         // Политика all-DONE-required: упавшая ветка → родитель BLOCKED (всплывает пользователю).
         await c.query(
@@ -3756,9 +3755,7 @@ export async function advanceJoinNodes(c) {
            VALUES ($1, 'STATUS_CHANGED', 'WAITING_FOR_CHILDREN', 'BLOCKED', $2, $3::jsonb)`,
           [p.id, p.current_role_id, JSON.stringify({ runner: true, reason: 'join_child_failed' })],
         );
-        await c.query('COMMIT');
-        advanced += 1;
-        continue;
+        return true;
       }
       // Слить карточки детей в родителя (накопительная карточка).
       let merged = { ...parseDataCard(p) };
@@ -3806,12 +3803,9 @@ export async function advanceJoinNodes(c) {
         [p.id, done ? 'TASK_DONE' : 'STATUS_CHANGED', toStatus, p.current_role_id,
          JSON.stringify(joinPayload)],
       );
-      await c.query('COMMIT');
-      advanced += 1;
-    } catch (error) {
-      await c.query('ROLLBACK');
-      throw error;
-    }
+      return true;
+    });
+    if (advancedParent) advanced += 1;
   }
   return advanced;
 }
