@@ -14,8 +14,8 @@ Timeweb → ingress-nginx кластера (см. [[../README.md]] и памят
 |---|---|---|---|
 | приоритетстрой.рф | prioritetstroy.conf | 211:1040 (psweb), 211:1033 (iam_admin /register,/assets), 211:8099 (iam /api/v1) | **кластер** ps-prod |
 | пс-чат.рф | ps-chat.conf | 211:1034 (chat_frontend), 211:8090 (avito /avito), 211:1033 (iam_admin), 211:8099 (iam), 211:5072 (chat MAX /max/webhook) | **кластер** ps-prod |
-| пс-смета.рф | ps-smeta.conf | httpServer = **192.168.1.140:9090** /applications/PSSmeta/ | НЕ переносилось (сервер приложений, не docker) |
-| пс-разработчик.рф | ps-razrabotchik.conf | httpServer = **192.168.1.140:9090** /console/ | НЕ переносилось (сервер приложений) |
+| пс-смета.рф | ps-smeta.conf | httpServer = **192.168.1.140:9090** /applications/PSSmeta/ | **кластер** ps-prod (20.07.2026, `PS/deploy/k8s-prod/63-ps-smeta-ingress.yaml`) |
+| пс-разработчик.рф | ps-razrabotchik.conf | httpServer = **192.168.1.140:9090** /console/ | **кластер** ps-prod (20.07.2026, `PS/deploy/k8s-prod/64-ps-razrabotchik-ingress.yaml`, + basic auth вместо geo) |
 | :8058 | beeline.conf | **192.168.1.200:8058** (Билайн АТС) | НЕ наше, не трогать |
 | :80 (server1c) | server1c.conf | **192.168.1.201:80** (1С) | НЕ наше, не трогать |
 
