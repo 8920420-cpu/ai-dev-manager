@@ -195,6 +195,11 @@ const ERROR_MESSAGES: Record<string, string> = {
   unsupported_host_role: 'Эта host-роль не поддерживается.',
   taskId_required: 'Не указан идентификатор задачи.',
   task_not_found: 'Задача не найдена.',
+  // Ответ человека на вопрос агента (TASK-NEEDS-INPUT-001)
+  task_not_awaiting_input: 'Задача уже не ждёт ответа — вопрос сняли или задача уехала дальше.',
+  question_not_found: 'Вопрос не найден.',
+  question_already_answered: 'На этот вопрос уже ответили.',
+  answer_required: 'Введите ответ или выберите вариант.',
 };
 
 function humanizeErrorMessage(message: string, status: number): string {

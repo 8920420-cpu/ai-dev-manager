@@ -29,10 +29,13 @@
 - `_orchestrator_template/` — Project folder
 
 ## Entry Points
-- No standard entry points detected — check manually
+- `src/main.tsx`
 
 ## Data Flow
-- Data flow not auto-detected — fill in manually
+1. Request hits entry point
+2. Routed through middleware
+3. Handled by route files in: _orchestrator_template/tasks/review, src/api, tasks/review
+4. Returns response
 
 ## External Dependencies
 - Docker Compose services detected (see docker-compose.yml)

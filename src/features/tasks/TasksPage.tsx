@@ -20,10 +20,9 @@ import {
   Select,
   Textarea,
   useToast,
-  type BadgeTone,
 } from '../../components/ui';
 import { cn } from '../../lib/cn';
-import { taskStatusLabel } from '../../data/taskStatuses';
+import { taskStatusLabel, taskStatusTone as statusTone } from '../../data/taskStatuses';
 import { taskPriorityLabel, taskPriorityTone } from '../../data/taskPriorities';
 import {
   subscribeTaskChanges,
@@ -44,17 +43,13 @@ type LoadState = 'loading' | 'error' | 'ready';
 // Статусы, из которых задача автоматически не двигается (нужно ручное перемещение).
 const TERMINAL_STATUSES = new Set(['DONE', 'CANCELLED', 'FAILED']);
 
-/** Можно ли продвинуть задачу «на следующий этап» автоматически. */
+/**
+ * Можно ли продвинуть задачу «на следующий этап» автоматически.
+ * NEEDS_INPUT сюда не входит: задача стоит на вопросе к человеку, и двигать её
+ * дальше нужно ответом (TASK-NEEDS-INPUT-001), а не кнопкой «Дальше».
+ */
 export function canAdvance(status: string): boolean {
-  return !TERMINAL_STATUSES.has(status) && status !== 'BLOCKED';
-}
-
-function statusTone(status: string): BadgeTone {
-  if (status === 'DONE') return 'success';
-  if (status === 'BLOCKED' || status === 'FAILED' || status === 'CANCELLED') return 'danger';
-  if (status === 'RESTART') return 'warning';
-  if (status === 'READY' || status === 'BACKLOG') return 'neutral';
-  return 'info';
+  return !TERMINAL_STATUSES.has(status) && status !== 'BLOCKED' && status !== 'NEEDS_INPUT';
 }
 
 /** Цель ручного перемещения — выбранная задача и её проект. */

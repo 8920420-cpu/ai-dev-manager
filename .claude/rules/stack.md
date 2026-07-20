@@ -36,13 +36,10 @@
 | `npm run test:all` | npm test && npm run test:services |
 | `npm run test:watch` | vitest |
 | `npm run memory:sync:pg` | node scripts/sync-codebase-memory-to-postgres.js |
+| `npm run memory:sync:pg:all` | node scripts/sync-codebase-memory-to-postgres.js --all-projects |
 
 ## Codebase Memory
 - `codebase-memory.cmd analyze .` regenerates local Claude/Codex-facing memory markdown.
 - `codebase-memory.cmd update .` appends incremental local memory updates.
 - `npm run memory:sync:pg` mirrors memory markdown into PostgreSQL.
-
-## New Commands (added 2026-07-10)
-| Command | What it does |
-|---------|-------------|
-| `npm run memory:sync:pg:all` | node scripts/sync-codebase-memory-to-postgres.js --all-projects |
+- `npm run memory:sync:pg:all` mirrors memory for every non-archived orchestrator project.

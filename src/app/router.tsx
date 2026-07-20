@@ -12,6 +12,7 @@ export type RouteKey =
   | 'projects'
   | 'tasks'
   | 'tasks-review'
+  | 'tasks-needs-input'
   | 'tasks-done'
   | 'departments-development'
   | 'servers'
@@ -27,6 +28,7 @@ const ROUTES: Record<RouteKey, string> = {
   projects: '#/projects',
   tasks: '#/tasks',
   'tasks-review': '#/tasks/review',
+  'tasks-needs-input': '#/tasks/needs-input',
   'tasks-done': '#/tasks/done',
   'departments-development': '#/departments/development',
   servers: '#/servers',
@@ -45,6 +47,7 @@ function parseHash(): RouteKey {
   const [section, sub] = window.location.hash.replace(/^#\/?/, '').split('/');
   if (section === 'tasks') {
     if (sub === 'review') return 'tasks-review';
+    if (sub === 'needs-input') return 'tasks-needs-input';
     if (sub === 'done') return 'tasks-done';
     return 'tasks';
   }

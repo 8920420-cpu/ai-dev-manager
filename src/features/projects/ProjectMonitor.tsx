@@ -48,13 +48,17 @@ const STATUS_LABEL: Record<string, string> = {
   BLOCKED: 'Заблокировано',
   FAILED: 'Ошибка',
   CANCELLED: 'Отменено',
+  NEEDS_INPUT: 'Нужна информация',
 };
 
+// У монитора своя палитра (активные стадии — 'primary'), поэтому общий
+// taskStatusTone здесь намеренно не используется: он бы перекрасил всю доску.
 const STATUS_TONE: Record<string, BadgeTone> = {
   DONE: 'success',
   BLOCKED: 'danger',
   FAILED: 'danger',
   CANCELLED: 'neutral',
+  NEEDS_INPUT: 'warning',
   REVIEW: 'info',
   TESTING: 'info',
   CODING: 'primary',

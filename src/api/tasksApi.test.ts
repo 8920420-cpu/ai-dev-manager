@@ -87,6 +87,85 @@ describe('tasksApi.setPriority', () => {
   });
 });
 
+describe('tasksApi.needsInputBoard', () => {
+  it('GET /api/tasks/needs-input-board и возвращает задачи с вопросами', async () => {
+    get.mockResolvedValue({
+      tasks: [
+        {
+          id: 't1',
+          title: 'Импорт контактов',
+          projectId: 'p1',
+          projectName: 'Альфа',
+          serviceCode: 'getway',
+          priority: 2,
+          question: {
+            id: 'q1',
+            question: 'Какой формат даты использовать?',
+            options: ['ISO-8601', 'DD.MM.YYYY'],
+            context: null,
+            roleCode: 'PROGRAMMER',
+            askedAt: '2026-07-01T10:00:00.000Z',
+          },
+        },
+      ],
+    });
+    const res = await tasksApi.needsInputBoard();
+    expect(get).toHaveBeenCalledWith('/api/tasks/needs-input-board', { signal: undefined });
+    expect(res.tasks[0].question.options).toEqual(['ISO-8601', 'DD.MM.YYYY']);
+  });
+
+  it('пробрасывает signal для отмены устаревшего запроса', async () => {
+    const ctrl = new AbortController();
+    get.mockResolvedValue({ tasks: [] });
+    await tasksApi.needsInputBoard(ctrl.signal);
+    expect(get).toHaveBeenCalledWith('/api/tasks/needs-input-board', { signal: ctrl.signal });
+  });
+});
+
+describe('tasksApi.answerQuestion', () => {
+  it('POST /api/tasks/:taskId/answer с телом { questionId, answer }', async () => {
+    post.mockResolvedValue({ answered: true, taskId: 't1', resumedStatus: 'CODING' });
+    const res = await tasksApi.answerQuestion('t1', { questionId: 'q1', answer: 'ISO-8601' });
+    expect(post).toHaveBeenCalledWith('/api/tasks/t1/answer', {
+      questionId: 'q1',
+      answer: 'ISO-8601',
+    });
+    expect(res.resumedStatus).toBe('CODING');
+  });
+
+  it('кодирует taskId в пути', async () => {
+    post.mockResolvedValue({ answered: true });
+    await tasksApi.answerQuestion('a/b', { questionId: 'q1', answer: 'да' });
+    expect(post).toHaveBeenCalledWith('/api/tasks/a%2Fb/answer', {
+      questionId: 'q1',
+      answer: 'да',
+    });
+  });
+
+  it('пробрасывает ApiError, если на вопрос уже ответили', async () => {
+    const err = new ApiError('На этот вопрос уже ответили.', 409, {
+      error: 'question_already_answered',
+    });
+    post.mockRejectedValue(err);
+    await expect(
+      tasksApi.answerQuestion('t1', { questionId: 'q1', answer: 'да' }),
+    ).rejects.toBe(err);
+    await expect(
+      tasksApi.answerQuestion('t1', { questionId: 'q1', answer: 'да' }),
+    ).rejects.toMatchObject({ status: 409 });
+  });
+
+  it('пробрасывает ApiError, если задача уже не ждёт ответа', async () => {
+    const err = new ApiError('Задача уже не ждёт ответа', 409, {
+      error: 'task_not_awaiting_input',
+    });
+    post.mockRejectedValue(err);
+    await expect(
+      tasksApi.answerQuestion('t1', { questionId: 'q1', answer: 'да' }),
+    ).rejects.toMatchObject({ status: 409, body: { error: 'task_not_awaiting_input' } });
+  });
+});
+
 describe('tasksApi — обработка ошибочных ответов', () => {
   it('advance пробрасывает ApiError при ошибке сервера', async () => {
     const err = new ApiError('Нельзя продвинуть терминальную задачу', 409, { error: 'terminal' });

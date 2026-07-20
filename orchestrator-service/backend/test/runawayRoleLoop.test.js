@@ -37,7 +37,9 @@ test('escalateRunawayRoleLoops: K подряд CANCELLED/TIMEOUT любой ро
   // Роль НЕ зашита — предохранитель общий (в отличие от ARCHITECT-BUDGET-LOOP-001).
   assert.equal(/r\.code = '/.test(main.sql), false, 'без фильтра по коду роли');
   // Уже остановленные и ждущие задачи не трогаем; занятые агентом — тоже.
-  assert.match(main.sql, /NOT IN \('DONE','CANCELLED','FAILED','BLOCKED','WAITING_FOR_CHILDREN'\)/);
+  // NEEDS_INPUT исключён: задача стоит на вопросе к человеку, её прогоны не идут,
+  // и записывать ей исчерпание бюджета (BLOCKED) не за что.
+  assert.match(main.sql, /NOT IN \('DONE','CANCELLED','FAILED','BLOCKED','WAITING_FOR_CHILDREN','NEEDS_INPUT'\)/);
   assert.match(main.sql, /t\.assigned_agent_id IS NULL/);
   // Считаем только оборванные без вердикта прогоны ПОСЛЕ последнего SUCCESS роли.
   assert.match(main.sql, /ar\.status IN \('CANCELLED','TIMEOUT'\)/);

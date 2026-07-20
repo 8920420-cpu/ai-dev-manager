@@ -27,6 +27,10 @@ import {
   restartStuckTasks,
   getAcceptanceBoard,
   acceptTask,
+  // TASK-NEEDS-INPUT-001: вопрос исполнителя к человеку и ответ на него.
+  requestTaskInput,
+  getNeedsInputBoard,
+  answerTaskQuestion,
   claimNextClaudeTask,
   releaseClaudeTask,
   claimNextHostTask,
@@ -684,6 +688,23 @@ export function createApp() {
           return sendJson(res, 200, result);
         }
 
+        // TASK-NEEDS-INPUT-001: исполнитель упёрся в неоднозначность и СПРАШИВАЕТ
+        // человека — задача паркуется в NEEDS_INPUT с вопросом, захват снимается.
+        // Отдельный эндпоинт, а не флаг в release-claude-task: это не откат
+        // захвата, а смена состояния задачи с ожиданием человека.
+        if (req.method === 'POST' && p === '/api/runner/needs-input') {
+          const body = await readBody(req);
+          const taskId = body.taskId;
+          const result = await requestTaskInput(await loadSettings(), taskId, {
+            question: body.question,
+            options: body.options,
+            context: body.context,
+            roleCode: body.roleCode,
+          });
+          publishTaskChange('task_needs_input', { taskId });
+          return sendJson(res, 200, result);
+        }
+
         // Host-мост: роли действия (PIPELINE_SERVICE/GIT_INTEGRATOR) исполняет
         // нативный host-runner — здесь он берёт задачу и сдаёт результат.
         if (req.method === 'GET' && p === '/api/runner/next-host-task') {
@@ -796,6 +817,24 @@ export function createApp() {
           const taskId = decodeURIComponent(acceptMatch[1]);
           const result = await acceptTask(await loadSettings(), taskId);
           publishTaskChange('task_accepted', { taskId });
+          return sendJson(res, 200, result);
+        }
+
+        // TASK-NEEDS-INPUT-001: доска задач, ждущих ответа человека.
+        if (req.method === 'GET' && p === '/api/tasks/needs-input-board')
+          return sendJson(res, 200, await getNeedsInputBoard(await loadSettings()));
+
+        // Ответ человека на вопрос исполнителя → задача возвращается на прежнюю стадию.
+        const answerMatch = p.match(/^\/api\/tasks\/([^/]+)\/answer$/);
+        if (answerMatch && req.method === 'POST') {
+          const taskId = decodeURIComponent(answerMatch[1]);
+          const body = await readBody(req);
+          const result = await answerTaskQuestion(await loadSettings(), taskId, {
+            questionId: body.questionId,
+            answer: body.answer,
+            answeredBy: body.answeredBy,
+          });
+          publishTaskChange('task_question_answered', { taskId });
           return sendJson(res, 200, result);
         }
 

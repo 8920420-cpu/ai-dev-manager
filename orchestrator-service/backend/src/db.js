@@ -1291,6 +1291,11 @@ export async function advanceTaskTx(c, taskId) {
     if (!task.project_id) throw scannerError(409, 'task_without_project');
     if (TERMINAL_STATUSES.has(task.status)) throw scannerError(409, 'task_terminal');
     if (task.status === 'BLOCKED') throw scannerError(409, 'task_blocked_use_manual');
+    // TASK-NEEDS-INPUT-001: задача стоит на вопросе к человеку. Продвинуть её
+    // «Дальше» — значит потерять вопрос и пустить исполнителя работать с той же
+    // неоднозначностью, из-за которой он и остановился. Двигают такую задачу
+    // ответом (answerTaskQuestionTx), который вернёт её на прежнюю стадию.
+    if (task.status === 'NEEDS_INPUT') throw scannerError(409, 'task_needs_input_use_answer');
     // Захваченную исполнителем задачу авто-продвигать нельзя: пока её слот занят
     // (assigned_agent_id != NULL), безусловный перевод дальше потеряет/перетрёт
     // активный прогон. Такие задачи двигаем только ручным moveTask с аудитом.
@@ -1489,7 +1494,7 @@ export async function restartStuckTasksTx(c) {
          SELECT id, status::text AS from_status, current_role_id FROM tasks
           WHERE project_id IS NOT NULL
             AND assigned_agent_id IS NULL
-            AND status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
+            AND status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','NEEDS_INPUT')
        ), upd AS (
          UPDATE tasks t SET updated_at = now()
            FROM targets WHERE t.id = targets.id
@@ -1632,6 +1637,248 @@ export async function acceptTaskTx(c, taskId) {
       [id, JSON.stringify({ source: 'manual-accept', via: 'acceptance-gate' })],
     );
     return { accepted: true, taskId: id };
+  });
+}
+
+// ─────────────────── TASK-NEEDS-INPUT-001: вопрос исполнителя ───────────────────
+//
+// Исполнитель, упёршийся в неоднозначность, раньше мог только выдумать ответ или
+// вернуть success=false (задача уходила в requeue и через несколько холостых
+// кругов — в BLOCKED, без единого понятного человеку вопроса). Теперь он паркует
+// задачу в NEEDS_INPUT с конкретным вопросом, человек отвечает, и задача
+// возвращается ровно на ту стадию, с которой ушла.
+
+/** Максимум длины описания задачи — тот же потолок, что у доливки артефактов. */
+const TASK_DESCRIPTION_MAX = 20000;
+
+/** Ограничители текстов вопроса/ответа: защита от простыни на весь контекст. */
+const QUESTION_MAX = 2000;
+const ANSWER_MAX = 4000;
+const OPTION_MAX = 300;
+const MAX_OPTIONS = 10;
+
+function clipText(value, max) {
+  const s = String(value ?? '').trim();
+  return s.length > max ? s.slice(0, max) : s;
+}
+
+/** Нормализовать варианты ответа: только непустые строки, без дублей, с лимитом. */
+function normalizeOptions(options) {
+  if (!Array.isArray(options)) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of options) {
+    const v = clipText(raw, OPTION_MAX);
+    if (!v || seen.has(v)) continue;
+    seen.add(v);
+    out.push(v);
+    if (out.length >= MAX_OPTIONS) break;
+  }
+  return out;
+}
+
+/**
+ * Припарковать задачу на вопросе к человеку.
+ *
+ * Идемпотентно по смыслу: если задача уже стоит на открытом вопросе, повторный
+ * вызов не плодит второй (уникальный частичный индекс task_questions_single_open_idx
+ * это и запрещает) и возвращает существующий — раннер мог не получить ответ HTTP
+ * и повторить запрос.
+ *
+ * @param {string} taskId
+ * @param {{question:string, options?:string[], context?:string, roleCode?:string}} input
+ */
+export async function requestTaskInput(s, taskId, input) {
+  return withClient(clientConfig(s), (c) => requestTaskInputTx(c, taskId, input));
+}
+
+export async function requestTaskInputTx(c, taskId, input = {}) {
+  const id = String(taskId ?? '').trim();
+  if (!id) throw scannerError(422, 'taskId_required');
+  const question = clipText(input.question, QUESTION_MAX);
+  if (!question) throw scannerError(422, 'question_required');
+  const options = normalizeOptions(input.options);
+  const context = clipText(input.context, QUESTION_MAX) || null;
+  const roleCode = clipText(input.roleCode, 64) || null;
+
+  return withTransaction(c, async () => {
+    const cur = await c.query(
+      `SELECT id, status::text AS status, needs_input_from_status::text AS from_status,
+              current_role_id
+         FROM tasks WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    if (!cur.rowCount) throw scannerError(404, 'task_not_found');
+    const task = cur.rows[0];
+
+    // Терминальную задачу парковать бессмысленно: отвечать на вопрос уже некому
+    // и некуда возвращать. Такое означает рассинхрон раннера с оркестратором.
+    if (TERMINAL_TASK_STATUSES.has(task.status)) throw scannerError(409, 'task_terminal');
+
+    const open = await c.query(
+      `SELECT id FROM task_questions WHERE task_id = $1 AND answered_at IS NULL LIMIT 1`,
+      [id],
+    );
+    if (open.rowCount) {
+      return { parked: true, duplicate: true, taskId: id, questionId: open.rows[0].id };
+    }
+
+    const ins = await c.query(
+      `INSERT INTO task_questions (task_id, role_code, question, options, context)
+       VALUES ($1, $2, $3, $4::jsonb, $5)
+       RETURNING id`,
+      [id, roleCode, question, JSON.stringify(options), context],
+    );
+    const questionId = ins.rows[0].id;
+
+    // Запоминаем стадию, с которой ушли: после ответа возвращаемся ровно на неё,
+    // а не пересчитываем маршрут заново (пересчёт увёл бы задачу не туда, если
+    // маршрут проекта успели поменять).
+    await c.query(
+      `UPDATE tasks
+          SET status = 'NEEDS_INPUT',
+              needs_input_from_status = $2::task_status,
+              assigned_agent_id = NULL,
+              updated_at = now()
+        WHERE id = $1`,
+      [id, task.status],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'STATUS_CHANGED', $2::task_status, 'NEEDS_INPUT'::task_status, $3, $4::jsonb)`,
+      [id, task.status, task.current_role_id ?? null,
+        JSON.stringify({ source: 'needs-input', via: 'agent-question', questionId, roleCode, question, options })],
+    );
+    return { parked: true, duplicate: false, taskId: id, questionId, fromStatus: task.status };
+  });
+}
+
+/**
+ * Доска «Нужна информация»: задачи, стоящие на открытом вопросе.
+ * Возвращает { tasks: [{ id, title, projectId, projectName, serviceCode, priority,
+ * question: { id, question, options, context, roleCode, askedAt } }] }.
+ */
+export async function getNeedsInputBoard(s) {
+  return withClient(clientConfig(s), (c) => getNeedsInputBoardTx(c));
+}
+
+export async function getNeedsInputBoardTx(c) {
+  const r = await c.query(
+    `SELECT t.id, t.title, t.priority::text AS priority,
+            p.id AS project_id, p.name AS project_name,
+            sv.service_name,
+            q.id AS question_id, q.question, q.options, q.context,
+            q.role_code, q.asked_at
+       FROM tasks t
+       JOIN task_questions q ON q.task_id = t.id AND q.answered_at IS NULL
+       LEFT JOIN projects p ON p.id = t.project_id
+       LEFT JOIN services sv ON sv.id = t.service_id
+      WHERE t.status = 'NEEDS_INPUT'
+      ORDER BY t.priority ASC, q.asked_at ASC
+      LIMIT 1000`,
+  );
+  return {
+    tasks: r.rows.map((row) => ({
+      id: row.id,
+      title: row.title,
+      projectId: row.project_id ?? null,
+      projectName: row.project_name ?? null,
+      serviceCode: row.service_name ?? null,
+      // Строкой — как на остальных досках (ср. getAcceptanceBoardTx): справочник
+      // src/data/taskPriorities.ts на фронте работает со строковыми кодами '0'..'3'.
+      priority: row.priority,
+      question: {
+        id: row.question_id,
+        question: row.question,
+        options: Array.isArray(row.options) ? row.options : [],
+        context: row.context ?? null,
+        roleCode: row.role_code ?? null,
+        askedAt: row.asked_at,
+      },
+    })),
+  };
+}
+
+/**
+ * Ответ человека: закрывает вопрос и возвращает задачу в работу.
+ *
+ * Ответ дописывается в ОПИСАНИЕ задачи отдельной секцией — это единственный
+ * канал, который исполнитель гарантированно видит (промпт строится из
+ * task.description, см. programmer-runner/src/promptBuilder.js). Ср. доливку
+ * артефактов Архитектора в renderWorkArtifactSections.
+ */
+export async function answerTaskQuestion(s, taskId, input) {
+  return withClient(clientConfig(s), (c) => answerTaskQuestionTx(c, taskId, input));
+}
+
+export async function answerTaskQuestionTx(c, taskId, input = {}) {
+  const id = String(taskId ?? '').trim();
+  if (!id) throw scannerError(422, 'taskId_required');
+  const answer = clipText(input.answer, ANSWER_MAX);
+  if (!answer) throw scannerError(422, 'answer_required');
+  const questionId = String(input.questionId ?? '').trim();
+  const answeredBy = clipText(input.answeredBy, 120) || null;
+
+  return withTransaction(c, async () => {
+    const cur = await c.query(
+      `SELECT id, status::text AS status, needs_input_from_status::text AS from_status,
+              description
+         FROM tasks WHERE id = $1 FOR UPDATE`,
+      [id],
+    );
+    if (!cur.rowCount) throw scannerError(404, 'task_not_found');
+    const task = cur.rows[0];
+    if (task.status !== 'NEEDS_INPUT') throw scannerError(409, 'task_not_awaiting_input');
+
+    // Вопрос берём либо явно указанный, либо единственный открытый: UI знает id,
+    // а ручной вызов из консоли — не обязан.
+    const qres = questionId
+      ? await c.query(
+        `SELECT id, question, answered_at FROM task_questions
+          WHERE id = $1 AND task_id = $2 FOR UPDATE`,
+        [questionId, id],
+      )
+      : await c.query(
+        `SELECT id, question, answered_at FROM task_questions
+          WHERE task_id = $1 AND answered_at IS NULL
+          ORDER BY asked_at DESC LIMIT 1 FOR UPDATE`,
+        [id],
+      );
+    if (!qres.rowCount) throw scannerError(404, 'question_not_found');
+    const q = qres.rows[0];
+    if (q.answered_at) throw scannerError(409, 'question_already_answered');
+
+    await c.query(
+      `UPDATE task_questions SET answer = $2, answered_at = now(), answered_by = $3
+        WHERE id = $1`,
+      [q.id, answer, answeredBy],
+    );
+
+    // Возврат на прежнюю стадию. Фолбэк на CODING — если задача попала в
+    // NEEDS_INPUT в обход requestTaskInput (ручная правка в БД, старые записи):
+    // лучше вернуть в разработку, чем оставить висеть в парковке навсегда.
+    const resumedStatus = task.from_status || 'CODING';
+    const section = `## Уточнение от заказчика\n**Вопрос:** ${q.question}\n**Ответ:** ${answer}`;
+    const base = String(task.description ?? '').trim();
+    const description = (base ? `${base}\n\n${section}` : section).slice(0, TASK_DESCRIPTION_MAX);
+
+    await c.query(
+      `UPDATE tasks
+          SET status = $2::task_status,
+              needs_input_from_status = NULL,
+              assigned_agent_id = NULL,
+              description = $3,
+              updated_at = now()
+        WHERE id = $1`,
+      [id, resumedStatus, description],
+    );
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'STATUS_CHANGED', 'NEEDS_INPUT'::task_status, $2::task_status, NULL, $3::jsonb)`,
+      [id, resumedStatus,
+        JSON.stringify({ source: 'needs-input', via: 'user-answer', questionId: q.id, answeredBy })],
+    );
+    return { answered: true, taskId: id, questionId: q.id, resumedStatus };
   });
 }
 
@@ -3407,7 +3654,7 @@ async function computeRoleFreeSlots(c, cap, roleCodes = LLM_ROLE_CODES) {
       WHERE r.code = ANY($1::text[])
         AND r.hidden = false
         AND p.status <> 'paused'
-        AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
+        AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','NEEDS_INPUT')
       GROUP BY r.code`,
     [roleCodes],
   );
@@ -3551,7 +3798,7 @@ async function advanceSkippedStageRoles(c) {
        FROM tasks t JOIN roles r ON r.id = t.current_role_id
       WHERE t.project_id = ANY($1::uuid[])
         AND t.assigned_agent_id IS NULL
-        AND t.status NOT IN ('DONE','CANCELLED','WAITING_FOR_CHILDREN')`,
+        AND t.status NOT IN ('DONE','CANCELLED','WAITING_FOR_CHILDREN','NEEDS_INPUT')`,
     [[...byProject.keys()]],
   );
 
@@ -3621,7 +3868,7 @@ export async function advanceForkNodes(c) {
        JOIN project_stages ps
          ON ps.project_id = t.project_id AND ps.stage_key = t.current_stage_key AND ps.kind = 'fork'
       WHERE t.assigned_agent_id IS NULL
-        AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
+        AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','NEEDS_INPUT')
         AND NOT EXISTS (SELECT 1 FROM tasks ch WHERE ch.parent_task_id = t.id
                           AND ch.status NOT IN ('DONE','CANCELLED','FAILED'))
       FOR UPDATE OF t SKIP LOCKED`,
@@ -3694,7 +3941,7 @@ export async function advanceJoinNodes(c) {
          ON ps.project_id = t.project_id AND ps.stage_key = t.current_stage_key AND ps.kind = 'join'
       WHERE t.parent_task_id IS NOT NULL
         AND t.assigned_agent_id IS NULL
-        AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN')
+        AND t.status NOT IN ('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','NEEDS_INPUT')
       FOR UPDATE OF t SKIP LOCKED`,
   );
   for (const k of kids.rows) {
@@ -4200,7 +4447,7 @@ async function reattachOrphanStageRoles(c) {
        SELECT t.id, t.project_id, t.status::text AS status, t.current_stage_key
          FROM tasks t
         WHERE t.current_role_id IS NULL
-          AND t.status NOT IN ('DONE','CANCELLED','FAILED','BACKLOG','WAITING_FOR_CHILDREN','BLOCKED')
+          AND t.status NOT IN ('DONE','CANCELLED','FAILED','BACKLOG','WAITING_FOR_CHILDREN','BLOCKED','NEEDS_INPUT')
      ), resolved AS (
        SELECT o.id, o.status,
               COALESCE(
@@ -4519,7 +4766,7 @@ export async function escalateRunawayRoleLoops(c, maxCancels = TASK_RUN_LOOP_MAX
                        WHERE mv.task_id = t.id AND mv.event_type = 'TASK_UPDATED'
                          AND mv.payload_json->>'via' = 'manual-move'), '-infinity'::timestamptz))
          ) cd
-        WHERE t.status NOT IN ('DONE','CANCELLED','FAILED','BLOCKED','WAITING_FOR_CHILDREN')
+        WHERE t.status NOT IN ('DONE','CANCELLED','FAILED','BLOCKED','WAITING_FOR_CHILDREN','NEEDS_INPUT')
           AND t.assigned_agent_id IS NULL
           AND cd.n_cancel >= $1
      ), blocked AS (

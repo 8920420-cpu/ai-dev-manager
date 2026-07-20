@@ -27,6 +27,9 @@ export const NAV_ITEMS: NavItem[] = [
     icon: ListTree,
     children: [
       { label: 'Проверка', route: 'tasks-review' },
+      // Очередь задач, остановленных на вопросе к человеку — рядом с «Проверкой»,
+      // потому что обе требуют действия человека, а не работы конвейера.
+      { label: 'Нужна информация', route: 'tasks-needs-input' },
       { label: 'В работе', route: 'tasks' },
       { label: 'Выполнено', route: 'tasks-done' },
     ],

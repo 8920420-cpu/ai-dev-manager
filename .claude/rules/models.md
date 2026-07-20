@@ -1,22 +1,6 @@
 # Data Models
 
 ## Model Files
-- `output\razrabotka-block-schema-vertical-clean.png`
-- `output\razrabotka-block-schema-vertical-table-names.png`
-- `output\razrabotka-block-schema-vertical.png`
-- `output\razrabotka-block-schema.png`
-
-
-## Enums & Constants
-- Scan model files above for enum definitions
-
-## Migration notes
-- No migrations detected
-
-## Postgres Memory Tables
-- `codebase_memory_documents` mirrors Codebase Memory markdown files in Postgres, keyed by `(project_id, doc_key)`.
-
-## New Models (added 2026-07-10)
 - `_orchestrator_template/migrations/0.0.0_to_1.0.0.md`
 - `_orchestrator_template/migrations/1.0.0_to_1.1.0.md`
 - `_orchestrator_template/migrations/1.1.0_to_1.2.0.md`
@@ -86,10 +70,17 @@
 - `orchestrator-service/backend/db/migrations/0055_codebase_memory_documents.sql`
 - `orchestrator-service/backend/db/migrations/0056_codebase_memory_role_prompts.sql`
 - `orchestrator-service/backend/db/migrations/0057_work_stack.sql`
+- `orchestrator-service/backend/db/migrations/0058_infrastructure_department.sql`
+- `orchestrator-service/backend/db/migrations/0059_infrastructure_pipeline.sql`
+- `orchestrator-service/backend/db/migrations/0060_restore_postjoin_git_integrator.sql`
+- `orchestrator-service/backend/db/migrations/0061_task_size_triage.sql`
+- `orchestrator-service/backend/db/migrations/0062_task_router_mini_architect.sql`
+- `orchestrator-service/backend/src/clickhouseSchema.js`
 - `output/razrabotka-block-schema-vertical-clean.png`
 - `output/razrabotka-block-schema-vertical-table-names.png`
 - `output/razrabotka-block-schema-vertical.png`
 - `output/razrabotka-block-schema.png`
+- `shared/logging/event.schema.json`
 - `src/types/common.ts`
 - `src/types/feedback.ts`
 - `src/types/fields.ts`
@@ -100,27 +91,16 @@
 - `src/types/settings.ts`
 - `src/types/taskStats.ts`
 
-## New Models (added 2026-07-10)
-- `orchestrator-service/backend/db/migrations/0058_infrastructure_department.sql`
 
-## New Models (added 2026-07-10)
-- `orchestrator-service/backend/db/migrations/0059_infrastructure_pipeline.sql`
+## Enums & Constants
+- Scan model files above for enum definitions
 
-## New Models (added 2026-07-11)
-- `orchestrator-service/backend/src/clickhouseSchema.js`
+## Migration notes
+- No migrations detected
 
-## New Models (added 2026-07-12)
-- `orchestrator-service/backend/tmp-inspect-schema.mjs`
-- `orchestrator-service/backend/tmp-schema.txt`
+## Postgres Memory Tables
+- `codebase_memory_documents` mirrors Codebase Memory markdown files in Postgres, keyed by `(project_id, doc_key)`.
 
-## New Models (added 2026-07-13)
-- `orchestrator-service/backend/db/migrations/0060_restore_postjoin_git_integrator.sql`
-
-## New Models (added 2026-07-14)
-- `orchestrator-service/backend/db/migrations/0061_task_size_triage.sql`
-
-## New Models (added 2026-07-14)
-- `orchestrator-service/backend/db/migrations/0062_task_router_mini_architect.sql`
-
-## New Models (added 2026-07-14)
-- `shared/logging/event.schema.json`
+## New Models (added 2026-07-20)
+- `orchestrator-service/backend/db/migrations/0063_task_needs_input_status.sql`
+- `orchestrator-service/backend/db/migrations/0064_task_questions.sql`

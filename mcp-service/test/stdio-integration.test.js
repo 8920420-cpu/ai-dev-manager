@@ -150,6 +150,9 @@ async function runStdioCreateTask({ token, envFileContent }) {
           projectPath: '/x',
           title: 'Integration test task',
           description: 'stdio integration',
+          // TASK-ACCEPTANCE-CRITERIA-001 — поле обязательное, SDK валидирует схему
+          // на реальном stdio-вызове (в отличие от юнит-тестов с фейковым реестром).
+          acceptanceCriteria: ['tools/call возвращает taskId без 401'],
         },
       },
     });

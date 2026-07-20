@@ -262,7 +262,10 @@ test('FORK-CHILD-001: join шаг(1) исключает WAITING_FOR_CHILDREN; ш
 
   const step1 = c.calls.find((q) => /parent_task_id IS NOT NULL/.test(q.sql));
   assert.ok(step1, 'шаг (1) выполнен');
-  assert.match(step1.sql, /NOT IN \('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN'\)/,
+  // NEEDS_INPUT (TASK-NEEDS-INPUT-001) исключён здесь по той же причине, что и
+  // WAITING_FOR_CHILDREN: ребёнок, стоящий на вопросе к человеку, ещё не отработал,
+  // и закрывать его на join нельзя.
+  assert.match(step1.sql, /NOT IN \('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','NEEDS_INPUT'\)/,
     'припаркованный fork-родитель не завершается шагом (1)');
 
   const step2 = c.calls.find((q) => /status = 'WAITING_FOR_CHILDREN'/.test(q.sql));

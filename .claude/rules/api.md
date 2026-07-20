@@ -1,27 +1,6 @@
 # API Surface
 
 ## Route Files
-No route files detected
-
-## Base URL
-- Check entry point configuration
-
-## Auth
-- Check middleware files for auth implementation
-
-## Endpoints
-- Read route files above for detailed endpoint listing
-
-## Codebase Memory
-- `GET /api/projects/:id/codebase-memory` lists memory document metadata. Add `?includeContent=1` to include markdown content.
-- `GET /api/projects/:id/codebase-memory/:key` reads one memory document.
-- `PUT /api/projects/:id/codebase-memory/:key` upserts one memory document.
-- `POST /api/projects/:id/codebase-memory` bulk syncs memory documents.
-
-## WebSockets / Events
-- Not auto-detected — fill in if applicable
-
-## New Routes (added 2026-07-10)
 - `_orchestrator_template/tasks/review/.gitkeep`
 - `src/api/appSettingsApi.ts`
 - `src/api/auditApi.ts`
@@ -40,6 +19,7 @@ No route files detected
 - `src/api/integrationsApi.test.ts`
 - `src/api/integrationsApi.ts`
 - `src/api/mcpRolesApi.ts`
+- `src/api/performanceApi.test.ts`
 - `src/api/performanceApi.ts`
 - `src/api/projectsApi.test.ts`
 - `src/api/projectsApi.ts`
@@ -74,5 +54,20 @@ No route files detected
 - `tasks/review/pipeline-runner__P1.2.md`
 - `tasks/review/scanner-service__P1.1.md`
 
-## New Routes (added 2026-07-12)
-- `src/api/performanceApi.test.ts`
+## Base URL
+- Check entry point configuration
+
+## Auth
+- Check middleware files for auth implementation
+
+## Endpoints
+- Read route files above for detailed endpoint listing
+
+## WebSockets / Events
+- Not auto-detected — fill in if applicable
+
+## Codebase Memory
+- `GET /api/projects/:id/codebase-memory` lists memory document metadata. Add `?includeContent=1` to include markdown content.
+- `GET /api/projects/:id/codebase-memory/:key` reads one memory document.
+- `PUT /api/projects/:id/codebase-memory/:key` upserts one memory document.
+- `POST /api/projects/:id/codebase-memory` bulk syncs memory documents.

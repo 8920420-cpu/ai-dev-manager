@@ -118,6 +118,26 @@ export class ProgrammerRunner {
     if (!agentResult || agentResult.ok !== true) {
       const reason = agentResult?.error || 'agent_reported_failure';
       const metrics = runMetrics(agentResult, Date.now() - startedAt);
+
+      // TASK-NEEDS-INPUT-001: агент не стал гадать, а задал человеку вопрос.
+      // Это НЕ провал: возвращать задачу в очередь бессмысленно (следующий заход
+      // упрётся в ту же неоднозначность и сожжёт слот), поэтому паркуем её в
+      // NEEDS_INPUT. Если ручка недоступна (старый оркестратор, сеть) — падаем
+      // обратно на обычный release, чтобы задача не зависла с захватом.
+      if (agentResult?.needsInput?.question && typeof this.http.needsInput === 'function') {
+        this.log.info?.('programmer asks for input', {
+          taskId: task.id, question: agentResult.needsInput.question, ...metrics,
+        });
+        try {
+          const parked = await this.http.needsInput(task.id, agentResult.needsInput);
+          return { taskId: task.id, needsInput: true, question: agentResult.needsInput.question, parked };
+        } catch (error) {
+          this.log.error?.('programmer needs-input failed, releasing instead', {
+            taskId: task.id, error: error.message,
+          });
+        }
+      }
+
       this.noteFailureReason(reason);
       // Упор в лимит ходов — ОТДЕЛЬНЫЙ помеченный исход: логируем заметно и сообщаем
       // оркестратору reason+meta, чтобы он записал событие KPI (отслеживаем работу

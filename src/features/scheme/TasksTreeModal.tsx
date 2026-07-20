@@ -13,10 +13,9 @@ import {
   EmptyState,
   LoadingBlock,
   Modal,
-  type BadgeTone,
 } from '../../components/ui';
 import { cn } from '../../lib/cn';
-import { taskStatusLabel } from '../../data/taskStatuses';
+import { taskStatusLabel, taskStatusTone as statusTone } from '../../data/taskStatuses';
 import {
   tasksApi,
   type TaskTree,
@@ -40,14 +39,7 @@ interface SelectedTask {
 
 type LoadState = 'loading' | 'error' | 'ready';
 
-// Тон бейджа статуса: завершённые — успех, проблемные — опасность, активные — инфо.
-function statusTone(status: string): BadgeTone {
-  if (status === 'DONE') return 'success';
-  if (status === 'BLOCKED' || status === 'FAILED' || status === 'CANCELLED')
-    return 'danger';
-  if (status === 'READY' || status === 'BACKLOG') return 'neutral';
-  return 'info';
-}
+// Тон бейджа статуса берём из общего справочника (data/taskStatuses).
 
 /**
  * Модальное дерево задач (read-only). Три уровня: Проект (категория) → Задача

@@ -13,9 +13,8 @@ import {
   EmptyState,
   LoadingBlock,
   Modal,
-  type BadgeTone,
 } from '../../components/ui';
-import { taskStatusLabel } from '../../data/taskStatuses';
+import { taskStatusLabel, taskStatusTone as statusTone } from '../../data/taskStatuses';
 import { tasksApi, type TaskHistory, type TaskHistoryEvent } from '../../api/tasksApi';
 import styles from './TaskChangesModal.module.css';
 
@@ -30,12 +29,7 @@ interface TaskChangesModalProps {
 
 type LoadState = 'loading' | 'error' | 'ready';
 
-function statusTone(status: string): BadgeTone {
-  if (status === 'DONE') return 'success';
-  if (status === 'BLOCKED' || status === 'FAILED' || status === 'CANCELLED') return 'danger';
-  if (status === 'READY' || status === 'BACKLOG') return 'neutral';
-  return 'info';
-}
+// Тон бейджа статуса — общий справочник (data/taskStatuses).
 
 function fmtTime(iso: string | null): string | null {
   if (!iso) return null;

@@ -41,8 +41,9 @@ test('restartStuck: зависшие задачи перезапускаются
   assert.ok(/'source', 'manual-restart'/.test(main.sql), 'source=manual-restart');
   assert.ok(/assigned_agent_id IS NULL/.test(main.sql), 'берутся только задачи «не в работе»');
   assert.ok(
-    /NOT IN \('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN'\)/.test(main.sql),
-    'исключены терминальные/ожидающие',
+    /NOT IN \('DONE','CANCELLED','FAILED','WAITING_FOR_CHILDREN','NEEDS_INPUT'\)/.test(main.sql),
+    'исключены терминальные/ожидающие (в т.ч. ждущие ответа человека: массовый '
+      + 'перезапуск не должен затирать заданный агентом вопрос)',
   );
   assert.ok(c.calls.some((q) => /COMMIT/.test(q.sql)), 'транзакция зафиксирована');
 });
