@@ -10,8 +10,11 @@
 import { query } from '@anthropic-ai/claude-agent-sdk';
 
 import { resolveRepo, loadRepoMap } from './repoResolver.js';
-import { buildPrompt, parseAgentJson } from './promptBuilder.js';
+import { buildPrompt, buildRepairPrompt, parseAgentJson } from './promptBuilder.js';
 import { WorktreeManager } from './worktreeManager.js';
+import {
+  DEFAULT_VERIFY_TIMEOUT_MS, detectVerifyCommands, resolveVerifyDir, runVerify,
+} from './selfCheck.js';
 
 // Набор инструментов, авто-разрешённых агенту. permissionMode='bypassPermissions'
 // и так утверждает всё; allowedTools оставляем как явную белую границу.
@@ -77,8 +80,10 @@ function extractUsage(final) {
  * diff или снимку основного дерева).
  * @returns {Promise<{ok:boolean, error?:string, result?:object}>}
  */
-async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTools, log }) {
-  const prompt = buildPrompt(task);
+async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTools, log, prompt: promptOverride }) {
+  // promptOverride — ремонтный заход самопроверки (PROGRAMMER-SELF-CHECK-001);
+  // без него это обычный первый прогон по описанию задачи.
+  const prompt = promptOverride || buildPrompt(task);
   const ac = linkSignal(signal);
 
   // PROGRAMMER-USAGE-KPI-001: cold start — от вызова query() до первого system/init
@@ -127,6 +132,23 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
   // Агент явно сообщил о провале — уважаем.
   if (parsed && parsed.success === false) {
     const out = { ok: false, error: `agent_reported_failure: ${parsed.summary || ''}`.trim() };
+    // TASK-NEEDS-INPUT-001: агент не стал гадать, а сформулировал вопрос человеку.
+    // Это не провал прогона: задачу надо припарковать в NEEDS_INPUT, а не вернуть
+    // в очередь на те же грабли. Вопрос без текста игнорируем — парковать задачу
+    // с пустым вопросом хуже, чем честно вернуть её в очередь.
+    const ni = parsed.needs_input && typeof parsed.needs_input === 'object' ? parsed.needs_input : null;
+    const question = ni ? String(ni.question ?? '').trim() : '';
+    if (question) {
+      out.needsInput = {
+        question,
+        options: Array.isArray(ni.options)
+          ? ni.options.map((o) => String(o ?? '').trim()).filter(Boolean)
+          : [],
+        context: String(ni.context ?? '').trim() || undefined,
+      };
+      out.error = `needs_input: ${question}`;
+      return out;
+    }
     // PROGRAMMER-CROSS-SERVICE-PREFLIGHT-001: агент явно назвал блокер — правку
     // контракта/сгенерированного кода ДРУГОГО сервиса. Помечаем исход, чтобы
     // оркестратор увёл задачу на переразбиение, а не гонял её по кругу в CODING.
@@ -172,6 +194,152 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
   };
 }
 
+/** Настройки самопроверки из окружения (PROGRAMMER-SELF-CHECK-001). */
+export function selfCheckConfig(env = process.env) {
+  const flag = String(env.PROGRAMMER_SELF_CHECK ?? '1').trim();
+  const attempts = Number(env.PROGRAMMER_SELF_CHECK_ATTEMPTS ?? 1);
+  const timeoutMs = Number(env.PROGRAMMER_VERIFY_TIMEOUT_MS ?? DEFAULT_VERIFY_TIMEOUT_MS);
+  return {
+    enabled: flag !== '0' && flag.toLowerCase() !== 'false',
+    // 0 попыток — проверка только сообщает о красном, ремонтных заходов нет.
+    maxAttempts: Number.isFinite(attempts) && attempts >= 0 ? Math.min(attempts, 3) : 1,
+    // Baseline можно выключить, если тестовый прогон проекта дорогой: тогда красная
+    // проверка НЕ блокирует сдачу (мы не знаем, наша это поломка или чужая).
+    baseline: String(env.PROGRAMMER_SELF_CHECK_BASELINE ?? '1').trim() !== '0',
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : DEFAULT_VERIFY_TIMEOUT_MS,
+  };
+}
+
+/**
+ * Сложить метрики ремонтных заходов в метрики первого прогона: для KPI важен
+ * СУММАРНЫЙ расход на задачу, иначе ремонт выглядит бесплатным.
+ */
+export function mergeAgentRuns(base, extra) {
+  const a = base?.result?.agent || {};
+  const b = extra?.result?.agent || {};
+  const sum = (x, y) => (Number.isFinite(x) || Number.isFinite(y) ? num(x) + num(y) : undefined);
+  return {
+    ...base,
+    result: {
+      ...base.result,
+      // Итоговое summary — от последнего (ремонтного) захода, он ближе к правде о
+      // состоянии кода; исходное сохраняем рядом, чтобы не потерять суть задачи.
+      summary: extra?.result?.summary || base?.result?.summary,
+      initialSummary: base?.result?.summary,
+      agent: {
+        ...a,
+        numTurns: sum(a.numTurns, b.numTurns),
+        totalCostUsd: sum(a.totalCostUsd, b.totalCostUsd),
+        tokensIn: sum(a.tokensIn, b.tokensIn),
+        tokensInput: sum(a.tokensInput, b.tokensInput),
+        tokensOut: sum(a.tokensOut, b.tokensOut),
+        tokensCacheRead: sum(a.tokensCacheRead, b.tokensCacheRead),
+        tokensCacheCreation: sum(a.tokensCacheCreation, b.tokensCacheCreation),
+        costUsd: sum(a.costUsd, b.costUsd),
+        // cold start — характеристика ПЕРВОГО запуска, суммировать бессмысленно.
+        coldStartMs: a.coldStartMs,
+      },
+    },
+  };
+}
+
+/**
+ * PROGRAMMER-SELF-CHECK-001 — прогон агента с замкнутой петлёй проверки:
+ *   [baseline] → агент → проверка → (красная? → ремонт → проверка) → исход.
+ *
+ * Красная проверка блокирует сдачу ТОЛЬКО если baseline был зелёным: иначе мы
+ * требовали бы от программиста починить поломки, которые он не вносил.
+ */
+async function runWithSelfCheck(opts) {
+  const { cwd, env, task, signal, log, selfCheck } = opts;
+  const verifyDir = resolveVerifyDir(cwd, task);
+  const commands = selfCheck.enabled ? detectVerifyCommands(verifyDir) : [];
+  const verifyOpts = { commands, cwd: verifyDir, env, signal, timeoutMs: selfCheck.timeoutMs, log };
+
+  // Baseline ДО работы агента: отделяет «я сломал» от «оно и так лежало».
+  let baselineOk = null;
+  if (commands.length && selfCheck.baseline) {
+    const base = await runVerify(verifyOpts);
+    baselineOk = base.ok;
+    if (!base.ok) {
+      log.warn?.('programmer self-check: baseline КРАСНЫЙ — проверка не блокирует сдачу', {
+        taskId: task.id, cmd: base.failure?.cmd, exitCode: base.failure?.exitCode,
+      });
+    }
+  }
+
+  let out = await runSdkOnce(opts);
+  if (!out.ok) return out;
+  if (!commands.length) {
+    // Нечего запускать (нет go.mod/скрипта test) — честно помечаем, а не делаем вид,
+    // что проверка прошла. Это же видно в KPI: где самопроверка реально работает.
+    out.result.verification = { status: selfCheck.enabled ? 'no_commands' : 'disabled', dir: verifyDir };
+    return out;
+  }
+
+  // Блокирующей проверка считается, когда baseline точно был зелёным.
+  const blocking = baselineOk === true;
+  let verify = await runVerify(verifyOpts);
+  let attempts = 0;
+
+  while (!verify.ok && attempts < selfCheck.maxAttempts && !signal?.aborted) {
+    attempts += 1;
+    log.warn?.('programmer self-check: проверка красная — ремонтный заход', {
+      taskId: task.id, attempt: attempts, cmd: verify.failure?.cmd, exitCode: verify.failure?.exitCode,
+    });
+    const repair = await runSdkOnce({
+      ...opts,
+      prompt: buildRepairPrompt(task, verify.failure, { attempt: attempts, maxAttempts: selfCheck.maxAttempts }),
+    });
+    // Ремонт не удался сам по себе (краш/лимит ходов) — не топим задачу: оставляем
+    // исход первого прогона и даём проверке вынести вердикт ниже.
+    if (repair.ok) out = mergeAgentRuns(out, repair);
+    else log.warn?.('programmer self-check: ремонтный заход не удался', { taskId: task.id, error: repair.error });
+    verify = await runVerify(verifyOpts);
+  }
+
+  out.result.verification = {
+    status: verify.ok ? 'passed' : (blocking ? 'failed' : 'failed_not_blocking'),
+    commands,
+    dir: verifyDir,
+    repairAttempts: attempts,
+    baseline: baselineOk === null ? 'skipped' : (baselineOk ? 'green' : 'red'),
+    failure: verify.ok ? undefined : {
+      cmd: verify.failure?.cmd,
+      exitCode: verify.failure?.exitCode ?? null,
+      timedOut: verify.failure?.timedOut,
+      output: verify.failure?.output,
+    },
+  };
+
+  if (verify.ok) {
+    log.info?.('programmer self-check: зелено', { taskId: task.id, repairAttempts: attempts });
+    return out;
+  }
+  if (!blocking) {
+    // Красное, но baseline тоже был красным (или не мерился) — сдаём с отметкой:
+    // блокировать нельзя, иначе один сломанный проект заклинит все свои задачи.
+    log.warn?.('programmer self-check: красная проверка, сдаём с отметкой (baseline не зелёный)', {
+      taskId: task.id, cmd: verify.failure?.cmd,
+    });
+    return out;
+  }
+  // Проверка была зелёной до нас и красная после — это наша поломка. Возвращаем
+  // задачу в очередь: сдавать заведомо красный код дальше по конвейеру нельзя.
+  log.error?.('programmer self-check: сдача заблокирована — проверка красная после правок', {
+    taskId: task.id, cmd: verify.failure?.cmd, exitCode: verify.failure?.exitCode, repairAttempts: attempts,
+  });
+  return {
+    ok: false,
+    error: `self_check_failed: ${verify.failure?.cmd || 'verify'} → exit ${verify.failure?.exitCode ?? 'timeout'}`,
+    meta: {
+      selfCheck: out.result.verification,
+      summary: String(out.result?.summary || '').slice(0, 500),
+    },
+    result: out.result,
+  };
+}
+
 /**
  * Фабрика исполнителя задачи. Возвращает runAgent(task, {signal}) для
  * ProgrammerRunner. Список изменённых файлов вычисляется драйвером через git, а
@@ -190,6 +358,8 @@ export function makeClaudeRunAgent(cfg = {}) {
   const maxTurns = Number(cfg.maxTurns || process.env.PROGRAMMER_MAX_TURNS || 100);
   const allowedTools = cfg.allowedTools || DEFAULT_ALLOWED_TOOLS;
   const log = cfg.log || console;
+  // PROGRAMMER-SELF-CHECK-001: политика самопроверки на процесс (env читаем один раз).
+  const selfCheck = cfg.selfCheck || selfCheckConfig();
   // Один менеджер worktree на процесс: держит по одному worktree на микросервис
   // и сериализует задачи внутри сервиса.
   const worktrees = cfg.worktreeManager || new WorktreeManager({ log });
@@ -211,7 +381,9 @@ export function makeClaudeRunAgent(cfg = {}) {
     const effectiveModel =
       typeof task?.model === 'string' && task.model.trim() ? task.model.trim() : model;
     const out = await worktrees.runForService(repoCwd, serviceKey, (worktreeCwd) =>
-      runSdkOnce({ cwd: worktreeCwd, env, task, signal, model: effectiveModel, maxTurns, allowedTools, log }));
+      runWithSelfCheck({
+        cwd: worktreeCwd, env, task, signal, model: effectiveModel, maxTurns, allowedTools, log, selfCheck,
+      }));
     // Ветка/коммит worktree программиста нужны стадии GIT_INTEGRATION (влить ветку в
     // main): прокидываем их наверх вместе с остальными полями исхода, ничего не теряя.
     // Нормализуем в null — чтобы ключи всегда были в agentResult (сдача шлёт их и при

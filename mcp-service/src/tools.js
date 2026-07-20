@@ -32,6 +32,52 @@ async function run(fn) {
   return asText(result);
 }
 
+/**
+ * TASK-ACCEPTANCE-CRITERIA-001 — критерии сдачи в постановке задачи.
+ *
+ * Зачем: у исполнителя (programmer-runner) понятия «критерий приёмки» нет — он
+ * получает текст описания и вынужден САМ угадывать, что значит «готово». Живой
+ * сессии это прощается (человек поправит через минуту), автономному раннеру — нет:
+ * цена ошибки там вся задача целиком. Поэтому критерии обязан согласовать с
+ * человеком постановщик, ДО создания задачи.
+ *
+ * Раскладываем список в два места:
+ *  - `card.acceptance_criteria` — структурно, для Архитектора;
+ *  - секция «## Критерии приёмки» в description — её увидит исполнитель (именно так
+ *    критерии Архитектора доезжают до промпта, ср. renderWorkArtifactSections
+ *    в orchestrator-service/backend/src/taskPolicy.js).
+ * Так критерии работают и без правок backend, на существующем контракте интейка.
+ */
+function withAcceptanceCriteria({ acceptanceCriteria, ...rest }) {
+  const list = (Array.isArray(acceptanceCriteria) ? acceptanceCriteria : [])
+    .map((s) => String(s ?? '').trim())
+    .filter(Boolean);
+  if (!list.length) return rest;
+  const section = `## Критерии приёмки\n${list.map((x) => `- ${x}`).join('\n')}`;
+  const base = String(rest.description ?? '').trim();
+  return {
+    ...rest,
+    // 20000 — тот же потолок описания, что применяет backend при доливке артефактов.
+    description: (base ? `${base}\n\n${section}` : section).slice(0, 20000),
+    card: { ...(rest.card ?? {}), acceptance_criteria: list },
+  };
+}
+
+/** Общий текст правила про критерии — одинаковый для всех постановочных инструментов. */
+const ACCEPTANCE_RULE =
+  'ПЕРЕД вызовом ОБЯЗАТЕЛЬНО согласуй с пользователем критерии сдачи (acceptanceCriteria): ' +
+  'по каким проверяемым признакам задача считается выполненной. Если пользователь их не назвал — ' +
+  'СНАЧАЛА спроси и дождись ответа, и только потом ставь задачу. Не выдумывай критерии за него ' +
+  'и не подменяй их пересказом задачи: исполнитель — автономный раннер, он не сможет переспросить ' +
+  'по ходу и сдаст то, что счёл нужным. ';
+
+/** Описание поля acceptanceCriteria (одно на все постановочные инструменты). */
+const ACCEPTANCE_FIELD_DESC =
+  'Критерии сдачи — согласованный с пользователем список проверяемых признаков «готово». ' +
+  'Формулируй проверяемо: «вкладка Телефония открывается и показывает звонки за сегодня», ' +
+  '«npm test зелёный», «в логах нет invalid contact input» — а не «работает корректно». ' +
+  'Уходят и в card.acceptance_criteria, и отдельной секцией в description.';
+
 // INFRA-DEPARTMENT-001 — коды ролей Инфраструктурного отдела (для фильтрации инфра-инструментов).
 const INFRA_ROLE_CODES = [
   'INFRA_ARCHITECT', 'SYSADMIN', 'DEVOPS_ENGINEER', 'NETWORK_ENGINEER', 'K8S_ENGINEER',
@@ -389,6 +435,7 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
       {
         title: 'Поставить задачу',
         description:
+          ACCEPTANCE_RULE +
           'Завести новую задачу. По умолчанию она создаётся под ролью «Приёмщик задач» ' +
           '(TASK_INTAKE_OFFICER) в статусе BACKLOG; дальше оркестратор сам ведёт её по цепочке ' +
           '(Приёмщик → Architect → …). Если ты применяешь роль «Постановщик задач» через MCP ' +
@@ -410,6 +457,7 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
           title: z.string().describe('Заголовок задачи (корректная UTF-8, без «кракозябр»). При intakeCompleted=true — это short_title из карточки интейка.'),
           service: z.string().optional().describe('Код сервиса (авто-регистрируется; можно пусто).'),
           description: z.string().optional().describe('Исходный запрос пользователя — его прочитает Приёмщик (корректная UTF-8). При intakeCompleted=true — это structured_description из карточки интейка.'),
+          acceptanceCriteria: z.array(z.string().min(1)).min(1).describe(ACCEPTANCE_FIELD_DESC),
           intakeCompleted: z.boolean().optional().describe('Постановщик через MCP уже выполнил приёмку: задача создаётся сразу в статусе ARCHITECTURE под ролью Architect, минуя пайплайновый Приёмщик/BACKLOG.'),
           card: z.record(z.any()).optional().describe('Карточка интейка по контракту роли (short_title, task_title, structured_description, project_understanding, task_type, project, service, component, user_goal, original_request, confidence, blocking_questions, optional_questions, assumptions). Сохраняется в data_card для Architect.'),
           result: z.string().optional(),
@@ -418,9 +466,11 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
       },
       // intakeCompleted — удобный флаг постановщика: разворачиваем его в entryRole=ARCHITECT
       // для backend (там маршрутизация по роли входа), сам флаг в тело не отправляем.
-      ({ intakeCompleted, ...rest }) =>
-        run(() => orchestratorClient.post('/api/scanner/task-intake',
-          intakeCompleted ? { ...rest, entryRole: 'ARCHITECT' } : rest)),
+      ({ intakeCompleted, ...rest }) => {
+        const body = withAcceptanceCriteria(rest);
+        return run(() => orchestratorClient.post('/api/scanner/task-intake',
+          intakeCompleted ? { ...body, entryRole: 'ARCHITECT' } : body));
+      },
     );
 
     tool(
@@ -485,20 +535,22 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
       {
         title: 'Поставить инфра-задачу',
         description:
+          ACCEPTANCE_RULE +
           'Завести задачу в конвейере Инфраструктурного отдела: создаётся сразу под ролью Инфра-архитектора ' +
           '(entryRole=INFRA_ARCHITECT), проект по умолчанию INFRA. POST /api/scanner/task-intake. ' +
           'Идемпотентно по (project, externalId). Требует MCP_ENABLE_ORCHESTRATOR_MUTATIONS=1.',
         inputSchema: {
           externalId: z.string().describe('Уникальный ключ задачи (идемпотентность)'),
           title: z.string().describe('Заголовок инфра-задачи'),
-          description: z.string().optional().describe('Постановка/критерии приёмки'),
+          description: z.string().optional().describe('Постановка задачи (сам критерий сдачи задавай в acceptanceCriteria).'),
+          acceptanceCriteria: z.array(z.string().min(1)).min(1).describe(ACCEPTANCE_FIELD_DESC),
           project: z.string().optional().describe('Код/путь инфра-проекта (по умолчанию INFRA)'),
           projectPath: z.string().optional(),
           card: z.record(z.any()).optional().describe('Дополнительные поля карточки'),
         },
       },
       ({ project, ...rest }) => run(() => orchestratorClient.post('/api/scanner/task-intake', {
-        ...rest, project: project ?? 'INFRA', entryRole: 'INFRA_ARCHITECT',
+        ...withAcceptanceCriteria(rest), project: project ?? 'INFRA', entryRole: 'INFRA_ARCHITECT',
       })),
     );
 

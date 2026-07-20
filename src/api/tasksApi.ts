@@ -233,6 +233,52 @@ export interface AcceptTaskResult {
   taskId: string;
 }
 
+/**
+ * TASK-NEEDS-INPUT-001 — вопрос агента-исполнителя, ждущий ответа человека.
+ * Исполнитель упёрся в неоднозначность, остановил задачу (NEEDS_INPUT) и задал
+ * ОДИН конкретный вопрос. Пока на него не ответили, задача сама не поедет.
+ */
+export interface TaskQuestion {
+  id: string;
+  question: string;
+  /**
+   * Готовые варианты ответа. Пустой массив — агент не предложил вариантов,
+   * отвечать нужно свободным текстом.
+   */
+  options: string[];
+  /** Контекст вопроса (что агент уже выяснил); null — контекста нет. */
+  context: string | null;
+  /** Код роли, задавшей вопрос (напр. PROGRAMMER); null — роль не указана. */
+  roleCode: string | null;
+  askedAt: string;
+}
+
+/** Задача, остановленная в статусе NEEDS_INPUT, вместе с открытым вопросом. */
+export interface NeedsInputTask {
+  id: string;
+  title: string;
+  /** У неразобранной задачи проекта может не быть — доска это допускает. */
+  projectId: string | null;
+  projectName: string | null;
+  serviceCode: string | null;
+  /** Приоритет строкой ('0'..'3') — как на прочих досках задач. */
+  priority: string;
+  question: TaskQuestion;
+}
+
+/** Ответ `GET /api/tasks/needs-input-board`. */
+export interface NeedsInputBoard {
+  tasks: NeedsInputTask[];
+}
+
+/** Ответ `POST /api/tasks/:taskId/answer`. */
+export interface AnswerQuestionResult {
+  answered: boolean;
+  taskId: string;
+  /** Статус, в который задача вернулась после ответа (напр. CODING). */
+  resumedStatus: string;
+}
+
 export const tasksApi = {
   /** `GET /api/tasks/tree` — все проекты с задачами и подзадачами. */
   async tree(signal?: AbortSignal): Promise<TaskTree> {
@@ -317,6 +363,31 @@ export const tasksApi = {
    */
   async accept(taskId: string): Promise<AcceptTaskResult> {
     return http.post<AcceptTaskResult>(`/api/tasks/${encodeURIComponent(taskId)}/accept`);
+  },
+
+  /**
+   * `GET /api/tasks/needs-input-board` — задачи в статусе NEEDS_INPUT: исполнитель
+   * остановился на неоднозначности и ждёт ответа человека. У каждой задачи ровно
+   * один открытый вопрос.
+   */
+  async needsInputBoard(signal?: AbortSignal): Promise<NeedsInputBoard> {
+    return http.get<NeedsInputBoard>('/api/tasks/needs-input-board', { signal });
+  },
+
+  /**
+   * `POST /api/tasks/:taskId/answer` — ответить на вопрос агента: задача выходит
+   * из NEEDS_INPUT и возвращается в работу (сервер отдаёт статус в resumedStatus).
+   * `questionId` обязателен — он защищает от ответа на уже устаревший вопрос
+   * (сервер вернёт question_already_answered).
+   */
+  async answerQuestion(
+    taskId: string,
+    input: { questionId: string; answer: string },
+  ): Promise<AnswerQuestionResult> {
+    return http.post<AnswerQuestionResult>(
+      `/api/tasks/${encodeURIComponent(taskId)}/answer`,
+      input,
+    );
   },
 
   /**

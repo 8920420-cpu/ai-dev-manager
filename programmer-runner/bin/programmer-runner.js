@@ -84,6 +84,24 @@ const http = {
     });
     return asJson(res, 'release');
   },
+  // TASK-NEEDS-INPUT-001: припарковать задачу на вопросе к человеку (NEEDS_INPUT).
+  // input: { question, options?, context? } — роль подставляем здесь, раннер знает
+  // её сам и агенту незачем её сочинять.
+  async needsInput(taskId, input = {}) {
+    const res = await fetch(`${ORCH}/api/runner/needs-input`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({
+        taskId,
+        question: input.question,
+        options: input.options,
+        context: input.context,
+        roleCode: 'PROGRAMMER',
+      }),
+    });
+    const json = await asJson(res, 'needs-input');
+    return json.data ?? json;
+  },
   // Настройка параллельности программиста из app-settings (Настройки → Выполнение).
   async programmerConcurrency() {
     const res = await fetch(`${ORCH}/api/app-settings`, { headers: headers() });

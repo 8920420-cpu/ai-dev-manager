@@ -33,9 +33,16 @@ function normalizeKey(value) {
 export const TASK_STATUSES = [
   'BACKLOG', 'READY', 'ARCHITECTURE', 'DECOMPOSITION', 'CODING', 'TESTING',
   'FAILURE_ANALYSIS', 'REVIEW', 'COMMIT', 'DEPLOY', 'DONE', 'BLOCKED',
-  'FAILED', 'CANCELLED', 'WAITING_FOR_CHILDREN', 'RESTART',
+  'FAILED', 'CANCELLED', 'WAITING_FOR_CHILDREN', 'NEEDS_INPUT', 'RESTART',
 ];
 const TASK_STATUS_SET = new Set(TASK_STATUSES);
+
+// TASK-NEEDS-INPUT-001 — служебные статусы, которые НЕЛЬЗЯ назначить Scanner-этапу.
+// Это парковки, куда задачу приводит система (ожидание подзадач на join, ожидание
+// ответа человека), а не стадия работы: повесив на такой статус роль, пользователь
+// заставил бы её клеймить запаркованные задачи и вопрос к человеку остался бы без
+// ответа навсегда.
+export const NON_STAGE_TASK_STATUSES = new Set(['WAITING_FOR_CHILDREN', 'NEEDS_INPUT']);
 
 // Стабильные машинные коды ошибок валидации (привязаны к stageId).
 export const STAGE_ERROR = {
@@ -51,6 +58,9 @@ export const STAGE_ERROR = {
   // task_status — по нему движок ставит/находит задачу на этом этапе.
   STAGE_STATUS_REQUIRED: 'stage_task_status_required',
   STAGE_STATUS_INVALID: 'stage_task_status_invalid',
+  // TASK-NEEDS-INPUT-001: статус существует в enum, но это системная парковка,
+  // на которую нельзя вешать этап (см. NON_STAGE_TASK_STATUSES).
+  STATUS_NOT_ASSIGNABLE: 'stage_task_status_not_assignable',
   // ROLE-NO-EXECUTOR-001: во включённый этап поставлена роль без исполнителя
   // (нет в ROLE_FLOW/HOST_ROLES/reasoning-ролях) — задачу никто не подхватит.
   ROLE_NO_EXECUTOR: 'stage_role_no_executor',
@@ -138,6 +148,12 @@ export function validateStages(stages, { requireScannerWatch = true } = {}) {
           code: STAGE_ERROR.STATUS_INVALID,
           message: 'Недопустимый статус задач для этапа Scanner.',
         });
+      } else if (taskStatus && NON_STAGE_TASK_STATUSES.has(taskStatus)) {
+        errors.push({
+          stageId,
+          code: STAGE_ERROR.STATUS_NOT_ASSIGNABLE,
+          message: 'Этот статус — системная парковка задачи (ожидание подзадач или ответа человека), этап на него назначить нельзя.',
+        });
       }
       if (enabled) {
         // В единой схеме (requireScannerWatch=false) папку не требуем: она у
@@ -182,6 +198,12 @@ export function validateStages(stages, { requireScannerWatch = true } = {}) {
           stageId,
           code: STAGE_ERROR.STAGE_STATUS_INVALID,
           message: 'Недопустимый статус задач этапа.',
+        });
+      } else if (NON_STAGE_TASK_STATUSES.has(taskStatus)) {
+        errors.push({
+          stageId,
+          code: STAGE_ERROR.STATUS_NOT_ASSIGNABLE,
+          message: 'Этот статус — системная парковка задачи (ожидание подзадач или ответа человека), этап на него назначить нельзя.',
         });
       }
 

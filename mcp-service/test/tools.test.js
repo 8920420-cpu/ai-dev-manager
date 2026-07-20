@@ -117,11 +117,13 @@ test('orchestrator_create_task с intakeCompleted разворачивает ent
   const card = { short_title: 'S', structured_description: 'D' };
   const out = await server.handlers.get('orchestrator_create_task')({
     externalId: 'mcp-1', projectPath: '/p', title: 'S', description: 'D', intakeCompleted: true, card,
+    acceptanceCriteria: ['карточка доезжает до Архитектора'],
   });
   assert.equal(seen.path, '/api/scanner/task-intake');
   assert.equal(seen.body.entryRole, 'ARCHITECT');
   assert.equal(seen.body.intakeCompleted, undefined); // флаг развёрнут в entryRole, в тело не идёт
-  assert.deepEqual(seen.body.card, card);
+  // критерии дополняют карточку, не затирая её исходные поля
+  assert.deepEqual(seen.body.card, { ...card, acceptance_criteria: ['карточка доезжает до Архитектора'] });
   const parsed = JSON.parse(out.content[0].text);
   assert.equal(parsed.data.toStatus, 'ARCHITECTURE');
   assert.ok(!out.isError);
@@ -141,6 +143,48 @@ test('orchestrator_create_task без intakeCompleted НЕ добавляет en
   await server.handlers.get('orchestrator_create_task')({ externalId: 'mcp-2', project: 'PS', title: 'T' });
   assert.equal(seen.body.entryRole, undefined);
   assert.equal(seen.body.intakeCompleted, undefined);
+});
+
+// TASK-ACCEPTANCE-CRITERIA-001 — критерии сдачи обязаны доехать до ОБОИХ читателей:
+// Архитектор берёт структурный card.acceptance_criteria, а исполнитель (programmer-runner)
+// видит только текст описания — там критерии должны лежать отдельной секцией.
+test('orchestrator_create_task раскладывает acceptanceCriteria в card и в секцию описания', async () => {
+  let seen;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig({ enableOrchestratorMutations: true }),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => ({ ok: true, status: 200, data: {} }),
+      post: async (path, body) => { seen = { path, body }; return { ok: true, status: 200, data: { accepted: true, taskId: 't4' } }; },
+    },
+  });
+  await server.handlers.get('orchestrator_create_task')({
+    externalId: 'mcp-3', project: 'PS', title: 'T', description: 'Исходный запрос',
+    acceptanceCriteria: ['npm test зелёный', '  ', 'вкладка открывается'],
+  });
+  assert.deepEqual(seen.body.card.acceptance_criteria, ['npm test зелёный', 'вкладка открывается']);
+  assert.match(seen.body.description, /^Исходный запрос\n\n## Критерии приёмки\n/);
+  assert.match(seen.body.description, /- npm test зелёный\n- вкладка открывается$/);
+  assert.equal(seen.body.acceptanceCriteria, undefined); // поле разложено, в тело интейка не идёт
+});
+
+test('orchestrator_create_task без критериев не изобретает card и не трогает описание', async () => {
+  let seen;
+  const server = fakeServer();
+  registerTools(server, {
+    config: baseConfig({ enableOrchestratorMutations: true }),
+    toolsClient: stubClients.toolsClient,
+    orchestratorClient: {
+      get: async () => ({ ok: true, status: 200, data: {} }),
+      post: async (path, body) => { seen = { path, body }; return { ok: true, status: 200, data: { accepted: true, taskId: 't5' } }; },
+    },
+  });
+  await server.handlers.get('orchestrator_create_task')({
+    externalId: 'mcp-4', project: 'PS', title: 'T', description: 'Только запрос', acceptanceCriteria: [],
+  });
+  assert.equal(seen.body.card, undefined);
+  assert.equal(seen.body.description, 'Только запрос');
 });
 
 test('файловый инструмент подставляет root из конфигурации', async () => {

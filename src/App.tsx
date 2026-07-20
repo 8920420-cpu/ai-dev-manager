@@ -5,6 +5,7 @@ import { AppShell } from './components/layout/AppShell';
 import { ConnectedProjectsPage } from './features/projects/ConnectedProjectsPage';
 import { TasksPage } from './features/tasks/TasksPage';
 import { AcceptanceBoardPage } from './features/tasks/AcceptanceBoardPage';
+import { NeedsInputPage } from './features/tasks/NeedsInputPage';
 import { DevelopmentSchemePage } from './features/scheme/DevelopmentSchemePage';
 import { ServersPage } from './features/servers/ServersPage';
 import { IntegrationsPage } from './features/integrations/IntegrationsPage';
@@ -24,6 +25,8 @@ function CurrentPage() {
       return <TasksPage />;
     case 'tasks-review':
       return <AcceptanceBoardPage mode="review" />;
+    case 'tasks-needs-input':
+      return <NeedsInputPage />;
     case 'tasks-done':
       return <AcceptanceBoardPage mode="done" />;
     case 'departments-development':

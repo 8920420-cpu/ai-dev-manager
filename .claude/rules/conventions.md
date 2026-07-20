@@ -21,6 +21,8 @@
 
 ## Code Style Notes
 
+
+
 - Text files must be saved as UTF-8 without BOM. This includes `.md`, `.env`,
   `.js`, `.ts`, `.json`, `.yml`, `.yaml`, `.sql`, `.conf`, `.ps1`, and `.sh`.
 - Do not paste Windows console mojibake back into source files. Verify Cyrillic by

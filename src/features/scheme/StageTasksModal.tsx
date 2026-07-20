@@ -9,7 +9,7 @@ import {
   type BadgeTone,
 } from '../../components/ui';
 import { cn } from '../../lib/cn';
-import { taskStatusLabel } from '../../data/taskStatuses';
+import { taskStatusLabel, taskStatusTone } from '../../data/taskStatuses';
 import { tasksApi, type StageTask, type StageTaskRun, type StageTasks } from '../../api/tasksApi';
 import styles from './StageTasksModal.module.css';
 
@@ -24,13 +24,7 @@ interface StageTasksModalProps {
 
 type LoadState = 'loading' | 'error' | 'ready';
 
-// Тон бейджа статуса задачи: завершённые — успех, проблемные — опасность.
-function taskStatusTone(status: string): BadgeTone {
-  if (status === 'DONE') return 'success';
-  if (status === 'BLOCKED' || status === 'FAILED' || status === 'CANCELLED') return 'danger';
-  if (status === 'READY' || status === 'BACKLOG') return 'neutral';
-  return 'info';
-}
+// Тон бейджа статуса задачи — общий справочник (data/taskStatuses).
 
 // Тон бейджа статуса запуска роли (agent_run_status).
 function runStatusTone(status: string): BadgeTone {

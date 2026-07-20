@@ -61,6 +61,11 @@ export function buildPrompt(task) {
     '- If this is a Go project and you use `go`, the environment may require GOWORK=off.',
     '- Do not commit; a later pipeline stage handles git integration.',
     '- Do not claim that tests passed unless you actually ran them and saw the result.',
+    // PROGRAMMER-SELF-CHECK-001: раннер всё равно прогоняет проверку сам и вернёт
+    // задачу на ремонт при красном — дешевле, чтобы агент увидел это до сдачи.
+    '- Before finishing, run the project checks yourself (e.g. `npm test` or'
+      + ' `go test ./...` in the service directory) and fix what your change broke.'
+      + ' The runner re-runs them after you finish and will send failures back to you.',
     // PROGRAMMER-DELTA-DENYLIST-001: сгенерированные/сборочные артефакты всё равно
     // вырезаются из дельты — не тратить ходы на их правку/регенерацию.
     '- Do not create or edit generated/build artifacts (e.g. *.tsbuildinfo, dist/,'
@@ -83,9 +88,71 @@ export function buildPrompt(task) {
     'If (and only if) you are blocked because the task requires changing another'
       + ' service\'s contract or generated code, additionally set'
       + ' "blocked_by_service": "<that service name>" alongside success=false.',
+    // TASK-NEEDS-INPUT-001: спросить человека дешевле, чем угадать и переделать.
+    // Раньше единственным выходом было гадать (и сдать не то) либо вернуть голый
+    // success=false — задача уходила в requeue и через несколько холостых кругов
+    // в BLOCKED, так и не показав человеку ни одного вопроса.
+    'If the task is ambiguous in a way you cannot resolve from the repository —'
+      + ' a decision only the requester can make (which of two behaviours is wanted,'
+      + ' which system is the source of truth, what the expected output should be) —'
+      + ' do NOT guess. Return success=false and add'
+      + ' "needs_input": {"question": "<one specific question>",'
+      + ' "options": ["<option 1>", "<option 2>"], "context": "<what you already established>"}.',
+    'Rules for needs_input: ask ONE question that is genuinely blocking; put what you'
+      + ' already found out in context so the person does not re-answer the obvious;'
+      + ' list options only when the choice is genuinely closed (omit or leave empty'
+      + ' otherwise). Do not use it for anything you can determine by reading the code.',
   );
 
   return sections.filter((s) => s !== undefined && s !== null).join('\n');
+}
+
+/**
+ * PROGRAMMER-SELF-CHECK-001 — промпт ремонтного захода.
+ *
+ * Отдаём агенту РОВНО то, что увидел бы человек: команду, код возврата и хвост
+ * вывода. Ремонт намеренно узкий — чинить падение, а не продолжать задачу: широкая
+ * формулировка на этом шаге заставляет агента переписывать работающий код «заодно».
+ *
+ * @param {Object} task    исходная задача (нужен контекст, что вообще делали)
+ * @param {Object} failure исход упавшей команды из runVerify().failure
+ * @param {{attempt:number, maxAttempts:number}} progress
+ */
+export function buildRepairPrompt(task, failure, { attempt, maxAttempts } = {}) {
+  const f = failure || {};
+  const why = f.timedOut
+    ? `The command timed out (no exit within the limit).`
+    : `The command exited with code ${f.exitCode ?? 'unknown'}.`;
+  return [
+    'You are the PROGRAMMER role. Your previous change in this worktree is complete,',
+    'but the project checks are RED, so the work cannot be handed over yet.',
+    '',
+    `Task: ${task?.title || '-'}    Service: ${task?.service || '-'}`,
+    attempt && maxAttempts ? `Repair attempt ${attempt} of ${maxAttempts}.` : '',
+    '',
+    '## Failing check',
+    '```',
+    String(f.cmd || ''),
+    '```',
+    why,
+    '',
+    '## Output (tail)',
+    '```',
+    String(f.output || '').trim() || '(no output captured)',
+    '```',
+    '',
+    '## Execution Rules',
+    '- Fix the failure. Do not start new work and do not refactor unrelated code.',
+    '- If the failure is unrelated to your change and pre-existed, say so in the summary',
+    '  instead of rewriting foreign code.',
+    '- Re-run the failing command yourself to confirm it is green before finishing.',
+    '- Do not commit; a later pipeline stage handles git integration.',
+    '',
+    '## Required Final Response',
+    'The final message must be exactly one JSON object with nothing after it:',
+    '{"success": true|false, "summary": "what you fixed", "files_changed": ["path1"]}',
+    'Use success=false if you could not make the check green, and explain why in summary.',
+  ].filter((s) => s !== undefined && s !== null && s !== '').join('\n');
 }
 
 // Extract the final JSON block from the agent output. Returns an object or null.

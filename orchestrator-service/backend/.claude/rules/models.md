@@ -93,3 +93,7 @@
 
 ## New Models (added 2026-07-14)
 - `db/migrations/0062_task_router_mini_architect.sql`
+
+## New Models (added 2026-07-20)
+- `db/migrations/0063_task_needs_input_status.sql`
+- `db/migrations/0064_task_questions.sql`

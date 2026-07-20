@@ -72,13 +72,20 @@ function Resolve-Cli {
 
 # Самая свежая mtime ИСХОДНИКОВ корня (без memory-артефактов и vendor-каталогов) —
 # маркер «код менялся». Сравнивается с mtime changelog.md (маркер последнего update).
+#
+# ВАЖНО (иначе -IfStale не работает): исключаем и РАНТАЙМ-каталоги. logs/ и runtime/
+# пишутся демонами непрерывно (heartbeat, *.log), поэтому «исходники» там всегда
+# новее памяти — с ними -IfStale не пропускал НИ РАЗУ, и вотчдог гонял update каждые
+# 30 минут круглосуточно, засыпая changelog записями «No structural changes detected»
+# (за 10 дней — 680 пустых записей на 14 содержательных).
 function Get-NewestSourceTime([string]$AbsRoot) {
   $excludeLeaf = @('CLAUDE.md', 'CONVENTIONS.md', '.cursorrules', '.clinerules',
     '.windsurfrules', '.roomodes', 'copilot-instructions.md')
   $newest = [datetime]::MinValue
   $files = Get-ChildItem -Path $AbsRoot -Recurse -File -ErrorAction SilentlyContinue |
     Where-Object {
-      $_.FullName -notmatch '\\(\.claude|\.git|node_modules)\\' -and
+      $_.FullName -notmatch '\\(\.claude|\.git|node_modules|logs|runtime|output|dist|build|coverage|\.next|\.turbo|__pycache__)\\' -and
+      $_.Extension -notin @('.log', '.heartbeat') -and
       $excludeLeaf -notcontains $_.Name
     }
   foreach ($f in $files) { if ($f.LastWriteTime -gt $newest) { $newest = $f.LastWriteTime } }
@@ -136,6 +143,14 @@ try {
   if (-not $cli) {
     Write-Log 'codebase-memory CLI не найден (ни в PATH, ни в APPDATA\npm) — пропуск'
     exit 0
+  }
+
+  # Наши правки глобального тула живут вне репозитория и стираются при `npm i -g`.
+  # Накатываем их перед каждым прогоном (идемпотентно) — иначе однажды потерянный
+  # патч separator снова даст «0 файлов» у всех модулей, и это заметят не сразу.
+  $patcher = Join-Path $RepoRoot 'scripts\patch-codebase-memory-tool.ps1'
+  if (Test-Path $patcher) {
+    try { & powershell -NoProfile -ExecutionPolicy Bypass -File $patcher | Out-Null } catch {}
   }
 
   if ($Only -and $Only.Count -gt 0) {
