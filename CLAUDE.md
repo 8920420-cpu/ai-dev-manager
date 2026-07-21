@@ -154,6 +154,32 @@ powershell -File scripts/start-runners.ps1 -Restart -Only host-runner   # или
 - git-хуки `post-commit`/`post-merge` — зовут вотчдог сразу после коммита/pull,
   тронувшего каталоги раннеров (hooksPath = `scripts/git-hooks`).
 
+## Бэкапы БД ПС (BACKUP-PS-001)
+
+Полный `pg_dumpall` обоих контуров Postgres на сетевую шару
+`\\192.168.1.114\общая\BackupPS` (стейджинг `E:\git\_backups`, лог там же
+`backup-ps.log`, ротация — последние 7 суточных файлов; локально держатся 2):
+
+- `scripts/backup-ps-prod.sh` — **k8s CNPG-кластер `pg-ps`** (ns `ps-prod`). Дампит
+  текущий primary по лейблу (следует за failover), сжимает НА НОДЕ (стрим через
+  SSH+kubectl рвётся), забирает `.gz` по scp. Scheduled Task
+  `ai-dev-manager ps-prod backup`, ежедневно 01:00.
+- `scripts/backup-ps-docker.sh` — **старый docker-инфра Postgres** (Patroni
+  `infra-patroni1-1` на 211, за `haproxy:5000`). Дампит/сжимает ВНУТРИ контейнера
+  (docker daemon локальный), забирает через `docker cp`; `bash -c`, а не `sh` —
+  нужен `pipefail`. Scheduled Task `ai-dev-manager ps-docker backup`, ежедневно 02:00.
+- `scripts/backup-ps-minio.sh` — MinIO бакет `chat-files`, 01:15.
+
+**Зачем оба контура:** fan-out мастер-данных из 1С пишет и в docker, и в k8s
+одновременно, и часть данных резидентна только/преимущественно в docker — тела
+документов Archivum (`upds`/`upds_outbox`, ~7.5 ГБ; в CNPG только метаданные) и
+`orchestrator_db`. До `backup-ps-docker.sh` (добавлен 21.07.2026) docker-контур не
+бэкапился ничем. CNPG-native бэкапов нет (`.spec.backup` пуст, `ScheduledBackup`
+отсутствует) — эти внешние `pg_dumpall` и есть единственная защита.
+
+Критерий целостности дампа = ровно один `database cluster dump complete` (footer
+`pg_dumpall`), проверяется до переноса и после (`gzip -t`).
+
 ## Петля самопроверки программиста (PROGRAMMER-SELF-CHECK-001)
 
 Стадия CODING больше не one-shot. `programmer-runner` после успешного прогона агента
