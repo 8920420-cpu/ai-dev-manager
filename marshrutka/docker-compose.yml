@@ -52,6 +52,22 @@ services:
     volumes:
       - kuma-data:/app/data
 
+  # UDP-релей туннеля Каскада до хаба AmneziaWG на timeweb.
+  # Провайдер Каскада с 22.07.2026 режет UDP от 72.56.73.96 в сторону площадки:
+  # хендшейк уходит, ответ хаба не доходит (проверено дампом на VPS — порт роли
+  # не играет, режется по адресу). Обход: Каскад шлёт на giga:9099, giga
+  # пробрасывает сюда (ip static udp ISP 9099 192.168.1.211 9099), socat
+  # пересылает на хаб — и на хабе пир Каскада виден с адреса giga, не блокируемого.
+  # Переключением endpoint между прямым путём и релеем рулит вотчдог
+  # ansible/playbooks/kaskad-awg-failover.yml.
+  awg-relay:
+    image: alpine/socat:latest
+    container_name: marshrutka-awg-relay
+    restart: unless-stopped
+    ports:
+      - "9099:9099/udp"
+    command: -T600 UDP4-RECVFROM:9099,fork UDP4-SENDTO:72.56.73.96:42666
+
   # Опционально: собственный веб-git для репозитория конфигов.
   # Запуск: docker compose --profile git-server up -d
   gitea:

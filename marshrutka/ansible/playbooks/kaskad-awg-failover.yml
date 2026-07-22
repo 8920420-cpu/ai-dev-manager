@@ -1,0 +1,29 @@
+# Вотчдог туннеля Каскад -> timeweb (Wireguard1, AmneziaWG).
+# Провайдер Каскада режет UDP от 72.56.73.96 в сторону площадки, поэтому у
+# туннеля два пути: прямой (72.56.73.96:42666) и через релей за giga
+# (195.98.86.63:9099 -> socat на 192.168.1.211 -> хаб). Скрипт переключает
+# endpoint, когда текущий путь лёг. Пароль роутера — RPASS из Environment
+# Semaphore («kaskad-router»).
+---
+- name: Failover туннеля Каскад → timeweb
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  tasks:
+    - name: paramiko присутствует
+      ansible.builtin.pip:
+        name: paramiko
+        state: present
+      failed_when: false
+
+    - name: kaskad_awg_failover.py
+      ansible.builtin.command:
+        cmd: python3 "{{ playbook_dir }}/../files/kaskad_awg_failover.py"
+      register: failover
+      changed_when: "'переключаю' in failover.stdout"
+      environment:
+        RPASS: "{{ lookup('ansible.builtin.env', 'RPASS') }}"
+
+    - name: Результат
+      ansible.builtin.debug:
+        var: failover.stdout_lines
