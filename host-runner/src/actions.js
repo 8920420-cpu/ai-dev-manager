@@ -579,16 +579,25 @@ export async function runGitAction(task, opts = {}) {
   // интеграции и подтверждённого повтора (already_integrated_content), чтобы
   // ретрай упавшей доставки был обычным повторным прогоном роли.
   const autodeploy = opts.autodeploy ?? runAutodeploy;
+  // GI-PUSH-AFTER-DEPLOY-001: origin пушим ТОЛЬКО после успешного autodeploy (или
+  // когда в прод доставлять нечего). Раньше пуш шёл ДО деплоя, и при провале деплоя
+  // оставалось «origin green, prod old» — недетерминированная, незаметная доставка
+  // (Проблема 6). Теперь origin не опережает прод: коммит на main пушится вместе с
+  // обновлением прода. Локальный main несёт коммит для ретрая — GI-RESYNC-RETRY-001
+  // однократно вернёт задачу на COMMIT, повторный прогон доставит (already_integrated)
+  // и повторит деплой; при успехе тогда же и запушит.
   const deployAndFinish = async (payload, deployFiles) => {
     const deploy = await autodeploy(repoRoot, deployFiles, { log: opts.deployLog ?? (() => {}) })
       .catch((error) => ({ attempted: true, ok: false, targets: [], error: String(error?.message ?? error).slice(0, 700) }));
     if (deploy.attempted && !deploy.ok) {
-      // Интеграция состоялась, но прод не обновился — честный провал с диагностикой
-      // (BLOCKED). Повторный прогон роли доинтегрирует ничего (контент уже в main)
-      // и повторит только доставку.
-      return { success: false, output: { ...payload, note: 'autodeploy_failed', deploy } };
+      // Прод не обновился → origin НЕ пушим (иначе «origin green, prod old»). Честный
+      // провал (BLOCKED) с диагностикой; ретрай доставит и запушит, когда прод поднимется.
+      return { success: false, output: { ...payload, note: 'autodeploy_failed', deploy, pushed: false, pushError: 'skipped_autodeploy_failed' } };
     }
-    return { success: true, output: { ...payload, ...(deploy.attempted ? { deploy } : {}) } };
+    // Прод обновлён (или деплоить нечего) → пушим origin (best-effort, как прежде:
+    // локальный коммит main уже есть, провал пуша роль не роняет).
+    const push = await pushHead(repoRoot);
+    return { success: true, output: { ...payload, pushed: push.pushed, pushError: push.pushError, ...(deploy.attempted ? { deploy } : {}) } };
   };
 
   // Пустой итог: если содержимое tip уже в HEAD (повторный прогон после успешной
@@ -606,7 +615,7 @@ export async function runGitAction(task, opts = {}) {
       if (contentPresent) {
         // Дубль дельты в autostash больше не нужен: содержимое подтверждено в main.
         if (res.extra?.autostash) await git(repoRoot, ['stash', 'drop']).catch(() => {});
-        const push = await pushHead(repoRoot);
+        // Пуш — внутри deployAndFinish, ПОСЛЕ успешного деплоя (GI-PUSH-AFTER-DEPLOY-001).
         return deployAndFinish({
           commit: null,
           files: verifyPaths,
@@ -614,8 +623,6 @@ export async function runGitAction(task, opts = {}) {
           reason: note,
           worktreeBranch,
           deliveredCommit,
-          pushed: push.pushed,
-          pushError: push.pushError,
         }, verifyPaths);
       }
       return {
@@ -634,14 +641,12 @@ export async function runGitAction(task, opts = {}) {
     return { success: true, output: { commit: null, files: [], note } };
   }
 
-  const push = await pushHead(repoRoot);
+  // Пуш — внутри deployAndFinish, ПОСЛЕ успешного деплоя (GI-PUSH-AFTER-DEPLOY-001).
   return deployAndFinish({
     commit: res.commit,
     branch: res.branch,
     files: res.files,
     ...(res.mergedFrom ? { mergedFrom: res.mergedFrom, deliveredCommit: res.deliveredCommit } : {}),
-    pushed: push.pushed,
-    pushError: push.pushError,
     repoInitialized: repo.created,
   }, res.files);
 }

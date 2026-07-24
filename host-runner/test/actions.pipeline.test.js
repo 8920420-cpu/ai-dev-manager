@@ -481,3 +481,48 @@ test('runGitAction: ветка удаляет файл ТОЛЬКО внутри
   assert.throws(() => git(dir, ['cat-file', '-e', 'main:obsolete.txt']), 'obsolete.txt удалён из main');
   assert.doesNotThrow(() => git(dir, ['cat-file', '-e', 'main:feature.js']), 'feature.js добавлен в main');
 });
+
+// ── GI-PUSH-AFTER-DEPLOY-001: origin пушится ТОЛЬКО после успешного autodeploy ─────
+// Проблема 6: раньше пуш шёл ДО деплоя → при провале деплоя оставалось «origin green,
+// prod old» (недетерминированная доставка). Теперь origin не опережает прод.
+
+function branchDeltaOnMain(dir, branch) {
+  git(dir, ['checkout', '--quiet', '-b', branch]);
+  writeFileSync(path.join(dir, 'feature.js'), 'export const x = 1;\n');
+  git(dir, ['add', '-A']);
+  git(dir, ['commit', '--quiet', '-m', 'programmer: task delta']);
+  const deliveredCommit = git(dir, ['rev-parse', 'HEAD']).trim();
+  git(dir, ['checkout', '--quiet', 'main']);
+  return deliveredCommit;
+}
+
+test('runGitAction: autodeploy УПАЛ → origin НЕ пушится (skipped), note autodeploy_failed, коммит в локальном main для ретрая', async (t) => {
+  const dir = initRepo(t);
+  const deliveredCommit = branchDeltaOnMain(dir, 'programmer/PROJECT/svc');
+  const res = await runGitAction(
+    { id: 't-deploy-fail', title: 'x', worktreeBranch: 'programmer/PROJECT/svc', deliveredCommit, changedFiles: ['feature.js'] },
+    { repoRoot: dir, autodeploy: async () => ({ attempted: true, ok: false, targets: [], error: 'boom' }) },
+  );
+  assert.equal(res.success, false, 'провал деплоя → провал роли (BLOCKED)');
+  assert.equal(res.output.note, 'autodeploy_failed');
+  assert.equal(res.output.pushed, false);
+  assert.equal(res.output.pushError, 'skipped_autodeploy_failed', 'origin НЕ пушится при провале деплоя');
+  // Интеграция состоялась: дельта в ЛОКАЛЬНОМ main (для ретрая GI-RESYNC-RETRY-001).
+  assert.doesNotThrow(() => git(dir, ['cat-file', '-e', 'main:feature.js']), 'дельта в локальном main для ретрая');
+});
+
+test('runGitAction: autodeploy УСПЕШЕН → origin пушится ПОСЛЕ деплоя (push предпринят)', async (t) => {
+  const dir = initRepo(t);
+  const deliveredCommit = branchDeltaOnMain(dir, 'programmer/PROJECT/svc');
+  let deployCalled = false;
+  const res = await runGitAction(
+    { id: 't-deploy-ok', title: 'x', worktreeBranch: 'programmer/PROJECT/svc', deliveredCommit, changedFiles: ['feature.js'] },
+    { repoRoot: dir, autodeploy: async () => { deployCalled = true; return { attempted: true, ok: true, targets: ['svc'] }; } },
+  );
+  assert.equal(res.success, true);
+  assert.equal(deployCalled, true, 'деплой выполнен');
+  // Пуш БЫЛ предпринят после деплоя: нет origin → 'no_origin' (а НЕ 'skipped_autodeploy_failed').
+  assert.equal(res.output.pushed, false);
+  assert.equal(res.output.pushError, 'no_origin', 'push предпринят ПОСЛЕ успешного деплоя');
+  assert.ok(res.output.deploy && res.output.deploy.ok, 'деплой отражён в выводе');
+});
