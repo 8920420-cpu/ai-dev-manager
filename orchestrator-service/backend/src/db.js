@@ -17,6 +17,7 @@ import { asObject, parseDataCard } from './dataCard.js';
 import { isDriverProvider } from './connectors.js';
 import { hashToken, messageFingerprint } from './intakeIntegrations.js';
 import { exportLatestAgentRunObservation } from './clickhouseObservability.js';
+import { checkApproach } from './antiRegression.js';
 import { withTransaction } from './transaction.js';
 import {
   buildProgrammerClaimTask,
@@ -5863,7 +5864,56 @@ function runKpiSet(kpi, base) {
 
 // Экспортируется для тестов (SERVICE-REPO-PATH-PREFLIGHT-001): проверяем ранний
 // preflight repository_path на split-ветке Архитектора без поднятия всей БД.
+// ANTI-REGRESSION-ADVISORY-001 — роли, предлагающие ПОДХОД (план/декомпозиция/фикс),
+// чью формулировку имеет смысл сверять с реестром ранее ОТВЕРГНУТЫХ решений.
+const ANTI_REGRESSION_ROLES = new Set(['ARCHITECT', 'MINI_ARCHITECT', 'FAILURE_ANALYST']);
+
+// Собрать текст «предложенного подхода» из вердикта роли (summary + findings + ключевые
+// структурированные поля). Массивы строк схлопываем в текст.
+function approachTextFromVerdict(verdict) {
+  const parts = [];
+  if (verdict?.summary) parts.push(String(verdict.summary));
+  if (Array.isArray(verdict?.findings)) parts.push(verdict.findings.filter((x) => typeof x === 'string').join(' '));
+  const f = verdict?.fields || {};
+  for (const key of ['root_cause', 'fix_task', 'plan', 'approach', 'scope_limits', 'risk_notes']) {
+    const v = f[key];
+    if (typeof v === 'string') parts.push(v);
+    else if (Array.isArray(v)) parts.push(v.filter((x) => typeof x === 'string').join(' '));
+  }
+  return parts.join(' ').trim();
+}
+
+// Observe-only анти-регрессия: если предложенный подход похож на ранее отвергнутое
+// решение — залогировать предупреждение. НЕ влияет на вердикт/маршрутизацию,
+// fire-and-forget (checkApproach best-effort и по контракту не бросает).
+function maybeCheckApproachRegression(claimed, verdict) {
+  try {
+    if (!ANTI_REGRESSION_ROLES.has(claimed?.role_code)) return;
+    const text = approachTextFromVerdict(verdict);
+    if (text.length < 24) return; // слишком коротко — нечего сверять
+    void checkApproach({ text })
+      .then((res) => {
+        if (res?.flagged && res.matches?.length) {
+          log.warn('Анти-регрессия: предложенный подход похож на ранее отвергнутые решения', {
+            event_code: 'ANTI_REGRESSION_MATCH',
+            operation: 'anti_regression.check',
+            attributes: {
+              taskId: claimed?.id,
+              roleCode: claimed?.role_code,
+              matches: res.matches.map((m) => ({ decision_id: m.decision_id, status: m.status, score: m.score })),
+            },
+          });
+        }
+      })
+      .catch(() => {});
+  } catch {
+    // Advisory-контур: сбой проверки никогда не влияет на обработку вердикта.
+  }
+}
+
 export async function applyReasoningVerdict(c, claimed, { route, contract, verdict, response, exchangeId, durationMs, kpi = null }) {
+  // Advisory (observe-only), до любой маршрутизации: fire-and-forget, ничего не блокирует.
+  maybeCheckApproachRegression(claimed, verdict);
   const { values: cardValues, missingRequired: missingOut } = extractOutputs(verdict.fields, contract.outputs);
   // FA-MISSING-ARTIFACT-001 (анти-петля): если Аналитик сбоя СНОВА жалуется на
   // отсутствие артефакта провала — проверяем, была ли та же жалоба в его прошлом

@@ -80,6 +80,28 @@ export function scoreMatch(aTokens, bTokens) {
 // Поля решения, по которым имеет смысл сверять формулировку подхода.
 const MATCH_FIELDS = ['problem_signature', 'approach', 'title', 'alternatives', 'forbidden'];
 
+// Минимум общих значимых токенов, при котором подключаем containment-бонус (иначе
+// короткий кандидат «попал» бы в длинное решение по 1–2 случайным словам).
+const MIN_SHARED_TOKENS = 3;
+
+// Оценка похожести кандидата и поля решения. Чистый Jaccard штрафует за разницу длин
+// (короткая формулировка подхода против длинного описания решения с причиной отклонения)
+// и упускает реальные повторы. Поэтому при достаточном пересечении (>= MIN_SHARED_TOKENS)
+// берём max(Jaccard, containment), где containment = |A∩B| / min(|A|,|B|) — ловит случай
+// «кандидат ⊂ известного отвергнутого решения». Малое пересечение → только Jaccard (точность).
+export function fieldScore(aTokens, bTokens) {
+  const a = aTokens instanceof Set ? aTokens : new Set(aTokens || []);
+  const b = bTokens instanceof Set ? bTokens : new Set(bTokens || []);
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const t of a) if (b.has(t)) inter += 1;
+  if (inter === 0) return 0;
+  const jac = inter / (a.size + b.size - inter);
+  if (inter < MIN_SHARED_TOKENS) return jac;
+  const cont = inter / Math.min(a.size, b.size);
+  return Math.max(jac, cont);
+}
+
 // Сопоставить кандидата с реестром отвергнутых решений. Чистая функция.
 //   candidate = { text, area? }
 //   rejectedDecisions = массив строк решений (как в CH-таблице)
@@ -105,7 +127,7 @@ export function matchRejected(candidate, rejectedDecisions, opts = {}) {
     for (const field of MATCH_FIELDS) {
       const value = decision[field];
       if (!value) continue;
-      const s = scoreMatch(candTokens, new Set(tokenize(value)));
+      const s = fieldScore(candTokens, new Set(tokenize(value)));
       if (s > best) best = s;
     }
     // Бонус за совпадение области — только когда есть базовое пересечение.

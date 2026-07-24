@@ -4,6 +4,7 @@ import {
   tokenize,
   signatureTokens,
   scoreMatch,
+  fieldScore,
   matchRejected,
 } from '../src/antiRegression.js';
 
@@ -63,7 +64,43 @@ test('scoreMatch: частичное пересечение (Jaccard = |A∩B|/|
   assert.equal(score, 0.5);
 });
 
+// ── fieldScore (Jaccard + containment) ─────────────────────────────────────────
+
+test('fieldScore: короткий кандидат ⊂ длинного решения → высокий score (containment)', () => {
+  // Кандидат (5 значимых токенов) целиком входит в длинное описание решения (12).
+  const cand = tokenize('пересоздавать ветку branch worktree add');
+  const long = tokenize('удалять и пересоздавать ветку branch worktree add на каждом заходе гонка шторм worktree ensure failed');
+  const jac = scoreMatch(cand, long); // чистый Jaccard занижен из-за разницы длин
+  const fs = fieldScore(cand, long);
+  assert.ok(fs > jac, `containment (${fs}) должен превышать Jaccard (${jac})`);
+  assert.ok(fs >= 0.45, `score ${fs} достаточен для срабатывания`);
+});
+
+test('fieldScore: малое пересечение (<3 общих) не раздувается containment', () => {
+  // 2 общих токена — только Jaccard, без containment-бонуса → низкий score.
+  const s = fieldScore(tokenize('тенант изоляция'), tokenize('тенант изоляция подсистема логика реестр индекс кластер'));
+  assert.ok(s < 0.45, `score ${s} должен остаться низким при 2 общих токенах`);
+});
+
+test('fieldScore: пустые → 0', () => {
+  assert.equal(fieldScore([], ['app']), 0);
+  assert.equal(fieldScore(['app'], []), 0);
+});
+
 // ── matchRejected ──────────────────────────────────────────────────────────────
+
+test('matchRejected: короткая формулировка против длинного rejected-описания → flagged', () => {
+  const decisions = [{
+    decision_id: 'orch-adr-02-alt',
+    area: 'worktree',
+    status: 'rejected',
+    approach: 'удалять и пересоздавать ветку branch -D + git worktree add -b на каждом заходе — отвергнут: гонка и шторм worktree_ensure_failed, бесполезные release-циклы',
+  }];
+  const candidate = { text: 'предлагаю удалять и пересоздавать ветку branch и git worktree add на каждом заходе' };
+  const found = matchRejected(candidate, decisions, { threshold: 0.45 });
+  assert.equal(found.length, 1, 'длинное описание с причиной отклонения не должно мешать совпадению');
+  assert.equal(found[0].decision.decision_id, 'orch-adr-02-alt');
+});
 
 const rejectedDecisions = [
   {
