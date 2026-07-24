@@ -65,6 +65,31 @@ test('worktree_ensure_failed (гонка) → git/warning', () => {
   assert.equal(c.severity, 'warning');
 });
 
+test('стухшая ветка (нетто-дифф откатывает main) → git/stale_branch_reverts_main/error', () => {
+  const c = classify(row({ status: 'FAILED', error_text: 'stale branch net-diff reverts main: доставка ветки programmer/PROJECT_2/auth-iam-service удалила бы файлы вне changed-set задачи (tenant_patches.go, tenant_patches.sql) — ветку нужно пересинкать на актуальный main перед доставкой' }), null);
+  assert.equal(c.error_component, 'git');
+  assert.equal(c.error_class, 'stale_branch_reverts_main');
+  assert.equal(c.severity, 'error');
+});
+
+test('cherry-pick важнее stale: текст с cherry-pick → cherry_pick_failed', () => {
+  const c = classify(row({ status: 'FAILED', error_text: 'git_integrator_failed: cherry-pick failed: could not apply 4fa3e28 (stale branch)' }), null);
+  assert.equal(c.error_class, 'cherry_pick_failed');
+});
+
+test('отсутствует зависимость окружения (qrcode.react нет в node_modules) → env/error', () => {
+  const c = classify(row({ status: 'FAILED', error_text: 'pipeline_stage_failed: Стадия "unit-tests" провалилась, команда: npm --prefix frontend test — Failed to resolve import "qrcode.react" from RegisterPage.tsx' }), null);
+  assert.equal(c.error_component, 'env');
+  assert.equal(c.error_class, 'env_missing_dependency');
+  assert.equal(c.severity, 'error');
+});
+
+test('обычный провал теста без module-resolution → остаётся pipeline_test_failed', () => {
+  const c = classify(row({ status: 'FAILED', error_text: 'pipeline_stage_failed: Стадия "unit-tests" провалилась, команда: npm --prefix host-runner test, exit=1' }), null);
+  assert.equal(c.error_component, 'pipeline');
+  assert.equal(c.error_class, 'pipeline_test_failed');
+});
+
 test('missing_required_inputs → contract/error', () => {
   const c = classify(row({ status: 'FAILED', error_text: 'missing_required_inputs: affected_files' }), null);
   assert.equal(c.error_component, 'contract');

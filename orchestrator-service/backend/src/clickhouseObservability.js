@@ -108,6 +108,13 @@ function classify(row, reason) {
   if (has('failed to authenticate', 'request not allowed', 'unauthorized', 'invalid api key', 'authentication failed')) return mk('provider_auth', 'provider', SEV.FATAL);
   if (has('ai response timeout', 'upstream timeout', 'connector') && has('timeout')) return mk('provider_timeout', 'provider', SEV.ERROR);
 
+  // 2b. Окружение сборки/тестов: зависимость объявлена в lockfile, но отсутствует в
+  //     node_modules (или пакет не установлен) — чинится подготовкой среды (npm ci),
+  //     а НЕ правкой кода задачи. Отдельный класс/компонент 'env', чтобы такой блокер
+  //     не маскировался под обычный провал теста/сборки (инцидент 24.07: qrcode.react
+  //     в IAM frontend завалил всю когорту и потребовал ручного вмешательства).
+  if (has('failed to resolve import', 'cannot find module', 'cannot find package', 'module not found', 'err_module_not_found', 'could not resolve dependency', 'cannot resolve dependency')) return mk('env_missing_dependency', 'env', SEV.ERROR);
+
   // 2. Pipeline — смотреть логи pipeline-runner (стадия в error_class).
   if (has('pipeline_no_verification', 'no_verification')) return mk('pipeline_no_verification', 'pipeline', SEV.ERROR);
   if (has('pipeline')) {
@@ -122,7 +129,11 @@ function classify(row, reason) {
   if (has('autodeploy')) return mk('autodeploy_failed', 'deploy', SEV.ERROR);
 
   // 4. Git Integrator / worktree — смотреть состояние веток и рабочего дерева.
+  //    Коды согласованы с GI_RESYNC_NOTES (db.js): доставочные блоки, которые
+  //    авто-ресинк GI способен разрулить после ребейза ветки на свежий main.
   if (has('cherry-pick', 'cherry_pick')) return mk('cherry_pick_failed', 'git', SEV.ERROR);
+  if (has('stale branch', 'reverts main', 'stale_branch_reverts_main', 'changed-set')) return mk('stale_branch_reverts_main', 'git', SEV.ERROR);
+  if (has('empty_deliverable_declared_changes', 'declared changes but produced no')) return mk('empty_deliverable_declared_changes', 'git', SEV.WARN);
   if (has('dirty worktree', 'dirty_worktree')) return mk('dirty_worktree', 'git', SEV.WARN);
   if (has('worktree_ensure_failed', 'worktree add', 'index.lock')) return mk('worktree_ensure_failed', 'git', SEV.WARN);
   if (has('integrate_conflict', 'already exists in working directory', 'расходится с патчем', 'apply --binary')) return mk('integrate_conflict', 'git', SEV.WARN);

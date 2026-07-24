@@ -151,6 +151,29 @@ SELECT
     countIf(severity IN ('error', 'fatal')) AS failures
 FROM ${table} FINAL
 GROUP BY hour, project_id, stage_key, role_code`,
+
+    // Дневной дайджест сбоев: класс × компонент × задачи × СТОИМОСТЬ неуспешных
+    // прогонов и число повторов (событий больше, чем задач = churn). Один запрос
+    // отвечает на «как отработал день»: `SELECT * FROM daily_failure_digest
+    // WHERE day = today() ORDER BY failed_cost DESC`. Включает warning (git-churn:
+    // dirty_worktree / empty_deliverable), исключает шум ok/info.
+    `CREATE OR REPLACE VIEW ${db}.daily_failure_digest AS
+SELECT
+    toDate(ts) AS day,
+    project_id,
+    error_component,
+    error_class,
+    severity,
+    count() AS events,
+    uniqExact(task_id) AS tasks,
+    uniqExact(role_code) AS roles,
+    round(events / greatest(tasks, 1), 2) AS retries_per_task,
+    sum(token_input + token_output) AS tokens,
+    round(sum(cost), 4) AS failed_cost,
+    any(reason) AS sample_reason
+FROM ${table} FINAL
+WHERE severity NOT IN ('ok', 'info')
+GROUP BY day, project_id, error_component, error_class, severity`,
   ];
 }
 
