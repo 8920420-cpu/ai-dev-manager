@@ -2169,6 +2169,19 @@ export async function claimNextClaudeTaskTx(c) {
                              + (($1::int[])[LEAST(cd.n_fail::int, array_length($1::int[], 1))])
                                * interval '1 millisecond'
              )
+             -- PROGRAMMER-CONTRACT-BARRIER-001: подзадачу-потребителя (task_kind=
+             -- 'subtask', путь Декомпозера) не выдаём, пока её зависимость (владелец
+             -- общего контракта proto) не «устаканилась». Гейт СТРОГО для subtask'ов:
+             -- fork/epic-зависимости висят на task_id service/epic и сюда не попадают.
+             -- Активная зависимость держит; терминал/BLOCKED — отпускает (без дедлока).
+             AND NOT (
+               t.task_kind = 'subtask'
+               AND EXISTS (
+                 SELECT 1 FROM task_dependencies d
+                   JOIN tasks dep ON dep.id = d.depends_on_task_id
+                  WHERE d.task_id = t.id
+                    AND dep.status NOT IN ('DONE','CANCELLED','FAILED','BLOCKED'))
+             )
            ORDER BY t.priority ASC, t.created_at ASC
            FOR UPDATE OF t SKIP LOCKED
            LIMIT 1
@@ -4117,6 +4130,20 @@ export async function advanceWorkStack(c) {
              WHERE t2.project_id = w.project_id AND t2.service_id = w.service_id
                AND t2.parent_task_id = w.epic_task_id
                AND t2.status NOT IN ('DONE','CANCELLED','FAILED'))
+          -- PROGRAMMER-CONTRACT-BARRIER-001: сервис-потребитель не промоутится, пока
+          -- владелец общего контракта (proto) этого эпика не «устаканился» (его
+          -- work_stack-элемент DONE/CANCELLED/FAILED). Владельца (его же service_id)
+          -- не гейтим; терминал владельца отпускает потребителей → дедлока нет.
+          AND NOT EXISTS (
+            SELECT 1 FROM tasks epic
+             WHERE epic.id = w.epic_task_id
+               AND (epic.data_card->'contract_barrier'->>'ownerServiceId') IS NOT NULL
+               AND (epic.data_card->'contract_barrier'->>'ownerServiceId') <> w.service_id::text
+               AND NOT EXISTS (
+                 SELECT 1 FROM work_stack ow
+                  WHERE ow.epic_task_id = w.epic_task_id
+                    AND ow.service_id::text = (epic.data_card->'contract_barrier'->>'ownerServiceId')
+                    AND ow.status IN ('DONE','CANCELLED','FAILED')))
         ORDER BY w.project_id, w.service_id, w.seq, w.created_at`,
     );
     let promoted = 0;
@@ -6286,6 +6313,40 @@ export function computePlannedServices(card, canonicalByCode) {
   return out;
 }
 
+// PROGRAMMER-CONTRACT-BARRIER-001 — очерёдность «общий контракт раньше потребителей».
+// Если ровно ОДИН сервис декомпозиции владеет общим контрактом (proto), сервисы-
+// потребители ждут его интеграции: их L2-подзадачи получают зависимость от L1
+// владельца (task_dependencies), а гейт claim (claimNextClaudeTaskTx) не выдаёт
+// подзадачу с активной зависимостью. Иначе гонка: потребитель правит по СТАРОМУ
+// сгенерированному коду, пока владелец регенерирует контракт (инцидент 23.07
+// «партнёр в чате»: agent_reported_failure «незавершённая регенерация
+// proto-contracts/chat»). Клапан: PROGRAMMER_CONTRACT_BARRIER=0/false/off.
+const CONTRACT_BARRIER_ENABLED = !/^(0|false|off)$/i.test(String(process.env.PROGRAMMER_CONTRACT_BARRIER ?? '').trim());
+
+// Путь ИСХОДНИКА общего контракта (proto-файл / его каталог). Сгенерированный код
+// (`*.pb.go` и т.п.) намеренно НЕ считаем: владельца определяет правка исходника
+// контракта, а сгенерированный код правит и потребитель. Нормализуем слэши/регистр.
+export function isContractPath(p) {
+  const s = String(p ?? '').replace(/\\/g, '/').toLowerCase();
+  if (!s) return false;
+  return s.endsWith('.proto')
+    || s.includes('proto-contracts/')
+    || /(^|\/)proto\//.test(s);
+}
+
+// Индекс ЕДИНСТВЕННОГО элемента-владельца контракта среди work-items декомпозиции.
+// 0 совпадений → контракта нет; ≥2 → неоднозначно (не рискуем неверной очерёдностью,
+// барьер не ставим); ровно 1 → его индекс. items[i].files = [{ path, what }].
+export function detectContractOwnerIndex(items) {
+  const list = Array.isArray(items) ? items : [];
+  const owners = [];
+  for (let i = 0; i < list.length; i += 1) {
+    const files = Array.isArray(list[i]?.files) ? list[i].files : [];
+    if (files.some((f) => isContractPath(f?.path))) owners.push(i);
+  }
+  return owners.length === 1 ? owners[0] : -1;
+}
+
 // DECOMP-CONTRACT-001 — материализация декомпозиции эпика в задачи-на-сервис (L1)
 // и подзадачи-на-файл (L2). Один txn. Идемпотентно: если у эпика уже есть дети,
 // повторно не создаём. Эпик паркуется в WAITING_FOR_CHILDREN. Если из карточки не
@@ -6367,7 +6428,7 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
       );
       const l1Id = l1.rows[0].id;
       serviceCount += 1;
-      createdServices.push({ id: l1Id, serviceCode: item.serviceCode });
+      const subtaskIds = [];
       await c.query(
         `INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)
          ON CONFLICT (task_id, depends_on_task_id) DO NOTHING`,
@@ -6380,14 +6441,46 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
       for (const f of files) {
         const childCard = JSON.stringify({ ...card, service: item.serviceCode, file: f.path, instruction: f.what });
         const subTitle = f.path ? `${item.serviceCode}: ${f.path}` : item.title;
-        await c.query(
+        const sub = await c.query(
           `INSERT INTO tasks (project_id, service_id, parent_task_id, task_kind, title, description,
                               status, current_role_id, created_by, data_card)
-           VALUES ($1, $2, $3, 'subtask', $4, $5, 'CODING', $6, 'decomposer', $7::jsonb)`,
+           VALUES ($1, $2, $3, 'subtask', $4, $5, 'CODING', $6, 'decomposer', $7::jsonb)
+           RETURNING id`,
           [claimed.project_id, item.serviceId, l1Id, subTitle, f.what || item.title,
            programmerRoleId, childCard],
         );
+        subtaskIds.push(sub.rows[0].id);
         subtaskCount += 1;
+      }
+      // Параллельно resolved: индекс createdServices == индекс resolved (для барьера).
+      createdServices.push({ id: l1Id, serviceCode: item.serviceCode, subtaskIds });
+    }
+
+    // PROGRAMMER-CONTRACT-BARRIER-001: ровно один сервис владеет общим контрактом
+    // (proto) → его L1 становится зависимостью для L2-подзадач сервисов-потребителей.
+    // Гейт claim (claimNextClaudeTaskTx) не выдаёт подзадачу с активной зависимостью,
+    // пока контракт не интегрирован (L1 владельца → терминал/BLOCKED). Барьер-
+    // зависимости ставятся ТОЛЬКО на subtask'и — fork/epic-связи их не затрагивают.
+    let contractBarrier = null;
+    if (CONTRACT_BARRIER_ENABLED && createdServices.length > 1) {
+      const ownerIdx = detectContractOwnerIndex(resolved);
+      if (ownerIdx >= 0) {
+        const ownerL1 = createdServices[ownerIdx].id;
+        let deps = 0;
+        for (let i = 0; i < createdServices.length; i += 1) {
+          if (i === ownerIdx) continue;
+          for (const subId of createdServices[i].subtaskIds) {
+            await c.query(
+              `INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)
+               ON CONFLICT (task_id, depends_on_task_id) DO NOTHING`,
+              [subId, ownerL1],
+            );
+            deps += 1;
+          }
+        }
+        if (deps > 0) {
+          contractBarrier = { ownerService: createdServices[ownerIdx].serviceCode, ownerTaskId: ownerL1, deps };
+        }
       }
     }
 
@@ -6400,7 +6493,10 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
     await c.query(
       `UPDATE tasks SET task_kind = 'epic', status = 'WAITING_FOR_CHILDREN', assigned_agent_id = NULL,
               data_card = data_card || $2::jsonb WHERE id = $1`,
-      [claimed.id, JSON.stringify({ ...(cardValues || {}), planned_services: plannedServices })],
+      [claimed.id, JSON.stringify({
+        ...(cardValues || {}), planned_services: plannedServices,
+        ...(contractBarrier ? { contract_barrier: contractBarrier } : {}),
+      })],
     );
     const kpiSet = runKpiSet(kpi, 2);
     await c.query(
@@ -6527,11 +6623,28 @@ export async function materializeArchitectSplit(c, claimed, { verdict, response,
     const canonicalRows = await c.query('SELECT service_code FROM services WHERE project_id = $1', [claimed.project_id]);
     const canonicalByCode = new Map(canonicalRows.rows.map((r) => [String(r.service_code).toLowerCase(), r.service_code]));
     const plannedServices = computePlannedServices(card, canonicalByCode);
+    // PROGRAMMER-CONTRACT-BARRIER-001: если ровно один сервис сплита владеет общим
+    // контрактом (proto), фиксируем его в data_card эпика. Промоутер work_stack
+    // (advanceWorkStack) не выпустит сервисы-потребители в CODING, пока владелец не
+    // завершён — иначе гонка по сгенерированному коду (инцидент 23.07 «партнёр в чате»).
+    let contractBarrier = null;
+    if (CONTRACT_BARRIER_ENABLED && services.length > 1) {
+      const ownerIdx = detectContractOwnerIndex(services);
+      if (ownerIdx >= 0) {
+        contractBarrier = {
+          ownerService: services[ownerIdx].serviceCode,
+          ownerServiceId: String(services[ownerIdx].serviceId),
+        };
+      }
+    }
     // Эпик: помечаем видом, паркуем на детях, доливаем поля вердикта Архитектора.
     await c.query(
       `UPDATE tasks SET task_kind = 'epic', status = 'WAITING_FOR_CHILDREN', assigned_agent_id = NULL,
               data_card = data_card || $2::jsonb WHERE id = $1`,
-      [claimed.id, JSON.stringify({ ...(cardValues || {}), planned_services: plannedServices })],
+      [claimed.id, JSON.stringify({
+        ...(cardValues || {}), planned_services: plannedServices,
+        ...(contractBarrier ? { contract_barrier: contractBarrier } : {}),
+      })],
     );
     const kpiSet = runKpiSet(kpi, 2);
     await c.query(
