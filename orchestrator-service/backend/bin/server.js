@@ -9,6 +9,7 @@ import { createTaskRunner } from '../src/taskRunner.js';
 import { recordDeployMarker, recordDowntimeMarker } from '../src/performance.js';
 import { ensureClickhouseSchema } from '../src/clickhouseSchema.js';
 import { flushClickhouseObservability } from '../src/clickhouseObservability.js';
+import { ensureDecisionSchema } from '../src/decisionLedger.js';
 import { resolveBool, resolveDuration, resolveInt } from '../src/envConfig.js';
 import { createLogger } from '../../../shared/logging/index.js';
 
@@ -81,6 +82,17 @@ async function main() {
       else if (r?.ok === false) log.warn('ClickHouse observability: схема не накатилась (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'clickhouse.ensure_schema', attributes: { error: r.error } });
     })
     .catch((e) => log.warn('ClickHouse observability: ensure schema error (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'clickhouse.ensure_schema', err: e }));
+
+  // DECISION-LEDGER-SCHEMA-001: реестр архитектурных решений (источники: DECISIONS.md +
+  // git) для анти-регрессии. Схему накатываем на старте тем же best-effort контуром, что
+  // и observability (не блокирует boot). Наполнение — отдельным seed-скриптом
+  // (scripts/seed-decisions.mjs), не на boot. Гейты те же: CLICKHOUSE_OBSERVABILITY_ENABLED.
+  void ensureDecisionSchema()
+    .then((r) => {
+      if (r?.ok) log.info('ClickHouse реестр решений: схема готова', { event_code: 'APP_BOOT_STEP', operation: 'clickhouse.decisions.ensure_schema' });
+      else if (r?.ok === false) log.warn('ClickHouse реестр решений: схема не накатилась (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'clickhouse.decisions.ensure_schema', attributes: { error: r.error } });
+    })
+    .catch((e) => log.warn('ClickHouse реестр решений: ensure schema error (продолжаю)', { event_code: 'APP_BOOT_STEP', operation: 'clickhouse.decisions.ensure_schema', err: e }));
 
   const server = createApp().listen(PORT, HOST, () => {
     log.info(`orchestrator-service слушает http://localhost:${PORT}`, { event_code: 'APP_STARTED', attributes: { port: PORT, host: HOST } });
