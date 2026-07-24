@@ -6476,6 +6476,61 @@ export function detectContractOwnerIndex(items) {
   return owners.length === 1 ? owners[0] : -1;
 }
 
+// PATH-INTERSECTION-BARRIER-001 — обобщение proto-барьера на НЕПРЯМЫЕ пересечения:
+// две подзадачи РАЗНЫХ сервисов одного эпика, правящие ОДИН И ТОТ ЖЕ не-контрактный
+// файл (монорепо-библиотеки packages/*, platform/* и т.п.), нельзя писать
+// параллельно — иначе те же гонки cherry_pick_failed, что proto-барьер чинит только
+// для контракта. Сериализуем их цепочкой task_dependencies; тот же гейт claim их
+// соблюдает, а BLOCKED/терминал предшественника отпускает следующего — без дедлока.
+//
+// По умолчанию ВЫКЛЮЧЕНО: механизм не обкатан на живом многосервисном пакете, а это
+// правка живого планировщика. Включение — PROGRAMMER_PATH_BARRIER=1/true/on (опт-ин
+// поверх уже включённого по умолчанию proto-барьера). Проверяется на КАЖДЫЙ вызов
+// (не модульная константа), чтобы клапан можно было менять без перезапуска демона.
+export function pathIntersectionBarrierEnabled() {
+  return /^(1|true|on)$/i.test(String(process.env.PROGRAMMER_PATH_BARRIER ?? '').trim());
+}
+
+// Ключ пути для сравнения пересечений: нормализуем слэши/регистр/пробелы, срезаем
+// ведущее `./` и хвостовой `/`. Контрактные и пустые пути обрабатываются отдельно.
+export function normalizePathKey(p) {
+  return String(p ?? '')
+    .replace(/\\/g, '/')
+    .trim()
+    .replace(/^\.\//, '')
+    .replace(/\/+$/, '')
+    .toLowerCase();
+}
+
+// По списку подзадач [{ id, path }] вернуть рёбра сериализации: для каждой группы
+// подзадач с ОДНИМ И ТЕМ ЖЕ не-контрактным непустым путём — цепочка по порядку
+// поступления (строгая сериализация A→B→C, а НЕ звезда: иначе B и C всё равно
+// гоняются за файл). Контрактные пути пропускаем (их держит proto-барьер), пустые
+// (подзадача-на-весь-сервис, нет файловой гранулярности) — тоже. Рёбра всегда идут
+// от большего индекса к меньшему ⇒ это DAG без циклов. Возврат: [{ taskId, dependsOn }].
+export function computePathIntersectionDeps(items) {
+  const list = Array.isArray(items) ? items : [];
+  const groups = new Map();
+  for (let i = 0; i < list.length; i += 1) {
+    const key = normalizePathKey(list[i]?.path);
+    if (!key || isContractPath(key)) continue;
+    const g = groups.get(key);
+    if (g) g.push(i);
+    else groups.set(key, [i]);
+  }
+  const edges = [];
+  for (const idxs of groups.values()) {
+    for (let k = 1; k < idxs.length; k += 1) {
+      const cur = list[idxs[k]];
+      const prev = list[idxs[k - 1]];
+      if (cur?.id && prev?.id && cur.id !== prev.id) {
+        edges.push({ taskId: cur.id, dependsOn: prev.id });
+      }
+    }
+  }
+  return edges;
+}
+
 // DECOMP-CONTRACT-001 — материализация декомпозиции эпика в задачи-на-сервис (L1)
 // и подзадачи-на-файл (L2). Один txn. Идемпотентно: если у эпика уже есть дети,
 // повторно не создаём. Эпик паркуется в WAITING_FOR_CHILDREN. Если из карточки не
@@ -6544,6 +6599,9 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
     let serviceCount = 0;
     let subtaskCount = 0;
     const createdServices = [];
+    // Плоский список ВСЕХ созданных подзадач с путями — для path-барьера (сериализация
+    // подзадач разных сервисов, правящих один и тот же не-контрактный файл).
+    const allSubtasks = [];
 
     for (const item of resolved) {
       // L1 — задача-на-сервис: единица приёмки. Пока есть подзадачи — ждёт их.
@@ -6579,6 +6637,7 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
            programmerRoleId, childCard],
         );
         subtaskIds.push(sub.rows[0].id);
+        allSubtasks.push({ id: sub.rows[0].id, path: f.path });
         subtaskCount += 1;
       }
       // Параллельно resolved: индекс createdServices == индекс resolved (для барьера).
@@ -6613,6 +6672,24 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
       }
     }
 
+    // PATH-INTERSECTION-BARRIER-001 (опт-ин): сериализуем подзадачи, правящие один и
+    // тот же не-контрактный файл (монорепо-библиотеки), цепочкой task_dependencies.
+    // Дополняет proto-барьер (тот покрывает только контракт). По умолчанию выключено.
+    let pathBarrier = null;
+    if (pathIntersectionBarrierEnabled() && allSubtasks.length > 1) {
+      const edges = computePathIntersectionDeps(allSubtasks);
+      let added = 0;
+      for (const e of edges) {
+        await c.query(
+          `INSERT INTO task_dependencies (task_id, depends_on_task_id) VALUES ($1, $2)
+           ON CONFLICT (task_id, depends_on_task_id) DO NOTHING`,
+          [e.taskId, e.dependsOn],
+        );
+        added += 1;
+      }
+      if (added > 0) pathBarrier = { sharedPathDeps: added };
+    }
+
     // JOIN-PLANNED-COVERAGE-001: фиксируем целевой список сервисов эпика в data_card,
     // чтобы роллап (advanceDecompositionParents) сверял фактических детей с заявленным
     // scope и не закрывал эпик DONE при потерянных фронтах.
@@ -6625,6 +6702,7 @@ export async function materializeDecomposition(c, claimed, { verdict, response, 
       [claimed.id, JSON.stringify({
         ...(cardValues || {}), planned_services: plannedServices,
         ...(contractBarrier ? { contract_barrier: contractBarrier } : {}),
+        ...(pathBarrier ? { path_barrier: pathBarrier } : {}),
       })],
     );
     const kpiSet = runKpiSet(kpi, 2);
