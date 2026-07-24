@@ -286,6 +286,22 @@ export function registerTools(server, { config, toolsClient, orchestratorClient 
   );
 
   tool(
+    'orchestrator_get_task_history',
+    {
+      title: 'История и причина блокировки задачи',
+      description:
+        'GET /api/tasks/history?taskId= — полный таймлайн task_events задачи (payload_json со ' +
+        'статусами, причиной блока: note/error/role, cherry_pick_failed и т.п.) + data_card. ' +
+        'Раньше это доставалось только прямым SQL в orchestrator_db.',
+      inputSchema: { taskId: z.string().describe('UUID задачи.') },
+    },
+    ({ taskId }) =>
+      run(() =>
+        orchestratorClient.get('/api/tasks/history', { query: { taskId } }),
+      ),
+  );
+
+  tool(
     'orchestrator_list_roles',
     { title: 'Список ролей', description: 'GET /api/roles.', inputSchema: {} },
     () => run(() => orchestratorClient.get('/api/roles')),

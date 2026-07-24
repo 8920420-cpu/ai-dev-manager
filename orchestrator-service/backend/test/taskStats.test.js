@@ -7,6 +7,9 @@ import {
   stageForStatus,
   clampPagination,
   TERMINAL_STATUSES,
+  normalizeKpi,
+  normalizeBlockReason,
+  enrichTaskRows,
 } from '../src/taskStats.js';
 
 const iso = (ms) => new Date(ms).toISOString();
@@ -160,4 +163,61 @@ test('TERMINAL_STATUSES содержит DONE/CANCELLED/FAILED', () => {
   assert.ok(TERMINAL_STATUSES.has('CANCELLED'));
   assert.ok(TERMINAL_STATUSES.has('FAILED'));
   assert.equal(TERMINAL_STATUSES.has('BLOCKED'), false);
+});
+
+// --- OBSERVABILITY-BLOCK-KPI-001 -------------------------------------------
+
+test('normalizeKpi: пусто → нули', () => {
+  assert.deepEqual(normalizeKpi(null), {
+    tokenInput: 0, tokenOutput: 0, tokenCacheRead: 0, tokenCacheCreation: 0,
+    tokenFreshInput: 0, cost: 0, turns: 0, runs: 0, failedRuns: 0,
+  });
+});
+
+test('normalizeKpi: строки pg (bigint/numeric) → числа, свежий ввод без кэша', () => {
+  const kpi = normalizeKpi({
+    token_input: '1000', token_output: '50', token_cache_read: '600',
+    token_cache_creation: '100', cost: '3.030492', turns: '41',
+    runs: '10', failed_runs: '2',
+  });
+  assert.equal(kpi.tokenInput, 1000);
+  assert.equal(kpi.tokenOutput, 50);
+  assert.equal(kpi.tokenFreshInput, 300); // 1000 - 600 - 100
+  assert.equal(kpi.cost, 3.030492);
+  assert.equal(kpi.turns, 41);
+  assert.equal(kpi.runs, 10);
+  assert.equal(kpi.failedRuns, 2);
+});
+
+test('normalizeKpi: кэш больше ввода → tokenFreshInput не отрицательный', () => {
+  const kpi = normalizeKpi({ token_input: '100', token_cache_read: '200' });
+  assert.equal(kpi.tokenFreshInput, 0);
+});
+
+test('normalizeBlockReason: null без данных, объект при наличии', () => {
+  assert.equal(normalizeBlockReason(null), null);
+  assert.equal(normalizeBlockReason({ note: null, error: null, role: null }), null);
+  const r = normalizeBlockReason({
+    note: 'cherry_pick_failed', error: 'conflict', role: 'GIT_INTEGRATOR', at: 1000,
+  });
+  assert.equal(r.note, 'cherry_pick_failed');
+  assert.equal(r.role, 'GIT_INTEGRATOR');
+  assert.equal(r.at, new Date(1000).toISOString());
+});
+
+test('enrichTaskRows: проставляет blockReason/kpi/docForcedAdvance по task_id', () => {
+  const rows = [{ id: 'a' }, { id: 'b' }, { id: 'c' }];
+  enrichTaskRows(rows, {
+    blockByTask: new Map([['a', { note: 'cherry_pick_failed', role: 'GIT_INTEGRATOR' }]]),
+    kpiByTask: new Map([['a', { token_input: '10', cost: '1.5', runs: '1' }]]),
+    docForcedSet: new Set(['b']),
+  });
+  assert.equal(rows[0].blockReason.note, 'cherry_pick_failed');
+  assert.equal(rows[0].kpi.tokenInput, 10);
+  assert.equal(rows[0].docForcedAdvance, false);
+  assert.equal(rows[1].blockReason, null);
+  assert.equal(rows[1].kpi.runs, 0); // нет agent_runs → нули
+  assert.equal(rows[1].docForcedAdvance, true); // force-продвинут (doc-ветка)
+  assert.equal(rows[2].blockReason, null);
+  assert.equal(rows[2].docForcedAdvance, false);
 });

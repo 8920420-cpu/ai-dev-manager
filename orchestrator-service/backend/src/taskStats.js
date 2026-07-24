@@ -125,6 +125,77 @@ export function computeTaskRows({ tasks, eventsByTask }, generatedAtMs) {
   return list.map((t) => computeTask(t, map.get(t.id) ?? [], generatedAtMs));
 }
 
+// --- Наблюдаемость (OBSERVABILITY-BLOCK-KPI-001) ----------------------------
+// Причину блокировки и KPI токенов/стоимости раньше нельзя было достать иначе как
+// прямым SQL в orchestrator_db (task_events.payload_json + agent_runs). Обогащаем
+// строки статистики этими данными, чтобы они шли и в HTTP-эндпоинт, и в MCP
+// (orchestrator_get_task_statistics) без изменения их схем. Разбор — чистые
+// функции ниже (юнит-тестируемы), сбор данных из БД — в getTaskStatistics.
+
+const nUint = (v) => {
+  const x = Number(v);
+  return Number.isFinite(x) && x > 0 ? x : 0;
+};
+
+/**
+ * KPI задачи из агрегата agent_runs. pg отдаёт bigint как строку, numeric как
+ * строку — приводим к числам. tokenFreshInput = свежий ввод без кэша
+ * (token_input − cache_read − cache_creation), не отрицательный.
+ */
+export function normalizeKpi(raw) {
+  if (!raw) {
+    return {
+      tokenInput: 0, tokenOutput: 0, tokenCacheRead: 0, tokenCacheCreation: 0,
+      tokenFreshInput: 0, cost: 0, turns: 0, runs: 0, failedRuns: 0,
+    };
+  }
+  const tokenInput = nUint(raw.token_input);
+  const tokenCacheRead = nUint(raw.token_cache_read);
+  const tokenCacheCreation = nUint(raw.token_cache_creation);
+  return {
+    tokenInput,
+    tokenOutput: nUint(raw.token_output),
+    tokenCacheRead,
+    tokenCacheCreation,
+    tokenFreshInput: Math.max(0, tokenInput - tokenCacheRead - tokenCacheCreation),
+    cost: Number(raw.cost) || 0,
+    turns: nUint(raw.turns),
+    runs: nUint(raw.runs),
+    failedRuns: nUint(raw.failed_runs),
+  };
+}
+
+/**
+ * Причина блокировки из последнего события с to_status='BLOCKED'.
+ * note/error/role уже вытащены из payload_json на SQL-слое. null, если ничего нет.
+ */
+export function normalizeBlockReason(raw) {
+  if (!raw) return null;
+  const note = raw.note ?? null;
+  const error = raw.error ?? null;
+  const role = raw.role ?? null;
+  if (note == null && error == null && role == null) return null;
+  const atMs = toMs(raw.at);
+  return { note, error, role, at: atMs == null ? null : new Date(atMs).toISOString() };
+}
+
+/**
+ * Обогатить строки статистики (мутирует и возвращает их же):
+ *  - blockReason — причина блока (или null);
+ *  - kpi — агрегат токенов/стоимости/прогонов;
+ *  - docForcedAdvance — документационная ветка была force-продвинута к join
+ *    сетью безопасности (advanceStuckDocumentationBranches, reason
+ *    documentation_branch_advanced): DONE без реальной работы движка доков.
+ */
+export function enrichTaskRows(rows, { blockByTask = new Map(), kpiByTask = new Map(), docForcedSet = new Set() } = {}) {
+  for (const row of rows) {
+    row.blockReason = normalizeBlockReason(blockByTask.get(row.id));
+    row.kpi = normalizeKpi(kpiByTask.get(row.id));
+    row.docForcedAdvance = docForcedSet.has(row.id);
+  }
+  return rows;
+}
+
 // --- DB-слой ---------------------------------------------------------------
 
 import { httpError } from './httpError.js';
@@ -252,6 +323,53 @@ export async function getTaskStatistics(s, projectId, pagination = {}) {
     }
 
     const tasks = computeTaskRows({ tasks: taskRows, eventsByTask }, generatedAtMs);
+
+    // OBSERVABILITY-BLOCK-KPI-001: причина блока (последнее событие BLOCKED),
+    // KPI токенов/стоимости из agent_runs и флаг force-продвижения doc-ветки —
+    // только для задач текущей страницы (три запроса, без N+1).
+    const blockByTask = new Map();
+    const kpiByTask = new Map();
+    const docForcedSet = new Set();
+    if (taskRows.length) {
+      const ids = taskRows.map((t) => t.id);
+      // Один pg-клиент не выполняет запросы параллельно — идём последовательно
+      // (как и остальные запросы этого хендлера).
+      const blk = await c.query(
+        `SELECT DISTINCT ON (task_id) task_id,
+                coalesce(payload_json->'output'->>'note', payload_json->>'note', payload_json->>'reason') AS note,
+                left(coalesce(payload_json->'output'->>'error', payload_json->>'error'), 800) AS error,
+                payload_json->>'role' AS role, created_at AS at
+           FROM task_events
+          WHERE task_id = ANY($1::uuid[]) AND to_status = 'BLOCKED'
+          ORDER BY task_id, created_at DESC`,
+        [ids],
+      );
+      const kpi = await c.query(
+        `SELECT task_id,
+                coalesce(sum(token_input),0)::bigint          AS token_input,
+                coalesce(sum(token_output),0)::bigint         AS token_output,
+                coalesce(sum(token_cache_read),0)::bigint     AS token_cache_read,
+                coalesce(sum(token_cache_creation),0)::bigint AS token_cache_creation,
+                coalesce(sum(cost),0)::numeric                AS cost,
+                coalesce(sum(turns),0)::bigint                AS turns,
+                count(*)::int                                 AS runs,
+                count(*) FILTER (WHERE status IN ('FAILED','TIMEOUT'))::int AS failed_runs
+           FROM agent_runs
+          WHERE task_id = ANY($1::uuid[])
+          GROUP BY task_id`,
+        [ids],
+      );
+      const doc = await c.query(
+        `SELECT DISTINCT task_id FROM task_events
+          WHERE task_id = ANY($1::uuid[])
+            AND payload_json->>'reason' = 'documentation_branch_advanced'`,
+        [ids],
+      );
+      for (const r of blk.rows) blockByTask.set(r.task_id, r);
+      for (const r of kpi.rows) kpiByTask.set(r.task_id, r);
+      for (const r of doc.rows) docForcedSet.add(r.task_id);
+    }
+    enrichTaskRows(tasks, { blockByTask, kpiByTask, docForcedSet });
 
     return {
       projectId: projectDbId,
