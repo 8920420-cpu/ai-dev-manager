@@ -65,6 +65,18 @@ test('parseDecisionsMarkdown: два ADR → adopted + альтернатива'
   assert.ok(adr02[0].forbidden.includes('push'), 'forbidden ADR-02 захвачен');
 });
 
+test('parseDecisionsMarkdown: idPrefix префиксует decision_id (без коллизий журналов)', () => {
+  const rows = parseDecisionsMarkdown(SAMPLE_MD, { sourceRef: 'DECISIONS.md', idPrefix: 'orch-' });
+  const ids = rows.map((r) => r.decision_id);
+  assert.ok(ids.includes('orch-adr-01'), 'adopted получил префикс');
+  assert.ok(ids.includes('orch-adr-01-alt'), 'rejected-альтернатива получила префикс');
+  assert.ok(ids.includes('orch-adr-02'), 'второй ADR получил префикс');
+  assert.ok(!ids.some((id) => /^adr-/.test(id)), 'нет непрефиксованных adr-NN');
+  // superseded_by тоже указывает на префиксованный id.
+  const alt = rows.find((r) => r.decision_id === 'orch-adr-01-alt');
+  assert.equal(alt.superseded_by, 'orch-adr-01');
+});
+
 test('parseGitLogDecisions: scope из conventional-commit', () => {
   const rows = parseGitLogDecisions(
     'abc1234 feat(git-integrator): ребейз стухшей ветки\n def5678 fix(pipeline): npm ci',

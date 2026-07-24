@@ -29,6 +29,8 @@ function printUsage() {
   console.log(`Использование: node scripts/seed-decisions.mjs [опции]
 
   --decisions <path>   путь к DECISIONS.md (по умолч. E:/git/PS/DECISIONS.md, если существует)
+  --id-prefix <s>      префикс decision_id для ADR (напр. orch- для журнала оркестратора,
+                       чтобы не конфликтовать с PS adr-NN; по умолч. пусто)
   --git-repo <path>    репозиторий для git log --oneline (по умолч. .)
   --git-limit <n>      сколько последних коммитов брать (по умолч. 200)
   --dry                не писать в ClickHouse, только показать распарсенное
@@ -36,11 +38,12 @@ function printUsage() {
 }
 
 function parseArgs(argv) {
-  const args = { decisions: 'E:/git/PS/DECISIONS.md', gitRepo: '.', gitLimit: 200, dry: false, help: false };
+  const args = { decisions: 'E:/git/PS/DECISIONS.md', idPrefix: '', gitRepo: '.', gitLimit: 200, dry: false, help: false };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === '--dry') args.dry = true;
     else if (a === '--decisions') args.decisions = argv[++i];
+    else if (a === '--id-prefix') args.idPrefix = argv[++i] || '';
     else if (a === '--git-repo') args.gitRepo = argv[++i];
     else if (a === '--git-limit') args.gitLimit = Number(argv[++i]) || 200;
     else if (a === '-h' || a === '--help') args.help = true;
@@ -50,11 +53,11 @@ function parseArgs(argv) {
 }
 
 // Прочитать и разобрать DECISIONS.md (если существует). Ошибки не бросаем.
-function collectDecisions(decisionsPath) {
+function collectDecisions(decisionsPath, idPrefix = '') {
   try {
     if (decisionsPath && fs.existsSync(decisionsPath)) {
       const md = fs.readFileSync(decisionsPath, 'utf8');
-      const rows = parseDecisionsMarkdown(md, { sourceRef: path.basename(decisionsPath) });
+      const rows = parseDecisionsMarkdown(md, { sourceRef: path.basename(decisionsPath), idPrefix });
       console.log(`DECISIONS.md: распарсено ${rows.length} строк из ${decisionsPath}`);
       return rows;
     }
@@ -107,7 +110,7 @@ async function main() {
   }
 
   const rows = [
-    ...collectDecisions(args.decisions),
+    ...collectDecisions(args.decisions, args.idPrefix),
     ...collectGit(args.gitRepo, args.gitLimit),
   ];
 

@@ -113,6 +113,9 @@ function extractMemoryField(body) {
 export function parseDecisionsMarkdown(md, opts = {}) {
   const text = String(md ?? '');
   const sourceRef = opts?.sourceRef || 'DECISIONS.md';
+  // Префикс decision_id — чтобы ADR из разных журналов (PS vs оркестратор) не
+  // конфликтовали по `adr-NN`. По умолчанию '' (обратная совместимость с PS-сидом).
+  const idPrefix = opts?.idPrefix || '';
   const rows = [];
 
   // Собираем позиции заголовков, затем нарезаем тела секций.
@@ -129,7 +132,7 @@ export function parseDecisionsMarkdown(md, opts = {}) {
     const body = text.slice(cur.bodyStart, bodyEnd);
 
     const nn = cur.nn;
-    const id = `adr-${nn.toLowerCase()}`;
+    const id = `${idPrefix}adr-${nn.toLowerCase()}`;
     const title = stripInlineMarkup(cur.title);
     const approach = extractBulletField(body, 'Решение');
     const reason = extractBulletField(body, 'Почему');
