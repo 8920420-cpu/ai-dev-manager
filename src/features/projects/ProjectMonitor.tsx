@@ -12,9 +12,9 @@ import { taskStatisticsApi } from '../../api/taskStatisticsApi';
 import { subscribeTaskChanges } from '../../api/tasksApi';
 import { dbProjectsApi } from '../../api/dbProjectsApi';
 import { ApiError } from '../../api/http';
-import { formatDateTime, formatDuration, formatTime } from '../../lib/format';
+import { formatCompact, formatCost, formatDateTime, formatDuration, formatTime, plural } from '../../lib/format';
 import { isStageEnabled, type Project } from '../../types/project';
-import type { TaskStatRow, TaskStatistics } from '../../types/taskStats';
+import type { TaskKpi, TaskStatRow, TaskStatistics } from '../../types/taskStats';
 import styles from './ProjectMonitor.module.css';
 
 interface ProjectMonitorProps {
@@ -515,6 +515,7 @@ export function ProjectMonitor({ project, onBack, onEdit, regionId = 'project-mo
                   <th scope="col">Статус</th>
                   <th scope="col">Время на этапе</th>
                   <th scope="col">Общее время</th>
+                  <th scope="col">Токены / $</th>
                   <th scope="col">Обновлено</th>
                 </tr>
               </thead>
@@ -558,15 +559,59 @@ export function ProjectMonitor({ project, onBack, onEdit, regionId = 'project-mo
   );
 }
 
+// Нулевой KPI — фолбэк для строк со старого бэкенда без поля kpi (rolling
+// deploy). Ячейка всегда рендерит числа, никогда «—» (иначе конфликт с пустым
+// сервисом в getByText тестах и путаница «нет данных» vs «ноль прогонов»).
+const EMPTY_KPI: TaskKpi = {
+  tokenInput: 0, tokenOutput: 0, tokenCacheRead: 0, tokenCacheCreation: 0,
+  tokenFreshInput: 0, cost: 0, turns: 0, runs: 0, failedRuns: 0,
+};
+
+// Полная разбивка KPI для нативного tooltip ячейки токенов/стоимости.
+function kpiTooltip(k: TaskKpi): string {
+  return [
+    `Свежий ввод: ${formatCompact(k.tokenFreshInput)} · кэш-чтение: ${formatCompact(k.tokenCacheRead)}`,
+    `Кэш-запись: ${formatCompact(k.tokenCacheCreation)} · вывод: ${formatCompact(k.tokenOutput)}`,
+    `Ходов: ${k.turns} · прогонов: ${k.runs}${k.failedRuns ? ` (упавших: ${k.failedRuns})` : ''}`,
+    `Стоимость: ${formatCost(k.cost)}`,
+  ].join('\n');
+}
+
+// Короткая причина блокировки: «РОЛЬ: заметка/ошибка», полная — в tooltip.
+function blockReasonText(r: NonNullable<TaskStatRow['blockReason']>): string {
+  const detail = r.note ?? r.error ?? '';
+  return [r.role, detail].filter(Boolean).join(': ') || 'Причина не указана';
+}
+
 function TaskRow({ row, elapsed }: { row: TaskStatRow; elapsed: number }) {
   const active = row.timingState === 'active';
   const stageMs = liveDuration(row.stageDurationMs, active, elapsed);
   const totalMs = liveDuration(row.totalDurationMs, active, elapsed);
   const updatedIso = row.completedAt ?? row.stageStartedAt ?? row.createdAt;
+  const kpi = row.kpi ?? EMPTY_KPI;
+  const block = row.blockReason;
   return (
     <tr>
-      <td className={styles.cellTitle} title={row.title}>
-        {row.title}
+      <td className={styles.cellTitle}>
+        <div className={styles.titleLine}>
+          <span className={styles.titleText} title={row.title}>
+            {row.title}
+          </span>
+          {row.docForcedAdvance && (
+            <Badge
+              tone="warning"
+              dot={false}
+              title="Документационная ветка force-продвинута к join без реального прогона движка доков (documentation_branch_advanced): DONE без написанной документации."
+            >
+              форс-док
+            </Badge>
+          )}
+        </div>
+        {block && (
+          <div className={styles.blockReason} title={[block.role, block.note, block.error].filter(Boolean).join('\n')}>
+            {blockReasonText(block)}
+          </div>
+        )}
       </td>
       <td>{row.service ?? '—'}</td>
       <td>{row.stageName}</td>
@@ -577,6 +622,14 @@ function TaskRow({ row, elapsed }: { row: TaskStatRow; elapsed: number }) {
       </td>
       <td className={active ? styles.live : undefined}>{formatDuration(stageMs)}</td>
       <td className={active ? styles.live : undefined}>{formatDuration(totalMs)}</td>
+      <td className={styles.kpiCell} title={kpiTooltip(kpi)}>
+        <span className={styles.kpiCost}>{formatCost(kpi.cost)}</span>
+        <span className={styles.kpiRuns}>
+          {`${kpi.runs} ${plural(kpi.runs, ['прогон', 'прогона', 'прогонов'])}${
+            kpi.failedRuns ? ` · ${kpi.failedRuns} упавш.` : ''
+          }`}
+        </span>
+      </td>
       <td className={styles.cellMuted}>{updatedIso ? formatDateTime(updatedIso) : 'Нет данных'}</td>
     </tr>
   );

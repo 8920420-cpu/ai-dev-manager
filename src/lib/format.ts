@@ -58,6 +58,24 @@ export function formatDuration(ms: number | null | undefined): string {
   return parts.slice(0, 2).join(' ') || `${secs} сек`;
 }
 
+/** Стоимость прогонов в долларах: `$79.99`, `$0.00` при отсутствии. */
+export function formatCost(usd: number | null | undefined): string {
+  const n = Number(usd);
+  return `$${(Number.isFinite(n) ? n : 0).toFixed(2)}`;
+}
+
+/**
+ * Компактное число токенов: `1.2M`, `543k`, `812`. Для tooltip с разбивкой
+ * KPI, где полная разрядность мешает читать.
+ */
+export function formatCompact(n: number | null | undefined): string {
+  const v = Number(n);
+  if (!Number.isFinite(v) || v <= 0) return '0';
+  if (v >= 1_000_000) return `${(v / 1_000_000).toFixed(v >= 10_000_000 ? 0 : 1)}M`;
+  if (v >= 1_000) return `${(v / 1_000).toFixed(v >= 10_000 ? 0 : 1)}k`;
+  return String(Math.round(v));
+}
+
 /** Русское склонение существительного по числу. */
 export function plural(n: number, forms: [string, string, string]): string {
   const abs = Math.abs(n) % 100;

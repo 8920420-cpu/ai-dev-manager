@@ -68,6 +68,19 @@ function makeRow(over: Partial<TaskStatRow> = {}): TaskStatRow {
     stageDurationMs: 60_000, // 1 мин на этапе
     totalDurationMs: 3_600_000, // 1 час всего
     timingState: 'active',
+    blockReason: null,
+    kpi: {
+      tokenInput: 12_000,
+      tokenOutput: 3_000,
+      tokenCacheRead: 8_000,
+      tokenCacheCreation: 1_000,
+      tokenFreshInput: 3_000,
+      cost: 0.42,
+      turns: 12,
+      runs: 3,
+      failedRuns: 0,
+    },
+    docForcedAdvance: false,
     ...over,
   };
 }
@@ -512,6 +525,99 @@ describe('ProjectMonitor — вид «По ролям» от конфигура�
     expect(within(rolesTable).queryByText('Архитектор')).not.toBeInTheDocument();
     expect(within(rolesTable).queryByText('Разработчик')).not.toBeInTheDocument();
     expect(within(rolesTable).queryByText('Ревьюер')).not.toBeInTheDocument();
+  });
+});
+
+describe('ProjectMonitor — наблюдаемость (KPI, причина блока, форс-док)', () => {
+  it('во вкладке «По задачам» показывает KPI: стоимость и число прогонов (с упавшими)', async () => {
+    getStatsMock.mockResolvedValue(
+      makeStats({
+        tasks: [
+          makeRow({
+            id: 'kpi-1',
+            title: 'С расходом токенов',
+            kpi: {
+              tokenInput: 500_000,
+              tokenOutput: 12_000,
+              tokenCacheRead: 400_000,
+              tokenCacheCreation: 20_000,
+              tokenFreshInput: 80_000,
+              cost: 79.99,
+              turns: 147,
+              runs: 12,
+              failedRuns: 2,
+            },
+          }),
+        ],
+        summary: makeStats().summary,
+      }),
+    );
+    const user = setupUser();
+    renderMonitor();
+    await waitFor(() => expect(getStatsMock).toHaveBeenCalled());
+    await switchToTasks(user);
+
+    const row = screen.getByText('С расходом токенов').closest('tr') as HTMLElement;
+    expect(within(row).getByText('$79.99')).toBeInTheDocument();
+    expect(within(row).getByText('12 прогонов · 2 упавш.')).toBeInTheDocument();
+  });
+
+  it('для заблокированной задачи показывает причину блокировки (роль и заметку)', async () => {
+    getStatsMock.mockResolvedValue(
+      makeStats({
+        tasks: [
+          makeRow({
+            id: 'blk-1',
+            title: 'Упавшая интеграция',
+            status: 'BLOCKED',
+            stageCode: 'BLOCKED',
+            stageName: 'Заблокировано',
+            timingState: 'active',
+            blockReason: {
+              role: 'GIT_INTEGRATOR',
+              note: 'cherry_pick_failed',
+              error: null,
+              at: '2026-06-22T11:00:00.000Z',
+            },
+          }),
+        ],
+        summary: makeStats().summary,
+      }),
+    );
+    const user = setupUser();
+    renderMonitor();
+    await waitFor(() => expect(getStatsMock).toHaveBeenCalled());
+    await switchToTasks(user);
+
+    const row = screen.getByText('Упавшая интеграция').closest('tr') as HTMLElement;
+    expect(within(row).getByText('GIT_INTEGRATOR: cherry_pick_failed')).toBeInTheDocument();
+  });
+
+  it('помечает задачу с форс-продвижением документации бейджем «форс-док»', async () => {
+    getStatsMock.mockResolvedValue(
+      makeStats({
+        tasks: [
+          makeRow({
+            id: 'doc-1',
+            title: 'Док-ветка без прогона',
+            status: 'DONE',
+            stageCode: 'DONE',
+            stageName: 'Завершено',
+            timingState: 'completed',
+            completedAt: '2026-06-22T11:00:00.000Z',
+            docForcedAdvance: true,
+          }),
+        ],
+        summary: makeStats().summary,
+      }),
+    );
+    const user = setupUser();
+    renderMonitor();
+    await waitFor(() => expect(getStatsMock).toHaveBeenCalled());
+    await switchToTasks(user);
+
+    const row = screen.getByText('Док-ветка без прогона').closest('tr') as HTMLElement;
+    expect(within(row).getByText('форс-док')).toBeInTheDocument();
   });
 });
 

@@ -5,6 +5,31 @@
 
 export type TimingState = 'active' | 'completed' | 'missing_completion' | 'missing_created';
 
+/**
+ * KPI задачи (агрегат `agent_runs`): токены/стоимость/прогоны.
+ * `tokenFreshInput` — свежий ввод без кэша (`tokenInput − cacheRead − cacheCreation`).
+ * Источник — backend `taskStats.normalizeKpi` (OBSERVABILITY-BLOCK-KPI-001).
+ */
+export interface TaskKpi {
+  tokenInput: number;
+  tokenOutput: number;
+  tokenCacheRead: number;
+  tokenCacheCreation: number;
+  tokenFreshInput: number;
+  cost: number;
+  turns: number;
+  runs: number;
+  failedRuns: number;
+}
+
+/** Причина блокировки задачи (последнее событие `to_status='BLOCKED'`). */
+export interface TaskBlockReason {
+  note: string | null;
+  error: string | null;
+  role: string | null;
+  at: string | null;
+}
+
 /** Одна строка монитора задач. */
 export interface TaskStatRow {
   id: string;
@@ -21,6 +46,15 @@ export interface TaskStatRow {
   /** мс за весь жизненный цикл; `null` — нет надёжной отметки. */
   totalDurationMs: number | null;
   timingState: TimingState;
+  /** Причина блокировки (или `null`). Наблюдаемость OBSERVABILITY-BLOCK-KPI-001. */
+  blockReason: TaskBlockReason | null;
+  /** KPI токенов/стоимости/прогонов задачи. */
+  kpi: TaskKpi;
+  /**
+   * Документационная ветка force-продвинута к join сетью безопасности
+   * (`documentation_branch_advanced`): DONE без реального прогона движка доков.
+   */
+  docForcedAdvance: boolean;
 }
 
 export interface TaskStatSummary {

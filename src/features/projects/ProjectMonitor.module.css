@@ -152,10 +152,52 @@
 
 .cellTitle {
   max-width: 280px;
-  overflow: hidden;
-  text-overflow: ellipsis;
   color: var(--text);
   font-weight: var(--weight-medium, 500);
+}
+
+/* Заголовок задачи + бейдж форс-дока в одну строку. */
+.titleLine {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.titleText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* Причина блокировки — второй строкой под заголовком, приглушённо. */
+.blockReason {
+  margin-top: var(--space-1);
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular, 400);
+  color: var(--danger, #dc2626);
+}
+
+/* Ячейка KPI: стоимость крупнее, число прогонов — приглушённой подписью. */
+.kpiCell {
+  font-variant-numeric: tabular-nums;
+}
+
+.kpiCost {
+  display: block;
+  color: var(--text);
+  font-weight: var(--weight-medium, 500);
+}
+
+.kpiRuns {
+  display: block;
+  font-size: var(--text-xs);
+  color: var(--text-muted);
 }
 
 .cellMuted {
