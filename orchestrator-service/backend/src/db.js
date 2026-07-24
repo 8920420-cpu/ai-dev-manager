@@ -3264,6 +3264,22 @@ const HOST_ROLE_CODES = Object.keys(HOST_ROLES);
 const docBranchAgeCfg = resolveDuration('RUNNER_DOC_BRANCH_MAX_AGE_MS', 60 * 60_000, { min: 60_000, max: 24 * 60 * 60_000 });
 const DOC_BRANCH_MAX_AGE_MS = docBranchAgeCfg.value;
 
+// GI-RESYNC-RETRY-001 — однократный авто-ретрай задач, заблокированных Git
+// Integrator'ом git-причиной (cherry_pick_failed/stale_branch_reverts_main/…), для
+// ресинка статуса с реальным main. Контент дельты часто уже в main (ветка пересажена
+// на свежий main — WORKTREE-REBASE-STALE-001; сиблинг/ручная доставка влили его), и
+// повторный прогон GI разрулит задачу (already_integrated_content). Grace — сколько
+// ждать после блокировки перед ретраем. Клапан: GI_RESYNC_RETRY=0/false/off.
+const GI_RESYNC_RETRY_ENABLED = !/^(0|false|off)$/i.test(String(process.env.GI_RESYNC_RETRY ?? '').trim());
+const giResyncGraceCfg = resolveDuration('GI_RESYNC_RETRY_GRACE_MS', 10 * 60_000, { min: 60_000, max: 6 * 60 * 60_000 });
+const GI_RESYNC_GRACE_MS = giResyncGraceCfg.value;
+// Git-причины блока GI, которые повторный прогон способен разрулить (контент мог
+// уже долететь в main). Orchestration-причины (next_role_missing и т.п.) сюда НЕ входят.
+const GI_RESYNC_NOTES = [
+  'cherry_pick_failed', 'stale_branch_reverts_main', 'empty_deliverable_declared_changes',
+  'autodeploy_failed', 'dirty_worktree_conflict',
+];
+
 // CONFIG-AUDIT-001: стартовый лог эффективных орфан-таймаутов с атрибуцией
 // источника (env|default) — чтобы по логу было видно, что реально применилось.
 logEffectiveConfig('orchestrator timeouts', [roleTimeoutCfg, claudeAssignCfg, hostTimeoutCfg]);
@@ -3567,6 +3583,11 @@ export async function advanceAutomatedTasks(s, opts = {}) {
     // родителя на join. Мёртвую ветку документации (BLOCKED/FAILED/исчерпание попыток)
     // продвигаем на узел вперёд к join ДО снятия join-барьера, чтобы родитель поехал.
     await advanceStuckDocumentationBranches(c);
+    // GI-RESYNC-RETRY-001: ресинк статуса с реальным main. Однократно возвращаем на
+    // COMMIT задачи, заблокированные Git Integrator'ом git-причиной (контент часто уже
+    // в main после WORKTREE-REBASE-STALE-001 / сиблинг-доставки), и переоткрываем их
+    // child-driven заблокированных предков — GI и join/rollup доведут их сами.
+    await retryGiBlockedForResync(c);
     // Пропускаемые роли (ROLE-GROUPS-001 / per-project) прокручиваются до первой
     // активной роли ДО любого claim — за пропущенные роли не создаётся agent/host run.
     await advanceSkippedStageRoles(c);
@@ -4940,6 +4961,114 @@ export async function advanceStuckDocumentationBranches(c, maxAttempts = MAX_REW
     });
   }
   return moved;
+}
+
+/**
+ * GI-RESYNC-RETRY-001 — ресинк статуса задач с реальным main. Задача, заблокированная
+ * Git Integrator'ом git-причиной (GI_RESYNC_NOTES), часто уже РАЗРЕШИМА: ветку
+ * пересадили на свежий main (WORKTREE-REBASE-STALE-001), сиблинг/ручная доставка влили
+ * контент. ОДНОКРАТНО (маркер data_card.gi_resync_retry) возвращаем такую задачу на
+ * COMMIT после grace-периода — host-runner переклеймит её на GIT_INTEGRATOR, а GI сам
+ * разрулит (already_integrated_content) либо честно заблокирует снова (реальный конфликт;
+ * маркер не даст ретраить второй раз). Контекст (worktreeBranch/deliveredCommit) GI
+ * пересоберёт из истории событий (DELIVERED-COMMIT-COUPLE-001), поэтому доп. данных не нужно.
+ *
+ * Дополнительно переоткрываем CHILD-DRIVEN заблокированных ПРЕДКОВ (fork-родитель /
+ * эпик), чьи блоки — следствие роллапа по этому ребёнку (последнее событие блока
+ * from_status='WAITING_FOR_CHILDREN'): переводим их обратно в WAITING_FOR_CHILDREN,
+ * чтобы join/rollup пересобрали их, когда ребёнок разрешится. Блоки, поставленные
+ * человеком/иной причиной (не из WFC), НЕ трогаем. Идемпотентно. Клапан GI_RESYNC_RETRY=0.
+ */
+export async function retryGiBlockedForResync(c) {
+  if (!GI_RESYNC_RETRY_ENABLED) return { retried: 0, reopened: 0 };
+  // (1) Ретрай GI-заблокированных задач: BLOCKED → COMMIT, маркер, только git-причины,
+  // роль GIT_INTEGRATOR, старше grace, ещё не ретраенные.
+  // CTE: сначала кандидаты (LATERAL к последнему событию блока разрешён внутри SELECT,
+  // где tasks в FROM), затем UPDATE FROM cand. LATERAL нельзя ссылаться на цель UPDATE.
+  const upd = await c.query(
+    `WITH cand AS (
+        SELECT t.id, t.current_role_id, lb.n AS reason
+          FROM tasks t
+          JOIN roles r ON r.code = 'GIT_INTEGRATOR' AND r.id = t.current_role_id
+          CROSS JOIN LATERAL (
+            SELECT coalesce(te.payload_json->'output'->>'note', te.payload_json->>'reason') AS n,
+                   te.created_at AS at
+              FROM task_events te
+             WHERE te.task_id = t.id AND te.to_status = 'BLOCKED'
+             ORDER BY te.created_at DESC LIMIT 1
+          ) lb
+         WHERE t.status = 'BLOCKED'
+           AND t.assigned_agent_id IS NULL
+           AND NOT (t.data_card ? 'gi_resync_retry')
+           AND lb.n = ANY($1::text[])
+           AND lb.at < now() - ($2::bigint * interval '1 millisecond')
+     )
+     UPDATE tasks t
+        SET status = 'COMMIT', updated_at = now(),
+            data_card = coalesce(t.data_card, '{}'::jsonb)
+                        || jsonb_build_object('gi_resync_retry',
+                             jsonb_build_object('at', now()::text, 'reason', cand.reason))
+       FROM cand
+      WHERE t.id = cand.id
+      RETURNING t.id, t.current_role_id, cand.reason AS reason`,
+    [GI_RESYNC_NOTES, GI_RESYNC_GRACE_MS],
+  );
+  const retriedIds = upd.rows.map((r) => r.id);
+  for (const row of upd.rows) {
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'STATUS_CHANGED', 'BLOCKED', 'COMMIT', $2, $3::jsonb)`,
+      [row.id, row.current_role_id, JSON.stringify({
+        runner: true, reason: 'gi_resync_retry', from: row.reason,
+        detail: 'Однократный авто-ретрай Git Integrator: контент дельты мог уже попасть в main.',
+      })],
+    );
+  }
+  if (!retriedIds.length) return { retried: 0, reopened: 0 };
+
+  // (2) Переоткрыть child-driven заблокированных предков ретраенных задач: BLOCKED →
+  // WAITING_FOR_CHILDREN, только если ПОСЛЕДНЕЕ событие блока предка — из WFC (роллап
+  // по ребёнку), а не человеческий/иной блок. join/rollup пересоберут их сами.
+  const reop = await c.query(
+    `WITH RECURSIVE anc AS (
+        SELECT parent_task_id AS id FROM tasks
+         WHERE id = ANY($1::uuid[]) AND parent_task_id IS NOT NULL
+        UNION
+        SELECT t.parent_task_id FROM tasks t JOIN anc ON t.id = anc.id
+         WHERE t.parent_task_id IS NOT NULL
+     ),
+     cand AS (
+        SELECT p.id
+          FROM tasks p
+          CROSS JOIN LATERAL (
+            SELECT te.from_status::text AS fs
+              FROM task_events te
+             WHERE te.task_id = p.id AND te.to_status = 'BLOCKED'
+             ORDER BY te.created_at DESC LIMIT 1
+          ) lb
+         WHERE p.id IN (SELECT id FROM anc WHERE id IS NOT NULL)
+           AND p.status = 'BLOCKED'
+           AND p.assigned_agent_id IS NULL
+           AND lb.fs = 'WAITING_FOR_CHILDREN'
+     )
+     UPDATE tasks p
+        SET status = 'WAITING_FOR_CHILDREN', updated_at = now()
+       FROM cand
+      WHERE p.id = cand.id
+      RETURNING p.id`,
+    [retriedIds],
+  );
+  for (const row of reop.rows) {
+    await c.query(
+      `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+       VALUES ($1, 'STATUS_CHANGED', 'BLOCKED', 'WAITING_FOR_CHILDREN', NULL, $2::jsonb)`,
+      [row.id, JSON.stringify({
+        runner: true, reason: 'gi_resync_reopen_parent',
+        detail: 'Предок переоткрыт: ребёнок Git Integrator отправлен на ресинк-ретрай.',
+      })],
+    );
+  }
+  return { retried: retriedIds.length, reopened: reop.rowCount };
 }
 
 /**
