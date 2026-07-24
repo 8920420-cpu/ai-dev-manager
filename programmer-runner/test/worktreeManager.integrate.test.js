@@ -164,7 +164,12 @@ test('sync: дельта ветки влита в main, main уехал впер
   cleanup(repo, root);
 });
 
-test('sync: неинтегрированная дельта в ветке → освежение пропускается, накопленное сохраняется', async () => {
+// WORKTREE-REBASE-STALE-001 (инцидент 23.07): ветка с НЕВЛИТОЙ дельтой на ПРОТУХШЕЙ
+// базе (main ушёл вперёд, содержимое файлов расходится) раньше НЕ освежалась — агент
+// правил устаревшее содержимое, и дельта падала при вливании (cherry_pick_failed /
+// stale_branch_reverts_main). Теперь дельта ПЕРЕБАЗИРУЕТСЯ на свежий main (коммиты
+// сохраняются), а не остаётся на древней базе.
+test('sync: неинтегрированная дельта + main уехал → ветка перебазируется на свежий main, дельта сохранена', async () => {
   const repo = makeRepo();
   const root = newRoot();
   const mgr = new WorktreeManager({ root, log: silent });
@@ -174,20 +179,54 @@ test('sync: неинтегрированная дельта в ветке → о
     return { ok: true, result: {} };
   });
   assert.equal(res1.ok, true, `первая сдача, error=${res1.error}`);
-  // main уехал вперёд по ДРУГОМУ файлу.
+  // main уехал вперёд по ДРУГОМУ файлу (частый случай: другой сервис влил дельту).
   writeFileSync(join(repo, 'other.txt'), 'other\n');
   git(repo, ['add', '--', 'other.txt']);
   git(repo, ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '--quiet', '-m', 'unrelated']);
+  const mainHead = git(repo, ['rev-parse', 'HEAD']).trim();
   const res2 = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
-    // Накопленное worktree на месте — сброс не должен был случиться.
+    // Невлитая дельта сохранена (rebase её перенёс), а база теперь свежая — файл,
+    // уехавший в main, виден в worktree (раньше его тут не было — база тухла).
     assert.equal(readFileSync(join(wt, 'pkg/f.txt'), 'utf8'), 'v1\n', 'невлитая дельта задачи 1 сохранена');
+    assert.equal(readFileSync(join(wt, 'other.txt'), 'utf8'), 'other\n', 'ветка на свежей базе main');
     put(wt, 'pkg/g.txt', 'v2\n');
     return { ok: true, result: {} };
   });
   assert.equal(res2.ok, true, `вторая сдача, error=${res2.error}`);
-  // Коммит невлитой дельты по-прежнему в ветке (его вольёт GI).
-  const kept = git(wtDir(root, 'PROJECT:SVC'), ['merge-base', '--is-ancestor', res1.commit, 'HEAD']);
-  assert.equal(kept, '', 'коммит первой сдачи не потерян при пропуске освежения');
+  const wt = wtDir(root, 'PROJECT:SVC');
+  // Ветка растёт от свежего main (его HEAD — предок ветки), дельта задачи 1 (по
+  // содержимому) в ней сохранена — GI вольёт её диапазоном merge-base..tip.
+  const onFreshBase = git(wt, ['merge-base', '--is-ancestor', mainHead, 'HEAD']);
+  assert.equal(onFreshBase, '', 'ветка сервиса на свежей базе main после rebase');
+  assert.equal(readFileSync(join(wt, 'pkg/f.txt'), 'utf8'), 'v1\n', 'дельта задачи 1 сохранена в ветке');
+  cleanup(repo, root);
+});
+
+// WORKTREE-REBASE-STALE-001: если rebase на свежий main КОНФЛИКТУЕТ (ветка и main
+// правят одни строки), синк делает rebase --abort и остаётся на текущей базе —
+// прежнее поведение, дельта не теряется, дерево не залипает в mid-rebase.
+test('sync: rebase-конфликт → abort, работаем на текущей базе, дельта не потеряна', async () => {
+  const repo = makeRepo();
+  const root = newRoot();
+  const mgr = new WorktreeManager({ root, log: silent });
+  // Задача 1 правит base.txt в ветке (не влита).
+  const res1 = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    writeFileSync(join(wt, 'base.txt'), 'branch-change\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res1.ok, true, `первая сдача, error=${res1.error}`);
+  // main меняет ТОТ ЖЕ файл иначе → rebase дельты на main конфликтует.
+  writeFileSync(join(repo, 'base.txt'), 'main-change\n');
+  git(repo, ['add', '-A']);
+  git(repo, ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '--quiet', '-m', 'main touches base.txt']);
+  const res2 = await mgr.runForService(repo, 'PROJECT:SVC', async (wt) => {
+    // rebase не удался (конфликт по base.txt) → abort, база прежняя, дельта цела.
+    assert.equal(readFileSync(join(wt, 'base.txt'), 'utf8'), 'branch-change\n', 'дельта сохранена после abort');
+    put(wt, 'pkg/h.txt', 'v2\n');
+    return { ok: true, result: {} };
+  });
+  assert.equal(res2.ok, true, `после abort вторая сдача проходит (дерево не в mid-rebase), error=${res2.error}`);
+  assert.deepEqual(res2.changedFiles, ['pkg/h.txt']);
   cleanup(repo, root);
 });
 

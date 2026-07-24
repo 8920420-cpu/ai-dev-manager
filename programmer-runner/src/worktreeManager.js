@@ -74,6 +74,11 @@ function parseDenyGlobs(raw) {
   return list.length ? list : DEFAULT_DENY_GLOBS;
 }
 
+// WORKTREE-REBASE-STALE-001: перебазировать ветку сервиса с НЕВЛИТОЙ дельтой на
+// свежий main, когда её база протухла (см. _syncWithMain). Аварийный клапан —
+// PROGRAMMER_SYNC_REBASE=0/false/off откатывает на прежнее поведение (пропуск синка).
+const SYNC_REBASE_ENABLED = !/^(0|false|off)$/i.test(String(process.env.PROGRAMMER_SYNC_REBASE ?? '').trim());
+
 // Совпадает ли путь дельты с deny-glob. path — от git (уже forward-slash, но на
 // всякий случай нормализуем). `*.ext` → по суффиксу; имя без `*` → как ТОЧНЫЙ
 // сегмент пути (не подстрока: `dist` не заденет `distributor.js`).
@@ -237,8 +242,36 @@ export class WorktreeManager {
         try {
           if (changed.length) git(repoCwd, ['diff', '--quiet', tip, mainHead, '--', ...changed]);
         } catch {
-          this.log.info?.('worktree sync skipped: в ветке неинтегрированная дельта',
-            { branch: handle.branch, pending: pending.length });
+          // Неинтегрированная дельта на ПРОТУХШЕЙ базе: main ушёл вперёд, а
+          // содержимое затронутых веткой файлов расходится с ним. Раньше синк
+          // ПРОПУСКАЛСЯ — агент правил устаревшее содержимое, и дельта не ложилась
+          // на main: cherry_pick_failed / stale_branch_reverts_main (инцидент
+          // 23.07 — ветка CHAT с базой 09.07, −304 коммита от main).
+          // WORKTREE-REBASE-STALE-001: переносим дельту на свежий main через rebase.
+          // Коммиты сохраняются (reset их бы потерял), их SHA переписываются — но
+          // GI ключуется по ИМЕНИ ветки и диапазону merge-base..tip, а не по
+          // стабильному SHA, поэтому доставка не ломается. Любой сбой rebase
+          // (конфликт по общим строкам) → rebase --abort и работаем на текущей базе
+          // (прежнее поведение, строго не хуже). Клапан: PROGRAMMER_SYNC_REBASE=0.
+          if (!SYNC_REBASE_ENABLED) {
+            this.log.info?.('worktree sync skipped: неинтегрированная дельта (rebase выключен)',
+              { branch: handle.branch, pending: pending.length });
+            return;
+          }
+          try {
+            git(wt, [
+              '-c', 'user.name=programmer-runner', '-c', 'user.email=programmer-runner@local',
+              'rebase', mainHead,
+            ]);
+            this.log.info?.('worktree branch перебазирована на свежий main (дельта сохранена)',
+              { branch: handle.branch, head: mainHead.slice(0, 12), pending: pending.length });
+          } catch (e) {
+            // Конфликт (или сбой) rebase: снимаем незавершённое состояние и остаёмся
+            // на текущей базе — GI честно заблокирует при реальном конфликте, как и до фикса.
+            try { git(wt, ['rebase', '--abort']); } catch { /* нет активного rebase — ок */ }
+            this.log.warn?.('worktree rebase на main не удался — работаем на текущей базе',
+              { branch: handle.branch, error: e.message });
+          }
           return;
         }
       }
