@@ -166,26 +166,53 @@ export class WorktreeManager {
       this.services.set(serviceKey, reused);
       return reused;
     }
-    // Ветки нет (или прицепиться не удалось — сломанное состояние): чистое
-    // создание от HEAD с зачисткой обломков, как раньше.
+    // Прицепиться не удалось (сломанное/racy состояние worktree): зачищаем ОБЛОМКИ
+    // (каталог + мёртвую admin-запись), но ВЕТКУ НЕ трогаем.
+    // WORKTREE-ENSURE-STALE-BRANCH-001: прежде здесь был `branch -D` + безусловный
+    // `worktree add -b`. Он (а) ТЕРЯЛ невлитую дельту ветки (branch -D сносил её
+    // коммиты — против WORKTREE-REUSE-001) и (б) если ветку удалить не удавалось
+    // (вычекана в другом worktree / удаление отклонено), падал `worktree add -b`
+    // «branch already exists», а на racy-обломках — «index.lock: No such file or
+    // directory», уводя задачу в шторм worktree_ensure_failed → programmer_release_loop
+    // (инцидент 24.07: CRM/Chat_Service после ручного перезапуска стухшей ветки 23.07).
+    // Теперь существующую ветку ПЕРЕИСПОЛЬЗУЕМ (add без -b), и только если её нет —
+    // создаём свежую от HEAD (_addWorktreeOnBranch).
     try { git(repoCwd, ['worktree', 'remove', '--force', dir]); } catch { /* нет — ок */ }
     try { rmSync(dir, { recursive: true, force: true }); } catch { /* нет — ок */ }
-    try { git(repoCwd, ['branch', '-D', branch]); } catch { /* нет — ок */ }
     try { git(repoCwd, ['worktree', 'prune']); } catch { /* не критично */ }
-    git(repoCwd, ['worktree', 'add', '--quiet', '-b', branch, dir, 'HEAD']);
+    this._addWorktreeOnBranch(repoCwd, dir, branch);
     const handle = { worktreeCwd: dir, branch };
     this.services.set(serviceKey, handle);
     return handle;
   }
 
+  // Существует ли локальная ветка (без throw).
+  _branchExists(repoCwd, branch) {
+    try {
+      git(repoCwd, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  // Поднять worktree каталога dir на ветке branch. Ветка есть → ПЕРЕИСПОЛЬЗУЕМ её
+  // (add без -b: невлитая дельта сохраняется, WORKTREE-REUSE-001); ветки нет →
+  // создаём свежую от HEAD (-b). НИКОГДА не пересоздаём существующую ветку через -b:
+  // это падало «branch already exists» и роняло задачу в шторм worktree_ensure_failed
+  // → programmer_release_loop (WORKTREE-ENSURE-STALE-BRANCH-001).
+  _addWorktreeOnBranch(repoCwd, dir, branch) {
+    if (this._branchExists(repoCwd, branch)) {
+      git(repoCwd, ['worktree', 'add', '--quiet', dir, branch]);
+    } else {
+      git(repoCwd, ['worktree', 'add', '--quiet', '-b', branch, dir, 'HEAD']);
+    }
+  }
+
   // Прицепиться к существующим worktree/ветке сервиса после рестарта процесса.
   // Возвращает handle либо null (ветки нет / состояние не поддаётся переиспользованию).
   _reattachWorktree(repoCwd, dir, branch) {
-    try {
-      git(repoCwd, ['rev-parse', '--verify', '--quiet', `refs/heads/${branch}`]);
-    } catch {
-      return null; // ветки нет — терять нечего, штатное чистое создание
-    }
+    if (!this._branchExists(repoCwd, branch)) return null; // ветки нет — штатное чистое создание
     try {
       let dirOnBranch = false;
       if (existsSync(dir)) {
