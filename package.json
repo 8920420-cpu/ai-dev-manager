@@ -4,6 +4,13 @@
   "private": true,
   "type": "module",
   "description": "Frontend dependencies for AI Dev Manager",
+  "workspaces": [
+    "shared",
+    "host-runner",
+    "programmer-runner",
+    "codex-runner",
+    "pipeline-runner"
+  ],
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",

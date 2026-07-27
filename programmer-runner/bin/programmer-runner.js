@@ -6,7 +6,7 @@
 import { ProgrammerRunner } from '../src/ProgrammerRunner.js';
 import { makeClaudeRunAgent } from '../src/claudeAgent.js';
 import { ensureClaudeToken } from '../src/loadToken.js';
-import { resolveDuration, logEffectiveConfig } from '../src/envConfig.js';
+import { resolveDuration, logEffectiveConfig } from '@orchestrator/shared/envConfig.js';
 import { beat } from '../../shared/heartbeat.js';
 
 const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');

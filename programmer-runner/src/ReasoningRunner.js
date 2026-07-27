@@ -8,7 +8,8 @@
 // Concurrency: до N задач одновременно (in-flight счётчик); драйвер (bin) поднимает
 // N воркеров над одним ReasoningRunner. Изоляции правок не нужно — роли работают в
 // read-only режиме и ничего не коммитят (в отличие от программиста с worktree).
-import { resolveCodeVersion } from './codeVersion.js';
+import { resolveCodeVersion } from '@orchestrator/shared/codeVersion.js';
+import { isProviderLimit } from '@orchestrator/shared/providerLimit.js';
 
 export class ReasoningRunner {
   /**
@@ -72,15 +73,9 @@ export class ReasoningRunner {
   // «Мягкий» отказ провайдера — лимит подписки/квоты/троттлинг/перегрузка. Долбить
   // его бессмысленно: держится долго. Отличаем от реальных сбоев (краш/таймаут/сеть),
   // которые штатно переигрываются на INTERVAL_MS.
+  // Делегирует общей реализации @orchestrator/shared/providerLimit.js (канон).
   static isProviderLimit(reason) {
-    // Разделитель между словами — пробел/подчёркивание/дефис: провайдеры пишут и
-    // «usage limit», и «rate_limit_error», и «too-many-requests». Набор синхронизирован
-    // с ProgrammerRunner.isProviderLimit (канон): +«hit your session limit»/403/«resets HH:MM».
-    // claude_code при исчерпании подписки пишет «You've hit your session limit · resets 6:50am» —
-    // без этих паттернов пауза PROVIDER-LIMIT-COOLDOWN-002 не срабатывала (churn 10.07).
-    return /hit your session limit|usage[\s_-]?limit|rate[\s_-]?limit|too[\s_-]?many[\s_-]?requests|\b403\b|\b429\b|\b529\b|quota|insufficient|overloaded|try again (at|later|in)|resets?\s+\d/i.test(
-      String(reason || ''),
-    );
+    return isProviderLimit(reason);
   }
 
   // Зафиксировать провайдер-лимит: включить общий (на инстанс) cooldown и пометить,

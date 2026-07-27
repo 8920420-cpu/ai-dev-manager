@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { parseDurationMs, resolveDuration, resolveInt, logEffectiveConfig } from '../src/envConfig.js';
+import { parseDurationMs, resolveDuration, resolveInt, logEffectiveConfig } from '@orchestrator/shared/envConfig.js';
 
 test('parseDurationMs: голое число трактуется как ms', () => {
   assert.equal(parseDurationMs('600000'), 600000);

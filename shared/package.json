@@ -1,3 +1,10 @@
 {
-  "type": "module"
+  "name": "@orchestrator/shared",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Общие модули хостовых раннеров оркестратора (клиент API, конфиг env, git-версия, провайдер-лимиты, запуск процессов, worker-петля, heartbeat, worktree-lock, логирование).",
+  "exports": {
+    "./*": "./*"
+  }
 }

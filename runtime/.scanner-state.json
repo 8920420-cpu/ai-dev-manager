@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "dispatched": {
+    "abc3bf2b-11d4-4eee-86d7-1daa2b341654": {
+      "dispatchedAt": "2026-06-22T04:54:29.861Z",
+      "service": "Catalog_Service",
+      "nextRole": "TASK_REVIEWER"
+    },
+    "256dd545-bca1-4133-9f46-dc73ec366e63": {
+      "dispatchedAt": "2026-06-22T05:01:45.101Z",
+      "service": "Catalog_Service",
+      "nextRole": "TASK_REVIEWER"
+    },
+    "eee69238-737a-4329-b4d9-2cdd25c9c4f5": {
+      "dispatchedAt": "2026-06-22T05:59:05.583Z",
+      "service": "Catalog_Service",
+      "nextRole": "TASK_REVIEWER"
+    },
+    "697bc0f0-063d-4e68-bf8e-fa1ceec84ec4": {
+      "dispatchedAt": "2026-06-22T06:33:15.918Z",
+      "service": "Connector_Service",
+      "nextRole": "TASK_REVIEWER"
+    },
+    "73d5149f-f4d3-4c02-93b7-4c91e851f69e": {
+      "dispatchedAt": "2026-06-22T13:39:34.874Z",
+      "service": "Catalog_Service",
+      "nextRole": "TASK_REVIEWER"
+    }
+  }
+}

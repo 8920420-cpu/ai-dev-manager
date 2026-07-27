@@ -15,5 +15,8 @@
     "test": "node --test",
     "example": "node bin/pipeline-runner.js --config example/.pipeline.json"
   },
+  "dependencies": {
+    "@orchestrator/shared": "*"
+  },
   "license": "MIT"
 }

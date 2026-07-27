@@ -10,7 +10,7 @@
 import { ReasoningRunner } from '../src/ReasoningRunner.js';
 import { makeClaudeReasoningRunAgent } from '../src/claudeReasoningAgent.js';
 import { ensureClaudeToken } from '../src/loadToken.js';
-import { resolveDuration, resolveInt, logEffectiveConfig } from '../src/envConfig.js';
+import { resolveDuration, resolveInt, logEffectiveConfig } from '@orchestrator/shared/envConfig.js';
 import { beat } from '../../shared/heartbeat.js';
 
 const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');

@@ -13,5 +13,8 @@
     "start": "node bin/codex-runner.js",
     "test": "node --test"
   },
+  "dependencies": {
+    "@orchestrator/shared": "*"
+  },
   "license": "MIT"
 }

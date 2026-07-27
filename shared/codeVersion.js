@@ -9,10 +9,16 @@
 // Считается один раз (раннер живёт долго, HEAD за прогон не меняется) и кэшируется.
 // Любой сбой git (нет .git, нет бинаря) → null: метка просто не проставится, на
 // работу раннера это не влияет.
+//
+// Единый источник для всех раннеров (@orchestrator/shared): раньше файл был
+// побайтно продублирован в programmer-runner и codex-runner.
 import { execFileSync } from 'node:child_process';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// Каталог shared/ лежит в корне репозитория ai-dev-manager, поэтому «..» ведёт в
+// корень репо. git всё равно поднимается к .git от любого cwd внутри репозитория,
+// так что SHA не зависит от того, какой раннер вызвал функцию.
 const REPO_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 
 let cached;

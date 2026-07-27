@@ -8,7 +8,11 @@
 // ProgrammerRunner. Изоляция параллельных правок — в runAgent (git worktree, см.
 // claudeAgent.js): дорогой шаг LLM параллелится, слияние в main сериализуется.
 // concurrency=1 → поведение прежнее (busy-гард не пускает второй tick).
-import { resolveCodeVersion } from './codeVersion.js';
+import { resolveCodeVersion } from '@orchestrator/shared/codeVersion.js';
+import { isProviderLimit, parseProviderResetAt } from '@orchestrator/shared/providerLimit.js';
+
+// Ре-экспорт для совместимости импортов (тест берёт parseProviderResetAt отсюда).
+export { parseProviderResetAt };
 
 export class ProgrammerRunner {
   /**
@@ -46,10 +50,9 @@ export class ProgrammerRunner {
     return Math.max(0, this.concurrency - this.inFlight);
   }
 
+  // Делегирует общей реализации @orchestrator/shared/providerLimit.js (канон).
   static isProviderLimit(reason) {
-    return /hit your session limit|usage[\s_-]?limit|rate[\s_-]?limit|too[\s_-]?many[\s_-]?requests|\b403\b|\b429\b|\b529\b|quota|insufficient|overloaded|try again (at|later|in)|resets?\s+\d/i.test(
-      String(reason || ''),
-    );
+    return isProviderLimit(reason);
   }
 
   providerCooldownUntil(reason) {
@@ -213,22 +216,6 @@ export function runMetrics(agentResult, totalMs) {
     costUsd: fin(agent.costUsd) ?? fin(agent.totalCostUsd),
     model: typeof agentResult?.model === 'string' ? agentResult.model : undefined,
   };
-}
-
-export function parseProviderResetAt(reason, nowMs = Date.now()) {
-  const text = String(reason || '');
-  const m = text.match(/(?:reset|resets|try again at)\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?/i);
-  if (!m) return null;
-  let hour = Number(m[1]);
-  const minute = Number(m[2] || 0);
-  if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour > 23 || minute > 59) return null;
-  const ampm = m[3]?.toLowerCase();
-  if (ampm === 'pm' && hour < 12) hour += 12;
-  if (ampm === 'am' && hour === 12) hour = 0;
-  const d = new Date(nowMs);
-  d.setHours(hour, minute, 0, 0);
-  if (d.getTime() <= nowMs) d.setDate(d.getDate() + 1);
-  return d.getTime();
 }
 
 // Тело сдачи для POST /api/scanner/task-completed. Поля берём из блока completion
