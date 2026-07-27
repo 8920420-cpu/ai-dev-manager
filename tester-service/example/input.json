@@ -1,7 +1,0 @@
-{
-  "taskId": "TASK-123",
-  "projectPath": "..",
-  "pipelineConfigPath": "../.pipeline.json",
-  "changedFiles": ["src/PipelineRunner.js"],
-  "programmerComment": "Добавил остановку на первом упавшем этапе"
-}
