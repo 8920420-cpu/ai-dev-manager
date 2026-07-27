@@ -85,6 +85,10 @@ $EnvKeys = [ordered]@{
   'CLAUDE_REASONING_CONCURRENCY' = $true
   'CLAUDE_REASONING_MODEL'       = $true
   'CLAUDE_REASONING_PROVIDER_COOLDOWN_MS' = $true
+  # GI-DOCS-ONLY-SKIP-STALE-001: host-runner (integrateWorktreeBranch) читает этот
+  # клапан из process.env; host-runner .env сам не грузит, поэтому пробрасываем через
+  # whitelist. docs-only ветки пропускают ложный нетто-гард stale_branch_reverts_main.
+  'GI_DOCS_ONLY_SKIP_STALE_GUARD' = $true
 }
 if (Test-Path $EnvFile) {
   foreach ($line in Get-Content $EnvFile) {
@@ -107,6 +111,9 @@ if ($env:PROGRAMMER_MAX_TURNS) {
 } else {
   Write-Host 'CONFIG: PROGRAMMER_MAX_TURNS не задан — раннер возьмёт дефолт кода (100)'
 }
+
+# GI-DOCS-ONLY-SKIP-STALE-001: показать эффективное значение клапана host-runner.
+Write-Host "CONFIG: GI_DOCS_ONLY_SKIP_STALE_GUARD=$(if ($env:GI_DOCS_ONLY_SKIP_STALE_GUARD) { $env:GI_DOCS_ONLY_SKIP_STALE_GUARD } else { '(off)' })"
 
 # База оркестратора — опубликованный из Docker порт 4186 (если не задано иначе).
 if (-not $env:ORCHESTRATOR_URL) { $env:ORCHESTRATOR_URL = 'http://localhost:4186' }
