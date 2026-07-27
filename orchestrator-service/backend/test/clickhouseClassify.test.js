@@ -90,6 +90,19 @@ test('обычный провал теста без module-resolution → ост
   assert.equal(c.error_class, 'pipeline_test_failed');
 });
 
+test('setup-сбой Go-воркспейса (модуль вне go.work, токен env_setup_failed) → env/error', () => {
+  const c = classify(row({ status: 'FAILED', error_text: 'env_setup_failed: Стадия "test" провалилась, команда: go -C "backend" test ./..., exit=1' }), null);
+  assert.equal(c.error_component, 'env');
+  assert.equal(c.error_class, 'env_setup_failed');
+  assert.equal(c.severity, 'error');
+});
+
+test('setup-сбой Go важнее pipeline_test: сырой маркер go.work при наличии "pipeline"/"test" → env_setup_failed', () => {
+  const c = classify(row({ status: 'FAILED', error_text: 'pipeline_stage_failed: Стадия "test" провалилась — pattern ./...: directory prefix . does not contain modules listed in go.work [setup failed]' }), null);
+  assert.equal(c.error_component, 'env');
+  assert.equal(c.error_class, 'env_setup_failed');
+});
+
 test('missing_required_inputs → contract/error', () => {
   const c = classify(row({ status: 'FAILED', error_text: 'missing_required_inputs: affected_files' }), null);
   assert.equal(c.error_component, 'contract');

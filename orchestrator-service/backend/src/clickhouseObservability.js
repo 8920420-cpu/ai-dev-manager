@@ -115,6 +115,16 @@ function classify(row, reason) {
   //     в IAM frontend завалил всю когорту и потребовал ручного вмешательства).
   if (has('failed to resolve import', 'cannot find module', 'cannot find package', 'module not found', 'err_module_not_found', 'could not resolve dependency', 'cannot resolve dependency')) return mk('env_missing_dependency', 'env', SEV.ERROR);
 
+  // 2c. Go-воркспейс: тестовая/сборочная стадия модуля ВНЕ корневого go.work падает
+  //     на setup (`directory prefix . does not contain modules listed in go.work` /
+  //     `[setup failed]`) — go test/build даже не стартует. Это ОКРУЖЕНИЕ (лечится
+  //     GOWORK=off / включением модуля в go.work), а НЕ код задачи, поэтому отдельный
+  //     класс env_setup_failed: иначе маскируется под pipeline_test_failed и Аналитик
+  //     сбоя гоняет его по кругу до max_rework (инцидент 26.07, 4 круга × ~$12/задача).
+  //     Токен 'env_setup_failed' приносит deriveHostFailureText (db.js); сырые маркеры
+  //     go.work/[setup failed] ловим на случай, если сигнал придёт из logTail/outcome.
+  if (has('env_setup_failed', 'go.work', '[setup failed]', 'does not contain modules listed')) return mk('env_setup_failed', 'env', SEV.ERROR);
+
   // 2. Pipeline — смотреть логи pipeline-runner (стадия в error_class).
   if (has('pipeline_no_verification', 'no_verification')) return mk('pipeline_no_verification', 'pipeline', SEV.ERROR);
   if (has('pipeline')) {
