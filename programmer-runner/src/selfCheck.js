@@ -17,9 +17,10 @@
 // escalateProgrammerReleaseLoop. Поэтому проверку сначала гоняем ДО агента: красный
 // baseline переводит самопроверку в необязательный режим (только лог и отметка в
 // result), зелёный — делает её блокирующей.
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
+import { killProcessTree } from '@orchestrator/shared/processExec.js';
 
 /** Сколько символов вывода упавшей команды показываем агенту и пишем в result. */
 const OUTPUT_TAIL = 4000;
@@ -87,35 +88,6 @@ export function detectVerifyCommands(absDir, { envOverride } = {}) {
   return [];
 }
 
-/**
- * Убить ДЕРЕВО процессов команды, а не только оболочку.
- *
- * `spawn(cmd, {shell:true})` запускает cmd.exe/sh, а тесты — уже его дети. Обычный
- * child.kill() снимает только оболочку: внук (node/go) доживает до конца сам и всё
- * это время держит открытыми унаследованные stdio, поэтому событие 'close' не
- * приходит — таймаут «срабатывал», но ждали мы всё равно полного прогона.
- */
-function killTree(child) {
-  if (!child?.pid) return;
-  if (process.platform === 'win32') {
-    // taskkill /T — вся ветка процессов, /F — принудительно. СИНХРОННО и намеренно:
-    // асинхронный spawn здесь не срабатывал (процесс успевал пережить снятие и
-    // продолжал писать в файлы ещё секунды), а kill — операция редкая и быстрая.
-    try {
-      execFileSync('taskkill', ['/pid', String(child.pid), '/T', '/F'], {
-        stdio: 'ignore',
-        windowsHide: true,
-        timeout: 5000,
-      });
-      return;
-    } catch { /* уже мёртв или taskkill недоступен — ниже страховочный kill */ }
-  } else {
-    // detached:true даёт отдельную группу процессов — снимаем её целиком.
-    try { process.kill(-child.pid, 'SIGKILL'); return; } catch { /* группы нет — ниже */ }
-  }
-  try { child.kill('SIGKILL'); } catch { /* процесс уже мёртв */ }
-}
-
 /** Хвост вывода — ошибки почти всегда в конце, а начало съедает контекст агента. */
 export function tailOutput(text, limit = OUTPUT_TAIL) {
   const s = String(text ?? '');
@@ -161,7 +133,7 @@ export function runVerifyCommand(cmd, { cwd, env, signal, timeoutMs = DEFAULT_VE
     // не зависаем в ожидании — отдаём исход сами.
     let giveUpTimer = null;
     const kill = () => {
-      killTree(child);
+      killProcessTree(child);
       if (!giveUpTimer) giveUpTimer = setTimeout(() => finish(null), 2000);
     };
     const timer = setTimeout(() => { timedOut = true; kill(); }, timeoutMs);

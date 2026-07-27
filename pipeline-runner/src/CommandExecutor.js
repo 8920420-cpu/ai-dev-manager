@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
 import process from 'node:process';
+import { killProcessTree } from '@orchestrator/shared/processExec.js';
 import { round } from './util.js';
 
 /**
@@ -44,7 +45,7 @@ export class CommandExecutor {
       if (Number.isFinite(timeoutMs) && timeoutMs > 0) {
         timer = setTimeout(() => {
           timedOut = true;
-          killTree(child);
+          killProcessTree(child);
           finalize(null, 'SIGKILL', null);
         }, timeoutMs);
       }
@@ -79,32 +80,6 @@ export class CommandExecutor {
       child.on('error', (err) => finalize(null, null, err));
       child.on('close', (code, signal) => finalize(code, signal, null));
     });
-  }
-}
-
-/** Кроссплатформенное завершение процесса и его дочерних процессов. */
-function killTree(child) {
-  const pid = child.pid;
-  if (!pid) return;
-  if (process.platform === 'win32') {
-    try {
-      child.kill('SIGKILL');
-    } catch {
-      /* process may already be gone */
-    }
-    // taskkill /T убивает всё дерево процессов.
-    spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { windowsHide: true });
-  } else {
-    try {
-      // Отрицательный pid = вся группа процессов (см. detached: true).
-      process.kill(-pid, 'SIGKILL');
-    } catch {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* процесс уже завершился */
-      }
-    }
   }
 }
 
