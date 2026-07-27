@@ -8,11 +8,12 @@ import { HostRunner } from '../src/HostRunner.js';
 import { runPipelineAction, runGitAction } from '../src/actions.js';
 import { pickFolder } from '../src/folderPicker.js';
 import { setupClaudeToken } from '../src/claudeToken.js';
-import { beat } from '../../shared/heartbeat.js';
+import { beat } from '@orchestrator/shared/heartbeat.js';
+import { resolveOrchestratorBase, bearerHeaders } from '@orchestrator/shared/orchestratorClient.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');
+const ORCH = resolveOrchestratorBase();
 const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
 const INTERVAL_MS = Number(process.env.HOST_RUNNER_INTERVAL_MS || 3000);
 const LOG_TICKS = /^(1|true|yes)$/i.test(String(process.env.HOST_RUNNER_LOG_TICKS || ''));
@@ -22,11 +23,7 @@ const REPO_ROOT = process.env.HOST_REPO_ROOT || path.resolve(__dirname, '../..')
 // Браузер открыт на той же машине → достучится по localhost. 0 = выключить.
 const PICKER_PORT = Number(process.env.HOST_PICKER_PORT || 4187);
 
-function headers(extra = {}) {
-  const h = { 'Content-Type': 'application/json', ...extra };
-  if (TOKEN) h.Authorization = `Bearer ${TOKEN}`;
-  return h;
-}
+const headers = (extra = {}) => bearerHeaders(TOKEN, extra);
 
 // Прочитать JSON-тело запроса моста (для /setup-claude-token). Пустое тело → {}.
 function readJsonBody(req, limitBytes = 1 << 20) {

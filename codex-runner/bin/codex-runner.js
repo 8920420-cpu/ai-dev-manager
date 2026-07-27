@@ -10,9 +10,10 @@
 import { ReasoningRunner } from '../src/ReasoningRunner.js';
 import { makeCodexRunAgent } from '../src/codexAgent.js';
 import { resolveDuration, resolveInt, logEffectiveConfig } from '@orchestrator/shared/envConfig.js';
-import { beat } from '../../shared/heartbeat.js';
+import { beat } from '@orchestrator/shared/heartbeat.js';
+import { resolveOrchestratorBase, bearerHeaders, asJson } from '@orchestrator/shared/orchestratorClient.js';
 
-const ORCH = (process.env.ORCHESTRATOR_URL || 'http://localhost:4186').replace(/\/+$/, '');
+const ORCH = resolveOrchestratorBase();
 const TOKEN = process.env.ORCHESTRATOR_API_TOKEN || '';
 // CONFIG-AUDIT-001: единый разбор числовых env (единицы, диапазон, источник).
 // КОНТРАКТ: TASK_TIMEOUT < орфан-таймаута оркестратора (RUNNER_ROLE_TIMEOUT_MS,
@@ -39,16 +40,7 @@ const PROVIDER_COOLDOWN_MS = providerCooldownCfg.value;
 // воркеры по ролям); иначе берёт любую делегированную Codex задачу.
 const ROLE = String(process.env.CODEX_ROLE || '').trim();
 
-function headers(extra = {}) {
-  const h = { 'Content-Type': 'application/json', ...extra };
-  if (TOKEN) h.Authorization = `Bearer ${TOKEN}`;
-  return h;
-}
-
-async function asJson(res, label) {
-  if (!res.ok) throw new Error(`${label}: HTTP ${res.status} ${await res.text().catch(() => '')}`);
-  return res.json();
-}
+const headers = (extra = {}) => bearerHeaders(TOKEN, extra);
 
 const http = {
   // GET /api/runner/next-reasoning-task?engine=codex[&role=] → { task } | { task:null } | { blocked }.
