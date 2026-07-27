@@ -23,6 +23,13 @@ export function computeTaskPriority(projectRow, requested, def = 2) {
   return normalizeClientPriority(requested, def);
 }
 
+// Терминальные статусы задачи: жизненный цикл завершён, длительности фиксируются,
+// каноническая запись хранится как история проекта. Единый набор для db.js,
+// performance.js, projectRoute.js и taskStats.js (раньше был продублирован в
+// каждом). NB: rolePipeline.js держит СВОЙ, более узкий набор (только
+// DONE/CANCELLED) — там иная семантика (из чего не двигают маршрут), не объединять.
+export const TERMINAL_TASK_STATUSES = new Set(['DONE', 'CANCELLED', 'FAILED']);
+
 export const TASK_SIZES = ['small', 'medium', 'large'];
 
 export function normalizeTaskSize(value, dflt = 'medium') {

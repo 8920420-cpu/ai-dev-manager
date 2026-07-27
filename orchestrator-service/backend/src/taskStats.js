@@ -4,6 +4,8 @@
 // серверного generatedAt; время браузера не используется. Этап определяется
 // по task_status (а НЕ по тексту/имени агента). Endpoint ничего не изменяет.
 import { withClient, clientConfig } from './db.js';
+import { resolveProjectRef } from './projectRef.js';
+import { TERMINAL_TASK_STATUSES as TERMINAL_STATUSES } from './taskPolicy.js';
 
 // Соответствие task_status → стабильный stageCode + дефолтное имя этапа.
 // stageCode стабилен (машинный), stageName — серверная подпись по умолчанию.
@@ -26,7 +28,9 @@ export const STAGE_BY_STATUS = {
 };
 
 // Терминальные статусы: жизненный цикл завершён, длительности фиксируются.
-export const TERMINAL_STATUSES = new Set(['DONE', 'CANCELLED', 'FAILED']);
+// Единый набор — src/taskPolicy.js; имя TERMINAL_STATUSES остаётся публичным
+// (его импортирует test/taskStats.test.js).
+export { TERMINAL_STATUSES };
 
 export function stageForStatus(status) {
   return STAGE_BY_STATUS[status] ?? { stageCode: status ?? 'UNKNOWN', stageName: status ?? 'Неизвестно' };
@@ -198,23 +202,6 @@ export function enrichTaskRows(rows, { blockByTask = new Map(), kpiByTask = new 
 
 // --- DB-слой ---------------------------------------------------------------
 
-import { httpError } from './httpError.js';
-
-async function resolveProjectId(c, projectId) {
-  const ref = String(projectId ?? '').trim();
-  if (!ref) throw httpError(422, 'project_id_required');
-  // Разрешаем по UUID, коду, папке (root_path) или имени. Папка — основной
-  // ключ привязки локального проекта к БД; code — стабильный машинный ключ.
-  const r = await c.query(
-    `SELECT id FROM projects
-      WHERE id::text = $1 OR code = $1 OR root_path = $1 OR name = $1
-      ORDER BY created_at LIMIT 1`,
-    [ref],
-  );
-  if (!r.rowCount) throw httpError(404, 'project_not_found');
-  return r.rows[0].id;
-}
-
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 200;
 
@@ -235,7 +222,7 @@ export function clampPagination({ limit, offset } = {}) {
 export async function getTaskStatistics(s, projectId, pagination = {}) {
   const { limit, offset } = clampPagination(pagination);
   return withClient(clientConfig(s), async (c) => {
-    const projectDbId = await resolveProjectId(c, projectId);
+    const projectDbId = await resolveProjectRef(c, projectId);
     const generatedAt = new Date();
     const generatedAtMs = generatedAt.getTime();
 

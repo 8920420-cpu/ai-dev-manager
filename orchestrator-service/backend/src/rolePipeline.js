@@ -153,7 +153,9 @@ export function roleKind(code) {
   return ROLE_KINDS[code] ?? '';
 }
 
-// Статусы, из которых задачу уже не двигают.
+// Статусы, из которых задачу уже не двигают. НАМЕРЕННО у́же, чем терминальный
+// набор задач (taskPolicy.TERMINAL_TASK_STATUSES = DONE/CANCELLED/FAILED): здесь
+// иная семантика маршрута — FAILED ещё может быть перезапущен, поэтому не объединяем.
 export const TERMINAL_STATUSES = new Set(['DONE', 'CANCELLED']);
 
 // TASK-ROUTER-001 — контур маршрута, который выбирает Task Router: small|medium|large.

@@ -9,8 +9,9 @@
 // читает этапы проекта и передаёт их сюда, затем применяет решение.
 import { ROLE_FLOW, roleKind } from './rolePipeline.js';
 
-// Терминальные статусы — задачу из них не двигаем.
-export const TERMINAL_STATUSES = new Set(['DONE', 'CANCELLED', 'FAILED']);
+// Терминальные статусы — задачу из них не двигаем (единый набор из taskPolicy.js;
+// имя TERMINAL_STATUSES сохранено — его импортирует db.js).
+export { TERMINAL_TASK_STATUSES as TERMINAL_STATUSES } from './taskPolicy.js';
 
 /**
  * Построить плоский упорядоченный маршрут проекта из контрактов этапов.

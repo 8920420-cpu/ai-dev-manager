@@ -7,6 +7,7 @@ import { buildRoute } from './projectRoute.js';
 import { validateFieldConsistency } from './fieldsContract.js';
 import { roleHasExecutor } from './rolePipeline.js';
 import { withTransaction } from './transaction.js';
+import { resolveProjectRef } from './projectRef.js';
 
 // Канонический код роли-сканера. Единственный источник признака Scanner.
 export const SCANNER_ROLE_CODE = 'SCANNER';
@@ -245,18 +246,11 @@ export function validateStages(stages, { requireScannerWatch = true } = {}) {
 
 // --- DB-слой ---------------------------------------------------------------
 
-// Разрешить :projectId как UUID или как code проекта. 404, если не найден.
+// Разрешить :projectId как UUID/code/root_path/name проекта. 404, если не найден.
+// Резолвер общий (src/projectRef.js); имя сохраняем для обратной совместимости —
+// его импортируют routeHealth.js и projects.js.
 export async function resolveProjectId(c, projectId) {
-  const ref = String(projectId ?? '').trim();
-  if (!ref) throw httpError(422, 'project_id_required');
-  const r = await c.query(
-    `SELECT id FROM projects
-      WHERE id::text = $1 OR code = $1 OR root_path = $1 OR name = $1
-      ORDER BY created_at LIMIT 1`,
-    [ref],
-  );
-  if (!r.rowCount) throw httpError(404, 'project_not_found');
-  return r.rows[0].id;
+  return resolveProjectRef(c, projectId, { strict: true });
 }
 
 // Все роли БД: id↔code (для резолва ссылок и определения SCANNER).

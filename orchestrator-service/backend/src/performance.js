@@ -6,8 +6,9 @@
 // повторная работа, нагрузка по ролям, длительности. Endpoint ничего не меняет.
 import { withClient, clientConfig } from './db.js';
 import { allStats as connectorBuckets } from './connectorLimiter.js';
-
-const TERMINAL = new Set(['DONE', 'CANCELLED', 'FAILED']);
+import { resolveProjectRef, applyProjectFilter } from './projectRef.js';
+// eslint-disable-next-line no-unused-vars -- единый терминальный набор (src/taskPolicy.js)
+import { TERMINAL_TASK_STATUSES as TERMINAL } from './taskPolicy.js';
 
 /**
  * Чистый расчёт производных KPI из сырых агрегатов (тестируется без БД).
@@ -621,13 +622,7 @@ async function fetchLastDeployMarkers(c, limit = 2) {
 // (при projectDbId=null поведение прежнее — глобально по всем задачам).
 export async function queryRoleLoadRows(c, startISO, endISO, projectDbId = null) {
   const params = [startISO, endISO, RELEASE_OUTCOMES];
-  let projJoin = '';
-  let projFilter = '';
-  if (projectDbId) {
-    params.push(projectDbId);
-    projJoin = 'JOIN tasks t ON t.id = ar.task_id';
-    projFilter = `AND t.project_id = $${params.length}`;
-  }
+  const { projJoin, projFilter } = applyProjectFilter(params, projectDbId);
   const r = await c.query(
     `SELECT r.code AS role_code, r.name AS role_name,
             count(*)::int AS runs,
@@ -672,13 +667,7 @@ export async function queryRoleLoadRows(c, startISO, endISO, projectDbId = null)
 // периода (= число уникальных задач всей таблицы ролей).
 export async function queryRoleLoadPeriodTotalsRow(c, startISO, endISO, projectDbId = null) {
   const params = [startISO, endISO];
-  let projJoin = '';
-  let projFilter = '';
-  if (projectDbId) {
-    params.push(projectDbId);
-    projJoin = 'JOIN tasks t ON t.id = ar.task_id';
-    projFilter = `AND t.project_id = $${params.length}`;
-  }
+  const { projJoin, projFilter } = applyProjectFilter(params, projectDbId);
   const r = await c.query(
     `WITH per_task AS (
        SELECT ar.task_id,
@@ -714,11 +703,8 @@ export async function queryRoleLoadPeriodTotalsRow(c, startISO, endISO, projectD
 // t.project_id прямо на CTE done_tasks (при null — глобально).
 export async function queryRoleLoadTaskTotalsRow(c, startISO, endISO, projectDbId = null) {
   const params = [startISO, endISO];
-  let projFilter = '';
-  if (projectDbId) {
-    params.push(projectDbId);
-    projFilter = `AND t.project_id = $${params.length}`;
-  }
+  // Тут tasks t уже основная таблица CTE — нужен только фильтр, JOIN не используется.
+  const { projFilter } = applyProjectFilter(params, projectDbId);
   const r = await c.query(
     `WITH done_tasks AS (
        SELECT t.id AS task_id, t.created_at AS created_at, ev.done_at AS done_at
@@ -1585,15 +1571,9 @@ export async function recordDowntimeMarker(s, { thresholdMs = 600000 } = {}) {
   });
 }
 
+// soft-резолвер: неизвестный/пустой проект → null (общий src/projectRef.js).
 async function resolveProjectId(c, projectId) {
-  if (projectId == null || String(projectId).trim() === '') return null;
-  const ref = String(projectId).trim();
-  const pr = await c.query(
-    `SELECT id FROM projects WHERE id::text = $1 OR code = $1 OR root_path = $1 OR name = $1
-      ORDER BY created_at LIMIT 1`,
-    [ref],
-  );
-  return pr.rowCount ? pr.rows[0].id : null;
+  return resolveProjectRef(c, projectId, { strict: false });
 }
 
 function numOrNull(v, digits) {

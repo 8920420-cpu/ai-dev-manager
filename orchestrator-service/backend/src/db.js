@@ -33,6 +33,7 @@ import {
   shouldSkipReviewerForSmallTask,
   taskRouteFromCard,
   taskSizeFromCard,
+  TERMINAL_TASK_STATUSES,
 } from './taskPolicy.js';
 import {
   looksCorruptedText,
@@ -141,6 +142,13 @@ export async function withClient(cfg, fn) {
     }
   }
 }
+
+// Фабрика тонких публичных обёрток над *Tx: открыть клиент по настройкам (s) и
+// выполнить транзакционную функцию с этим клиентом, пробросив остальные аргументы
+// как есть. Заменяет ~десяток идентичных однострочных обёрток
+//   export async function foo(s, ...args) { return withClient(clientConfig(s), (c) => fooTx(c, ...args)); }
+// Только для обёрток БЕЗ доп. логики (те, что до/после вызова что-то делают, оставлены как есть).
+const publicTx = (fn) => (s, ...args) => withClient(clientConfig(s), (c) => fn(c, ...args));
 
 // Резолв id роли по её коду. Инлайн-форма
 //   (await c.query('SELECT id FROM roles WHERE code = $1', [x])).rows[0]?.id ?? null
@@ -1272,9 +1280,7 @@ export async function assignTaskProject(s, taskId, projectRef) {
  * Терминальные (DONE/CANCELLED/FAILED) и BLOCKED задачи авто-продвижению не
  * подлежат — для них ручное перемещение moveTask. Публичная обёртка над Tx.
  */
-export async function advanceTask(s, taskId) {
-  return withClient(clientConfig(s), (c) => advanceTaskTx(c, taskId));
-}
+export const advanceTask = publicTx(advanceTaskTx);
 
 export async function advanceTaskTx(c, taskId) {
   const id = String(taskId ?? '').trim();
@@ -1357,9 +1363,7 @@ export async function advanceTaskTx(c, taskId) {
  * снимаем назначение агента. Целевой этап обязан принадлежать проекту задачи и
  * иметь статус (контрольные узлы fork/join отклоняются). Публичная обёртка над Tx.
  */
-export async function moveTask(s, taskId, input) {
-  return withClient(clientConfig(s), (c) => moveTaskTx(c, taskId, input));
-}
+export const moveTask = publicTx(moveTaskTx);
 
 export async function moveTaskTx(c, taskId, input) {
   const id = String(taskId ?? '').trim();
@@ -1423,9 +1427,7 @@ export async function moveTaskTx(c, taskId, input) {
  * ниже 0 (её приоритет всегда 0). Меняем ТОЛЬКО число приоритета — статус/слот
  * (assigned_agent_id) не трогаем, RUNNING-прогоны не вытесняем. Публичная обёртка над Tx.
  */
-export async function setTaskPriority(s, taskId, priority) {
-  return withClient(clientConfig(s), (c) => setTaskPriorityTx(c, taskId, priority));
-}
+export const setTaskPriority = publicTx(setTaskPriorityTx);
 
 export async function setTaskPriorityTx(c, taskId, priority) {
   const id = String(taskId ?? '').trim();
@@ -1480,9 +1482,7 @@ export async function setTaskPriorityTx(c, taskId, priority) {
  * зависшая сессия отпускает слот → её задача переигрывается на текущем этапе, а
  * реально активные задачи сохраняют назначение и не трогаются.
  */
-export async function restartStuckTasks(s) {
-  return withClient(clientConfig(s), (c) => restartStuckTasksTx(c));
-}
+export const restartStuckTasks = publicTx(restartStuckTasksTx);
 
 export async function restartStuckTasksTx(c) {
   await resetStaleClaims(c);
@@ -1529,9 +1529,7 @@ export async function restartStuckTasksTx(c) {
  * Возвращает { tasks: [{ id, title, status, priority, projectId, projectName,
  * serviceName, accepted, acceptedAt, updatedAt, cancelReason, duplicateOf }] }.
  */
-export async function getAcceptanceBoard(s) {
-  return withClient(clientConfig(s), (c) => getAcceptanceBoardTx(c));
-}
+export const getAcceptanceBoard = publicTx(getAcceptanceBoardTx);
 
 export async function getAcceptanceBoardTx(c) {
   const r = await c.query(
@@ -1589,9 +1587,7 @@ export async function getAcceptanceBoardTx(c) {
  * повторный приём просто обновляет метку. Пишет audit-событие source='manual-accept'.
  * Публичная обёртка над Tx.
  */
-export async function acceptTask(s, taskId) {
-  return withClient(clientConfig(s), (c) => acceptTaskTx(c, taskId));
-}
+export const acceptTask = publicTx(acceptTaskTx);
 
 // TASK-AUTO-ACCEPT-001 — «не проверять выполненные задачи»: массово принять все
 // задачи, дошедшие до DONE, но ещё не принятые (accepted_at IS NULL). Вызывается
@@ -1689,9 +1685,7 @@ function normalizeOptions(options) {
  * @param {string} taskId
  * @param {{question:string, options?:string[], context?:string, roleCode?:string}} input
  */
-export async function requestTaskInput(s, taskId, input) {
-  return withClient(clientConfig(s), (c) => requestTaskInputTx(c, taskId, input));
-}
+export const requestTaskInput = publicTx(requestTaskInputTx);
 
 export async function requestTaskInputTx(c, taskId, input = {}) {
   const id = String(taskId ?? '').trim();
@@ -1759,9 +1753,7 @@ export async function requestTaskInputTx(c, taskId, input = {}) {
  * Возвращает { tasks: [{ id, title, projectId, projectName, serviceCode, priority,
  * question: { id, question, options, context, roleCode, askedAt } }] }.
  */
-export async function getNeedsInputBoard(s) {
-  return withClient(clientConfig(s), (c) => getNeedsInputBoardTx(c));
-}
+export const getNeedsInputBoard = publicTx(getNeedsInputBoardTx);
 
 export async function getNeedsInputBoardTx(c) {
   const r = await c.query(
@@ -1808,9 +1800,7 @@ export async function getNeedsInputBoardTx(c) {
  * task.description, см. programmer-runner/src/promptBuilder.js). Ср. доливку
  * артефактов Архитектора в renderWorkArtifactSections.
  */
-export async function answerTaskQuestion(s, taskId, input) {
-  return withClient(clientConfig(s), (c) => answerTaskQuestionTx(c, taskId, input));
-}
+export const answerTaskQuestion = publicTx(answerTaskQuestionTx);
 
 export async function answerTaskQuestionTx(c, taskId, input = {}) {
   const id = String(taskId ?? '').trim();
@@ -2092,9 +2082,7 @@ async function requireService(c, projectId, serviceCode) {
 // (иначе N воркеров одновременно проходят проверку и хватают ОДИН сервис).
 const CLAUDE_CLAIM_LOCK_KEY = 911_017;
 
-export async function claimNextClaudeTask(s) {
-  return withClient(clientConfig(s), (c) => claimNextClaudeTaskTx(c));
-}
+export const claimNextClaudeTask = publicTx(claimNextClaudeTaskTx);
 
 /**
  * Транзакционное ядро claimNextClaudeTask (тестируется с fake-клиентом без живого
@@ -2709,8 +2697,7 @@ export async function claimNextHostTask(s, roleCode) {
 // Терминальные статусы задачи: жизненный цикл завершён, каноническая запись
 // сохраняется как история проекта. Повторный сигнал завершения такой задачи
 // обрабатывается идемпотентно — без новых событий, изменения истории и двойного
-// учёта в «Завершено».
-const TERMINAL_TASK_STATUSES = new Set(['DONE', 'CANCELLED', 'FAILED']);
+// учёта в «Завершено». Набор общий (src/taskPolicy.js, импортирован выше).
 
 // ENV-SETUP-FAIL-FAST-001 (клапан, дефолт OFF) — при setup-сбое Go-воркспейса
 // (env_setup_failed: модуль вне go.work → тесты/сборка не стартуют) блокировать
@@ -3770,9 +3757,7 @@ async function getOrchestratorEnabledTx(c) {
   return parseBoolSetting(await readAppSetting(c, 'orchestrator_enabled', true), true);
 }
 
-export async function getOrchestratorEnabled(s) {
-  return withClient(clientConfig(s), (c) => getOrchestratorEnabledTx(c));
-}
+export const getOrchestratorEnabled = publicTx(getOrchestratorEnabledTx);
 
 // Лимит параллельных обработок на роль (app_settings.max_concurrency_per_role).
 export async function getMaxConcurrencyPerRole(s) {
