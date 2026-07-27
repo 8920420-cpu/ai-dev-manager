@@ -79,3 +79,19 @@ test('пустой код → null, БД не трогаем', async () => {
   assert.equal(id, null);
   assert.equal(c.calls.length, 0, 'пустой код не порождает запросов');
 });
+
+// P1-4 (инцидент 26.07): раньше нормализация убирала только -/_, поэтому
+// Pricing_AI_pricing_engine (подчёркивания) НЕ находил сиблинга Pricing/AI_pricing_engine
+// (слэш) → авто-создавался с repository_path=NULL → гарантированный missing_repository_path.
+// Теперь нормализация убирает и '/', и такие варианты наследуют путь.
+test('нормализация кода при наследовании убирает и "/" (Pricing_AI_pricing_engine ← Pricing/AI_pricing_engine)', async () => {
+  const c = fakeClient([
+    NOT_FOUND,
+    { re: /SELECT DISTINCT repository_path/, reply: { rows: [{ repository_path: 'Pricing/AI_pricing_engine' }], rowCount: 1 } },
+    INSERT_OK,
+  ]);
+  await getOrCreateService(c, 'p1', 'Pricing_AI_pricing_engine', null, null);
+  const sib = c.calls.find((x) => /SELECT DISTINCT repository_path/.test(x.sql));
+  assert.match(sib.sql, /regexp_replace\(lower\(service_code\), '\[-_\/\]'/, 'нормализация убирает -, _ и /');
+  assert.equal(insertedRepoPath(c), 'Pricing/AI_pricing_engine', 'путь унаследован от слэш-версии кода');
+});

@@ -1904,7 +1904,9 @@ export async function getOrCreateService(c, projectId, serviceCode, serviceName,
     // по коду каталога он намеренно отвергает). Каждый источник (scanner-intake, виджет,
     // постановщик) шлёт своё написание кода → плодятся пустые дубли и блоки. Наследуем
     // путь от существующего сервиса-СИБЛИНГА того же проекта с совпадающим
-    // НОРМАЛИЗОВАННЫМ кодом (lower, без разделителей -/_) и валидным путём. Порог
+    // НОРМАЛИЗОВАННЫМ кодом (lower, без разделителей -, _ и /: чтобы
+    // Pricing_AI_pricing_engine наследовал путь от Pricing/AI_pricing_engine) и
+    // валидным путём. Порог
     // неоднозначности: если под одним норм-кодом у сиблингов РАЗНЫЕ пути — не угадываем,
     // оставляем NULL (штатный блок, регистр правит человек). Логические не-код «сервисы»
     // (ARCHITECTURE/INTEGRATION/…) сиблинга с путём не имеют → остаются NULL, как и было.
@@ -1912,8 +1914,8 @@ export async function getOrCreateService(c, projectId, serviceCode, serviceName,
       `SELECT DISTINCT repository_path FROM services
         WHERE project_id = $1
           AND repository_path IS NOT NULL AND btrim(repository_path) <> ''
-          AND regexp_replace(lower(service_code), '[-_]', '', 'g')
-            = regexp_replace(lower($2), '[-_]', '', 'g')`,
+          AND regexp_replace(lower(service_code), '[-_/]', '', 'g')
+            = regexp_replace(lower($2), '[-_/]', '', 'g')`,
       [projectId, code],
     );
     if (sib.rowCount === 1) repoPath = String(sib.rows[0].repository_path).trim();
@@ -2710,6 +2712,14 @@ export async function claimNextHostTask(s, roleCode) {
 // учёта в «Завершено».
 const TERMINAL_TASK_STATUSES = new Set(['DONE', 'CANCELLED', 'FAILED']);
 
+// ENV-SETUP-FAIL-FAST-001 (клапан, дефолт OFF) — при setup-сбое Go-воркспейса
+// (env_setup_failed: модуль вне go.work → тесты/сборка не стартуют) блокировать
+// задачу СРАЗУ, минуя Аналитика сбоя: анализировать нечего (код задачи не при чём),
+// а петля CODING→TESTING→FA до max_rework лишь жжёт токены (инцидент 26.07: 4 круга
+// × ~$12/задача). Включить: env PIPELINE_ENV_FAIL_FAST=1|true|on. При OFF — прежнее
+// поведение (провал стадии → Аналитик сбоя).
+const PIPELINE_ENV_FAIL_FAST = /^(1|true|on)$/i.test(String(process.env.PIPELINE_ENV_FAIL_FAST ?? '').trim());
+
 /**
  * Принять результат host-роли и сделать переход. Для PIPELINE_SERVICE пишет
  * pipeline_runs. Переход считает МАРШРУТ ПРОЕКТА (граф при current_stage_key,
@@ -2802,6 +2812,40 @@ export async function completeHostTaskTx(c, input) {
             output.logPath ?? null,
           ],
         );
+        // ENV-SETUP-FAIL-FAST-001: инфраструктурный setup-сбой Go-воркспейса (модуль
+        // вне go.work → go test/build не стартует) анализировать нечего — блокируем
+        // СРАЗУ, минуя Аналитика сбоя и петлю реворков. За клапаном (дефолт OFF).
+        if (!success && PIPELINE_ENV_FAIL_FAST && detectEnvSetupFailure(output)) {
+          const reason = 'env_setup_failed';
+          await c.query(
+            `UPDATE tasks SET status = 'BLOCKED', current_role_id = NULL, assigned_agent_id = NULL,
+                    data_card = data_card || $2::jsonb, current_stage_key = $3::uuid
+              WHERE id = $1`,
+            [taskId, JSON.stringify({ orchestration_error: reason }), t.current_stage_key ?? null],
+          );
+          await c.query(
+            `UPDATE agent_runs
+                SET status = 'FAILED', finished_at = COALESCE(finished_at, now()), error_text = $2,
+                    output_json = $3::jsonb
+              WHERE id = (
+                SELECT id FROM agent_runs
+                 WHERE task_id = $1 AND role_id = $4 AND status IN ('RUNNING','TIMEOUT')
+                 ORDER BY started_at DESC LIMIT 1
+              )`,
+            [taskId, deriveHostFailureText(roleCode, output), JSON.stringify(output), t.current_role_id],
+          );
+          await c.query(
+            `INSERT INTO task_events (task_id, event_type, from_status, to_status, role_id, payload_json)
+             VALUES ($1, 'TASK_BLOCKED', $2::task_status, 'BLOCKED', $3, $4::jsonb)`,
+            [taskId, t.status, t.current_role_id, JSON.stringify({
+              runner: true, host: true, role: roleCode, event: 'env_setup_failed', reason,
+              detail: 'setup-сбой Go-воркспейса (модуль вне go.work): нужен GOWORK=off или включение модуля в go.work; задача заблокирована без анализа сбоя (ENV-SETUP-FAIL-FAST-001)',
+              outcome: 'BLOCK',
+            })],
+          );
+          await c.query('COMMIT');
+          return { taskId, role: roleCode, success: false, toStatus: 'BLOCKED', nextRole: null, reason };
+        }
         // Успех → вперёд по маршруту (граф минует аналитика на зелёном пути);
         // провал → к аналитику (ветка 'failure' графа / branch линейного маршрута).
         resolved = await resolveHost(success
@@ -5351,14 +5395,33 @@ export function deriveHostFailureText(roleCode, output) {
     const s = v == null ? '' : String(v).trim();
     return s ? s : null;
   };
-  const code = nonEmpty(artifact.errorCode)
-    ?? nonEmpty(artifact.failedStage)
-    ?? `${role.toLowerCase()}_failed`;
+  // ENV-SETUP-FAIL-001: setup-сбой Go-воркспейса (модуль вне go.work) → код причины
+  // env_setup_failed вместо родового pipeline_stage_failed, чтобы классификатор CH
+  // (clickhouseObservability.classify) и монитор видели именно ОКРУЖЕНИЕ, а не «тест».
+  const code = detectEnvSetupFailure(output)
+    ? 'env_setup_failed'
+    : (nonEmpty(artifact.errorCode)
+      ?? nonEmpty(artifact.failedStage)
+      ?? `${role.toLowerCase()}_failed`);
   const detail = nonEmpty(artifact.errorMessage)
     ?? nonEmpty(artifact.note)
     ?? 'no structured detail';
   const text = `${code}: ${detail}`;
   return text.length > HOST_FAILURE_TEXT_MAX ? text.slice(0, HOST_FAILURE_TEXT_MAX) : text;
+}
+
+// ENV-SETUP-FAIL-001 — распознать инфраструктурный setup-сбой Go-воркспейса в артефакте
+// провала стадии: модуль сервиса вне корневого go.work → `go test/build` не стартует
+// (`directory prefix . does not contain modules listed in go.work` / `[setup failed]`).
+// Это ОКРУЖЕНИЕ (лечится GOWORK=off / включением модуля в go.work), а не код задачи —
+// гонять такой провал через Аналитика сбоя бессмысленно (нет кода для правки). Матчим по
+// errorMessage + logTail + упавшей команде; узкий набор маркеров против ложных срабатываний.
+export function detectEnvSetupFailure(output) {
+  const a = summarizeFailureArtifact('', output);
+  const hay = `${a.errorMessage || ''}\n${a.logTail || ''}\n${a.failedCommand?.command || ''}`.toLowerCase();
+  return hay.includes('go.work')
+    || hay.includes('[setup failed]')
+    || hay.includes('does not contain modules listed');
 }
 
 // FA-MISSING-ARTIFACT-001 — артефакт ПОСЛЕДНЕГО провального прогона host-роли задачи

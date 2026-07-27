@@ -5,7 +5,7 @@
 // Мини-клиент pg (как в priorOutputsDedup.test.js): отвечает по первому regex-правилу.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { summarizeFailureArtifact, fetchFailureArtifact } from '../src/db.js';
+import { summarizeFailureArtifact, fetchFailureArtifact, detectEnvSetupFailure, deriveHostFailureText } from '../src/db.js';
 import { isMissingArtifactComplaint, decideOutcome } from '../src/roleEngine.js';
 
 function fakeClient(rules = []) {
@@ -202,4 +202,49 @@ test('decideOutcome FA: содержательный диагноз даже п�
   const d = decideOutcome('FAILURE_ANALYST', verdict, { reworkCount: 1, priorMissingArtifact: true });
   assert.equal(d.outcome, 'REWORK');
   assert.equal(d.reason, 'diagnosed');
+});
+
+// ── ENV-SETUP-FAIL-001: распознавание setup-сбоя Go-воркспейса (модуль вне go.work) ──
+// Форма от pipeline-runner: команда `go -C "backend" test ./...` падает на setup,
+// т.к. активный корневой go.work не содержит модуль сервиса. Это ОКРУЖЕНИЕ, не код.
+const goWorkSetupOutput = {
+  summary: {
+    status: 'failed',
+    error: {
+      code: 'pipeline_stage_failed',
+      message: 'Стадия "test" провалилась, команда: go -C "backend" test ./..., exit=1',
+      logTail: '# ./...\npattern ./...: directory prefix . does not contain modules listed in go.work or their selected dependencies\nFAIL\t./... [setup failed]\nFAIL\n',
+    },
+    actions: [
+      { stage: 'test', name: 'test', command: 'go -C "backend" test ./...', status: 'failed', exitCode: 1, logFragment: 'directory prefix . does not contain modules listed in go.work' },
+    ],
+  },
+  failedStage: 'test',
+};
+
+const ordinaryTestFailOutput = {
+  summary: {
+    status: 'failed',
+    error: { code: 'pipeline_stage_failed', message: 'Стадия "test" провалилась, команда: npm test, exit=1', logTail: 'FAIL src/foo.test.js\n  ✕ падает (5 ms)' },
+    actions: [{ stage: 'test', name: 'test', command: 'npm test', status: 'failed', exitCode: 1, logFragment: 'FAIL src/foo.test.js' }],
+  },
+  failedStage: 'test',
+};
+
+test('detectEnvSetupFailure: setup-сбой Go-воркспейса (go.work / [setup failed]) → true', () => {
+  assert.equal(detectEnvSetupFailure(goWorkSetupOutput), true);
+});
+
+test('detectEnvSetupFailure: обычный провал теста (без go.work) → false', () => {
+  assert.equal(detectEnvSetupFailure(ordinaryTestFailOutput), false);
+});
+
+test('deriveHostFailureText: setup-сбой Go-воркспейса → код причины env_setup_failed', () => {
+  const text = deriveHostFailureText('PIPELINE_SERVICE', goWorkSetupOutput);
+  assert.match(text, /^env_setup_failed:/, 'код причины подменён на env_setup_failed');
+});
+
+test('deriveHostFailureText: обычный провал теста → код не тронут (pipeline_stage_failed)', () => {
+  const text = deriveHostFailureText('PIPELINE_SERVICE', ordinaryTestFailOutput);
+  assert.match(text, /^pipeline_stage_failed:/, 'обычный провал сохраняет родовой код');
 });
