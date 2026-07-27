@@ -52,7 +52,11 @@ export class PipelineRunner {
     const deadline = config.timeoutMinutes
       ? startedAt.getTime() + config.timeoutMinutes * 60_000
       : null;
-    const env = { ...process.env };
+    // GOWORK=off: тестовая/сборочная стадия Go-сервисов вне корневого go.work
+    // иначе падает на setup `directory prefix . does not contain modules listed
+    // in go.work` (в PS 15/26 Go-модулей не входят в E:\git\go.work). Применяется
+    // ко всем стадиям/сервисам, безвредно для docker/npm, переопределяемо хостом.
+    const env = { ...process.env, GOWORK: process.env.GOWORK ?? 'off' };
 
     const stages = [];
     let failedStage = null;
