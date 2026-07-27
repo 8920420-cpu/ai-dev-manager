@@ -6072,8 +6072,9 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
       // Провал хотя бы одного сервиса → блокируем ЭПИК (детей НЕ создаём) с кодом
       // missing_repository_path и перечнем проблемных сервисов.
       const failed = [];
+      const allowProjectRoot = isProjectScopeTask(parseDataCard(claimed));
       for (const svc of split.services) {
-        const pf = await preflightServiceRepoPath(c, svc.serviceId);
+        const pf = await preflightServiceRepoPath(c, svc.serviceId, { allowProjectRoot });
         if (!pf.ok) failed.push({ code: svc.serviceCode, message: pf.message });
       }
       if (failed.length) {
@@ -6099,7 +6100,9 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
     // ловил только claim PIPELINE_SERVICE — задачу успевали прогнать через Architect и
     // Programmer, и она падала лишь на Pipeline с тем же диагнозом, впустую тратя слоты.
     // Сервис без пути/с несуществующим каталогом → BLOCKED c кодом missing_repository_path.
-    const preflight = await preflightServiceRepoPath(c, ensured.resolvedServiceId);
+    // PROJECT-SCOPE-TASK-001: read-only/audit — не блокируем, исполнится из корня проекта.
+    const preflight = await preflightServiceRepoPath(c, ensured.resolvedServiceId,
+      { allowProjectRoot: isProjectScopeTask(parseDataCard(claimed)) });
     if (!preflight.ok) {
       return blockClaimedReason(c, claimed, preflight.reason, {
         verdict, cardValues, kpi, event: 'missing_repository_path', detail: preflight.message,
@@ -6150,7 +6153,8 @@ export async function applyReasoningVerdict(c, claimed, { route, contract, verdi
     if (ensured.blocked) {
       return blockClaimedReason(c, claimed, ensured.reason, { verdict, cardValues, kpi, event: 'mini_architect_no_service' });
     }
-    const preflight = await preflightServiceRepoPath(c, ensured.resolvedServiceId);
+    const preflight = await preflightServiceRepoPath(c, ensured.resolvedServiceId,
+      { allowProjectRoot: isProjectScopeTask(parseDataCard(claimed)) });
     if (!preflight.ok) {
       return blockClaimedReason(c, claimed, preflight.reason, {
         verdict, cardValues, kpi, event: 'missing_repository_path', detail: preflight.message,
@@ -6381,7 +6385,22 @@ async function ensureArchitectService(c, claimed, verdictFields, cardValues) {
 // принимаем ТОЛЬКО валидный сохранённый путь (changed:false); бэкфилл (changed:true)
 // трактуем как провал. Возвращает { ok: true } либо { ok: false, code, reason, message }.
 // Только чтение.
-export async function preflightServiceRepoPath(c, serviceId) {
+// PROJECT-SCOPE-TASK-001 — задача уровня проекта (read-only/аудит) исполняется из
+// КОРНЯ проекта: отдельный каталог сервиса ей не нужен (программист и так работает из
+// projects.root_path через repoResolver, а пустой repository_path в
+// buildPipelineClaimContract даёт workingDirectory=projectRoot). Признаём по ЯВНЫМ
+// маркерам карточки — read_only=true / scope='project' / task_type содержит 'audit'
+// (значения 'audit' нет в штатном словаре task_type → это осознанный маркер аудита).
+export function isProjectScopeTask(card) {
+  const c = asObject(card);
+  if (c.read_only === true || c.readOnly === true) return true;
+  if (typeof c.scope === 'string' && c.scope.trim().toLowerCase() === 'project') return true;
+  const tt = c.task_type;
+  const types = Array.isArray(tt) ? tt : (typeof tt === 'string' ? [tt] : []);
+  return types.some((t) => String(t).trim().toLowerCase() === 'audit');
+}
+
+export async function preflightServiceRepoPath(c, serviceId, opts = {}) {
   if (!serviceId) return { ok: true };
   const row = await c.query(
     `SELECT s.service_code, s.repository_path, p.root_path
@@ -6393,6 +6412,9 @@ export async function preflightServiceRepoPath(c, serviceId) {
   if (!svc) return { ok: true }; // сервис не найден — не наша ветка диагноза
   const resolved = resolveServiceRepoPath(svc.root_path, svc.service_code, svc.repository_path);
   if (resolved.ok && !resolved.changed) return { ok: true };
+  // PROJECT-SCOPE-TASK-001: read-only/audit задача уровня проекта исполняется из корня
+  // проекта — отсутствующий/неразрешённый repository_path сервиса её не блокирует.
+  if (opts.allowProjectRoot) return { ok: true, projectRoot: true };
   const code = String(svc.service_code ?? '').trim() || '(без кода)';
   return {
     ok: false,

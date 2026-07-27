@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { preflightServiceRepoPath, applyReasoningVerdict } from '../src/db.js';
+import { preflightServiceRepoPath, applyReasoningVerdict, isProjectScopeTask } from '../src/db.js';
 import { buildRoute } from '../src/projectRoute.js';
 
 // SERVICE-REPO-PATH-PREFLIGHT-001 — ранний preflight repository_path сервиса на
@@ -108,6 +108,36 @@ test('preflight: сервис не найден в реестре → ok (обы
     { re: /FROM services s JOIN projects p/, reply: { rowCount: 0, rows: [] } },
   ]);
   assert.deepEqual(await preflightServiceRepoPath(c, 'svc-missing'), { ok: true });
+});
+
+// --- PROJECT-SCOPE-TASK-001: read-only/audit исполняется из корня проекта ----------
+
+test('isProjectScopeTask: read_only=true / scope=project / task_type содержит audit → true', () => {
+  assert.equal(isProjectScopeTask({ read_only: true }), true);
+  assert.equal(isProjectScopeTask({ scope: 'project' }), true);
+  assert.equal(isProjectScopeTask({ task_type: ['backend', 'audit'] }), true);
+  assert.equal(isProjectScopeTask({ task_type: 'audit' }), true);
+});
+
+test('isProjectScopeTask: обычная задача (bugfix/backend, без маркеров) → false', () => {
+  assert.equal(isProjectScopeTask({ task_type: ['bugfix', 'backend'] }), false);
+  assert.equal(isProjectScopeTask({ scope: 'service' }), false);
+  assert.equal(isProjectScopeTask({}), false);
+  assert.equal(isProjectScopeTask(null), false);
+});
+
+test('preflight + allowProjectRoot: пустой repository_path у audit-задачи → ok (идёт из корня, не блок)', async () => {
+  const c = svcClient({ service_code: 'platform', repository_path: null, root_path: 'K:\\no\\such\\host\\root' });
+  const r = await preflightServiceRepoPath(c, 'svc-audit', { allowProjectRoot: true });
+  assert.equal(r.ok, true, 'read-only/audit не блокируется отсутствием repository_path');
+  assert.equal(r.projectRoot, true, 'помечено исполнение из корня проекта');
+});
+
+test('preflight БЕЗ allowProjectRoot: тот же пустой путь по-прежнему блокирует (обратная совместимость)', async () => {
+  const c = svcClient({ service_code: 'platform', repository_path: null, root_path: 'K:\\no\\such\\host\\root' });
+  const r = await preflightServiceRepoPath(c, 'svc-audit');
+  assert.equal(r.ok, false);
+  assert.equal(r.code, 'missing_repository_path');
 });
 
 // --- Мультисервисный split Архитектора: preflight ДО материализации детей ---------
