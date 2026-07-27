@@ -28,6 +28,23 @@ function isMemoryArtifact(p) {
   return false;
 }
 
+// GI-DOCS-ONLY-SKIP-STALE-001 (клапан, дефолт OFF) — предохранитель нетто-удалений
+// (stale_branch_reverts_main) защищает main от реверта стухшей веткой. Но доставка
+// идёт cherry-pick'ом ТОЛЬКО коммитов дельты (affected), а не заменой дерева: если
+// вся дельта под docs/, cherry-pick доков физически не может удалить код вне docs/ —
+// гард здесь ложный (net-diff before..tip лишь сравнивает деревья целиком). Инцидент
+// 26.07: аудит (docs/audit/*.md) на стухшей ветке зря вставал в BLOCKED. Включить:
+// env GI_DOCS_ONLY_SKIP_STALE_GUARD=1|true|on. При OFF — прежнее (гард срабатывает).
+const GI_DOCS_ONLY_SKIP_STALE_GUARD = /^(1|true|on)$/i.test(String(process.env.GI_DOCS_ONLY_SKIP_STALE_GUARD ?? '').trim());
+
+// docs-only дельта: непустой набор путей и КАЖДЫЙ под docs/ (POSIX-нормализация).
+// Только для такой дельты пропуск net-deletion гарда безопасен.
+export function isDocsOnlyChangedSet(paths) {
+  const list = Array.isArray(paths) ? paths : [...(paths || [])];
+  const norm = list.map((p) => String(p ?? '').replace(/\\/g, '/').replace(/^\.\//, '').trim()).filter(Boolean);
+  return norm.length > 0 && norm.every((p) => p.startsWith('docs/'));
+}
+
 // PIPELINE-WORKTREE-LONGPATH-001 — каноничная (длинная) база для эфемерных
 // worktree. Под кириллическим/пробельным именем пользователя os.tmpdir() отдаёт
 // 8.3-КОРОТКОЕ имя (напр. C:\Users\7272~1\AppData\Local\Temp), а vite/vitest
@@ -414,7 +431,11 @@ async function integrateWorktreeBranch(repoRoot, { worktreeBranch, deliveredComm
       .filter((parts) => parts[0] && parts[0][0] === 'D')
       .map((parts) => parts[parts.length - 1].trim())
       .filter((p) => p && !affected.has(p));
-    if (deletedOutsideChangedSet.length > 0) {
+    // GI-DOCS-ONLY-SKIP-STALE-001: для docs-only дельты (вся affected под docs/)
+    // cherry-pick доков не может удалить код вне docs/ → нетто-гард ложный. За
+    // клапаном (дефолт OFF) пропускаем его и продолжаем доставку доков.
+    const docsOnlySkip = GI_DOCS_ONLY_SKIP_STALE_GUARD && isDocsOnlyChangedSet(affected);
+    if (deletedOutsideChangedSet.length > 0 && !docsOnlySkip) {
       // Проверка ПРЕДПОЛЁТНАЯ: cherry-pick ещё не начинался, HEAD не двигался (уже
       // на before). cherry-pick --abort — защитный no-op на случай остаточного
       // состояния. autostash (дубль дельты / doc-работа fork-сиблинга) НЕ дропаем:
