@@ -139,6 +139,86 @@ test('runAutodeploy: исчерпание totalBudgetMs помечает хво�
   assert.match(res.targets[0].error, /budget_exceeded/);
 });
 
+// ── Цели-Job (batch/v1 Job вместо Deployment) ─────────────────────────────────
+// Сервис-Job (etl-reaper) нельзя раскатать rollout restart'ом: Deployment'а нет, а
+// spec живого Job иммутабелен. Доставка = build → push → delete job → apply -f.
+const CFG_JOB = {
+  ...CFG,
+  targets: [
+    ...CFG.targets,
+    {
+      job: 'etl-reaper', manifest: 'deploy/k8s-prod/42-etl-reaper-job.yaml',
+      image: 'etl-reaper', compose: 'ETL/docker-compose.yml', service: 'etl-reaper',
+      builtImage: 'localhost:5000/etl-reaper:local',
+      paths: ['ETL/ETL-Reaper/', 'ETL/Dockerfile.etl_reaper'],
+    },
+  ],
+};
+
+test('pickAutodeployTargets: job-цель совпадает по префиксу и дедупится по имени Job', () => {
+  const hit = pickAutodeployTargets(['ETL/ETL-Reaper/backend/main.go'], CFG_JOB);
+  assert.deepEqual(hit.map((t) => t.job), ['etl-reaper']);
+  // Дедуп: две одноимённые job-цели в карте дают одну.
+  const dup = pickAutodeployTargets(['ETL/ETL-Reaper/x.go'], {
+    targets: [CFG_JOB.targets[2], { ...CFG_JOB.targets[2], paths: ['ETL/'] }],
+  });
+  assert.equal(dup.length, 1);
+});
+
+test('pickAutodeployTargets: цель без deployment и без manifest не раскатывается', () => {
+  // Job без манифеста пересоздавать нечем — такая цель игнорируется целиком.
+  const cfg = { targets: [{ job: 'etl-reaper', image: 'etl-reaper', compose: 'ETL/docker-compose.yml', service: 'etl-reaper', paths: ['ETL/'] }] };
+  assert.deepEqual(pickAutodeployTargets(['ETL/ETL-Reaper/main.go'], cfg), []);
+});
+
+test('runAutodeploy: job-цель → build → push → delete job → apply -f манифеста', async () => {
+  const calls = [];
+  const res = await runAutodeploy('/repo', ['ETL/ETL-Reaper/backend/main.go'], {
+    config: CFG_JOB, exec: fakeExec(calls),
+  });
+  assert.equal(res.ok, true);
+  assert.deepEqual(res.targets, [{ job: 'etl-reaper', image: 'etl-reaper', ok: true, stage: 'done' }]);
+  const lines = calls.map((c) => `${c.cmd} ${c.args.join(' ')}`);
+  assert.deepEqual(lines, [
+    'docker compose --env-file compose.build.env -f ETL/docker-compose.yml build etl-reaper',
+    // builtImage (:local) отличается от тега registry — tag нужен в оба registry.
+    'docker tag localhost:5000/etl-reaper:local localhost:5000/etl-reaper:latest',
+    'docker push localhost:5000/etl-reaper:latest',
+    'docker tag localhost:5000/etl-reaper:local 192.168.1.211:5000/etl-reaper:latest',
+    'docker push 192.168.1.211:5000/etl-reaper:latest',
+    'kubectl delete job etl-reaper -n ps-prod --ignore-not-found --wait=true',
+    'kubectl apply -f deploy/k8s-prod/42-etl-reaper-job.yaml -n ps-prod',
+  ]);
+  // Никакого rollout restart: Deployment'а с таким именем в кластере нет.
+  assert.ok(!lines.some((l) => l.includes('rollout')));
+});
+
+test('runAutodeploy: waitSec>0 → ожидание condition=complete, провал ожидания роняет цель', async () => {
+  const cfg = { ...CFG_JOB, targets: [{ ...CFG_JOB.targets[2], waitSec: 600 }] };
+  const calls = [];
+  const ok = await runAutodeploy('/repo', ['ETL/ETL-Reaper/main.go'], { config: cfg, exec: fakeExec(calls) });
+  assert.equal(ok.ok, true);
+  assert.equal(
+    calls.map((c) => `${c.cmd} ${c.args.join(' ')}`).at(-1),
+    'kubectl wait --for=condition=complete job/etl-reaper -n ps-prod --timeout=600s',
+  );
+  const failed = await runAutodeploy('/repo', ['ETL/ETL-Reaper/main.go'], {
+    config: cfg, exec: fakeExec([], { failOn: 'wait --for=condition=complete' }),
+  });
+  assert.equal(failed.ok, false);
+  assert.equal(failed.targets[0].stage, 'wait');
+});
+
+test('runAutodeploy: провал delete job → стадия recreate, deployment-цели не задеты', async () => {
+  const res = await runAutodeploy('/repo', ['ETL/ETL-Reaper/main.go', 'WebStore/PSweb/a.ts'], {
+    config: CFG_JOB, exec: fakeExec([], { failOn: 'delete job' }),
+  });
+  assert.equal(res.ok, false);
+  const job = res.targets.find((t) => t.job === 'etl-reaper');
+  assert.equal(job.stage, 'recreate');
+  assert.equal(res.targets.find((t) => t.deployment === 'psweb').ok, true);
+});
+
 // Карта с секцией manifestApply (kustomize-корень deploy/k8s-prod). image-цели те
 // же (psweb/chat-service), namespace ps-prod.
 const CFG_KUSTOMIZE = {

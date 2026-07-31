@@ -47,9 +47,24 @@
 //     { "deployment": "psweb", "image": "psweb",
 //       "compose": "WebStore/docker-compose.yml", "service": "psweb",
 //       "paths": ["WebStore/PSweb/", "packages/"],
-//       "builtImage": "localhost:5000/psweb:latest" }           // опционально, если тег сборки ≠ <buildRegistry>/<image>:latest
+//       "builtImage": "localhost:5000/psweb:latest" },          // опционально, если тег сборки ≠ <buildRegistry>/<image>:latest
+//     { "job": "etl-reaper", "manifest": "deploy/k8s-prod/42-etl-reaper-job.yaml",
+//       "image": "etl-reaper", "compose": "ETL/docker-compose.yml", "service": "etl-reaper",
+//       "builtImage": "localhost:5000/etl-reaper:local",
+//       "waitSec": 0,                                           // >0 → ждать condition=complete столько секунд
+//       "paths": ["ETL/ETL-Reaper/"] }
 //   ]
 // }
+//
+// Цели-Job (`job` вместо `deployment`) — для сервисов, которые разворачиваются как
+// batch/v1 Job, а не Deployment: `rollout restart` к ним неприменим в принципе, и
+// без отдельного сценария правки такого сервиса доезжали в main, но в рантайм не
+// попадали НИКОГДА (случай etl-reaper: образ в registry отставал от main на неделю).
+// Job'у нельзя обновить spec поверх (поля template иммутабельны), поэтому доставка
+// такой цели = build → push → `kubectl delete job` → `kubectl apply -f <manifest>`.
+// Старые раннеры такие цели просто пропускают (у них нет `deployment`), поэтому
+// карту можно обновлять раньше раннера — доставка деградирует до прежнего no-op,
+// а не до ошибочного rollout несуществующего Deployment.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { readFile } from 'node:fs/promises';
@@ -77,9 +92,18 @@ export async function loadAutodeployConfig(repoRoot, { readFileImpl = readFile }
   return cfg;
 }
 
+// Ключ цели: Deployment (rollout restart) либо Job (пересоздание по манифесту).
+// Job-цель обязана нести `manifest` — пересоздавать её больше нечем. Возвращает
+// null для цели, которую этот раннер раскатать не умеет (её просто пропускают).
+function targetKey(t) {
+  if (t?.deployment) return `deployment/${t.deployment}`;
+  if (t?.job && t?.manifest) return `job/${t.job}`;
+  return null;
+}
+
 // Чистая функция: цели доставки, чьи path-префиксы совпали с файлами дельты.
 // Пути нормализуются к forward-slash (git отдаёт их так, но changedFiles из событий
-// исторически бывали с backslash). Дедуп по deployment, порядок — как в карте.
+// исторически бывали с backslash). Дедуп по цели (Deployment/Job), порядок — как в карте.
 export function pickAutodeployTargets(files, config) {
   const norm = (Array.isArray(files) ? files : [])
     .map((f) => String(f ?? '').replaceAll('\\', '/').trim())
@@ -88,13 +112,14 @@ export function pickAutodeployTargets(files, config) {
   const out = [];
   const seen = new Set();
   for (const t of config?.targets ?? []) {
-    if (!t || !t.deployment || !t.compose || !t.service || seen.has(t.deployment)) continue;
+    const key = targetKey(t);
+    if (!key || !t.compose || !t.service || seen.has(key)) continue;
     const prefixes = (Array.isArray(t.paths) ? t.paths : [])
       .map((p) => String(p ?? '').replaceAll('\\', '/'))
       .filter(Boolean);
     if (!prefixes.length) continue;
     if (norm.some((f) => prefixes.some((p) => f.startsWith(p)))) {
-      seen.add(t.deployment);
+      seen.add(key);
       out.push(t);
     }
   }
@@ -209,7 +234,10 @@ export async function runAutodeploy(repoRoot, files, { config, exec = pexec, log
 
   const results = [];
   for (const t of targets) {
-    const r = { deployment: t.deployment, image: t.image, ok: false, stage: null };
+    const isJob = !t.deployment && Boolean(t.job);
+    const r = isJob
+      ? { job: t.job, image: t.image, ok: false, stage: null }
+      : { deployment: t.deployment, image: t.image, ok: false, stage: null };
     results.push(r);
     if (now() - startedAt > totalBudgetMs) {
       r.stage = 'skipped';
@@ -235,19 +263,43 @@ export async function runAutodeploy(repoRoot, files, { config, exec = pexec, log
         await exec('docker', ['push', ref], { cwd: repoRoot, env, maxBuffer: 16 << 20, timeout: 5 * 60_000 });
       }
 
-      r.stage = 'rollout';
-      log(`autodeploy: rollout restart deployment/${t.deployment} -n ${namespace}`);
-      await exec('kubectl', ['rollout', 'restart', `deployment/${t.deployment}`, '-n', namespace],
-        { cwd: repoRoot, env, timeout: 60_000 });
-      await exec('kubectl', ['rollout', 'status', `deployment/${t.deployment}`, '-n', namespace,
-        `--timeout=${rolloutTimeoutSec}s`],
-        { cwd: repoRoot, env, maxBuffer: 4 << 20, timeout: (rolloutTimeoutSec + 30) * 1000 });
+      if (isJob) {
+        // Job нельзя обновить apply'ем поверх: поля spec.template иммутабельны, и
+        // apply на живой Job с новым spec падает. Пересоздаём: delete (--wait, чтобы
+        // apply не наткнулся на удаляемый объект) → apply манифеста. Именно delete+
+        // apply, а не только push образа: без пересоздания новый образ никто не
+        // запустит — Job однократный, рестартовать нечего.
+        r.stage = 'recreate';
+        log(`autodeploy: delete job/${t.job} -n ${namespace} → apply -f ${t.manifest}`);
+        await exec('kubectl', ['delete', 'job', String(t.job), '-n', namespace, '--ignore-not-found', '--wait=true'],
+          { cwd: repoRoot, env, timeout: 120_000 });
+        await exec('kubectl', ['apply', '-f', String(t.manifest), '-n', namespace],
+          { cwd: repoRoot, env, maxBuffer: 4 << 20, timeout: 60_000 });
+        // Ожидание завершения — опция: разовый Job может идти дольше бюджета роли,
+        // и «доставка» для него = запущенный прогон на новом образе. waitSec>0
+        // включает ожидание там, где итог прогона важен для успеха доставки.
+        const waitSec = Number(t.waitSec) > 0 ? Number(t.waitSec) : 0;
+        if (waitSec > 0) {
+          r.stage = 'wait';
+          await exec('kubectl', ['wait', '--for=condition=complete', `job/${t.job}`, '-n', namespace,
+            `--timeout=${waitSec}s`],
+            { cwd: repoRoot, env, maxBuffer: 4 << 20, timeout: (waitSec + 30) * 1000 });
+        }
+      } else {
+        r.stage = 'rollout';
+        log(`autodeploy: rollout restart deployment/${t.deployment} -n ${namespace}`);
+        await exec('kubectl', ['rollout', 'restart', `deployment/${t.deployment}`, '-n', namespace],
+          { cwd: repoRoot, env, timeout: 60_000 });
+        await exec('kubectl', ['rollout', 'status', `deployment/${t.deployment}`, '-n', namespace,
+          `--timeout=${rolloutTimeoutSec}s`],
+          { cwd: repoRoot, env, maxBuffer: 4 << 20, timeout: (rolloutTimeoutSec + 30) * 1000 });
+      }
 
       r.stage = 'done';
       r.ok = true;
     } catch (error) {
       r.error = String(error?.stderr || error?.message || error).trim().slice(0, 700);
-      log(`autodeploy: ${t.deployment} провал на стадии ${r.stage}: ${r.error}`);
+      log(`autodeploy: ${t.deployment || `job/${t.job}`} провал на стадии ${r.stage}: ${r.error}`);
     }
   }
   // Итоговый ok = все image-цели ok И apply манифестов ok (если применялся).
