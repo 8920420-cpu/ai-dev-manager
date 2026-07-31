@@ -69,6 +69,23 @@ test('looksCorruptedText: mojibake распознаётся', () => {
   assert.equal(looksCorruptedText('????????? ? ??????? legacy-??????'), true);
 });
 
+// INTAKE-QUESTION-MARKS-001 — эвристика «?» отклоняла живые обращения: в русском
+// тексте «???» это эмоция, а не потеря кодировки. Признак настоящей порчи — буквы
+// исчезли; если букв заметно больше, чем «?», текст читаем.
+test('looksCorruptedText: вопросительные знаки в живом тексте не считаются порчей', () => {
+  assert.equal(looksCorruptedText('Не работает???'), false);
+  assert.equal(looksCorruptedText('Как быть?? Что делать??'), false);
+  assert.equal(looksCorruptedText('Почему не приходит письмо? Куда смотреть? Кому писать?'), false);
+  assert.equal(looksCorruptedText('Ошибка 500 при отправке. Что делать???'), false);
+});
+
+test('looksCorruptedText: порча остаётся порчей и при остатках букв', () => {
+  // Букв мало, вопросов много — ровно то, как выглядит потерянная кодировка.
+  assert.equal(looksCorruptedText('?? ???????? ?????? ? ??????'), true);
+  assert.equal(looksCorruptedText('???'), true);
+  assert.equal(looksCorruptedText('ab ?????? ????'), true);
+});
+
 test('normalizeScannerIntake: битый title → 422 corrupted_encoding', () => {
   assert.throws(
     () => normalizeScannerIntake({ externalId: 'X', title: '?????? ?????? ?????' }),
