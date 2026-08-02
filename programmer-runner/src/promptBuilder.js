@@ -66,6 +66,15 @@ export function buildPrompt(task) {
     '- Before finishing, run the project checks yourself (e.g. `npm test` or'
       + ' `go test ./...` in the service directory) and fix what your change broke.'
       + ' The runner re-runs them after you finish and will send failures back to you.',
+    // PROGRAMMER-WORKTREE-DEPS-001: worktree — свежий checkout БЕЗ node_modules
+    // (их ставит только пайплайн у себя). Без этой оговорки агент запускал тесты
+    // как есть и сдавал результат вида «312/312, 2 ошибки окружения» — прогон,
+    // которому нельзя верить, выданный за проверку.
+    '- This worktree is a fresh checkout: dependency directories (node_modules, vendor)'
+      + ' are NOT installed. If the checks need them, install first in the service directory'
+      + ' (e.g. `npm ci --prefer-offline --no-audit --no-fund`, falling back to `npm install`).'
+      + ' A run that fails on unresolved imports or a missing test environment (e.g. jsdom)'
+      + ' did NOT verify anything — say so plainly instead of reporting it as a pass.',
     // PROGRAMMER-DELTA-DENYLIST-001: сгенерированные/сборочные артефакты всё равно
     // вырезаются из дельты — не тратить ходы на их правку/регенерацию.
     '- Do not create or edit generated/build artifacts (e.g. *.tsbuildinfo, dist/,'
