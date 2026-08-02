@@ -93,6 +93,9 @@ test('runAutodeploy: последовательность build → tag/push × 
   assert.deepEqual(res.targets, [{ deployment: 'psweb', image: 'psweb', ok: true, stage: 'done' }]);
   const lines = calls.map((c) => `${c.cmd} ${c.args.join(' ')}`);
   assert.deepEqual(lines, [
+    // AUTODEPLOY-DEDUP-001: HEAD спрашивается один раз перед раскаткой image-целей
+    // (fake-exec отдаёт пустой stdout → отметки выключены, поведение прежнее).
+    'git -C /repo rev-parse HEAD',
     'docker compose --env-file compose.build.env -f WebStore/docker-compose.yml build psweb',
     // первый registry совпадает с образом сборки — tag не нужен
     'docker push localhost:5000/psweb:latest',
@@ -102,8 +105,11 @@ test('runAutodeploy: последовательность build → tag/push × 
     'kubectl rollout status deployment/psweb -n ps-prod --timeout=180s',
   ]);
   // Сборка получает IMAGE_REGISTRY, kubectl — KUBECONFIG (резолв от repoRoot).
-  assert.equal(calls[0].opts.env.IMAGE_REGISTRY, 'localhost:5000');
-  assert.equal(calls[4].opts.env.KUBECONFIG, path.resolve('/repo', 'deploy/kubeconfig'));
+  // Ищем по команде, а не по индексу: перед раскаткой идёт ещё git rev-parse HEAD.
+  const build = calls.find((c) => c.cmd === 'docker' && c.args.includes('build'));
+  const rollout = calls.find((c) => c.cmd === 'kubectl' && c.args.includes('restart'));
+  assert.equal(build.opts.env.IMAGE_REGISTRY, 'localhost:5000');
+  assert.equal(rollout.opts.env.KUBECONFIG, path.resolve('/repo', 'deploy/kubeconfig'));
 });
 
 test('runAutodeploy: провал стадии → ok:false со стадией и stderr, остальные цели не бросаются', async () => {
@@ -180,6 +186,9 @@ test('runAutodeploy: job-цель → build → push → delete job → apply -f
   assert.deepEqual(res.targets, [{ job: 'etl-reaper', image: 'etl-reaper', ok: true, stage: 'done' }]);
   const lines = calls.map((c) => `${c.cmd} ${c.args.join(' ')}`);
   assert.deepEqual(lines, [
+    // AUTODEPLOY-DEDUP-001: HEAD спрашивается один раз перед раскаткой image-целей
+    // (fake-exec отдаёт пустой stdout → отметки выключены, поведение прежнее).
+    'git -C /repo rev-parse HEAD',
     'docker compose --env-file compose.build.env -f ETL/docker-compose.yml build etl-reaper',
     // builtImage (:local) отличается от тега registry — tag нужен в оба registry.
     'docker tag localhost:5000/etl-reaper:local localhost:5000/etl-reaper:latest',
@@ -346,6 +355,9 @@ test('runAutodeploy: apply И раскатка образа вместе → ok 
   const lines = calls.map((c) => `${c.cmd} ${c.args.join(' ')}`);
   assert.deepEqual(lines, [
     'kubectl apply -k deploy/k8s-prod -n ps-prod',
+    // AUTODEPLOY-DEDUP-001: HEAD спрашивается один раз перед раскаткой image-целей
+    // (fake-exec отдаёт пустой stdout → отметки выключены, поведение прежнее).
+    'git -C /repo rev-parse HEAD',
     'docker compose --env-file compose.build.env -f WebStore/docker-compose.yml build psweb',
     'docker push localhost:5000/psweb:latest',
     'docker tag localhost:5000/psweb:latest 192.168.1.211:5000/psweb:latest',
@@ -445,4 +457,100 @@ test('runGitAction: дельта заявлена, но контента в main
   // считается already_integrated_content (истинная пустая дельта ветки).
   assert.equal(res.success, true);
   assert.equal(res.output.note, 'already_integrated_content');
+});
+
+// ── AUTODEPLOY-DEDUP-001: не катать прод повторно тем же коммитом ──────────────
+// Fork/join даёт два прогона Git Integrator подряд: дочерний вливает дельту и
+// раскатывает, родительский приходит с пустой дельтой и раскатывал те же цели
+// второй раз (лишняя ревизия Deployment + ~50 c на rollout status).
+
+// repoRoot с каталогом .git (там живёт отметка) + exec, отдающий заданный HEAD.
+function dedupRepo() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'autodeploy-dedup-'));
+  mkdirSync(path.join(dir, '.git'), { recursive: true });
+  return dir;
+}
+function fakeExecWithHead(calls, sha, { failOn = null } = {}) {
+  return async (cmd, args, opts) => {
+    const line = `${cmd} ${args.join(' ')}`;
+    if (cmd === 'git' && args.includes('rev-parse')) return { stdout: `${sha}\n`, stderr: '' };
+    calls.push({ cmd, args, opts });
+    if (failOn && line.includes(failOn)) {
+      const e = new Error(`fail: ${line}`);
+      e.stderr = `stderr of ${line}`;
+      throw e;
+    }
+    return { stdout: '', stderr: '' };
+  };
+}
+
+test('AUTODEPLOY-DEDUP-001: повторный прогон тем же коммитом не трогает прод', async () => {
+  const dir = dedupRepo();
+  try {
+    const first = [];
+    const r1 = await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], { config: CFG, exec: fakeExecWithHead(first, 'sha-aaa') });
+    assert.equal(r1.ok, true);
+    assert.equal(r1.targets[0].skipped, undefined, 'первый прогон катает по-настоящему');
+    assert.ok(first.some((c) => c.cmd === 'kubectl' && c.args.includes('restart')));
+
+    // Второй прогон (родительский GI после join): дельта та же, HEAD тот же.
+    const second = [];
+    const r2 = await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], { config: CFG, exec: fakeExecWithHead(second, 'sha-aaa') });
+    assert.equal(r2.ok, true, 'цель считается доставленной');
+    assert.deepEqual(r2.targets, [{ deployment: 'psweb', image: 'psweb', ok: true, stage: 'done', skipped: 'already_delivered_same_commit' }]);
+    assert.deepEqual(second, [], 'ни docker, ни kubectl не вызывались');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('AUTODEPLOY-DEDUP-001: новый коммит раскатывается штатно', async () => {
+  const dir = dedupRepo();
+  try {
+    await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], { config: CFG, exec: fakeExecWithHead([], 'sha-aaa') });
+    const calls = [];
+    const res = await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], { config: CFG, exec: fakeExecWithHead(calls, 'sha-bbb') });
+    assert.equal(res.targets[0].skipped, undefined);
+    assert.ok(calls.some((c) => c.cmd === 'kubectl' && c.args.includes('restart')), 'другой HEAD → раскатка');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('AUTODEPLOY-DEDUP-001: упавшая доставка не ставит отметку — ретрай катает заново', async () => {
+  const dir = dedupRepo();
+  try {
+    const r1 = await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], {
+      config: CFG, exec: fakeExecWithHead([], 'sha-aaa', { failOn: 'rollout restart' }),
+    });
+    assert.equal(r1.ok, false, 'доставка провалилась');
+
+    const calls = [];
+    const r2 = await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], { config: CFG, exec: fakeExecWithHead(calls, 'sha-aaa') });
+    assert.equal(r2.targets[0].skipped, undefined, 'ретрай не должен пропускать цель');
+    assert.ok(calls.some((c) => c.cmd === 'kubectl' && c.args.includes('restart')));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('AUTODEPLOY-DEDUP-001: протухшая отметка (TTL) не блокирует раскатку', async () => {
+  const dir = dedupRepo();
+  try {
+    await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], { config: CFG, exec: fakeExecWithHead([], 'sha-aaa') });
+    const calls = [];
+    // deliveryDedupTtlMs=1 мс: отметка первого прогона уже вне окна.
+    const res = await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], {
+      config: { ...CFG, deliveryDedupTtlMs: 1 }, exec: fakeExecWithHead(calls, 'sha-aaa'), now: () => Date.now() + 60_000,
+    });
+    assert.equal(res.targets[0].skipped, undefined);
+    assert.ok(calls.some((c) => c.cmd === 'kubectl' && c.args.includes('restart')));
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('AUTODEPLOY-DEDUP-001: deliveryDedupTtlMs=0 полностью выключает дедупликацию', async () => {
+  const dir = dedupRepo();
+  try {
+    const cfg = { ...CFG, deliveryDedupTtlMs: 0 };
+    await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], { config: cfg, exec: fakeExecWithHead([], 'sha-aaa') });
+    const calls = [];
+    const res = await runAutodeploy(dir, ['WebStore/PSweb/a.ts'], { config: cfg, exec: fakeExecWithHead(calls, 'sha-aaa') });
+    assert.equal(res.targets[0].skipped, undefined);
+    assert.ok(calls.some((c) => c.cmd === 'kubectl' && c.args.includes('restart')));
+    assert.ok(!calls.some((c) => c.cmd === 'git'), 'при выключенной дедупликации HEAD не спрашиваем');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });

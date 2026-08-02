@@ -67,10 +67,53 @@
 // а не до ошибочного rollout несуществующего Deployment.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 const pexec = promisify(execFile);
+
+// AUTODEPLOY-DEDUP-001 — не катать прод повторно тем же коммитом.
+//
+// Fork/join даёт ДВА прогона Git Integrator подряд на одной задаче: дочерняя ветка
+// вливает дельту и доставляет её, затем родительская после join приходит с пустой
+// дельтой (note already_integrated_content) и катает те же цели второй раз. Деплой
+// при повторе задуман намеренно — так ретрай УПАВШЕЙ доставки остаётся обычным
+// повторным прогоном роли, — но в fork/join это лишний перекат прода: новая
+// ревизия Deployment, ещё один rollout status, ~50 секунд впустую.
+//
+// Различаем по факту, а не по намерению: после успешной раскатки цели пишем
+// отметку {sha, at} в .git/ai-dev-autodeploy-state.json. Следующий прогон
+// пропускает цель, если ТОТ ЖЕ коммит уже раскатан недавно. Провал доставки
+// отметку не пишет — ретрай штатно катает заново. Файл лежит в .git/ (в коммиты
+// не попадает, живёт с репозиторием), сбой чтения/записи — тихий no-op.
+const DEFAULT_DEDUP_TTL_MS = 15 * 60_000;
+const DELIVERY_STATE_FILE = 'ai-dev-autodeploy-state.json';
+
+function deliveryStatePath(repoRoot) {
+  return path.join(repoRoot, '.git', DELIVERY_STATE_FILE);
+}
+
+export async function readDeliveryState(repoRoot, { readFileImpl = readFile } = {}) {
+  try {
+    const parsed = JSON.parse(await readFileImpl(deliveryStatePath(repoRoot), 'utf8'));
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function writeDeliveryState(repoRoot, state, { writeFileImpl = writeFile } = {}) {
+  try {
+    await writeFileImpl(deliveryStatePath(repoRoot), JSON.stringify(state), 'utf8');
+  } catch {
+    /* отметка — оптимизация, а не контракт: не смогли записать → просто не дедуплицируем */
+  }
+}
+
+// Ключ цели в отметке доставки: Deployment и Job с одинаковым именем — разные цели.
+export function deliveryKey(t) {
+  return t.deployment ? `deployment:${t.deployment}` : `job:${t.job}`;
+}
 
 // Прочитать карту доставки репозитория. Нет файла → null (доставка не настроена).
 // Битый JSON — громкая ошибка (карта есть, но не работает — молчать нельзя).
@@ -232,6 +275,20 @@ export async function runAutodeploy(repoRoot, files, { config, exec = pexec, log
     }
   }
 
+  // AUTODEPLOY-DEDUP-001: отметки уже раскатанных целей и текущий коммит main.
+  // Не смогли определить HEAD (не git-репо, сбой) → дедупликация выключена и
+  // поведение прежнее: катаем всё, как раньше.
+  // HEAD спрашиваем только когда есть что раскатывать: при apply-only прогоне
+  // (правка одних манифестов) дедуплицировать нечего.
+  const dedupTtlMs = Number(cfg.deliveryDedupTtlMs) >= 0 ? Number(cfg.deliveryDedupTtlMs) : DEFAULT_DEDUP_TTL_MS;
+  const headSha = targets.length && dedupTtlMs > 0
+    ? await exec('git', ['-C', repoRoot, 'rev-parse', 'HEAD'], { cwd: repoRoot, timeout: 30_000 })
+      .then((r) => String(r?.stdout ?? '').trim() || null)
+      .catch(() => null)
+    : null;
+  const deliveryState = headSha && dedupTtlMs > 0 ? await readDeliveryState(repoRoot) : {};
+  let deliveryStateDirty = false;
+
   const results = [];
   for (const t of targets) {
     const isJob = !t.deployment && Boolean(t.job);
@@ -242,6 +299,16 @@ export async function runAutodeploy(repoRoot, files, { config, exec = pexec, log
     if (now() - startedAt > totalBudgetMs) {
       r.stage = 'skipped';
       r.error = 'budget_exceeded: цель доедет при повторном прогоне роли';
+      continue;
+    }
+    // Тот же коммит уже раскатан недавно (типовой случай — второй Git Integrator
+    // после join): цель считается доставленной, ok:true. Прод не трогаем.
+    const mark = headSha && dedupTtlMs > 0 ? deliveryState[deliveryKey(t)] : null;
+    if (mark && mark.sha === headSha && Number.isFinite(Number(mark.at)) && now() - Number(mark.at) < dedupTtlMs) {
+      r.stage = 'done';
+      r.ok = true;
+      r.skipped = 'already_delivered_same_commit';
+      log(`autodeploy: ${deliveryKey(t)} уже раскатан коммитом ${headSha.slice(0, 8)} — пропуск`);
       continue;
     }
     try {
@@ -297,11 +364,18 @@ export async function runAutodeploy(repoRoot, files, { config, exec = pexec, log
 
       r.stage = 'done';
       r.ok = true;
+      // AUTODEPLOY-DEDUP-001: отметку ставим ТОЛЬКО после успешной раскатки —
+      // упавшая доставка её не пишет, и ретрай катает цель заново.
+      if (headSha && dedupTtlMs > 0) {
+        deliveryState[deliveryKey(t)] = { sha: headSha, at: now() };
+        deliveryStateDirty = true;
+      }
     } catch (error) {
       r.error = String(error?.stderr || error?.message || error).trim().slice(0, 700);
       log(`autodeploy: ${t.deployment || `job/${t.job}`} провал на стадии ${r.stage}: ${r.error}`);
     }
   }
+  if (deliveryStateDirty) await writeDeliveryState(repoRoot, deliveryState);
   // Итоговый ok = все image-цели ok И apply манифестов ok (если применялся).
   // manifest.ok=false (или budget_exceeded → stage skipped, ok=false) роняет
   // роль так же, как провал rollout: «код в main, но spec/Ingress старый» — тоже
