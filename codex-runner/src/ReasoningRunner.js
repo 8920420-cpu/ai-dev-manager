@@ -229,5 +229,11 @@ export function buildCompletionBody(task, agentResult) {
     // VERSION-KPI-TRACKING-001: метки версии кода раннера и использованной модели.
     codeVersion: resolveCodeVersion(),
     model: typeof agentResult.model === 'string' && agentResult.model ? agentResult.model : null,
+    // OBSERVABILITY-REASONING-001: KPI прогона из usage-события codex (см.
+    // extractCodexUsage). Имена полей — контракт normalizeRunKpi на бэкенде;
+    // отсутствие usage даёт null, и COALESCE не затрёт уже записанное.
+    tokensIn: agentResult.usage?.tokensIn ?? null,
+    tokensOut: agentResult.usage?.tokensOut ?? null,
+    tokensCacheRead: agentResult.usage?.tokensCacheRead ?? null,
   };
 }

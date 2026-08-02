@@ -3,7 +3,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
-import { makeCodexRunAgent } from '../src/codexAgent.js';
+import { makeCodexRunAgent, extractCodexUsage } from '../src/codexAgent.js';
 
 // Фейковый дочерний процесс: запоминает stdin, эмитит close с заданным кодом.
 function fakeSpawn(captured, { code = 0 } = {}) {
@@ -73,4 +73,42 @@ test('codexAgent: codex упал и нет вывода → ok:false', async () 
   const run = makeCodexRunAgent({ spawn: fakeSpawn(cap, { code: 1 }), log: { warn() {} } });
   const out = await run(task, {});
   assert.equal(out.ok, false);
+});
+
+// OBSERVABILITY-REASONING-001 — разбор usage из хвоста JSONL `codex exec --json`.
+// Форма события зафиксирована по реальному прогону gpt-5.5 (см. комментарий в
+// codexAgent.js): input_tokens включает cached_input_tokens, output_tokens
+// включает reasoning_output_tokens — слагаемые не складываем.
+test('extractCodexUsage: берёт usage из turn.completed в хвосте', () => {
+  const tail = [
+    '{"type":"turn.started"}',
+    '{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"READY"}}',
+    '{"type":"turn.completed","usage":{"input_tokens":18746,"cached_input_tokens":4480,"output_tokens":34,"reasoning_output_tokens":16}}',
+  ].join('\n');
+  assert.deepEqual(extractCodexUsage(tail), {
+    tokensIn: 18746, tokensOut: 34, tokensCacheRead: 4480,
+  });
+});
+
+test('extractCodexUsage: нет usage-события → null (COALESCE сохранит записанное)', () => {
+  assert.equal(extractCodexUsage('{"type":"turn.started"}\nне-JSON строка'), null);
+  assert.equal(extractCodexUsage(''), null);
+  assert.equal(extractCodexUsage(null), null);
+});
+
+test('extractCodexUsage: битый хвост и usage без чисел не ломают разбор', () => {
+  // Обрезанная первая строка (хвост 8 КБ режет посередине) + пустой usage.
+  const tail = [
+    'ut_tokens":5}}',
+    '{"type":"turn.completed","usage":{}}',
+  ].join('\n');
+  assert.equal(extractCodexUsage(tail), null);
+});
+
+test('extractCodexUsage: берёт ПОСЛЕДНЕЕ usage-событие, а не первое', () => {
+  const tail = [
+    '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":1}}',
+    '{"type":"turn.completed","usage":{"input_tokens":20,"cached_input_tokens":7,"output_tokens":2}}',
+  ].join('\n');
+  assert.deepEqual(extractCodexUsage(tail), { tokensIn: 20, tokensOut: 2, tokensCacheRead: 7 });
 });

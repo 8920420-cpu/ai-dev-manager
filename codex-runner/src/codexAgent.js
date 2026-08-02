@@ -50,6 +50,36 @@ function extractCodexError(stdoutTail) {
   return '';
 }
 
+// OBSERVABILITY-REASONING-001: KPI прогона рассуждающей роли. `codex exec --json`
+// закрывает поток событием turn.completed с usage — оно всегда в хвосте stdout,
+// который мы и так храним ради диагностики ошибок. Без этого agent_runs codex-ролей
+// оставались с нулями (token_input/token_output/cost = 0), и стоимость задачи с
+// документационной веткой в статистике была занижена.
+//
+// Форма события (проверено на gpt-5.5, `codex exec --json`):
+//   {"type":"turn.completed","usage":{"input_tokens":18746,"cached_input_tokens":4480,
+//    "output_tokens":34,"reasoning_output_tokens":16}}
+// input_tokens ВКЛЮЧАЕТ cached_input_tokens, а output_tokens — reasoning_output_tokens
+// (проверено сравнением двух прогонов: ответ в ~12 токенов дал output 34 при
+// reasoning 16). Поэтому слагаемые НЕ складываем — иначе двойной счёт. Такой же
+// контракт у claude-раннера: token_input там тоже полный вход, а разбивка кэша
+// лежит в отдельных полях.
+export function extractCodexUsage(stdoutTail) {
+  const lines = String(stdoutTail || '').split(/\r?\n/).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    let ev;
+    try { ev = JSON.parse(lines[i]); } catch { continue; }
+    const u = ev?.usage;
+    if (!u || typeof u !== 'object') continue;
+    const int = (v) => (Number.isFinite(Number(v)) ? Math.round(Number(v)) : null);
+    const tokensIn = int(u.input_tokens);
+    const tokensOut = int(u.output_tokens);
+    if (tokensIn === null && tokensOut === null) continue;
+    return { tokensIn, tokensOut, tokensCacheRead: int(u.cached_input_tokens) };
+  }
+  return null;
+}
+
 // Связать внешний AbortSignal с убийством процесса.
 function linkAbort(child, signal) {
   if (!signal) return () => {};
@@ -144,13 +174,16 @@ export function makeCodexRunAgent(cfg = {}) {
       let verdict = null;
       try { verdict = JSON.parse(raw); } catch { /* отдадим как сырой текст */ }
       const durationMs = Date.now() - started;
+      // KPI прогона из хвоста JSONL (см. extractCodexUsage). null — прогон без
+      // usage-события: KPI просто не перезапишутся (на стороне БД COALESCE).
+      const usage = extractCodexUsage(out.stdoutTail);
 
       if (verdict && typeof verdict === 'object' && !Array.isArray(verdict)) {
-        return { ok: true, verdict, response: raw, durationMs, model };
+        return { ok: true, verdict, response: raw, durationMs, model, usage };
       }
       // Схема должна была гарантировать JSON; если нет — отдадим текст, оркестратор
       // распарсит толерантно (parseVerdict) либо пометит verdict_unparsed.
-      if (raw) return { ok: true, response: raw, durationMs, model };
+      if (raw) return { ok: true, response: raw, durationMs, model, usage };
       return { ok: false, error: 'empty_codex_output' };
     } catch (e) {
       return { ok: false, error: `agent_threw: ${e.message}` };
