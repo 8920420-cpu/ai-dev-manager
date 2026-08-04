@@ -25,9 +25,9 @@ function startServer(t) {
   });
 }
 
-test('/api/client-auth never exposes ORCHESTRATOR_API_TOKEN', async (t) => {
+test('/api/client-auth exposes ORCHESTRATOR_API_TOKEN only with explicit bootstrap opt-in', async (t) => {
   const base = await startServer(t);
   const res = await fetch(`${base}/api/client-auth`);
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { token: null });
+  assert.deepEqual(await res.json(), { token: 'server-secret-token' });
 });

@@ -391,7 +391,9 @@ export function createApp() {
         if (req.method === 'GET' && p === '/health') return sendJson(res, 200, { status: 'ok' });
 
         if (req.method === 'GET' && p === '/api/client-auth') {
-          return sendJson(res, 200, { token: null });
+          const token = String(process.env.ORCHESTRATOR_API_TOKEN || '').trim();
+          const bootstrap = process.env.UI_BOOTSTRAP_API_TOKEN === '1';
+          return sendJson(res, 200, { token: bootstrap && token ? token : null });
         }
 
         // Healthcheck версии: версия сервиса + сводка применённых миграций.
