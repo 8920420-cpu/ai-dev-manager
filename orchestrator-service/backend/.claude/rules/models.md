@@ -97,3 +97,6 @@
 ## New Models (added 2026-07-20)
 - `db/migrations/0063_task_needs_input_status.sql`
 - `db/migrations/0064_task_questions.sql`
+
+## New Models (added 2026-08-04)
+- `db/migrations/0065_task_stack_specialization.sql`
