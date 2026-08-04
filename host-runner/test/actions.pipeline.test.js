@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
@@ -288,6 +288,101 @@ test('worktree-сдача → build+deploy ВЫПОЛНЯЮТСЯ в изоля�
   assert.equal(stages.deploy.status, 'success');
   assert.equal(stages.smoke.status, 'SKIPPED');
   assert.equal(stages.smoke.reason, 'skipped_in_isolation');
+});
+
+// PIPELINE-WORKTREE-ENVFILE-001: инцидент 04.08.2026 — deploy из worktree поднял
+// прод-стек без gitignored `.env`, compose обнулил `${VAR:-}` и вырубил двойную запись
+// в k3s на три дня. Env-файл общего дерева обязан доезжать в изолированный checkout.
+test('worktree-сдача → gitignored .env общего дерева доставлен в изоляцию (deploy не теряет переменные)', async (t) => {
+  const root = tmpDir(t);
+  gitIn(root, ['init', '--quiet']);
+  gitIn(root, ['config', 'user.email', 'test@local']);
+  gitIn(root, ['config', 'user.name', 'test']);
+  gitIn(root, ['config', 'commit.gpgsign', 'false']);
+  gitIn(root, ['config', 'core.autocrlf', 'false']);
+  writeServiceConfig(root, 'svc', {
+    deploy: { commands: ['docker compose up -d'], enabled: true },
+  });
+  // `.env` живёт ТОЛЬКО в общем дереве и под .gitignore — ровно как Archive/.env на 211.
+  writeFileSync(path.join(root, '.gitignore'), '.env\n');
+  writeFileSync(path.join(root, 'svc', '.env'), 'ARCHIVUM_SECONDARY_INGEST_URLS=http://host:30670/POST\n');
+  gitIn(root, ['add', '-A']);
+  gitIn(root, ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '--quiet', '-m', 'init']);
+  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '', '.env не попал в коммит (gitignored)');
+
+  const branch = 'programmer/PROJECT/svc';
+  const bwt = path.join(os.tmpdir(), `bwt3-${process.pid}-${Date.now()}`);
+  t.after(() => rmSync(bwt, { recursive: true, force: true }));
+  gitIn(root, ['worktree', 'add', '--quiet', '-b', branch, bwt, 'HEAD']);
+  writeFileSync(path.join(bwt, 'svc', 'DELTA.txt'), 'delta\n');
+  gitIn(bwt, ['add', '-A']);
+  gitIn(bwt, ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '--quiet', '-m', 'programmer: task delta']);
+  const deliveredCommit = gitIn(bwt, ['rev-parse', 'HEAD']).trim();
+  gitIn(root, ['worktree', 'remove', '--force', bwt]);
+
+  // Состояние env-файла фиксируем В МОМЕНТ выполнения deploy — worktree ещё жив.
+  let seen = null;
+  const executor = {
+    calls: [],
+    async run(command, opts = {}) {
+      const envPath = path.join(opts.cwd, '.env');
+      seen = { present: existsSync(envPath), body: existsSync(envPath) ? readFileSync(envPath, 'utf8') : '' };
+      this.calls.push({ command, opts });
+      return { command, exitCode: 0, signal: null, stdout: '', stderr: '', timedOut: false, error: null, durationSeconds: 0.01 };
+    },
+  };
+
+  const task = claimTask({ root, serviceRel: 'svc', serviceCode: 'svc' });
+  task.worktreeBranch = branch;
+  task.deliveredCommit = deliveredCommit;
+
+  const result = await runPipelineAction(task, { runnerDeps: runnerDeps(executor) });
+
+  assert.equal(result.success, true);
+  assert.ok(seen, 'стадия deploy выполнялась');
+  assert.equal(seen.present, true, '.env общего дерева доставлен в изолированный worktree');
+  assert.match(seen.body, /ARCHIVUM_SECONDARY_INGEST_URLS=http:\/\/host:30670\/POST/);
+  // Общее дерево не тронуто копированием (читаем, а не пишем).
+  assert.equal(gitIn(root, ['status', '--porcelain']).trim(), '', 'общее дерево чистое');
+});
+
+test('worktree-сдача: .env из доставленного коммита НЕ перетирается файлом общего дерева', async (t) => {
+  const root = tmpDir(t);
+  gitIn(root, ['init', '--quiet']);
+  gitIn(root, ['config', 'user.email', 'test@local']);
+  gitIn(root, ['config', 'user.name', 'test']);
+  gitIn(root, ['config', 'commit.gpgsign', 'false']);
+  gitIn(root, ['config', 'core.autocrlf', 'false']);
+  writeServiceConfig(root, 'svc', { deploy: { commands: ['docker compose up -d'], enabled: true } });
+  // Здесь `.env` закоммичен — версия из коммита приоритетнее грязного общего дерева.
+  writeFileSync(path.join(root, 'svc', '.env'), 'FROM=committed\n');
+  gitIn(root, ['add', '-A']);
+  gitIn(root, ['-c', 'user.name=test', '-c', 'user.email=test@local', 'commit', '--quiet', '-m', 'init']);
+  writeFileSync(path.join(root, 'svc', '.env'), 'FROM=dirty-shared-tree\n');
+
+  const branch = 'programmer/PROJECT/svc';
+  const bwt = path.join(os.tmpdir(), `bwt4-${process.pid}-${Date.now()}`);
+  t.after(() => rmSync(bwt, { recursive: true, force: true }));
+  gitIn(root, ['worktree', 'add', '--quiet', '-b', branch, bwt, 'HEAD']);
+  const deliveredCommit = gitIn(bwt, ['rev-parse', 'HEAD']).trim();
+  gitIn(root, ['worktree', 'remove', '--force', bwt]);
+
+  let body = null;
+  const executor = {
+    calls: [],
+    async run(command, opts = {}) {
+      body = readFileSync(path.join(opts.cwd, '.env'), 'utf8');
+      this.calls.push({ command, opts });
+      return { command, exitCode: 0, signal: null, stdout: '', stderr: '', timedOut: false, error: null, durationSeconds: 0.01 };
+    },
+  };
+
+  const task = claimTask({ root, serviceRel: 'svc', serviceCode: 'svc' });
+  task.worktreeBranch = branch;
+  task.deliveredCommit = deliveredCommit;
+
+  await runPipelineAction(task, { runnerDeps: runnerDeps(executor) });
+  assert.match(body, /FROM=committed/, 'версия из доставленного коммита сохранена');
 });
 
 test('worktree-сдача без deliveredCommit/ветки → фолбэк на общее дерево (совместимость)', async (t) => {

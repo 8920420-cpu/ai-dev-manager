@@ -3,8 +3,8 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import path from 'node:path';
 import os from 'node:os';
-import { rm } from 'node:fs/promises';
-import { realpathSync } from 'node:fs';
+import { rm, readdir, copyFile } from 'node:fs/promises';
+import { realpathSync, constants as fsConstants } from 'node:fs';
 import { runServicePipeline } from '../../pipeline-runner/src/index.js';
 import { runAutodeploy } from './autodeploy.js';
 import { withRepoWorktreeLock } from '../../shared/repoWorktreeLock.js';
@@ -81,6 +81,57 @@ const ISOLATION_SKIP_STAGES = String(
   .split(',')
   .map((s) => s.trim())
   .filter(Boolean);
+
+// PIPELINE-WORKTREE-ENVFILE-001 — gitignored `.env` общего дерева переносим в эфемерный
+// worktree ПЕРЕД прогоном стадий. Инцидент 04.08.2026: pipeline пересоздал прод-стек
+// `archive` (Archivum + коннектор 1С) из worktree, где `.env` физически нет — файл вне
+// git. Compose подставляет такие переменные как `${VAR:-}`, поэтому МОЛЧА обнулились
+// сразу четыре (`ARCHIVUM_SECONDARY_INGEST_URLS`, `CONNECTOR_K8S_GETWAY_GRPC_ADDR` и
+// `_INTERNAL_TOKEN`, `ORCHESTRATOR_INTAKE_*`): контейнеры поднялись healthy, а двойная
+// запись документов и справочников в k3s выключилась на три дня. Выгрузки из 1С шли
+// только в docker-контур, тогда как прод-фронт ПС-Торговли читает k8s; ни ошибки, ни
+// алерта — расхождение нашли по жалобе пользователя («выгрузил 310 документов, в
+// ПС-Торговле не изменилось»).
+//
+// Копируем ТОЛЬКО отсутствующие в worktree файлы (COPYFILE_EXCL): что пришло
+// доставленным коммитом — приоритетнее грязного общего дерева. Обход мелкий и
+// ограниченный: env-файлы лежат у корней подсистем (`Archive/.env`, `PS-Torg/.env`,
+// `WMS/Inbound_Acceptance/.env`), глубже искать незачем.
+const ENV_COPY_FILE_NAMES = new Set(['.env']);
+const ENV_COPY_SKIP_DIRS = new Set([
+  '.git', 'node_modules', 'dist', 'build', 'out', 'coverage', 'vendor', 'target', '.next', '.venv', '__pycache__',
+]);
+const ENV_COPY_MAX_DEPTH = 4;
+
+export async function copyEnvFilesIntoWorktree(repoRoot, worktreeDir, { log = () => {} } = {}) {
+  const copied = [];
+  const walk = async (relDir, depth) => {
+    let entries;
+    try {
+      entries = await readdir(path.join(repoRoot, relDir), { withFileTypes: true });
+    } catch {
+      return; // каталог исчез/недоступен — не повод валить прогон
+    }
+    for (const e of entries) {
+      const rel = relDir ? path.join(relDir, e.name) : e.name;
+      if (e.isDirectory()) {
+        if (depth >= ENV_COPY_MAX_DEPTH || ENV_COPY_SKIP_DIRS.has(e.name)) continue;
+        await walk(rel, depth + 1);
+        continue;
+      }
+      if (!e.isFile() || !ENV_COPY_FILE_NAMES.has(e.name)) continue;
+      try {
+        await copyFile(path.join(repoRoot, rel), path.join(worktreeDir, rel), fsConstants.COPYFILE_EXCL);
+        copied.push(rel.replace(/\\/g, '/'));
+      } catch {
+        // Файл уже есть в worktree (пришёл коммитом) либо каталога там нет — пропуск.
+      }
+    }
+  };
+  await walk('', 0);
+  if (copied.length) log(`pipeline: env-файлы общего дерева перенесены в worktree: ${copied.join(', ')}`);
+  return copied;
+}
 
 /**
  * PIPELINE_SERVICE: реальный прогон pipeline сервиса задачи через pipeline-runner.
@@ -164,6 +215,9 @@ async function withPipelineWorktree(repoRoot, task, run) {
     return run(repoRoot); // не смогли изолировать — безопасный фолбэк на общее дерево
   }
   try {
+    // PIPELINE-WORKTREE-ENVFILE-001: перенести gitignored `.env` ДО стадий — build и
+    // deploy поднимают compose именно отсюда, а без env-файла переменные обнуляются молча.
+    await copyEnvFilesIntoWorktree(repoRoot, dir, { log: (m) => console.log(m) }).catch(() => {});
     // В изоляции: доставить node_modules (в worktree их нет) и прогнать пайплайн.
     // PIPELINE-LOCAL-REBUILD-001: build+deploy теперь ВЫПОЛНЯЮТСЯ и здесь — образы
     // собираются из доставленного коммита, `up -d` рестартит общий стек (compose с
