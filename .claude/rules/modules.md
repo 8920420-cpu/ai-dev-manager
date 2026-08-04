@@ -276,3 +276,14 @@
 - `scripts/sync-codebase-memory-to-postgres.js` mirrors `CLAUDE.md`, `.claude/rules/*.md`, and `CONVENTIONS.md` into orchestrator PostgreSQL.
 - `orchestrator-service/backend/src/codebaseMemory.js` owns validation, file discovery, and DB upsert/list/get helpers.
 - `orchestrator-service/backend/db/migrations/0055_codebase_memory_documents.sql` creates the Postgres storage table.
+
+## agent-skills
+- **Location**: `agent-skills/`
+- **Purpose**: Project folder
+- **Key files**:
+  - `agent-skills/.claude-plugin/plugin.json`
+  - `agent-skills/README.md`
+  - `agent-skills/skills/buf-workflow/SKILL.md`
+  - `agent-skills/skills/contract-migration-planner/SKILL.md`
+  - `agent-skills/skills/database-migration-engineer/SKILL.md`
+- **File count**: 23

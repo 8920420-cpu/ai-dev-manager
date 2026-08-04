@@ -1,0 +1,33 @@
+{
+  "name": "orchestrator-skills",
+  "version": "1.0.0",
+  "description": "Инженерные скилы ролей оркестратора: Go-сервисы, protobuf/gRPC-контракты, Next.js/React-фронтенд, тесты, миграции БД, безопасность, наблюдаемость, релизы. Подключается раннерами через Claude Agent SDK (options.plugins) — без него скилы не видны headless-агенту.",
+  "author": {
+    "name": "ai-dev-manager"
+  },
+  "license": "MIT",
+  "keywords": ["go", "grpc", "protobuf", "nextjs", "react", "testing", "migrations", "security", "observability"],
+  "skills": [
+    "./skills/buf-workflow",
+    "./skills/contract-migration-planner",
+    "./skills/database-migration-engineer",
+    "./skills/frontend-code-review",
+    "./skills/frontend-testing",
+    "./skills/frontend-ui-engineer",
+    "./skills/go-code-review",
+    "./skills/go-service-engineer",
+    "./skills/go-test-engineer",
+    "./skills/grpc-api-design",
+    "./skills/integration-test-engineer",
+    "./skills/nextjs-app-router",
+    "./skills/nextjs-performance",
+    "./skills/observability-engineer",
+    "./skills/protobuf-contracts",
+    "./skills/react-component-engineer",
+    "./skills/react-state-management",
+    "./skills/release-engineer",
+    "./skills/security-reviewer",
+    "./skills/system-architect",
+    "./skills/test-strategy-planner"
+  ]
+}

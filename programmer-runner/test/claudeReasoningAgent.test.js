@@ -125,6 +125,35 @@ test('без cachePrefix: прежнее склеенное поведение, 
   assert.equal(capture.prompt, 'SYS\n\nUSR');
 });
 
+// AGENT-SKILLS-001: роль с профилем получает плагин скилов и подсказку в СТАТИЧНОЙ
+// части промпта (кэш-префикс остаётся стабильным для роли).
+test('роль с профилем: plugins/skills в options, подсказка в system-части', async () => {
+  const capture = {};
+  const run = makeClaudeReasoningRunAgent({ query: fakeQuery([
+    { type: 'system' }, { type: 'result', subtype: 'success', result: 'OK', num_turns: 1 },
+  ], capture) });
+  await run({ ...task, role: 'ARCHITECT', cachePrefix: true }, {});
+  assert.equal(capture.options.plugins.length, 1);
+  assert.ok(capture.options.skills.includes('orchestrator-skills:system-architect'));
+  assert.match(capture.options.systemPrompt[0], /^SYS\n\n## Skills/);
+  assert.equal(capture.options.systemPrompt[1], SYSTEM_PROMPT_DYNAMIC_BOUNDARY);
+  assert.equal(capture.prompt, 'USR', 'динамика задачи не смешивается с подсказкой');
+  // Изоляция настроек (COLDSTART-MCP-ISOLATION-001) не ослаблена плагином.
+  assert.deepEqual(capture.options.settingSources, []);
+  assert.deepEqual(capture.options.mcpServers, {});
+});
+
+test('роль без профиля: options без скилов, промпт как раньше', async () => {
+  const capture = {};
+  const run = makeClaudeReasoningRunAgent({ query: fakeQuery([
+    { type: 'system' }, { type: 'result', subtype: 'success', result: 'OK', num_turns: 1 },
+  ], capture) });
+  await run({ ...task, role: 'TASK_INTAKE_OFFICER' }, {});
+  assert.equal(capture.options.plugins, undefined);
+  assert.equal(capture.options.skills, undefined);
+  assert.equal(capture.prompt, 'SYS\n\nUSR');
+});
+
 test('classifyAbort: не поднялся / завис / работал — как было', () => {
   assert.equal(classifyAbort(null, 0, 0, 100), 'coldstart_failed');
   assert.equal(classifyAbort(10, 0, 10, 100), 'stuck_no_response');

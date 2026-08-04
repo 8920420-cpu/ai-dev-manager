@@ -23,6 +23,7 @@ import {
   buildProgrammerClaimTask,
   buildProgrammerRunSnapshot,
   programmerModelForKind,
+  resolveTaskStack,
 } from './programmerClaim.js';
 import {
   computeTaskPriority,
@@ -255,14 +256,18 @@ export async function claimNextClaudeTaskTx(c) {
       }
       const row = picked.rows[0];
       const meta = await c.query(
-        `SELECT p.code AS project_code, s.service_code, t.task_kind
+        `SELECT p.code AS project_code, s.service_code, t.task_kind, t.data_card
            FROM tasks t
            JOIN projects p ON p.id = t.project_id
            LEFT JOIN services s ON s.id = t.service_id
           WHERE t.id = $1`,
         [row.id],
       );
-      const { project_code, service_code, task_kind } = meta.rows[0];
+      const { project_code, service_code, task_kind, data_card } = meta.rows[0];
+      // STACK-SPECIALIZATION-001: стек задачи из карточки (Архитектор проставляет его
+      // по сервису в work_items). Раннер подаёт по нему профиль скилов; null → раннер
+      // определит стек сам по описанию.
+      const stack = resolveTaskStack(data_card);
       // Проброс контекста Programmer'у: вывод ARCHITECT/DECOMPOSER и последнее
       // ревью, чтобы Claude реализовывал по проекту, а не с нуля.
       const prior = await fetchPriorOutputs(c, row.id);
@@ -354,6 +359,7 @@ export async function claimNextClaudeTaskTx(c) {
         mcpConfig,
         requiredFields,
         completionKey,
+        stack,
       });
       return { task };
   });

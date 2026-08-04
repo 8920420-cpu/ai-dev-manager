@@ -12,6 +12,7 @@ import { query } from '@anthropic-ai/claude-agent-sdk';
 import { resolveRepo, loadRepoMap } from './repoResolver.js';
 import { buildPrompt, buildRepairPrompt, parseAgentJson } from './promptBuilder.js';
 import { WorktreeManager } from './worktreeManager.js';
+import { skillOptionsForStack, skillHintForStack, detectStack } from './skillProfiles.js';
 import {
   DEFAULT_VERIFY_TIMEOUT_MS, detectVerifyCommands, resolveVerifyDir, runVerify,
 } from './selfCheck.js';
@@ -81,9 +82,15 @@ function extractUsage(final) {
  * @returns {Promise<{ok:boolean, error?:string, result?:object}>}
  */
 async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTools, log, prompt: promptOverride }) {
+  // AGENT-SKILLS-001: профиль скилов по СТЕКУ задачи (специализация данными, а не
+  // отдельными ролями программиста). Пустой объект = скилы выключены/каталога нет →
+  // прогон идёт ровно как раньше. Ремонтный заход получает тот же профиль: чинить
+  // Go-тест без go-скилов так же неудобно, как писать его.
+  const stack = detectStack(task);
+  const skillOptions = skillOptionsForStack(stack);
   // promptOverride — ремонтный заход самопроверки (PROGRAMMER-SELF-CHECK-001);
   // без него это обычный первый прогон по описанию задачи.
-  const prompt = promptOverride || buildPrompt(task);
+  const prompt = promptOverride || buildPrompt(task, { skillHint: skillHintForStack(stack) });
   const ac = linkSignal(signal);
 
   // PROGRAMMER-USAGE-KPI-001: cold start — от вызова query() до первого system/init
@@ -101,6 +108,7 @@ async function runSdkOnce({ cwd, env, task, signal, model, maxTurns, allowedTool
         maxTurns,
         permissionMode: 'bypassPermissions',
         allowedTools,
+        ...skillOptions,
         abortController: ac,
         env: { ...process.env, ...env },
       },

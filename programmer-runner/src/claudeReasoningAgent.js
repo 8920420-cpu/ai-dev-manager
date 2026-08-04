@@ -16,6 +16,8 @@
 // успевает» (working_slow) от «висит и ничего не делает» (stuck_no_response/coldstart_failed).
 import { query, SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from '@anthropic-ai/claude-agent-sdk';
 
+import { skillOptionsForRole, skillHintForRole } from './skillProfiles.js';
+
 // Рассуждающим ролям достаточно чтения: смотрят код/доки и выносят вердикт.
 const READONLY_TOOLS = ['Read', 'Glob', 'Grep', 'Bash'];
 
@@ -111,8 +113,15 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
     // (SYSTEM_PROMPT_DYNAMIC_BOUNDARY): драйвер кэширует её (5-мин ephemeral), и
     // повторные прогоны того же проекта/роли не переоплачивают карту. Динамику задачи
     // шлём как user-сообщение. Иначе — прежнее склеенное поведение (одна строка).
-    const sys = String(task.systemPrompt || '');
+    const sysRole = String(task.systemPrompt || '');
     const user = String(task.userPrompt || '');
+    // AGENT-SKILLS-001: профиль скилов роли (Архитектор, Ревьюер, Аналитик падений…).
+    // Подсказку кладём в СТАТИЧНУЮ часть промпта: она зависит только от роли, поэтому
+    // не ломает кэш-префикс (PROMPT-CACHE-001) и переиспользуется между прогонами.
+    // Роли без профиля (Приёмщик, Router) не получают ничего — прогон как раньше.
+    const skillOptions = skillOptionsForRole(task.role);
+    const skillHint = skillHintForRole(task.role);
+    const sys = skillHint ? `${sysRole}\n\n${skillHint}`.trim() : sysRole;
     const useCachePrefix = task.cachePrefix === true && sys !== '';
     const prompt = useCachePrefix ? user : `${sys}\n\n${user}`.trim();
     const systemPromptOpt = useCachePrefix ? [sys, SYSTEM_PROMPT_DYNAMIC_BOUNDARY] : undefined;
@@ -173,6 +182,10 @@ export function makeClaudeReasoningRunAgent(cfg = {}) {
           settingSources: [],
           strictMcpConfig: true,
           mcpServers: {},
+          // AGENT-SKILLS-001: скилы приходят ЛОКАЛЬНЫМ ПЛАГИНОМ, а не через
+          // settingSources — изоляция настроек выше остаётся в силе (плагин подаётся
+          // абсолютным путём, MCP-дискавери у него выключено).
+          ...skillOptions,
           abortController: ac,
           env: { ...process.env },
         },

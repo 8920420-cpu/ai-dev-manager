@@ -71,3 +71,7 @@
 - `GET /api/projects/:id/codebase-memory/:key` reads one memory document.
 - `PUT /api/projects/:id/codebase-memory/:key` upserts one memory document.
 - `POST /api/projects/:id/codebase-memory` bulk syncs memory documents.
+
+## New Routes (added 2026-08-04)
+- `agent-skills/skills/frontend-code-review/SKILL.md`
+- `agent-skills/skills/go-code-review/SKILL.md`

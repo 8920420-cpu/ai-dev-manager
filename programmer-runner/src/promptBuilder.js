@@ -22,9 +22,12 @@ function summarizePriorRuns(priorRoleOutputs = []) {
 
 /**
  * @param {Object} task claimed Claude task
+ * @param {Object} [opts]
+ * @param {string} [opts.skillHint] AGENT-SKILLS-001 — секция со списком скилов,
+ *   доступных агенту в этом прогоне (пустая строка, когда скилы выключены).
  * @returns {string} prompt for query()
  */
-export function buildPrompt(task) {
+export function buildPrompt(task, { skillHint = '' } = {}) {
   const prior = summarizePriorRuns(task.priorRoleOutputs);
   const caps = Array.isArray(task.capabilities) ? task.capabilities.join(', ') : '';
   const fields = Array.isArray(task.requiredFields) && task.requiredFields.length
@@ -50,6 +53,12 @@ export function buildPrompt(task) {
 
   if (prior) {
     sections.push('', '## Previous Role Context', prior);
+  }
+
+  // AGENT-SKILLS-001: скилы стека. Ставим ПЕРЕД правилами исполнения — они меняют
+  // то, КАК агент собирается работать, поэтому должны быть прочитаны до правки.
+  if (skillHint) {
+    sections.push('', skillHint);
   }
 
   sections.push(
