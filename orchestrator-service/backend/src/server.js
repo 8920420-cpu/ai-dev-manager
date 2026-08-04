@@ -375,6 +375,17 @@ function matchFeedbackScreenshotRoute(pathname) {
   return { id: decodeURIComponent(m[1]) };
 }
 
+// CLIENT-AUTH-LOOPBACK-001: петлевой ли адрес отправителя. Node отдаёт IPv6-форму
+// («::1», «::ffff:127.0.0.1» для IPv4-mapped), поэтому одной строкой не обойтись.
+// Пустой/неизвестный адрес трактуем как НЕ петлевой (fail-closed).
+export function isLoopbackAddress(addr) {
+  const a = String(addr ?? '').trim().toLowerCase();
+  if (!a) return false;
+  if (a === '::1' || a === '0:0:0:0:0:0:0:1') return true;
+  const v4 = a.startsWith('::ffff:') ? a.slice('::ffff:'.length) : a;
+  return /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(v4);
+}
+
 export function createApp() {
   const handler = async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -390,10 +401,25 @@ export function createApp() {
       if (p.startsWith('/api/') || p === '/health') {
         if (req.method === 'GET' && p === '/health') return sendJson(res, 200, { status: 'ok' });
 
+        // CLIENT-AUTH-LOOPBACK-001: bootstrap-выдача токена UI. Ручка открыта ДО
+        // проверки авторизации (иначе фронт не смог бы получить токен), поэтому
+        // отдавать ORCHESTRATOR_API_TOKEN можно только при ДВУХ условиях сразу:
+        // явный opt-in UI_BOOTSTRAP_API_TOKEN=1 И запрос с петлевого адреса.
+        // Инцидент 04.08.2026: флаг стоял в проде, порт опубликован на 0.0.0.0 —
+        // `curl http://192.168.1.211:4186/api/client-auth` из LAN отдавал админский
+        // токен всем желающим, а с ним открыты все ~60 ручек API (включая /api/db/*).
+        // Токен здесь один общий, ротация = правка .env + рестарт, а GET в логах
+        // неотличим от обычной загрузки UI — незаметный обход 401.
+        // ВАЖНО про docker: контейнер за NAT видит адрес шлюза (172.x), а не
+        // отправителя, поэтому в проде условие ложно ДАЖЕ для запроса с самого
+        // хоста. Это осознанно: UI показывает форму ввода токена (ApiTokenGate),
+        // а сеть больше ничего не получает. Петлевая ветка остаётся рабочей для
+        // запуска без docker (npm start) и для тестов.
         if (req.method === 'GET' && p === '/api/client-auth') {
           const token = String(process.env.ORCHESTRATOR_API_TOKEN || '').trim();
           const bootstrap = process.env.UI_BOOTSTRAP_API_TOKEN === '1';
-          return sendJson(res, 200, { token: bootstrap && token ? token : null });
+          const loopback = isLoopbackAddress(req.socket?.remoteAddress);
+          return sendJson(res, 200, { token: bootstrap && loopback && token ? token : null });
         }
 
         // Healthcheck версии: версия сервиса + сводка применённых миграций.
